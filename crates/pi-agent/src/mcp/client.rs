@@ -12,10 +12,11 @@ use crate::mcp::transports::sse::LegacySseTransport;
 use crate::mcp::transports::stdio::StdioTransport;
 use crate::mcp::transports::McpTransport;
 use crate::mcp::types::{
-    MCPContent, MCPInitializeParams, MCPInitializeResult, MCPResource, MCPResourceReadParams,
-    MCPResourceReadResult, MCPResourceTemplate, MCPResourceTemplatesListResult,
-    MCPResourcesListResult, MCPServerCapabilities, MCPServerConfig, MCPServerInfo,
-    MCPToolCallResult, MCPToolDefinition, MCPToolsListResult, MCP_PROTOCOL_VERSION,
+    MCPClientCapabilities, MCPContent, MCPInitializeParams, MCPInitializeResult, MCPResource,
+    MCPResourceReadParams, MCPResourceReadResult, MCPResourceTemplate,
+    MCPResourceTemplatesListResult, MCPResourcesListResult, MCPRootsCapability,
+    MCPServerCapabilities, MCPServerConfig, MCPServerInfo, MCPToolCallResult, MCPToolDefinition,
+    MCPToolsListResult, MCP_PROTOCOL_VERSION,
 };
 
 // Conservative pagination bounds for untrusted servers; shared by resources
@@ -112,7 +113,11 @@ async fn create_and_init_transport(
 
     let init_params = MCPInitializeParams {
         protocol_version: MCP_PROTOCOL_VERSION.to_string(),
-        capabilities: Default::default(),
+        // Every transport answers `roots/list` with the workspace root, so the
+        // capability is declared instead of advertised as `roots: null`.
+        capabilities: MCPClientCapabilities {
+            roots: Some(MCPRootsCapability { list_changed: false }),
+        },
         client_info: crate::mcp::types::MCPClientInfo {
             name: "omp".to_string(),
             version: "1.0.0".to_string(),

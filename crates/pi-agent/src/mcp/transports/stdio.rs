@@ -10,7 +10,7 @@ use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
 
 use crate::mcp::error::McpError;
-use crate::mcp::transports::McpTransport;
+use crate::mcp::transports::{McpTransport, roots_list_reply};
 use crate::mcp::types::{MCPStdioServerConfig, RequestIdFormat};
 
 struct PendingGuard<'a> {
@@ -52,6 +52,40 @@ impl<'a> Drop for PendingGuard<'a> {
     }
 }
 
+/// Parent variables a stdio server needs to execute at all: command lookup,
+/// home, Termux prefix/tmp, terminal, locale, and CA-bundle paths (paths, not
+/// secrets). Everything else the host holds (provider keys, tokens, ambient
+/// credentials, proxy URLs that may embed credentials) is withheld: those must
+/// come from explicit `config.env`, which is applied afterwards and always wins.
+const INHERITED_ENV: &[&str] = &[
+    "PATH",
+    "HOME",
+    "PREFIX",
+    "TMPDIR",
+    "TMP",
+    "TEMP",
+    "LANG",
+    "LC_ALL",
+    "LC_CTYPE",
+    "LC_MESSAGES",
+    "TZ",
+    "TERM",
+    "SSL_CERT_FILE",
+    "NODE_EXTRA_CA_CERTS",
+];
+
+fn apply_isolated_env(cmd: &mut Command, overrides: &HashMap<String, String>) {
+    cmd.env_clear();
+    for key in INHERITED_ENV {
+        if let Some(value) = std::env::var_os(key) {
+            cmd.env(key, value);
+        }
+    }
+    for (key, value) in overrides {
+        cmd.env(key, value);
+    }
+}
+
 pub struct StdioTransport {
     child: Arc<Mutex<Option<Child>>>,
     stdin_tx: mpsc::Sender<String>,
@@ -72,9 +106,11 @@ impl StdioTransport {
             cmd.current_dir(cwd);
         }
 
-        for (k, v) in &config.env {
-            cmd.env(k, v);
-        }
+        apply_isolated_env(&mut cmd, &config.env);
+
+        // Advertised root: the configured server cwd (the project root set by
+        // the host) when present, never a blind assumption of the process cwd.
+        let configured_root = config.cwd.clone().map(std::path::PathBuf::from);
 
         cmd.stdin(std::process::Stdio::piped());
         cmd.stdout(std::process::Stdio::piped());
@@ -176,21 +212,7 @@ impl StdioTransport {
                                 "id": id,
                                 "result": {}
                             }),
-                            "roots/list" => {
-                                let cwd = std::env::current_dir()
-                                    .map(|p| p.to_string_lossy().to_string())
-                                    .unwrap_or_else(|_| ".".to_string());
-                                json!({
-                                    "jsonrpc": "2.0",
-                                    "id": id,
-                                    "result": {
-                                        "roots": [{
-                                            "uri": format!("file://{}", cwd),
-                                            "name": "workspace"
-                                        }]
-                                    }
-                                })
-                            }
+                            "roots/list" => roots_list_reply(id, configured_root.as_deref()),
                             _ => json!({
                                 "jsonrpc": "2.0",
                                 "id": id,
@@ -422,6 +444,142 @@ mod tests {
     use super::*;
     use crate::mcp::types::MCPStdioServerConfig;
     use std::collections::HashMap;
+
+    /// Ambient parent variables must not reach the child; explicit config env
+    /// must, and the documented platform baseline must survive. Mutates only
+    /// the `Command` under test, never the process environment.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn spawn_env_is_explicit_not_ambient() {
+        let mut overrides = HashMap::new();
+        overrides.insert("MCP_TEST_EXPLICIT".to_string(), "from-config".to_string());
+        // A proxy may embed credentials, so it is only ever accepted from
+        // explicit server config (D27), never from the host environment.
+        overrides.insert("HTTPS_PROXY".to_string(), "http://explicit.invalid:8080".to_string());
+
+        let mut cmd = Command::new("env");
+        apply_isolated_env(&mut cmd, &overrides);
+
+        let out = cmd.output().await.expect("spawn env");
+        assert!(out.status.success(), "env failed: {}", String::from_utf8_lossy(&out.stderr));
+        let child: HashMap<String, String> = String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .filter_map(|line| line.split_once('='))
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+
+        assert_eq!(
+            child.get("MCP_TEST_EXPLICIT").map(String::as_str),
+            Some("from-config"),
+            "explicit config env must be passed"
+        );
+        assert_eq!(
+            child.get("HTTPS_PROXY").map(String::as_str),
+            Some("http://explicit.invalid:8080"),
+            "explicit server config must be able to set a proxy"
+        );
+
+        // Anything outside the baseline (plus explicit overrides) means the
+        // parent environment leaked through.
+        for key in child.keys() {
+            assert!(
+                INHERITED_ENV.contains(&key.as_str()) || overrides.contains_key(key.as_str()),
+                "ambient parent variable {key} leaked into the MCP child"
+            );
+        }
+
+        // Baseline values present in the parent are preserved verbatim.
+        for key in INHERITED_ENV {
+            let parent = std::env::var(key).ok();
+            let got = child.get(*key).cloned();
+            assert_eq!(got, parent, "baseline variable {key} must match the parent");
+        }
+
+        // Other proxy URLs are not inherited; HTTPS_PROXY is only present above
+        // because server config set it explicitly.
+        for key in [
+            "HTTP_PROXY",
+            "NO_PROXY",
+            "ALL_PROXY",
+            "http_proxy",
+            "https_proxy",
+            "no_proxy",
+            "all_proxy",
+        ] {
+            if std::env::var_os(key).is_some() {
+                assert!(
+                    !child.contains_key(key),
+                    "proxy variable {key} must come from explicit server env, not the host"
+                );
+            }
+        }
+    }
+
+    /// `roots/list` is reachable now that the capability is declared. The root is
+    /// the configured server cwd, and its URI must be valid (percent-encoded).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn roots_list_returns_encoded_configured_cwd() {
+        let dir = std::env::temp_dir().join(format!("omp mcp roots #{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("create root dir");
+        let script_path = dir.join("roots_server.py");
+        std::fs::write(
+            &script_path,
+            r#"
+import sys, json
+init_id = None
+def send(obj):
+    sys.stdout.write(json.dumps(obj) + "\n")
+    sys.stdout.flush()
+for line in sys.stdin:
+    msg = json.loads(line)
+    if msg.get("method") == "initialize":
+        init_id = msg["id"]
+        send({"jsonrpc": "2.0", "id": 9001, "method": "roots/list"})
+    elif msg.get("id") == 9001 and "result" in msg:
+        uri = msg["result"]["roots"][0]["uri"]
+        send({"jsonrpc": "2.0", "id": init_id, "result": {
+            "protocolVersion": "2025-11-25",
+            "capabilities": {},
+            "serverInfo": {"name": "roots", "version": "1"},
+            "instructions": uri,
+        }})
+"#,
+        )
+        .expect("write roots fixture");
+
+        let config = MCPStdioServerConfig {
+            command: "python3".to_string(),
+            args: vec![script_path.to_string_lossy().into_owned()],
+            env: HashMap::new(),
+            cwd: Some(dir.to_string_lossy().into_owned()),
+            timeout: Some(10_000),
+            request_id_format: Some(RequestIdFormat::Number),
+        };
+        let transport = StdioTransport::spawn(&config).await.expect("spawn roots fixture");
+        let init = transport
+            .request(
+                "initialize",
+                Some(serde_json::json!({
+                    "protocolVersion": "2025-11-25",
+                    "capabilities": {"roots": {"listChanged": false}},
+                    "clientInfo": {"name": "test", "version": "1"},
+                })),
+                Some(Duration::from_secs(10)),
+            )
+            .await
+            .expect("initialize");
+        transport.close().await.expect("close");
+
+        let uri = init["instructions"].as_str().expect("server echoed the root uri");
+        reqwest::Url::parse(uri).expect("advertised root must be a valid URI");
+        assert!(uri.starts_with("file:///"), "uri={uri}");
+        assert!(!uri.contains(' '), "space must be encoded: {uri}");
+        assert!(!uri.contains('#'), "fragment delimiter must be encoded: {uri}");
+        assert!(uri.contains("omp%20mcp%20roots%20%23"), "configured cwd must be the root: {uri}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     /// Stub: after close(), child pid must leave /proc (reaped, not zombie).
     #[cfg(unix)]

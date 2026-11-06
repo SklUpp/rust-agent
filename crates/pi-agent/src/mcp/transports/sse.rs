@@ -12,7 +12,7 @@ use tokio::task::JoinHandle;
 use crate::mcp::error::McpError;
 use crate::mcp::timeout::resolve_mcp_timeout_ms;
 use crate::mcp::transports::header_policy::{merge_mcp_headers, without_header};
-use crate::mcp::transports::McpTransport;
+use crate::mcp::transports::{McpTransport, roots_list_reply};
 use crate::mcp::types::{MCPSseServerConfig, RequestIdFormat};
 
 pub const MAX_MCP_FRAME_SIZE: usize = 16 * 1024 * 1024; // 16 MiB bound to prevent memory exhaustion
@@ -506,21 +506,7 @@ impl LegacySseTransport {
                                             "id": id,
                                             "result": {}
                                         }),
-                                        "roots/list" => {
-                                            let cwd = std::env::current_dir()
-                                                .map(|p| p.to_string_lossy().to_string())
-                                                .unwrap_or_else(|_| ".".to_string());
-                                            json!({
-                                                "jsonrpc": "2.0",
-                                                "id": id,
-                                                "result": {
-                                                    "roots": [{
-                                                        "uri": format!("file://{}", cwd),
-                                                        "name": "workspace"
-                                                    }]
-                                                }
-                                            })
-                                        }
+                                        "roots/list" => roots_list_reply(id, None),
                                         _ => json!({
                                             "jsonrpc": "2.0",
                                             "id": id,

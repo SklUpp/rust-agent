@@ -226,7 +226,9 @@ pub struct MCPRootsCapability {
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct MCPClientCapabilities {
-	#[serde(default)]
+	/// Advertised only when the client actually serves `roots/list`; an
+	/// undeclared capability must be omitted, not serialized as `null`.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub roots: Option<MCPRootsCapability>,
 }
 
@@ -295,14 +297,10 @@ pub enum MCPContent {
 		#[serde(rename = "mimeType")]
 		mime_type: String,
 	},
+	/// MCP wire shape is `{"type":"resource","resource":{uri,mimeType,text|blob}}`,
+	/// not flat fields beside `type`.
 	#[serde(rename = "resource")]
-	Resource {
-		uri: String,
-		#[serde(default)]
-		text: Option<String>,
-		#[serde(default)]
-		blob: Option<String>,
-	},
+	Resource { resource: MCPResourceContentItem },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -379,6 +377,8 @@ pub struct MCPResourceTemplatesListResult {
 	pub next_cursor: Option<String>,
 }
 
+/// Resource contents. The same MCP wire shape is used by `resources/read`
+/// results and by embedded `{"type":"resource"}` tool content.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MCPResourceContentItem {
 	pub uri: String,
@@ -452,5 +452,67 @@ mod tests {
 		assert!(!h.contains("secret_auth"));
 		assert!(!h.contains("secret_oauth"));
 		assert!(h.contains("[REDACTED]"));
+	}
+
+	/// Real spec wire JSON: embedded resources are nested under `resource`,
+	/// keeping uri/MIME/text or blob intact.
+	#[test]
+	fn tool_result_decodes_nested_embedded_resource() {
+		let wire = r#"{
+			"content": [
+				{"type": "text", "text": "before"},
+				{"type": "resource", "resource": {"uri": "mem://notes/a", "mimeType": "text/plain", "text": "hello"}},
+				{"type": "resource", "resource": {"uri": "mem://img/b", "mimeType": "image/png", "blob": "AAECAwQ="}},
+				{"type": "resource", "resource": {"uri": "mem://empty/c"}}
+			],
+			"isError": false
+		}"#;
+		let result: MCPToolCallResult =
+			serde_json::from_str(wire).expect("nested resource must decode");
+		assert_eq!(result.content.len(), 4);
+		match &result.content[1] {
+			MCPContent::Resource { resource } => {
+				assert_eq!(resource.uri, "mem://notes/a");
+				assert_eq!(resource.mime_type.as_deref(), Some("text/plain"));
+				assert_eq!(resource.text.as_deref(), Some("hello"));
+				assert!(resource.blob.is_none());
+			},
+			other => panic!("expected embedded resource, got {other:?}"),
+		}
+		match &result.content[2] {
+			MCPContent::Resource { resource } => {
+				assert_eq!(resource.uri, "mem://img/b");
+				assert_eq!(resource.mime_type.as_deref(), Some("image/png"));
+				assert_eq!(resource.blob.as_deref(), Some("AAECAwQ="));
+				assert!(resource.text.is_none());
+			},
+			other => panic!("expected embedded blob resource, got {other:?}"),
+		}
+		match &result.content[3] {
+			MCPContent::Resource { resource } => {
+				assert_eq!(resource.uri, "mem://empty/c");
+				assert!(resource.text.is_none() && resource.blob.is_none());
+			},
+			other => panic!("expected empty embedded resource, got {other:?}"),
+		}
+
+		// Round-trip must keep the nested shape the server sent.
+		let back = serde_json::to_value(&result).expect("serialize");
+		assert_eq!(back["content"][1]["resource"]["uri"], "mem://notes/a");
+		assert!(back["content"][1].get("uri").is_none());
+	}
+
+	#[test]
+	fn client_capabilities_declare_roots_only_when_served() {
+		let declared =
+			MCPClientCapabilities { roots: Some(MCPRootsCapability { list_changed: false }) };
+		assert_eq!(
+			serde_json::to_value(&declared).unwrap(),
+			serde_json::json!({"roots": {"listChanged": false}})
+		);
+		assert_eq!(
+			serde_json::to_value(MCPClientCapabilities::default()).unwrap(),
+			serde_json::json!({})
+		);
 	}
 }

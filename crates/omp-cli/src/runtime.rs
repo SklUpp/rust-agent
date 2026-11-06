@@ -5502,16 +5502,24 @@ impl Tool for McpTool {
 									}
 									content.push_str(&format!("[Image: {mime_type}; base64={data}]"));
 								},
-								MCPContent::Resource { uri, text, blob } => {
+								MCPContent::Resource { resource } => {
 									if !content.is_empty() {
 										content.push_str("\n\n");
 									}
-									if let Some(t) = text {
-										content.push_str(&format!("[Resource: {uri}]\n{t}"));
-									} else if let Some(b) = blob {
-										content.push_str(&format!("[Resource: {uri}; base64={b}]"));
+									let uri = &resource.uri;
+									let mime = resource
+										.mime_type
+										.as_deref()
+										.map(|m| format!("; {m}"))
+										.unwrap_or_default();
+									if let Some(t) = &resource.text {
+										content.push_str(&format!("[Resource: {uri}{mime}]\n{t}"));
+									} else if let Some(b) = &resource.blob {
+										content.push_str(&format!(
+											"[Resource: {uri}{mime}; base64={b}]"
+										));
 									} else {
-										content.push_str(&format!("[Resource: {uri}]"));
+										content.push_str(&format!("[Resource: {uri}{mime}]"));
 									}
 								},
 							}
