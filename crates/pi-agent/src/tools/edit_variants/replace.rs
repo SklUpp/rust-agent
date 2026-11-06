@@ -13,7 +13,7 @@ use super::{
 };
 use crate::{
 	state::{AgentContext, ToolResult},
-	tools::ToolError,
+	tool::ToolError,
 };
 
 pub const DESCRIPTION: &str = "Single file string replacement; fuzzy whitespace matching.\n\n\

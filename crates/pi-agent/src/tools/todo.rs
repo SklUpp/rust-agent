@@ -16,7 +16,7 @@ use serde_json::{Value, json};
 
 use crate::state::{AgentContext, ToolResult};
 
-use super::{Tool, ToolError, tool_result};
+use crate::tool::{Tool, ToolError, tool_result};
 
 /// Phase name used by a flat `items` init when no `phase` is given.
 const DEFAULT_INIT_PHASE: &str = "Tasks";

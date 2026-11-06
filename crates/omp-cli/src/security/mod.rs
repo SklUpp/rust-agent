@@ -86,7 +86,7 @@ impl SecurityConfig {
 /// The caller registers it under [`tool::SECURITY_SCAN_TOOL_NAME`] and offers
 /// the name in the tool list only when [`SecurityConfig::enabled`] is true.
 #[must_use]
-pub fn security_scan_tool(host: Arc<dyn SecurityHost>) -> Arc<dyn pi_agent::tools::Tool> {
+pub fn security_scan_tool(host: Arc<dyn SecurityHost>) -> Arc<dyn pi_agent::tool::Tool> {
 	Arc::new(SecurityScanTool::new(host))
 }
 

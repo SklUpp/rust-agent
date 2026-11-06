@@ -23,7 +23,7 @@ use pi_agent::{
 		EvalSettings, EvalTool, Interpreters, KernelMode,
 	},
 	state::{AgentContext, ToolResult},
-	tools::{Tool, ToolError},
+	tool::{Tool, ToolError},
 };
 
 #[derive(Default)]

@@ -1771,7 +1771,7 @@ impl RpcSession {
 			self.skill_options.clone(),
 			self.skill_snapshot.clone(),
 		) {
-			let tool: Arc<dyn pi_agent::tools::Tool> = Arc::new(tool);
+			let tool: Arc<dyn pi_agent::tool::Tool> = Arc::new(tool);
 			tools.push(crate::agent::ExtraTool::from(tool));
 		}
 		if learn && let Some(tool) = crate::autolearn::LocalLearnTool::create_if(
@@ -1780,7 +1780,7 @@ impl RpcSession {
 			self.skill_options.clone(),
 			self.skill_snapshot.clone(),
 		) {
-			let tool: Arc<dyn pi_agent::tools::Tool> = Arc::new(tool);
+			let tool: Arc<dyn pi_agent::tool::Tool> = Arc::new(tool);
 			tools.push(crate::agent::ExtraTool::from(tool));
 		}
 		tools
@@ -2216,7 +2216,7 @@ impl RpcSession {
 		};
 		let mut extra_tools: Vec<crate::agent::ExtraTool> = Vec::new();
 		if self.goal_tool_mounted() {
-			let tool: Arc<dyn pi_agent::tools::Tool> = Arc::new(
+			let tool: Arc<dyn pi_agent::tool::Tool> = Arc::new(
 				crate::goal_tool::GoalTool::new(Arc::clone(&self.goal))
 					.with_plan_mode(self.plan_mode_probe.clone()),
 			);

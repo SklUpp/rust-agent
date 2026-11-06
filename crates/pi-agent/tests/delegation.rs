@@ -17,6 +17,14 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio::sync::{Semaphore, mpsc, oneshot};
 
+fn registry_with_builtins() -> ToolRegistry {
+	let mut registry = ToolRegistry::new();
+	for tool in pi_agent::tools::builtin_tools() {
+		registry.register(tool);
+	}
+	registry
+}
+
 fn tool_call_response(tool_name: &str, tool_args: &Value) -> Value {
 	json!({
 		"choices": [
@@ -1221,7 +1229,7 @@ async fn test_t9_dropping_child_future_kills_its_shell_tree() {
 	let marker = dir.join("marker.txt");
 
 	let supervisor = Supervisor::new(
-		ToolRegistry::with_builtins(),
+		registry_with_builtins(),
 		provider,
 		None,
 		DelegationLimits::default(),

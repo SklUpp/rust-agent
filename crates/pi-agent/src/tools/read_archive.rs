@@ -47,8 +47,8 @@ use super::{
 		read_multi_range, read_single_range, resolve_path, selector_offset_limit,
 		split_path_and_sel, truncate_head, truncation_json,
 	},
-	tool_result,
 };
+use crate::tool::tool_result;
 use crate::state::{AgentContext, ToolResult};
 
 const HELPER_SCRIPT: &str = include_str!("read_archive_helper.py");

@@ -216,7 +216,7 @@ fn gallery_covers_every_runtime_tool() {
 
 #[test]
 fn gallery_fixture_arguments_validate_against_tool_schemas() {
-	use pi_agent::tools::Tool;
+	use pi_agent::tool::Tool;
 
 	let args_for = |name: &str| -> Value {
 		let fixture = GALLERY_TOOLS

@@ -28,13 +28,16 @@ use pi_walker::{
 use serde_json::{Value, json};
 
 use super::{
-	ParsedFindPattern, Tool, ToolError, extract_raw_paths, fix_unclosed_braces,
-	format_path_relative_to_cwd, has_glob_path_chars, is_root_path, normalize_path,
-	normalize_path_like_input, parse_find_pattern,
+	ParsedFindPattern, extract_raw_paths, fix_unclosed_braces, format_path_relative_to_cwd,
+	has_glob_path_chars, is_root_path, normalize_path, normalize_path_like_input,
+	parse_find_pattern,
 	read::{FileDisplayInputs, ReadSnapshotSink, normalize_snapshot_text},
-	resolve_to_cwd, split_top_level_delimited, tool_result,
+	resolve_to_cwd, split_top_level_delimited,
 };
-use crate::state::{AgentContext, ToolResult};
+use crate::{
+	state::{AgentContext, ToolResult},
+	tool::{Tool, ToolError, tool_result},
+};
 
 /// Upstream `DEFAULT_AST_LIMIT`.
 const DEFAULT_AST_LIMIT: usize = 50;
@@ -1111,7 +1114,7 @@ mod tests {
 
 	use serde_json::json;
 
-	use crate::tools::Tool as _;
+	use crate::tool::Tool as _;
 
 	use super::*;
 

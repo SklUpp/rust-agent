@@ -30,7 +30,7 @@ use super::{
 	},
 };
 use crate::state::{AgentContext, ToolResult};
-use crate::tools::{Tool, ToolError};
+use crate::tool::{Tool, ToolError};
 
 /// Actions that only read program state. Everything else mutates the debuggee
 /// or the session tree and therefore needs exec approval.

@@ -10,7 +10,7 @@ use serde_json::{Map, Value};
 
 use crate::{
 	state::{AgentContext, ToolResult},
-	tools::ToolError,
+	tool::ToolError,
 };
 
 use super::types::EvalStatusEvent;

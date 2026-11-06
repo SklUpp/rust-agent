@@ -16,7 +16,7 @@ use std::{
 use async_trait::async_trait;
 use pi_agent::{
 	state::{AgentContext, ToolResult},
-	tools::{Tool, ToolError},
+	tool::{Tool, ToolError},
 };
 use serde_json::{Value, json};
 use tokio::sync::mpsc;

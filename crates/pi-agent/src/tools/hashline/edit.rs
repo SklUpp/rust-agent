@@ -30,7 +30,8 @@ use super::{
 };
 use crate::{
 	state::{AgentContext, ToolResult},
-	tools::{MAX_EDIT_BYTES, ToolError, read_capped, write_atomic_with_mode},
+	tool::{ToolError, tool_result},
+	tools::{MAX_EDIT_BYTES, read_capped, write_atomic_with_mode},
 };
 
 /// Inline cap on unseen anchor lines echoed back by the rejection.

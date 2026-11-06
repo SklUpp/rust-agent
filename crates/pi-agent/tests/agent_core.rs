@@ -19,6 +19,14 @@ use pi_agent::{
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use serde_json::json;
 
+fn registry_with_builtins() -> ToolRegistry {
+	let mut registry = ToolRegistry::new();
+	for tool in pi_agent::tools::builtin_tools() {
+		registry.register(tool);
+	}
+	registry
+}
+
 /// Record a file the way `read` does — normalized text plus the displayed
 /// source lines — into the session store the `edit` tool validates against.
 fn record_edit_snapshot(store: &pi_agent::tools::hashline::SnapshotStore, path: &std::path::Path) -> String {
@@ -191,7 +199,7 @@ async fn tool_call_round_trip_feeds_result_back_to_the_model() {
 	let agent = AgentLoop::new(
 		config(&dir.path, 5),
 		std::sync::Arc::new(provider),
-		ToolRegistry::with_builtins(),
+		registry_with_builtins(),
 	);
 	let mut state = AgentState::default();
 
@@ -258,7 +266,7 @@ async fn provider_error_surfaces_without_polluting_history() {
 	let agent = AgentLoop::new(
 		config(&dir.path, 3),
 		std::sync::Arc::new(provider),
-		ToolRegistry::with_builtins(),
+		registry_with_builtins(),
 	);
 	let mut state = AgentState::default();
 
@@ -289,7 +297,7 @@ async fn max_turns_is_enforced_and_history_stays_answerable() {
 	let agent = AgentLoop::new(
 		config(&dir.path, 2),
 		std::sync::Arc::new(LoopingProvider { calls: AtomicUsize::new(0) }),
-		ToolRegistry::with_builtins(),
+		registry_with_builtins(),
 	);
 	let mut state = AgentState::default();
 
@@ -328,7 +336,7 @@ async fn unknown_tool_still_answers_every_call() {
 	let agent = AgentLoop::new(
 		config(&dir.path, 3),
 		std::sync::Arc::new(provider),
-		ToolRegistry::with_builtins(),
+		registry_with_builtins(),
 	);
 	let mut state = AgentState::default();
 
@@ -361,7 +369,7 @@ async fn interrupt_cancels_tools_without_orphans() {
 	let agent = AgentLoop::new(
 		config(&dir.path, 3),
 		std::sync::Arc::new(provider),
-		ToolRegistry::with_builtins(),
+		registry_with_builtins(),
 	);
 	let mut state = AgentState::default();
 	let (steering_tx, steering_rx) = tokio::sync::mpsc::channel(4);
@@ -891,7 +899,7 @@ async fn write_preserves_restrictive_mode_on_existing_file() {
 
 #[test]
 fn registry_schemas_are_sorted_and_include_edit() {
-	let registry = ToolRegistry::with_builtins();
+	let registry = registry_with_builtins();
 	let names: Vec<String> = registry
 		.schemas()
 		.iter()
@@ -1987,7 +1995,7 @@ async fn streaming_emits_text_deltas_in_arrival_order() {
 		done_chunk(),
 	]]));
 	let agent =
-		AgentLoop::new(config(&dir.path, 3), provider.clone(), ToolRegistry::with_builtins());
+		AgentLoop::new(config(&dir.path, 3), provider.clone(), registry_with_builtins());
 	let mut state = AgentState::default();
 	let (events_tx, events_rx) = tokio::sync::mpsc::channel(8);
 	let drainer = spawn_drainer(events_rx);
@@ -2025,7 +2033,7 @@ async fn streaming_keeps_tool_calls_finalized_across_turns() {
 		vec![text_chunk("Done"), done_chunk()],
 	]));
 	let agent =
-		AgentLoop::new(config(&dir.path, 3), provider.clone(), ToolRegistry::with_builtins());
+		AgentLoop::new(config(&dir.path, 3), provider.clone(), registry_with_builtins());
 	let mut state = AgentState::default();
 	let (events_tx, events_rx) = tokio::sync::mpsc::channel(8);
 	let drainer = spawn_drainer(events_rx);
@@ -2144,7 +2152,7 @@ async fn child_registry_gets_fresh_store_registers_and_seen_lines() {
 	std::fs::write(&path, "l1\nl2\nl3\nl4\nl5\nl6\nl7\nl8\nl9\nl10\n").expect("write");
 	let provider = Arc::new(ScriptedProvider::with_turns(Vec::new()));
 	let supervisor = Supervisor::new(
-		ToolRegistry::with_builtins(),
+		registry_with_builtins(),
 		provider,
 		None,
 		DelegationLimits::default(),
@@ -2343,7 +2351,7 @@ impl ModelProvider for StalledStreamProvider {
 async fn interrupt_stalled_provider_stream_setup() {
 	let dir = TempDir::new("interrupt-stalled-stream");
 	let provider = Arc::new(StalledStreamProvider);
-	let agent = AgentLoop::new(config(&dir.path, 3), provider, ToolRegistry::with_builtins());
+	let agent = AgentLoop::new(config(&dir.path, 3), provider, registry_with_builtins());
 	let mut state = AgentState::default();
 	let (steering_tx, steering_rx) = tokio::sync::mpsc::channel(4);
 	let (events_tx, _events_rx) = tokio::sync::mpsc::channel(8);
@@ -2370,7 +2378,7 @@ async fn first_message_update_readable_before_done() {
 	let dir = TempDir::new("live-first-chunk");
 	let (chunk_tx, chunk_rx) = futures::channel::mpsc::unbounded();
 	let provider = Arc::new(ChannelProvider::new(Box::pin(chunk_rx)));
-	let agent = AgentLoop::new(config(&dir.path, 3), provider, ToolRegistry::with_builtins());
+	let agent = AgentLoop::new(config(&dir.path, 3), provider, registry_with_builtins());
 	let mut state = AgentState::default();
 	let (events_tx, mut events_rx) = tokio::sync::mpsc::channel(8);
 
@@ -2405,7 +2413,7 @@ async fn interrupt_pending_provider_stream() {
 	let dir = TempDir::new("interrupt-stream");
 	let (chunk_tx, chunk_rx) = futures::channel::mpsc::unbounded();
 	let provider = Arc::new(ChannelProvider::new(Box::pin(chunk_rx)));
-	let agent = AgentLoop::new(config(&dir.path, 3), provider, ToolRegistry::with_builtins());
+	let agent = AgentLoop::new(config(&dir.path, 3), provider, registry_with_builtins());
 	let mut state = AgentState::default();
 	let (steering_tx, steering_rx) = tokio::sync::mpsc::channel(4);
 	let (events_tx, mut events_rx) = tokio::sync::mpsc::channel(8);
@@ -2466,7 +2474,7 @@ async fn interrupt_two_tool_batch_without_orphan() {
 		done_chunk(),
 	]]));
 
-	let agent = AgentLoop::new(config(&dir.path, 3), provider, ToolRegistry::with_builtins());
+	let agent = AgentLoop::new(config(&dir.path, 3), provider, registry_with_builtins());
 	let mut state = AgentState::default();
 	let (steering_tx, steering_rx) = tokio::sync::mpsc::channel(4);
 	let (events_tx, mut events_rx) = tokio::sync::mpsc::channel(16);
@@ -2555,7 +2563,7 @@ async fn sse_toolbatch_ordering_message_end_before_tool_start_and_turn_end_statu
 		vec![text_chunk("File content read successfully."), done_chunk()],
 	]));
 
-	let agent = AgentLoop::new(config(&dir.path, 5), provider, ToolRegistry::with_builtins());
+	let agent = AgentLoop::new(config(&dir.path, 5), provider, registry_with_builtins());
 	let mut state = AgentState::default();
 	let (events_tx, mut events_rx) = tokio::sync::mpsc::channel(32);
 
@@ -2627,7 +2635,7 @@ async fn mid_stream_abort_discards_incomplete_tool_calls() {
 	let dir = TempDir::new("mid-stream-abort");
 	let (chunk_tx, chunk_rx) = futures::channel::mpsc::unbounded();
 	let provider = Arc::new(ChannelProvider::new(Box::pin(chunk_rx)));
-	let agent = AgentLoop::new(config(&dir.path, 3), provider, ToolRegistry::with_builtins());
+	let agent = AgentLoop::new(config(&dir.path, 3), provider, registry_with_builtins());
 	let mut state = AgentState::default();
 	let (steering_tx, steering_rx) = tokio::sync::mpsc::channel(4);
 	let (events_tx, mut events_rx) = tokio::sync::mpsc::channel(16);
@@ -2709,7 +2717,7 @@ async fn batch_abort_paired_results_in_provider_context() {
 		done_chunk(),
 	]]));
 
-	let agent = AgentLoop::new(config(&dir.path, 3), provider, ToolRegistry::with_builtins());
+	let agent = AgentLoop::new(config(&dir.path, 3), provider, registry_with_builtins());
 	let mut state = AgentState::default();
 	let (steering_tx, steering_rx) = tokio::sync::mpsc::channel(4);
 	let (events_tx, mut events_rx) = tokio::sync::mpsc::channel(16);
@@ -4260,7 +4268,7 @@ async fn steering_injection_preserves_text_and_image_parts() {
 	let agent = AgentLoop::new(
 		config(&dir.path, 3),
 		provider.clone(),
-		ToolRegistry::with_builtins(),
+		registry_with_builtins(),
 	);
 	let mut state = AgentState::default();
 	let (steering_tx, steering_rx) = tokio::sync::mpsc::channel(4);

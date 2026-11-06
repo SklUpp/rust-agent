@@ -2,10 +2,8 @@ use std::sync::Arc;
 
 use futures::future::join_all;
 
-use super::{
-	ToolError,
-	registry::{ToolRegistry, excluded_tool_reason},
-};
+use super::registry::{ToolRegistry, excluded_tool_reason};
+use crate::tool::ToolError;
 use crate::state::{AgentContext, ToolApprover, ToolCall, ToolResult};
 /// Scheduler partitions a tool batch into concurrent non-exclusive runs and
 /// sequential exclusive ones, preserving call order in the results.

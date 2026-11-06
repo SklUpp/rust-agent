@@ -26,7 +26,7 @@ use super::process::{
 	LogOptions, ProcessBackend, ProcessError, ProcessSnapshot, ProcessSpec, ProcessState, ReadySpec,
 	RestartPolicy, Signal, WaitRequest, is_terminal_state,
 };
-use super::{Tool, ToolError};
+use crate::tool::{Tool, ToolError};
 use crate::{
 	mailbox::{
 		DEFAULT_IRC_TIMEOUT_MS, IrcMessage, MAIN_AGENT_ID, format_incoming,

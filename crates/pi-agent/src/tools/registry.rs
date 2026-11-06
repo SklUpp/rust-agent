@@ -2,7 +2,9 @@ use std::{collections::BTreeMap, sync::Arc};
 
 use serde_json::Value;
 
-use super::{Tool, builtin_tools};
+#[cfg(test)]
+use super::builtin_tools;
+use crate::tool::Tool;
 
 /// Model-facing tool ids that are known upstream tools excluded by the approved
 /// platform boundary — not typos and not missing ports. Dispatch must state the
@@ -44,6 +46,10 @@ impl ToolRegistry {
 	}
 
 	/// Create a registry preloaded with the standard builtins.
+	///
+	/// Test-only: production assembly lives in the product host, so the
+	/// registry module has no builtin dependency in a normal build.
+	#[cfg(test)]
 	pub fn with_builtins() -> Self {
 		let mut registry = Self::new();
 		for tool in builtin_tools() {
@@ -119,7 +125,7 @@ impl ToolRegistry {
 
 		let matching: Vec<&str> = all_servers
 			.iter()
-			.filter(|s| crate::mcp::naming::mcp_tool_match_score(s, name) > 0)
+			.filter(|s| super::naming::mcp_tool_match_score(s, name) > 0)
 			.map(String::as_str)
 			.collect();
 

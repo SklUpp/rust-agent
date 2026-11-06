@@ -575,7 +575,7 @@ impl SecurityPublishTool {
 }
 
 #[async_trait]
-impl pi_agent::tools::Tool for SecurityPublishTool {
+impl pi_agent::tool::Tool for SecurityPublishTool {
 	fn name(&self) -> &str {
 		SECURITY_PUBLISH_TOOL_NAME
 	}
@@ -592,11 +592,11 @@ impl pi_agent::tools::Tool for SecurityPublishTool {
 		&self,
 		args: &Value,
 		_ctx: &pi_agent::state::AgentContext,
-	) -> Result<pi_agent::state::ToolResult, pi_agent::tools::ToolError> {
+	) -> Result<pi_agent::state::ToolResult, pi_agent::tool::ToolError> {
 		let bundle = self
 			.publisher
 			.publish(args)
-			.map_err(|error| pi_agent::tools::ToolError::ExecutionFailed(error.to_string()))?;
+			.map_err(|error| pi_agent::tool::ToolError::ExecutionFailed(error.to_string()))?;
 		let details = SecurityPublishDetails {
 			scan_id: self.publisher.scan_id().to_string(),
 			finding_count: bundle.findings.len(),

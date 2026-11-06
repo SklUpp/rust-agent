@@ -32,16 +32,24 @@ use pi_agent::{
 		turn_journal_messages,
 	},
 	tools::{
-		Tool,
 		hub::{HubTool, HubToolDetails},
 		hub_park,
 		internal_urls::{InternalUrlRouter, UrlScope},
 		registry::ToolRegistry,
 		task_catalog::{AgentCatalog, AgentDefinition, AgentSource},
 	},
+	Tool,
 };
 use serde_json::json;
 use tokio::sync::{Notify, Semaphore, mpsc};
+
+fn registry_with_builtins() -> ToolRegistry {
+	let mut registry = ToolRegistry::new();
+	for tool in pi_agent::tools::builtin_tools() {
+		registry.register(tool);
+	}
+	registry
+}
 
 fn stream_text(content: &str) -> StreamChunk {
 	StreamChunk {
@@ -343,7 +351,7 @@ fn history_scope(root: &Path) -> UrlScope {
 
 fn test_supervisor(root: &PathBuf, provider: Arc<dyn ModelProvider>) -> Arc<Supervisor> {
 	let supervisor = Supervisor::new(
-		ToolRegistry::with_builtins(),
+		registry_with_builtins(),
 		provider,
 		None,
 		DelegationLimits::default(),
@@ -432,7 +440,7 @@ fn live_child(
 			cwd: root.to_path_buf(),
 		},
 		provider,
-		ToolRegistry::with_builtins(),
+		registry_with_builtins(),
 	);
 	RevivedChild {
 		agent_loop,
@@ -453,7 +461,7 @@ fn child_messages() -> Vec<Message> {
 fn reviver_factory(provider: Arc<GatedProvider>) -> Arc<DefaultPersistedReviverFactory> {
 	Arc::new(DefaultPersistedReviverFactory::new(
 		provider,
-		ToolRegistry::with_builtins(),
+		registry_with_builtins(),
 	))
 }
 
@@ -687,7 +695,7 @@ impl CountingReviver {
 		Arc::new(Self {
 			inner: Arc::new(DefaultPersistedReviverFactory::new(
 				provider,
-				ToolRegistry::with_builtins(),
+				registry_with_builtins(),
 			)),
 			calls: AtomicUsize::new(0),
 		})
@@ -1082,7 +1090,7 @@ async fn cold_revive_binds_the_child_url_scope_and_restores_before_the_reviver()
 		Arc::new(OrderProbeReviver {
 			inner: Arc::new(DefaultPersistedReviverFactory::new(
 				provider.clone(),
-				ToolRegistry::with_builtins(),
+				registry_with_builtins(),
 			)),
 			probe: probe.clone(),
 		}),
@@ -1099,7 +1107,7 @@ async fn cold_revive_binds_the_child_url_scope_and_restores_before_the_reviver()
 		Some(Some(transcript_path(&root, &id))),
 		"the supervisor record must exist before the reviver builds the registry"
 	);
-	let mut registry = ToolRegistry::with_builtins();
+	let mut registry = registry_with_builtins();
 	restarted.rebind_session_tools(&mut registry, None, Some(&id));
 	let read = registry.get("read").expect("read tool");
 	let result = read
@@ -1133,7 +1141,7 @@ async fn a_cancel_that_lands_during_the_revive_refuses_the_actor() {
 		Arc::new(CancelRaceReviver {
 			inner: Arc::new(DefaultPersistedReviverFactory::new(
 				provider.clone(),
-				ToolRegistry::with_builtins(),
+				registry_with_builtins(),
 			)),
 			reached: reached.clone(),
 			release: release.clone(),
@@ -1337,7 +1345,7 @@ async fn concurrent_sends_coalesce_into_one_revive() {
 		Arc::new(CancelRaceReviver {
 			inner: Arc::new(DefaultPersistedReviverFactory::new(
 				provider.clone(),
-				ToolRegistry::with_builtins(),
+				registry_with_builtins(),
 			)),
 			reached: reached.clone(),
 			release: release.clone(),
@@ -1446,7 +1454,7 @@ async fn a_failed_first_turn_after_revive_keeps_the_shifted_history() {
 	let root = session_root("failed-first-turn");
 	let provider = FailingProvider::new();
 	let supervisor: Arc<Supervisor> = Supervisor::new(
-		ToolRegistry::with_builtins(),
+		registry_with_builtins(),
 		provider.clone(),
 		None,
 		DelegationLimits::default(),
@@ -1458,7 +1466,7 @@ async fn a_failed_first_turn_after_revive_keeps_the_shifted_history() {
 		DEFAULT_AGENT_IDLE_TTL_MS,
 		Arc::new(DefaultPersistedReviverFactory::new(
 			provider.clone(),
-			ToolRegistry::with_builtins(),
+			registry_with_builtins(),
 		)),
 	);
 	// A revived state without a system prompt: the loop inserts one at index 0, so
@@ -1661,7 +1669,7 @@ async fn an_aside_accepted_in_the_failing_step_after_a_tool_step_is_journaled_on
 		DEFAULT_AGENT_IDLE_TTL_MS,
 		Arc::new(DefaultPersistedReviverFactory::new(
 			provider.clone(),
-			ToolRegistry::with_builtins(),
+			registry_with_builtins(),
 		)),
 	);
 	// The fixture seeds the persisted replay (assignment plus the settled answer):
@@ -1735,7 +1743,7 @@ async fn an_aside_accepted_in_a_successful_step_is_not_duplicated_by_a_later_fai
 		DEFAULT_AGENT_IDLE_TTL_MS,
 		Arc::new(DefaultPersistedReviverFactory::new(
 			provider.clone(),
-			ToolRegistry::with_builtins(),
+			registry_with_builtins(),
 		)),
 	);
 	manager
@@ -1811,7 +1819,7 @@ async fn an_undurable_journal_blocks_destructive_compaction() {
 			cwd: root.clone(),
 		},
 		provider,
-		ToolRegistry::with_builtins(),
+		registry_with_builtins(),
 	)
 	.with_turn_observer(Some(observer));
 	let mut state = AgentState { messages: vec![Message::user("first question")], total_turns: 0 };
@@ -2225,7 +2233,7 @@ async fn actor_rewrites_only_yielding_follow_up_artifacts() {
 	let reviver: Arc<dyn PersistedChildReviverFactory> = Arc::new(
 		DefaultPersistedReviverFactory::new(
 			provider,
-			ToolRegistry::with_builtins(),
+			registry_with_builtins(),
 		),
 	);
 	let manager = attach(&supervisor, 120, reviver);
@@ -2422,7 +2430,7 @@ impl ModelProvider for PairingProvider {
 
 fn one_turn(provider: Arc<dyn ModelProvider>, depth_limit: i32) -> Arc<Supervisor> {
 	let supervisor = Supervisor::new(
-		ToolRegistry::with_builtins(),
+		registry_with_builtins(),
 		provider,
 		None,
 		DelegationLimits {
@@ -2486,7 +2494,7 @@ async fn revived_child_is_bound_at_its_recorded_depth() {
 	);
 	contract.write(&root).expect("write contract");
 	let replayed = load_transcript(&transcript_path(&root, &id)).expect("transcript");
-	let mut revived = DefaultPersistedReviverFactory::new(provider, ToolRegistry::with_builtins())
+	let mut revived = DefaultPersistedReviverFactory::new(provider, registry_with_builtins())
 		.revive(&contract, replayed, Some(&supervisor))
 		.expect("revive");
 	let turns = revived
@@ -2523,7 +2531,7 @@ async fn revived_child_is_bound_at_its_recorded_depth() {
 		1,
 	);
 	let replayed = load_transcript(&transcript_path(&root, &id)).expect("transcript");
-	let mut revived = DefaultPersistedReviverFactory::new(provider, ToolRegistry::with_builtins())
+	let mut revived = DefaultPersistedReviverFactory::new(provider, registry_with_builtins())
 		.revive(&contract, replayed, Some(&supervisor))
 		.expect("revive");
 	let turns = revived
@@ -2564,7 +2572,7 @@ async fn revived_child_can_yield() {
 	);
 	let contract = contract_for(&id, &root, "investigate", vec!["yield".to_string()], "scout", 1);
 	let replayed = load_transcript(&transcript_path(&root, &id)).expect("transcript");
-	let mut revived = DefaultPersistedReviverFactory::new(provider, ToolRegistry::with_builtins())
+	let mut revived = DefaultPersistedReviverFactory::new(provider, registry_with_builtins())
 		.revive(&contract, replayed, Some(&supervisor))
 		.expect("revive");
 	let turns = revived
@@ -2644,7 +2652,7 @@ async fn revived_replay_pairs_tool_calls_with_results() {
 		"scout",
 		1,
 	);
-	let mut revived = DefaultPersistedReviverFactory::new(provider.clone(), ToolRegistry::with_builtins())
+	let mut revived = DefaultPersistedReviverFactory::new(provider.clone(), registry_with_builtins())
 		.revive(&contract, replayed, Some(&supervisor))
 		.expect("revive");
 	let turns = revived

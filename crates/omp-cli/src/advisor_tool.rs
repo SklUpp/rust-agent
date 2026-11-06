@@ -11,7 +11,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use pi_agent::state::{AgentContext, ToolResult};
-use pi_agent::tools::{Tool, ToolError};
+use pi_agent::tool::{Tool, ToolError};
 use serde_json::{Value, json};
 
 use crate::advisor_emit::{Note, Severity};

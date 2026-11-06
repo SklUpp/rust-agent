@@ -30,7 +30,7 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
-use super::{Tool, ToolError};
+use crate::tool::{Tool, ToolError};
 use crate::state::{AgentContext, ToolResult};
 
 /// Tool names, also used by the session layer to recognise results.

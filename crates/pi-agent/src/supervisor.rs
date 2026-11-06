@@ -16,6 +16,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::{
 	dap::DapTool,
+	delivery::{BackgroundDelivery, BackgroundResultSink},
 	eval::EvalToolBinder,
 	loop_module::{AgentEvent, SteeringEvent},
 	lsp::LspTool,
@@ -115,32 +116,6 @@ fn now_ms() -> u64 {
 		.unwrap_or(0)
 }
 
-/// Pull-based delivery of finished background results into an agent loop.
-///
-/// The loop calls [`take_background_results`] at a turn boundary; removal and
-/// return happen under the supervisor lock, so a result is delivered exactly
-/// once even when several callers race.
-pub trait BackgroundResultSink: Send + Sync {
-	fn take_background_results(&self) -> Vec<String>;
-
-	/// Rich view for hosts that account delivered child usage at the boundary.
-	///
-	/// Shares one consumption with [`take_background_results`]: whichever view
-	/// drains an id first removes it, so a host wrapper may call this while the
-	/// loop calls the text view and still see every delivery once. The default
-	/// carries no identity or usage (a sink with no supervisor behind it);
-	/// supervisor-backed sinks override it.
-	fn take_background_deliveries(&self) -> Vec<BackgroundDelivery> {
-		self
-			.take_background_results()
-			.into_iter()
-			.map(|text| {
-				BackgroundDelivery { id: String::new(), result_key: None, text, usage: None }
-			})
-			.collect()
-	}
-}
-
 /// One undelivered background result, scoped to the agent that spawned it.
 #[derive(Clone)]
 struct PendingDelivery {
@@ -154,23 +129,6 @@ struct PendingDelivery {
 	/// Summed reported usage retained from the settled job record at enqueue
 	/// time. `None` when the child (or the host-owned eval job) reported none.
 	usage: Option<TokenUsage>,
-}
-
-/// A delivered background result with the identity and reported usage that
-/// make root accounting exact.
-///
-/// `id` is the exactly-once key: the supervisor marks a result consumed under
-/// the same lock that removes it, so an id reaches a consumer through the
-/// auto-delivery path or the hub snapshot path, never both. `usage` is absent
-/// when nothing was reported — never a zero-filled stand-in.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct BackgroundDelivery {
-	pub id: String,
-	/// Canonical accounting key. `None` only for a sink that has no supervisor
-	/// behind it (the trait default); consumers then fall back to `id`.
-	pub result_key: Option<String>,
-	pub text: String,
-	pub usage: Option<TokenUsage>,
 }
 
 /// One child's own provider-reported usage, recorded once for accounting.
@@ -2929,7 +2887,8 @@ mod process_wiring_tests {
 	use crate::{
 		provider::{ChunkStream, ModelProvider, ProviderError, ToolChoice},
 		state::{AgentContext, Message, ToolResult},
-		tools::{PendingAction, ToolError, process::ProcessManager, registry::ToolRegistry, Tool},
+		tool::{Tool, ToolError},
+		tools::{PendingAction, process::ProcessManager, registry::ToolRegistry},
 	};
 
 	struct Stage(std::path::PathBuf);

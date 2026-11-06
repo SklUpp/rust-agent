@@ -33,7 +33,7 @@ use async_trait::async_trait;
 use regex::Regex;
 use serde_json::{Value, json};
 
-use super::{Tool, ToolError};
+use crate::tool::{Tool, ToolError};
 use crate::state::{AgentContext, ContentPart, ToolResult};
 
 /// TS `MAX_IMAGE_INPUT_BYTES` (`utils/image-loading.ts`).

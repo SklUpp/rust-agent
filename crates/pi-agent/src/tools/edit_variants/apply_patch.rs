@@ -14,7 +14,7 @@ use super::{
 };
 use crate::{
 	state::{AgentContext, ToolResult},
-	tools::ToolError,
+	tool::ToolError,
 };
 
 const BEGIN_PATCH_MARKER: &str = "*** Begin Patch";

@@ -18,7 +18,7 @@ use std::{
 
 use async_trait::async_trait;
 
-use super::{ToolError, tool_result};
+use crate::tool::{ToolError, tool_result};
 use crate::state::{AgentContext, ToolResult};
 
 /// Plain-text resolution devices (`xd://resolve`, `xd://reject`).
@@ -380,7 +380,8 @@ mod tests {
 	use tokio::sync::Notify;
 
 	use super::*;
-	use crate::tools::{ReadTool, Tool, WriteTool};
+	use crate::tool::Tool;
+	use crate::tools::{ReadTool, WriteTool};
 
 	struct TempDir(PathBuf);
 

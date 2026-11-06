@@ -17,6 +17,14 @@ use pi_agent::{
 	tools::registry::ToolRegistry,
 };
 
+fn registry_with_builtins() -> ToolRegistry {
+	let mut registry = ToolRegistry::new();
+	for tool in pi_agent::tools::builtin_tools() {
+		registry.register(tool);
+	}
+	registry
+}
+
 struct UnusedProvider;
 
 #[async_trait]
@@ -42,7 +50,7 @@ impl ModelProvider for UnusedProvider {
 
 fn supervisor() -> Arc<Supervisor> {
 	Supervisor::new(
-		ToolRegistry::with_builtins(),
+		registry_with_builtins(),
 		Arc::new(UnusedProvider),
 		None,
 		DelegationLimits::default(),

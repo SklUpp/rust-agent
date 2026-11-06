@@ -20,11 +20,11 @@ use pi_agent::{
 		ChildStatus, DelegationLimits, MAX_OUTSTANDING_RESULTS, Supervisor,
 	},
 	tools::{
-		Tool,
 		hub::{HubTool, HubToolDetails},
 		registry::ToolRegistry,
 		task::{TaskTool, TaskToolDetails},
 	},
+	Tool,
 };
 use serde_json::json;
 use tokio::sync::{Notify, Semaphore};
@@ -740,11 +740,11 @@ impl BackgroundResultSink for UsageSink {
 		Vec::new()
 	}
 
-	fn take_background_deliveries(&self) -> Vec<pi_agent::supervisor::BackgroundDelivery> {
+	fn take_background_deliveries(&self) -> Vec<pi_agent::BackgroundDelivery> {
 		if self.calls.fetch_add(1, Ordering::SeqCst) > 0 {
 			return Vec::new();
 		}
-		vec![pi_agent::supervisor::BackgroundDelivery {
+		vec![pi_agent::BackgroundDelivery {
 			id: "task-usage".to_string(),
 			result_key: Some("ns:task-usage".to_string()),
 			text: "<task-result id=\"task-usage\" status=\"completed\">\n<usage input=\"5\" output=\"2\" />\n\

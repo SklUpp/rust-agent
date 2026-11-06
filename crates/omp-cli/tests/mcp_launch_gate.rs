@@ -7,7 +7,8 @@ use std::path::Path;
 use omp_cli::approve::{ApprovalMode, Approvals};
 use omp_cli::config::{Config, DiscoveredMcpServer};
 use omp_cli::runtime::filter_and_spawn_mcp_servers;
-use pi_agent::mcp::{MCPServerConfig, MCPStdioServerConfig, create_mcp_tool_name};
+use pi_agent::mcp::{MCPServerConfig, MCPStdioServerConfig};
+use pi_agent::tools::naming::create_mcp_tool_name;
 struct TempDir(std::path::PathBuf);
 
 impl TempDir {

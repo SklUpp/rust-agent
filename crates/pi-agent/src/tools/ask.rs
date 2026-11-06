@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tokio_util::sync::CancellationToken;
 
-use super::{Tool, ToolError, tool_result};
+use crate::tool::{Tool, ToolError, tool_result};
 use crate::state::{AgentContext, ToolResult};
 
 pub const OTHER_OPTION: &str = "Other (type your own)";

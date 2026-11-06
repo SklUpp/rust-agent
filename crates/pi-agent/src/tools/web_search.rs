@@ -26,14 +26,14 @@ use reqwest::{StatusCode, Url, header};
 use serde_json::{Value, json};
 use tokio_util::sync::CancellationToken;
 
-use super::{
-	Tool, ToolError,
-	search_query::{
-		ConstraintSource, StructuredQuery, filter_source_indices, format_scraper_query,
-		parse_search_query, parse_timestamp_ms,
-	},
+use super::search_query::{
+	ConstraintSource, StructuredQuery, filter_source_indices, format_scraper_query,
+	parse_search_query, parse_timestamp_ms,
 };
-use crate::state::{AgentContext, ToolResult};
+use crate::{
+	state::{AgentContext, ToolResult},
+	tool::{Tool, ToolError},
+};
 
 /// Upstream `DEFAULT_NUM_RESULTS`.
 pub const DEFAULT_NUM_RESULTS: usize = 10;

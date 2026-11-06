@@ -34,11 +34,19 @@ use pi_agent::{
 		registry::ToolRegistry,
 		read::ReadTool,
 		task::{TaskTool, TaskToolDetails},
-		Tool,
 	},
+	Tool,
 };
 use serde_json::json;
 use tokio::sync::{Notify, Semaphore};
+
+fn registry_with_builtins() -> ToolRegistry {
+	let mut registry = ToolRegistry::new();
+	for tool in pi_agent::tools::builtin_tools() {
+		registry.register(tool);
+	}
+	registry
+}
 
 struct TempRoot {
 	path: PathBuf,
@@ -262,7 +270,7 @@ fn gated_manager(supervisor: &Arc<Supervisor>, provider: Arc<GatedProvider>) -> 
 		0,
 		Arc::new(DefaultPersistedReviverFactory::new(
 			provider,
-			ToolRegistry::with_builtins(),
+			registry_with_builtins(),
 		)),
 	)
 }
@@ -270,7 +278,7 @@ fn gated_manager(supervisor: &Arc<Supervisor>, provider: Arc<GatedProvider>) -> 
 fn supervisor(root: &TempRoot) -> Arc<Supervisor> {
 	let provider: Arc<dyn ModelProvider> = Arc::new(NoopProvider);
 	let supervisor = Supervisor::new(
-		ToolRegistry::with_builtins(),
+		registry_with_builtins(),
 		provider,
 		None,
 		DelegationLimits::default(),
@@ -285,7 +293,7 @@ fn supervisor_with(
 ) -> Arc<Supervisor> {
 	let provider: Arc<dyn ModelProvider> = provider;
 	let supervisor = Supervisor::new(
-		ToolRegistry::with_builtins(),
+		registry_with_builtins(),
 		provider,
 		None,
 		DelegationLimits::default(),
@@ -301,7 +309,7 @@ fn manager(supervisor: &Arc<Supervisor>) -> Arc<SubagentLifecycleManager> {
 		0,
 		Arc::new(DefaultPersistedReviverFactory::new(
 			provider,
-			ToolRegistry::with_builtins(),
+			registry_with_builtins(),
 		)),
 	)
 }
@@ -1380,7 +1388,7 @@ mod symlink_scope {
 
 		let provider: Arc<dyn ModelProvider> = Arc::new(NoopProvider);
 		let supervisor = Supervisor::new(
-			ToolRegistry::with_builtins(),
+			registry_with_builtins(),
 			provider,
 			None,
 			DelegationLimits::default(),

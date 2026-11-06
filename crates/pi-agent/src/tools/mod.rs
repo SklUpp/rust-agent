@@ -15,6 +15,7 @@ pub mod internal_urls;
 pub mod internal_urls_agent;
 pub mod internal_urls_artifact;
 pub mod internal_urls_github;
+pub mod naming;
 pub mod pending;
 pub mod process;
 pub mod read;
@@ -72,6 +73,7 @@ use crate::state::{
 	AcpClientBridge, AcpClientError, AgentContext, PlanWriteOp, PlanWriteTarget, ProposeHandler,
 	ToolResult,
 };
+use crate::tool::{Tool, ToolError, tool_result};
 use crate::tools::conflict::{ConflictEntry, ConflictId};
 use crate::tools::process::{ProcessBackend, ProcessError, ProcessSpec, RestartPolicy};
 
@@ -97,50 +99,6 @@ const MAX_GREP_MATCHES: usize = 100;
 const MAX_GREP_OUTPUT_BYTES: usize = 32 * 1024;
 /// Characters of a single matched line kept in `grep` output.
 const MAX_GREP_LINE_CHARS: usize = 200;
-
-#[derive(Debug, thiserror::Error)]
-pub enum ToolError {
-	#[error("Invalid arguments: {0}")]
-	InvalidArguments(String),
-	#[error("Execution failed: {0}")]
-	ExecutionFailed(String),
-	#[error("Operation aborted: {0}")]
-	Aborted(String),
-	/// Upstream `ToolError.render()` text, surfaced verbatim (no prefix).
-	#[error("{0}")]
-	Rejected(String),
-}
-
-/// Dynamic trait implemented by all agent tools.
-#[async_trait]
-pub trait Tool: Send + Sync {
-	fn name(&self) -> &str;
-	/// Model-facing name when it differs from the registry key (upstream
-	/// `customWireName`); `None` advertises [`Tool::name`].
-	fn wire_name(&self) -> Option<&str> {
-		None
-	}
-	fn description(&self) -> &str;
-	fn schema(&self) -> Value;
-	fn is_exclusive(&self) -> bool {
-		false
-	}
-	async fn execute(&self, args: &Value, ctx: &AgentContext) -> Result<ToolResult, ToolError>;
-	/// Execute with the model's tool-call id.
-	///
-	/// Host-bridged tools need the real id (`host_tool_call.toolCallId`), but
-	/// the scheduler's later result-id rewrite cannot repair a frame that was
-	/// already emitted. Defaults to [`Tool::execute`], so every existing
-	/// implementer is unchanged.
-	async fn execute_with_call_id(
-		&self,
-		_id: &str,
-		args: &Value,
-		ctx: &AgentContext,
-	) -> Result<ToolResult, ToolError> {
-		self.execute(args, ctx).await
-	}
-}
 
 /// String buffer that stops growing past `cap` and counts what it dropped.
 struct BoundedText {
@@ -199,16 +157,6 @@ fn skip_note(base: &str, skipped: usize) -> String {
 		base.to_string()
 	} else {
 		format!("{base} ({skipped} file(s) skipped: unreadable or above the size limit)")
-	}
-}
-
-fn tool_result(content: impl Into<String>, is_error: bool) -> ToolResult {
-	ToolResult {
-		tool_call_id: String::new(),
-		content: content.into(),
-		is_error,
-		terminate: false,
-		details: None,
 	}
 }
 

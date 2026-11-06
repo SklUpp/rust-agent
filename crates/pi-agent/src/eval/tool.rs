@@ -17,7 +17,7 @@ use tokio::sync::mpsc;
 
 use crate::{
 	state::{AgentContext, ToolResult},
-	tools::{Tool, ToolError},
+	tool::{Tool, ToolError},
 };
 
 use super::{

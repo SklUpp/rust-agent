@@ -1824,7 +1824,7 @@ impl Session<'_> {
 		if !self.goal_tool_mounted() {
 			return Vec::new();
 		}
-		let tool: Arc<dyn pi_agent::tools::Tool> =
+		let tool: Arc<dyn pi_agent::tool::Tool> =
 			Arc::new(GoalTool::new(Arc::clone(&self.goal)));
 		vec![ExtraTool::from(tool)]
 	}
@@ -1853,7 +1853,7 @@ impl Session<'_> {
 		if manage && let Some(tool) =
 			ManageSkillTool::create_if(true, self.skill_options.clone(), self.skill_snapshot.clone())
 		{
-			let tool: Arc<dyn pi_agent::tools::Tool> = Arc::new(tool);
+			let tool: Arc<dyn pi_agent::tool::Tool> = Arc::new(tool);
 			tools.push(ExtraTool::from(tool));
 		}
 		if learn && let Some(tool) = LocalLearnTool::create_if(
@@ -1862,7 +1862,7 @@ impl Session<'_> {
 			self.skill_options.clone(),
 			self.skill_snapshot.clone(),
 		) {
-			let tool: Arc<dyn pi_agent::tools::Tool> = Arc::new(tool);
+			let tool: Arc<dyn pi_agent::tool::Tool> = Arc::new(tool);
 			tools.push(ExtraTool::from(tool));
 		}
 		tools

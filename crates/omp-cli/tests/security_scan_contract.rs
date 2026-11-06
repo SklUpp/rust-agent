@@ -45,7 +45,8 @@ use omp_cli::{
 };
 use pi_agent::{
 	state::AgentContext,
-	tools::{Tool as _, internal_urls::InternalUrl},
+	tool::Tool as _,
+	tools::internal_urls::InternalUrl,
 };
 
 // ---------------------------------------------------------------------------
@@ -270,7 +271,7 @@ struct FakeSession {
 }
 
 impl FakeSession {
-	fn publish(&self, params: &Value) -> Result<(), pi_agent::tools::ToolError> {
+	fn publish(&self, params: &Value) -> Result<(), pi_agent::tool::ToolError> {
 		let context = AgentContext::new(self.request.execution_root.clone());
 		let runtime = tokio::runtime::Builder::new_current_thread()
 			.enable_all()

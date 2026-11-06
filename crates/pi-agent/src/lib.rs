@@ -1,5 +1,6 @@
 pub mod compaction;
 pub mod dap;
+pub mod delivery;
 pub mod eval;
 pub mod lsp;
 pub mod mailbox;
@@ -16,6 +17,7 @@ pub mod subagent_lifecycle;
 pub mod supervisor;
 pub mod task_persisted_revive;
 pub mod tokenizer;
+pub mod tool;
 pub mod tools;
 
 pub use compaction::Compactor;
@@ -38,10 +40,12 @@ pub use state::{
 	ToolApprover, ToolCall, ToolResult, TurnResult, TurnStatus,
 };
 pub use tokenizer::Tokenizer;
+pub use delivery::{BackgroundDelivery, BackgroundResultSink};
 pub use supervisor::{
-	BackgroundResultSink, CancelAttempt, ChildGuard, ChildRecord, ChildStatus, ChildToolSettings,
-	DelegationLimits, Supervisor,
+	CancelAttempt, ChildGuard, ChildRecord, ChildStatus, ChildToolSettings, DelegationLimits,
+	Supervisor,
 };
+pub use tool::{Tool, ToolError};
 pub use mailbox::{
 	DEFAULT_IRC_TIMEOUT_MS, IrcMessage, MAIN_AGENT_ID, MAILBOX_CAP, Mailbox, MailboxWaiter,
 	format_incoming,
@@ -49,6 +53,6 @@ pub use mailbox::{
 pub use tools::{
 	AskTool, AstGrepTool, BashTool, CheckpointTool, EditTool, GlobTool, GrepTool, HubTool,
 	PendingAction, PendingStore, REJECT_DEVICE_PATH, RESOLVE_DEVICE_PATH, ReadTool, RewindTool,
-	TaskTool, ThinkTool, TodoTool, Tool, ToolError, WriteTool, YieldTool, registry::ToolRegistry,
+	TaskTool, ThinkTool, TodoTool, WriteTool, YieldTool, registry::ToolRegistry,
 	scheduler::ToolScheduler,
 };

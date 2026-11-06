@@ -246,7 +246,7 @@ impl SecurityScanTool {
 }
 
 #[async_trait]
-impl pi_agent::tools::Tool for SecurityScanTool {
+impl pi_agent::tool::Tool for SecurityScanTool {
 	fn name(&self) -> &str {
 		SECURITY_SCAN_TOOL_NAME
 	}
@@ -263,15 +263,15 @@ impl pi_agent::tools::Tool for SecurityScanTool {
 		&self,
 		args: &Value,
 		_ctx: &pi_agent::state::AgentContext,
-	) -> Result<pi_agent::state::ToolResult, pi_agent::tools::ToolError> {
+	) -> Result<pi_agent::state::ToolResult, pi_agent::tool::ToolError> {
 		if !self.host.security_enabled() {
-			return Err(pi_agent::tools::ToolError::Rejected(
+			return Err(pi_agent::tool::ToolError::Rejected(
 				SECURITY_DISABLED_TOOL.to_string(),
 			));
 		}
 		let (text, details) = self
 			.action(args)
-			.map_err(|error| pi_agent::tools::ToolError::ExecutionFailed(error.to_string()))?;
+			.map_err(|error| pi_agent::tool::ToolError::ExecutionFailed(error.to_string()))?;
 		Ok(pi_agent::state::ToolResult {
 			tool_call_id: String::new(),
 			content: text,

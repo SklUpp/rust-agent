@@ -365,7 +365,7 @@ impl std::fmt::Debug for ObserverHandle {
 /// wrapper supplies both: `RunRequest` stays `Debug` and a conflict message can
 /// name the tool.
 #[derive(Clone)]
-pub struct ExtraTool(pub std::sync::Arc<dyn pi_agent::tools::Tool>);
+pub struct ExtraTool(pub std::sync::Arc<dyn pi_agent::tool::Tool>);
 
 impl std::fmt::Debug for ExtraTool {
 	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -373,8 +373,8 @@ impl std::fmt::Debug for ExtraTool {
 	}
 }
 
-impl From<std::sync::Arc<dyn pi_agent::tools::Tool>> for ExtraTool {
-	fn from(tool: std::sync::Arc<dyn pi_agent::tools::Tool>) -> Self {
+impl From<std::sync::Arc<dyn pi_agent::tool::Tool>> for ExtraTool {
+	fn from(tool: std::sync::Arc<dyn pi_agent::tool::Tool>) -> Self {
 		Self(tool)
 	}
 }

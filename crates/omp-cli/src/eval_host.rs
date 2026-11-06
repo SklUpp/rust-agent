@@ -25,8 +25,8 @@ use pi_agent::{
 	provider::{ModelProvider, ToolChoice},
 	state::{AgentContext, Message, ToolCall, ToolResult},
 	supervisor::{DelegationLimits, Supervisor},
+	tool::ToolError,
 	tools::{
-		ToolError,
 		registry::ToolRegistry,
 		scheduler::ToolScheduler,
 		task_catalog::ChildModelFactory,
@@ -637,7 +637,7 @@ async fn publish_staged_artifact(staged: &Path, final_path: &Path) -> Result<boo
 #[cfg(test)]
 mod tests {
 	use super::*;
-	use pi_agent::{CancellationToken, tools::Tool};
+	use pi_agent::{CancellationToken, tool::Tool};
 	use tokio::sync::Notify;
 
 	fn temp_dir(prefix: &str) -> PathBuf {

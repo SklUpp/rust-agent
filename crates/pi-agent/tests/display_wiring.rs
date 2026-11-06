@@ -21,6 +21,14 @@ use pi_agent::{
 };
 use serde_json::{Value, json};
 
+fn registry_with_builtins() -> ToolRegistry {
+	let mut registry = ToolRegistry::new();
+	for tool in pi_agent::tools::builtin_tools() {
+		registry.register(tool);
+	}
+	registry
+}
+
 fn temp_dir(label: &str) -> std::path::PathBuf {
 	static COUNTER: AtomicU64 = AtomicU64::new(0);
 	let dir = std::env::temp_dir().join(format!(
@@ -128,7 +136,7 @@ impl SessionDisplayResolver for RecordingResolver {
 #[tokio::test]
 async fn children_resolve_their_own_model_and_drop_anchors_without_edit() {
 	let supervisor = Supervisor::with_selection(
-		ToolRegistry::with_builtins(),
+		registry_with_builtins(),
 		Arc::new(
 			pi_agent::OpenAiCompatibleProvider::new("http://127.0.0.1:9", "test-key", "test-model")
 				.expect("provider"),
@@ -187,7 +195,7 @@ fn default_builtin_context_keeps_hashline_and_edit() {
 	assert_eq!(resolved.edit_tool, EditMode::Hashline);
 	assert!(resolved.display.has_edit_tool);
 	assert!(!resolved.display.read_line_numbers);
-	let registry = ToolRegistry::with_builtins();
+	let registry = registry_with_builtins();
 	assert!(registry.get("read").is_some());
 	assert!(registry.get("edit").is_some());
 }

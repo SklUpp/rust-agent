@@ -1091,7 +1091,7 @@ fn normalize_prompt_cache_key(value: &str) -> Option<String> {
 	if value.encode_utf16().count() <= 64 {
 		return Some(value.to_string());
 	}
-	let hash = crate::mcp::naming::bun_hash_base36(value.as_bytes());
+	let hash = crate::tools::naming::bun_hash_base36(value.as_bytes());
 	Some(format!("pc_{hash}"))
 }
 

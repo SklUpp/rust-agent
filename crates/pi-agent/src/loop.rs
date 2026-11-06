@@ -6,6 +6,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::{
 	compaction::{CompactionReport, Compactor},
+	delivery::BackgroundResultSink,
 	mailbox::{Mailbox, format_incoming},
 	provider::{ModelProvider, ProviderError, StreamAssembler, ToolChoice},
 	state::{
@@ -13,7 +14,6 @@ use crate::{
 		SoftToolRequirement, StopReason, TokenUsage, ToolApprover, ToolCall, ToolPolicy, ToolResult,
 		TurnResult, TurnStatus,
 	},
-	supervisor::BackgroundResultSink,
 	tools::{registry::ToolRegistry, scheduler::ToolScheduler},
 };
 

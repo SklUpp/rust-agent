@@ -18,7 +18,8 @@ use omp_cli::{
 };
 use pi_agent::{
 	Tool,
-	mcp::{MCPServerConfig, MCPStdioServerConfig, McpToolOriginSource, connect_to_server},
+	mcp::{MCPServerConfig, MCPStdioServerConfig, connect_to_server},
+	tools::naming::McpToolOriginSource,
 };
 use serde_json::json;
 

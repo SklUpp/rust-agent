@@ -1,4 +1,9 @@
-use std::{collections::HashMap, path::PathBuf, sync::Arc};
+use std::{
+	collections::HashMap,
+	ffi::OsStr,
+	path::PathBuf,
+	sync::Arc,
+};
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -1129,7 +1134,11 @@ pub trait PlanModeGuard: Send + Sync {
 /// mounted handler `write xd://propose` fails with the upstream wording.
 #[async_trait]
 pub trait ProposeHandler: Send + Sync {
-	async fn propose(&self, body: &str, ctx: &AgentContext) -> Result<ToolResult, crate::tools::ToolError>;
+	async fn propose(
+		&self,
+		body: &str,
+		ctx: &AgentContext,
+	) -> Result<ToolResult, crate::tool::ToolError>;
 }
 
 /// Two-policy stack: the staged-preview requirement wins while a preview is
@@ -1310,6 +1319,46 @@ pub trait ToolApprover: Send + Sync {
 	}
 }
 
+/// Environment variables an agent context inherits from the host.
+///
+/// This is an allowlist, not a blocklist: provider credentials and every other
+/// ambient variable stay out unless a caller sets them explicitly on
+/// [`AgentContext::env`] (for example a per-call tool override). `PREFIX` and
+/// the `TMP*` names cover Termux; `LC_*` is matched by prefix below.
+const AGENT_ENV_ALLOWLIST: &[&str] = &[
+	"PATH", "HOME", "PREFIX", "TMPDIR", "TMP", "TEMP", "LANG", "TERM", "SHELL", "TZ",
+];
+
+/// Whether a host environment variable is safe for an agent subprocess.
+#[must_use]
+fn is_inherited_env(name: &str) -> bool {
+	name.starts_with("LC_") || AGENT_ENV_ALLOWLIST.contains(&name)
+}
+
+/// Filter host variables down to the platform allowlist.
+///
+/// Pure over its iterator so callers and tests never mutate the process-global
+/// environment. Non-UTF-8 names or values are dropped: tools receive a
+/// `HashMap<String, String>` and an unrepresentable variable is not silently
+/// reinterpreted.
+pub(crate) fn platform_env<I, K, V>(vars: I) -> HashMap<String, String>
+where
+	I: IntoIterator<Item = (K, V)>,
+	K: AsRef<OsStr>,
+	V: AsRef<OsStr>,
+{
+	vars
+		.into_iter()
+		.filter_map(|(name, value)| {
+			let name = name.as_ref().to_str()?;
+			if !is_inherited_env(name) {
+				return None;
+			}
+			Some((name.to_string(), value.as_ref().to_str()?.to_string()))
+		})
+		.collect()
+}
+
 /// Shared context accessible to tools and execution loop.
 #[derive(Clone)]
 pub struct AgentContext {
@@ -1352,7 +1401,7 @@ impl AgentContext {
 	pub fn new(cwd: PathBuf) -> Self {
 		Self {
 			cwd,
-			env: std::env::vars().collect(),
+			env: platform_env(std::env::vars()),
 			cancellation_token: CancellationToken::new(),
 			approver: None,
 			ask: None,
@@ -1365,7 +1414,7 @@ impl AgentContext {
 	pub fn with_cancellation(cwd: PathBuf, cancellation_token: CancellationToken) -> Self {
 		Self {
 			cwd,
-			env: std::env::vars().collect(),
+			env: platform_env(std::env::vars()),
 			cancellation_token,
 			approver: None,
 			ask: None,
@@ -1383,7 +1432,7 @@ impl AgentContext {
 		let ask = approver.as_ref().and_then(|approver| approver.ask_channel());
 		Self {
 			cwd,
-			env: std::env::vars().collect(),
+			env: platform_env(std::env::vars()),
 			cancellation_token,
 			approver,
 			ask,
@@ -1589,5 +1638,49 @@ mod composite_policy_tests {
 			None,
 		);
 		assert!(policy.requirement().is_none());
+	}
+}
+
+#[cfg(test)]
+mod env_allowlist_tests {
+	use super::*;
+
+	#[test]
+	fn platform_env_keeps_platform_keys_and_drops_credentials() {
+		let env = platform_env([
+			("PATH", "/usr/bin"),
+			("HOME", "/home/user"),
+			("PREFIX", "/data/data/com.termux/files/usr"),
+			("TMPDIR", "/tmp"),
+			("TMP", "/tmp"),
+			("TEMP", "/tmp"),
+			("LANG", "en_US.UTF-8"),
+			("LC_ALL", "C"),
+			("LC_CTYPE", "UTF-8"),
+			("TERM", "xterm-256color"),
+			("SHELL", "/bin/bash"),
+			("TZ", "UTC"),
+			("OPENAI_API_KEY", "sk-secret"),
+			("PI_PROVIDER_KEY", "provider-secret"),
+			("UNRELATED_HOST_STATE", "leak"),
+		]);
+
+		for name in [
+			"PATH", "HOME", "PREFIX", "TMPDIR", "TMP", "TEMP", "LANG", "LC_ALL", "LC_CTYPE", "TERM",
+			"SHELL", "TZ",
+		] {
+			assert!(env.contains_key(name), "{name} must be inherited");
+		}
+		assert_eq!(env.len(), 12);
+		assert!(!env.contains_key("OPENAI_API_KEY"));
+		assert!(!env.contains_key("PI_PROVIDER_KEY"));
+		assert!(!env.contains_key("UNRELATED_HOST_STATE"));
+	}
+
+	#[test]
+	fn platform_env_prefixed_lc_variables_are_inherited() {
+		let env = platform_env([("LC_MESSAGES", "C.UTF-8"), ("NOT_LC_ALLOWED", "x")]);
+		assert_eq!(env.get("LC_MESSAGES").map(String::as_str), Some("C.UTF-8"));
+		assert!(!env.contains_key("NOT_LC_ALLOWED"));
 	}
 }

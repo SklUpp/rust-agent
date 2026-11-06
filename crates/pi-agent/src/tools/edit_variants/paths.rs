@@ -21,7 +21,7 @@ use std::{
 
 use tokio_util::sync::CancellationToken;
 
-use crate::tools::ToolError;
+use crate::tool::ToolError;
 
 /// Internal schemes the TypeScript `edit` tool routes through
 /// `InternalUrlRouter`/`resolvePlanPath`. This crate has no URL adapter.

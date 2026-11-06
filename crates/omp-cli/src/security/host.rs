@@ -23,7 +23,7 @@ pub struct SecurityScanRequest {
 	pub scan_id: String,
 	pub execution_root: PathBuf,
 	pub model: SecurityModelRef,
-	pub publication_tool: Arc<dyn pi_agent::tools::Tool>,
+	pub publication_tool: Arc<dyn pi_agent::tool::Tool>,
 	pub cancel: pi_agent::CancellationToken,
 	pub resolver: Arc<crate::auth::security::ExactSecurityOAuthResolver>,
 }

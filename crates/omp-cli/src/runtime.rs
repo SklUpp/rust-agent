@@ -28,10 +28,13 @@ use pi_agent::{
 	lsp::{LspSession, LspTool},
 	mcp::{
 		MCPContent, MCPServerConfig, MCPStdioServerConfig, McpConnection, McpError,
-		McpToolOriginSource, connect_to_server, create_mcp_tool_name, get_mcp_tool_origin_key,
-		mcp_tool_match_score, register_active_session, sanitize_mcp_tool_name_part,
+		connect_to_server, register_active_session,
 	},
 	tools::hashline::{NativeSnapshotSink, SnapshotStore, edit::EditToolOptions},
+	tools::naming::{
+		McpToolOriginSource, create_mcp_tool_name, get_mcp_tool_origin_key, mcp_tool_match_score,
+		sanitize_mcp_tool_name_part,
+	},
 	tools::{
 		edit_variants::{
 			EditMode, ResolvedSessionTools, SessionDisplayResolver, default_session_tools,
@@ -5555,7 +5558,7 @@ fn collect_all_configured_server_names(
 	res.sort();
 	res
 }
-// mcp_tool_match_score re-exported from pi_agent::mcp
+// mcp_tool_match_score is defined by the pure naming contract in pi_agent::tools::naming
 
 fn mcp_server_matches_tools(
 	server_name: &str,

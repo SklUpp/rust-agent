@@ -36,7 +36,6 @@ use serde_json::{Value, json};
 use tokio_util::sync::CancellationToken;
 
 use super::{
-	Tool, ToolError,
 	ast_grep::{
 		Candidate, GroupedSection, code_frame_line, collect_candidates, common_base,
 		format_grouped_files, plan_targets_single,
@@ -45,9 +44,12 @@ use super::{
 	hashline::{SnapshotStore, canonical_key, format_header},
 	pending::{PendingAction, PendingStore, REJECT_DEVICE_PATH, RESOLVE_DEVICE_PATH},
 	read::{FileDisplayInputs, normalize_snapshot_text},
-	tool_result, write_atomic,
+	write_atomic,
 };
-use crate::state::{AgentContext, ToolResult};
+use crate::{
+	state::{AgentContext, ToolResult},
+	tool::{Tool, ToolError, tool_result},
+};
 
 /// Upstream `PI_MAX_AST_FILES` default.
 const DEFAULT_MAX_AST_FILES: usize = 1000;
@@ -1179,7 +1181,7 @@ mod tests {
 	use serde_json::json;
 
 	use super::*;
-	use crate::tools::Tool as _;
+	use crate::tool::Tool as _;
 
 	struct TempDir(PathBuf);
 

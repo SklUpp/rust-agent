@@ -23,7 +23,7 @@ use serde_json::Value;
 use super::{fsops, paths, text};
 use crate::{
 	state::{AgentContext, ToolResult},
-	tools::ToolError,
+	tool::ToolError,
 };
 
 pub const OPENER: char = '«';

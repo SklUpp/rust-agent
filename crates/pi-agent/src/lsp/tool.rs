@@ -19,7 +19,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::{
 	state::{AgentContext, ToolResult},
-	tools::{Tool, ToolError},
+	tool::{Tool, ToolError},
 };
 
 use super::{

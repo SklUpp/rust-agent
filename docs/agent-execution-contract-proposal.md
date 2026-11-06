@@ -32,6 +32,8 @@ Explicit task stop передаётся дочерней ветви и её пр
 
 Shell env составляется явно без массового копирования env runtime. Exported shell variables передаются её external children согласно разрешённой execution policy; credentials provider не входят в shell env. Состояние функций/options нельзя без доказанного совместимого моста переносить между Bashkit/brush/native shell. Ошибка `exit` in-process не должна завершать runtime.
 
+В текущем extraction это `state::platform_env`: allowlist (`PATH`, `HOME`, `PREFIX`, `TMP*`, `LANG`, `LC_*`, `TERM`, `SHELL`, `TZ`) применяется и к `AgentContext`-конструкторам, и к overlay-ветке process broker; произвольное имя ключа провайдера не наследуется, явный `ctx.env` caller override сохраняется. Это фильтрация источника env, не sandbox и не authority (D92).
+
 Bashkit может выполнить встроенный участок, но его jobs ограничены exec и no-spawn моделью. Для настоящих toolchains и dev server нужен process backend; нельзя выдать его гарантии за гарантии VFS. Поведение при недоступности OS-изоляции явно отложено пользователем.
 
 ## Запись и integration

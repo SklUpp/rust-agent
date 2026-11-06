@@ -24,7 +24,7 @@ use serde_json::Value;
 
 use crate::{
 	state::{AgentContext, ToolResult},
-	tools::ToolError,
+	tool::ToolError,
 };
 
 /// Per-mode tool metadata the parent `EditTool` returns from

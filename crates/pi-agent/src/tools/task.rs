@@ -13,7 +13,6 @@ use tokio::sync::Semaphore;
 use tokio_util::sync::CancellationToken;
 
 use super::{
-	Tool, ToolError,
 	registry::ToolRegistry,
 	task_catalog::{
 		AgentCatalog, AgentDefinition, AgentSource, ChildModel, ChildModelFactory, HandoffTarget,
@@ -32,6 +31,7 @@ use crate::{
 	subagent_lifecycle::TranscriptJournal,
 	supervisor::{ChildGuard, ChildSpawn, Supervisor, cap_result_text},
 	task_persisted_revive::{PersistedChildSession, RevivedChild},
+	tool::{Tool, ToolError},
 };
 
 #[derive(Clone)]

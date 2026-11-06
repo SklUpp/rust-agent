@@ -10,7 +10,10 @@ use std::path::Path;
 
 use tokio_util::sync::CancellationToken;
 
-use crate::tools::{MAX_EDIT_BYTES, ToolError, read_capped, write_atomic_with_mode};
+use crate::{
+	tool::ToolError,
+	tools::{MAX_EDIT_BYTES, read_capped, write_atomic_with_mode},
+};
 
 /// Read an existing UTF-8 file under the edit size cap.
 pub async fn read_text(path: &Path, display: &str) -> Result<String, ToolError> {

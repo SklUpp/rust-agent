@@ -42,13 +42,12 @@ use tokio::io::{AsyncReadExt, AsyncSeekExt};
 use tokio_util::sync::CancellationToken;
 
 use super::{
-	Tool, ToolError,
 	edit_variants::mode::{EditMode, FileDisplayMode, resolve_file_display_mode},
 	internal_urls::{self, InternalResource, InternalUrlRouter},
 	internal_urls_agent,
 	internal_urls_artifact,
-	tool_result,
 };
+use crate::tool::{Tool, ToolError, tool_result};
 use crate::state::{AcpClientBridge, AcpClientError, AgentContext, ToolResult};
 
 /// Shared read caps (`packages/coding-agent/src/session/streaming-output.ts`).
@@ -3252,7 +3251,7 @@ mod display_tests {
 	use crate::{
 		CancellationToken,
 		state::ToolResult,
-		tools::Tool as _,
+		tool::Tool as _,
 		tools::internal_urls::{InternalUrl, ProtocolHandler, ResolveContext, UrlScope},
 	};
 
@@ -3959,7 +3958,8 @@ mod conflict_read_tests {
 	use serde_json::json;
 
 	use super::*;
-	use crate::tools::{PendingStore, Tool as _, WriteTool};
+	use crate::tool::Tool as _;
+	use crate::tools::{PendingStore, WriteTool};
 
 	struct TempDir(PathBuf);
 

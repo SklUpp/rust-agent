@@ -800,7 +800,7 @@ fn run_operation(
 					record_for_publish.update("publishing", None, now_iso);
 				})),
 			}));
-			let publisher_tool: Arc<dyn pi_agent::tools::Tool> =
+			let publisher_tool: Arc<dyn pi_agent::tool::Tool> =
 				Arc::new(SecurityPublishTool::new(Arc::clone(&publisher_instance)));
 			publisher = Some(Arc::clone(&publisher_instance));
 			let request = SecurityScanRequest {

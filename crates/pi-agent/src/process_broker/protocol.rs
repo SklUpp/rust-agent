@@ -684,15 +684,17 @@ impl WireSpec {
 	/// `full_env = true` (every [`ProcessSpec`]-derived launch and every recovery
 	/// relaunch) uses the transported environment verbatim, so a broker's own
 	/// ambient variables never leak into a persisted or re-adopted child.
-	/// Hand-written overlay specs merge onto the broker's ambient environment.
+	/// Hand-written overlay specs merge onto the broker's platform allowlist
+	/// (see [`crate::state::platform_env`]), never onto every ambient variable.
 	#[must_use]
 	pub fn into_process_spec(&self) -> ProcessSpec {
 		let env: HashMap<String, String> = if self.full_env {
 			self.env.iter().map(|(key, value)| (key.clone(), value.clone())).collect()
 		} else {
-			let mut env: HashMap<String, String> = std::env::vars_os()
-				.filter_map(|(key, value)| Some((key.into_string().ok()?, value.into_string().ok()?)))
-				.collect();
+			// Overlay specs inherit only the platform allowlist, never the
+			// broker's provider credentials or other ambient state. A caller
+			// that needs another variable puts it in `self.env` explicitly.
+			let mut env = crate::state::platform_env(std::env::vars_os());
 			for (key, value) in &self.env {
 				env.insert(key.clone(), value.clone());
 			}

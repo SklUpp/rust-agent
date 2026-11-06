@@ -1,6 +1,6 @@
 # Точный разрез Rust-ядра OMP
 
-Дата: 2026-11-06. Статус: предложение реализации, код не изменён. Продолжает [карту доноров](agent-loop-tool-implementation-map.md), подчиняется [D01–D79](agent-architecture-decisions.md). Пути и номера строк ниже относятся к исходному Rust-форку `3008cfd0ca88bb0e28323561a165f39efa7159e1`, а не к будущей раскладке продукта.
+Дата: 2026-11-06. Статус: S1 и часть S2 (tool/delivery/env) применены в standalone-репозитории (`tool.rs`, `delivery.rs`, `tools/naming.rs`, env allowlist); SQLite/session owner не начаты, compilation proof не выполнялся. Остальные пункты — предложение. Продолжает [карту доноров](agent-loop-tool-implementation-map.md), подчиняется [D01–D79](agent-architecture-decisions.md). Пути и номера строк ниже относятся к исходному Rust-форку `3008cfd0ca88bb0e28323561a165f39efa7159e1`, а не к будущей раскладке продукта.
 
 ## 1. Вывод
 
@@ -25,6 +25,15 @@ Loop уже отделён от CLI на уровне зависимости: `o
 После разреза loop не обязан компилировать `pi-shell`, `pi-ast`, `pi-iso`, LSP/DAP/eval и MCP transports. Но конечный бинарник по-прежнему подключает выбранные engines и MCP: минимальный loop не означает урезанный продукт.
 
 Не переносить `tools/mod.rs` целиком с новым именем: он одновременно определяет контракт и конкретные shell/read/write/grep/AST tools, а также безусловно объявляет task/hub/SSH/web/SQLite модули. Именно эта связь заставляет тащить реализации через registry.
+
+### 2.1 Применённые разрезы (S1/S2)
+
+- `Tool`, `ToolError`, `tool_result` живут в `crates/pi-agent/src/tool.rs`; `tools/mod.rs` только импортирует контракт, все callers (loop, scheduler, builtin/dap/lsp/eval tools, `omp-cli`) переведены на новый путь без aliases.
+- `BackgroundResultSink`/`BackgroundDelivery` — в `crates/pi-agent/src/delivery.rs`; `loop.rs` импортирует delivery, не `supervisor`.
+- `mcp/naming.rs` → `tools/naming.rs`: чистая std-логика имён больше не тянет MCP implementation; registry использует её рядом с lookup.
+- `ToolRegistry::with_builtins` — только `#[cfg(test)]`; production-сборка набора остаётся у product host (`omp-cli/src/runtime.rs`), integration-тесты строят registry явно.
+- `state::platform_env` — явный allowlist (`PATH`, `HOME`, `PREFIX`, `TMP*`, `LANG`, `LC_*`, `TERM`, `SHELL`, `TZ`); `AgentContext`-конструкторы и overlay-ветка process broker больше не копируют ambient env. `ctx.env` остаётся явным caller override.
+- HTTP-адаптер `OpenAiCompatibleProvider` пока не выделен: provider связан с `reqwest` и общими stream-типами; follow-up — вынести `provider.rs:257–630` в внутренний `provider_http`-модуль и пересчитать фактические зависимости после compilation proof.
 
 ## 3. Точный состав сохраняемого loop-среза
 

@@ -7,7 +7,7 @@
 use async_trait::async_trait;
 use serde_json::{Value, json};
 
-use super::{Tool, ToolError};
+use crate::tool::{Tool, ToolError};
 use crate::state::{AgentContext, ToolResult};
 
 pub struct ThinkTool;

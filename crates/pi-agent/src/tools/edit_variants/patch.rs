@@ -19,7 +19,7 @@ use super::{
 };
 use crate::{
 	state::{AgentContext, ToolResult},
-	tools::ToolError,
+	tool::ToolError,
 };
 
 const EOF_MARKER: &str = "*** End of File";

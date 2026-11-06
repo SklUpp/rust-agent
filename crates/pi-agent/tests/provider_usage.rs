@@ -23,6 +23,14 @@ use serde_json::{Value, json};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
+fn registry_with_builtins() -> ToolRegistry {
+	let mut registry = ToolRegistry::new();
+	for tool in pi_agent::tools::builtin_tools() {
+		registry.register(tool);
+	}
+	registry
+}
+
 fn usage(input: u64, output: u64, cache_read: u64, cache_write: u64) -> TokenUsage {
 	TokenUsage {
 		input,
@@ -455,7 +463,7 @@ async fn failed_request_keeps_its_reported_usage_once() {
 	let agent = AgentLoop::new(
 		config(&dir.path),
 		agent_provider,
-		ToolRegistry::with_builtins(),
+		registry_with_builtins(),
 	);
 	let mut state = AgentState::default();
 	let (events_tx, mut events_rx) = tokio::sync::mpsc::channel(16);
