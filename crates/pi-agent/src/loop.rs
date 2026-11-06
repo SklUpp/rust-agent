@@ -7,6 +7,7 @@ use tokio_util::sync::CancellationToken;
 use crate::{
 	compaction::{CompactionReport, Compactor},
 	delivery::BackgroundResultSink,
+	durable::DURABILITY_FAILURE_CODE,
 	mailbox::{Mailbox, format_incoming},
 	provider::{ModelProvider, ProviderError, StreamAssembler, ToolChoice},
 	state::{
@@ -330,6 +331,8 @@ pub enum AgentError {
 	Interrupted,
 	#[error("Model provider error: {0}")]
 	Provider(#[from] ProviderError),
+	#[error("Durable session write failed: {0}")]
+	Durable(String),
 	#[error("Internal error: {0}")]
 	Internal(String),
 }
@@ -569,9 +572,12 @@ fn apply_turn_boundary(
 	scrub_custom_type: Option<String>,
 	provider: Option<Arc<dyn ModelProvider>>,
 	replacement_context_limit: Option<usize>,
-) {
+) -> bool {
+	let mut rewrote = false;
 	if let Some(custom_type) = scrub_custom_type.as_deref() {
+		let before = messages.len();
 		messages.retain(|message| message.custom_type.as_deref() != Some(custom_type));
+		rewrote |= messages.len() != before;
 	}
 	if let Some(provider) = provider {
 		*active_provider = provider;
@@ -579,7 +585,11 @@ fn apply_turn_boundary(
 	if let Some(limit) = replacement_context_limit {
 		*context_limit = limit;
 	}
-	messages.extend(guidance);
+	if !guidance.is_empty() {
+		messages.extend(guidance);
+		rewrote = true;
+	}
+	rewrote
 }
 
 /// Synthetic result for a call that must never run (TS
@@ -687,6 +697,9 @@ pub struct AgentLoop {
 	peer_inbox: Option<(Arc<Mailbox>, String)>,
 	/// Session-owned staged-preview policy (peeked from the registry).
 	policy: Option<Arc<dyn ToolPolicy>>,
+	/// Host-injected durability boundary. Every model request and tool effect
+	/// is ordered behind an ordinary awaited write; there is no ack protocol.
+	durable: Option<Arc<dyn crate::durable::DurableBoundary>>,
 	/// Turn-end persistence/rewind handshake with the session owner.
 	turn_ack: Option<Arc<TurnAck>>,
 	/// Session plan-mode guard copied into every tool call context of this run.
@@ -733,6 +746,7 @@ impl AgentLoop {
 			background_results: None,
 			peer_inbox: None,
 			policy,
+			durable: None,
 			turn_ack: None,
 			plan: None,
 			conflicts: None,
@@ -758,6 +772,7 @@ impl AgentLoop {
 			background_results: None,
 			peer_inbox: None,
 			policy,
+			durable: None,
 			turn_ack: None,
 			plan: None,
 			conflicts: None,
@@ -799,6 +814,18 @@ impl AgentLoop {
 	#[must_use]
 	pub fn with_continuation(mut self, continuation: bool) -> Self {
 		self.continuation = continuation;
+		self
+	}
+
+	/// Attach the host-injected durability boundary. Message writes are awaited
+	/// at the loop boundary and intent/outcome writes around every tool effect.
+	#[must_use]
+	pub fn with_durable(
+		mut self,
+		durable: Option<Arc<dyn crate::durable::DurableBoundary>>,
+	) -> Self {
+		self.scheduler.set_durable(durable.clone());
+		self.durable = durable;
 		self
 	}
 
@@ -867,6 +894,46 @@ impl AgentLoop {
 			}
 		}
 	}
+	/// Await host durability for the conversation. A failed write is terminal:
+	/// the caller must not issue the next model request or start another tool
+	/// effect on top of unpersisted history.
+	async fn persist_conversation(&self, messages: &[Message]) -> Result<(), AgentError> {
+		let Some(durable) = &self.durable else {
+			return Ok(());
+		};
+		durable
+			.persist_messages(messages)
+			.await
+			.map_err(|error| AgentError::Durable(error.to_string()))
+	}
+
+	/// Tell the owner that a checkpoint/branch rewrite replaced the live
+	/// conversation from durable state. The next write appends only the new
+	/// tail; the rewritten prefix is never duplicated.
+	async fn resync_conversation(&self, messages: &[Message]) -> Result<(), AgentError> {
+		let Some(durable) = &self.durable else {
+			return Ok(());
+		};
+		durable
+			.resync_messages(messages)
+			.await
+			.map_err(|error| AgentError::Durable(error.to_string()))
+	}
+
+	async fn compact_conversation(
+		&self,
+		messages: &[Message],
+		report: &CompactionReport,
+	) -> Result<(), AgentError> {
+		let Some(durable) = &self.durable else {
+			return Ok(());
+		};
+		durable
+			.compacted(messages, report)
+			.await
+			.map_err(|error| AgentError::Durable(error.to_string()))
+	}
+
 	fn begin_turn_ack(
 		&self,
 		turn_start: usize,
@@ -1060,6 +1127,12 @@ impl AgentLoop {
 				state.messages.push(requirement.reminder.clone());
 			}
 
+			// Ordinary awaited durability: every complete user/assistant message
+			// accepted so far must be on disk before the next provider request.
+			// A failure stops the run; there is no ack handshake and no silent
+			// "persistence disabled" downgrade.
+			self.persist_conversation(&state.messages).await?;
+
 			// Durable before destructive: the owner journals everything accepted
 			// so far. If that write failed, the prune below is skipped — dropping
 			// a turn the transcript does not hold would lose it silently. The next
@@ -1077,6 +1150,9 @@ impl AgentLoop {
 				// infer the rewrite from lengths (they can match again).
 				if let (Some(observer), Some(report)) = (&self.turn_observer, report) {
 					observer(&state.messages, Some(report));
+				}
+				if let Some(report) = report.as_ref() {
+					self.compact_conversation(&state.messages, report).await?;
 				}
 			}
 
@@ -1142,6 +1218,9 @@ impl AgentLoop {
 			let turn_start = state.messages.len();
 			state.messages.push(assistant.clone());
 			state.total_turns += 1;
+			// The complete assistant turn (including its tool-call ids) is durable
+			// before any tool effect starts. A failure here prevents the batch.
+			self.persist_conversation(&state.messages).await?;
 
 			// A turn is compliant only when it calls the required tool and
 			// nothing else, mirroring the forced request that can emit only
@@ -1185,6 +1264,9 @@ impl AgentLoop {
 					&mut state.messages,
 				)
 				.await;
+				// Synthetic results answer the assistant's calls; persist them so a
+				// reopen does not reconstruct the turn as a dangling call.
+				self.persist_conversation(&state.messages).await?;
 				let ack_rx =
 					self.begin_turn_ack(turn_start, state.messages.len() + pending_injections.len());
 				if let Some(events_sink) = events.as_ref() {
@@ -1200,11 +1282,14 @@ impl AgentLoop {
 					announce_user_steer(&events, &parts).await;
 					state.messages.push(Message::user_with_parts(parts));
 				}
+				self.persist_conversation(&state.messages).await?;
 				let decision = self.await_turn_ack(ack_rx, &cancellation_token).await;
 				// A terminal provider turn ends the dialog: journaling/rewind still
 				// apply, but a provider swap or guidance must not start another turn.
 				let TurnAckDecision { rewrite, warning, .. } = decision;
-				let _ = self.apply_turn_rewrite(&mut state.messages, rewrite, warning);
+				if self.apply_turn_rewrite(&mut state.messages, rewrite, warning) {
+					self.resync_conversation(&state.messages).await?;
+				}
 				turn_results.push(TurnResult {
 					message: assistant,
 					tool_results: results,
@@ -1247,10 +1332,12 @@ impl AgentLoop {
 							&mut state.messages,
 						)
 						.await;
+						self.persist_conversation(&state.messages).await?;
 						for parts in pending_injections {
 							announce_user_steer(&events, &parts).await;
 							state.messages.push(Message::user_with_parts(parts));
 						}
+						self.persist_conversation(&state.messages).await?;
 						return Err(AgentError::Internal(format!(
 							"Soft tool requirement '{}' was not satisfied after \
 							 {limit} forced turns; aborting to avoid an unbounded force loop.",
@@ -1334,9 +1421,11 @@ impl AgentLoop {
 					context_limit: replacement_context_limit,
 					tool_selection: replacement_tools,
 				} = decision;
-				let _ = self.apply_turn_rewrite(&mut state.messages, rewrite, warning);
+				if self.apply_turn_rewrite(&mut state.messages, rewrite, warning) {
+					self.resync_conversation(&state.messages).await?;
+				}
 				self.apply_turn_tools(replacement_tools);
-				apply_turn_boundary(
+				if apply_turn_boundary(
 					&mut state.messages,
 					&mut active_provider,
 					&mut context_limit,
@@ -1344,7 +1433,9 @@ impl AgentLoop {
 					scrub_custom_type,
 					provider,
 					replacement_context_limit,
-				);
+				) {
+					self.resync_conversation(&state.messages).await?;
+				}
 				turn_results.push(TurnResult {
 					message: assistant,
 					tool_results: results,
@@ -1368,6 +1459,9 @@ impl AgentLoop {
 					&mut state.messages,
 				)
 				.await;
+				// Synthetic results answer the assistant's calls; persist them so a
+				// reopen does not reconstruct the turn as a dangling call.
+				self.persist_conversation(&state.messages).await?;
 				let ack_rx =
 					self.begin_turn_ack(turn_start, state.messages.len() + pending_injections.len());
 				if let Some(events_sink) = events.as_ref() {
@@ -1394,9 +1488,11 @@ impl AgentLoop {
 					context_limit: replacement_context_limit,
 					tool_selection: replacement_tools,
 				} = decision;
-				let _ = self.apply_turn_rewrite(&mut state.messages, rewrite, warning);
+				if self.apply_turn_rewrite(&mut state.messages, rewrite, warning) {
+					self.resync_conversation(&state.messages).await?;
+				}
 				self.apply_turn_tools(replacement_tools);
-				apply_turn_boundary(
+				if apply_turn_boundary(
 					&mut state.messages,
 					&mut active_provider,
 					&mut context_limit,
@@ -1404,7 +1500,9 @@ impl AgentLoop {
 					scrub_custom_type,
 					provider,
 					replacement_context_limit,
-				);
+				) {
+					self.resync_conversation(&state.messages).await?;
+				}
 				turn_results.push(TurnResult {
 					message: assistant,
 					tool_results: results,
@@ -1437,6 +1535,7 @@ impl AgentLoop {
 					announce_user_steer(&events, &parts).await;
 					state.messages.push(Message::user_with_parts(parts));
 				}
+				self.persist_conversation(&state.messages).await?;
 				let decision = self.await_turn_ack(ack_rx, &cancellation_token).await;
 				let TurnAckDecision {
 					rewrite,
@@ -1449,9 +1548,13 @@ impl AgentLoop {
 					tool_selection: replacement_tools,
 				} = decision;
 				let mut continue_turn = continue_turn;
-				continue_turn |= self.apply_turn_rewrite(&mut state.messages, rewrite, warning);
+				let rewrote = self.apply_turn_rewrite(&mut state.messages, rewrite, warning);
+				continue_turn |= rewrote;
+				if rewrote {
+					self.resync_conversation(&state.messages).await?;
+				}
 				self.apply_turn_tools(replacement_tools);
-				apply_turn_boundary(
+				if apply_turn_boundary(
 					&mut state.messages,
 					&mut active_provider,
 					&mut context_limit,
@@ -1459,7 +1562,9 @@ impl AgentLoop {
 					scrub_custom_type,
 					provider,
 					replacement_context_limit,
-				);
+				) {
+					self.resync_conversation(&state.messages).await?;
+				}
 				turn_results.push(TurnResult {
 					message: assistant,
 					tool_results: Vec::new(),
@@ -1569,6 +1674,9 @@ impl AgentLoop {
 				announce_user_steer(&events, &parts).await;
 				state.messages.push(Message::user_with_parts(parts));
 			}
+			// Accepted steering is a user message; make it durable before the
+			// owner is acked and before any next provider request.
+			self.persist_conversation(&state.messages).await?;
 			let decision = self.await_turn_ack(ack_rx, &cancellation_token).await;
 			let TurnAckDecision {
 				rewrite,
@@ -1580,9 +1688,11 @@ impl AgentLoop {
 				context_limit: replacement_context_limit,
 				tool_selection: replacement_tools,
 			} = decision;
-			let _ = self.apply_turn_rewrite(&mut state.messages, rewrite, warning);
+			if self.apply_turn_rewrite(&mut state.messages, rewrite, warning) {
+				self.resync_conversation(&state.messages).await?;
+			}
 			self.apply_turn_tools(replacement_tools);
-			apply_turn_boundary(
+			if apply_turn_boundary(
 				&mut state.messages,
 				&mut active_provider,
 				&mut context_limit,
@@ -1590,7 +1700,25 @@ impl AgentLoop {
 				scrub_custom_type,
 				provider,
 				replacement_context_limit,
-			);
+			) {
+				self.resync_conversation(&state.messages).await?;
+			}
+
+			let durability_failure = outcome.results.iter().find_map(|result| {
+				result
+					.details
+					.as_ref()
+					.and_then(|details| details.get("code"))
+					.and_then(serde_json::Value::as_str)
+					.filter(|code| *code == DURABILITY_FAILURE_CODE)
+					.map(|_| result.content.clone())
+			});
+			if let Some(error) = durability_failure {
+				// The effect may already have run; its intent stays unresolved.
+				// Terminate instead of issuing another model request, and never
+				// replay the call automatically.
+				return Err(AgentError::Durable(error));
+			}
 
 			let should_terminate = outcome.results.iter().any(|r| r.terminate);
 
@@ -2147,7 +2275,7 @@ mod live_cut_tests {
 	#[test]
 	fn turn_boundary_scrubs_consumed_guidance_then_injects_and_swaps_provider() {
 		let first: Arc<dyn ModelProvider> = Arc::new(
-			crate::provider::OpenAiCompatibleProvider::new(
+			crate::provider::http::OpenAiCompatibleProvider::new(
 				"http://127.0.0.1:9/v1",
 				"key",
 				"model-a",
@@ -2155,7 +2283,7 @@ mod live_cut_tests {
 			.expect("first provider"),
 		);
 		let replacement: Arc<dyn ModelProvider> = Arc::new(
-			crate::provider::OpenAiCompatibleProvider::new(
+			crate::provider::http::OpenAiCompatibleProvider::new(
 				"http://127.0.0.1:9/v1",
 				"key",
 				"model-b",

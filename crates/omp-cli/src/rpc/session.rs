@@ -426,6 +426,11 @@ impl RpcSession {
 		for warning in store.take_warnings() {
 			eprintln!("warning: {warning}");
 		}
+		if store.legacy_read_only() {
+			return Err(Error::new(
+				"cannot run RPC on a legacy JSONL session: read-only; import it into the SQLite store first",
+			));
+		}
 		let base_service_tiers = if store.has_service_tier_entry() {
 			store.service_tier_by_family()
 		} else {
@@ -445,11 +450,6 @@ impl RpcSession {
 			&& let Err(err) = store.append_service_tier_change(&live_service_tiers)
 		{
 			eprintln!("warning: cannot record service tier change: {err}");
-		}
-		if store.is_v1() {
-			return Err(Error::new(
-				"cannot run RPC on a legacy v1 session log: read-only; use import_legacy_v1",
-			));
 		}
 		// Every persisted session owns a `local://` artifact directory. Tools
 		// may be configured without eval, so its creation cannot depend on the
@@ -1423,22 +1423,34 @@ impl RpcSession {
 	/// Switch to an existing session log.
 	pub fn switch_session(&mut self, path: &Path) -> Result<()> {
 		let old_scope = self.session_scope_identity();
-		if !path.is_file() {
-			return Err(Error::new(format!("Session not found: {}", path.display())));
-		}
-		let mut options = self.store_options.clone();
-		options.dir = path.parent().map(Path::to_path_buf);
-		options.id = path
+		let dir = path.parent().map(Path::to_path_buf);
+		let id = path
 			.file_stem()
 			.and_then(|stem| stem.to_str())
 			.map(str::to_string);
+		let durable_exists = match (&dir, &id) {
+			(Some(dir), Some(id)) => crate::durable_session::session_exists(
+				&crate::durable_session::database_path(dir),
+				id,
+			)
+			.unwrap_or(false),
+			_ => false,
+		};
+		if !durable_exists && !path.is_file() {
+			return Err(Error::new(format!("Session not found: {}", path.display())));
+		}
+		let mut options = self.store_options.clone();
+		options.dir = dir;
+		options.id = id;
 		options.continue_latest = false;
 		let mut store = SessionStore::open(&options);
 		for warning in store.take_warnings() {
 			eprintln!("warning: {warning}");
 		}
-		if store.is_v1() {
-			return Err(Error::new("cannot switch to a legacy v1 session log: read-only"));
+		if store.legacy_read_only() {
+			return Err(Error::new(
+				"cannot switch to a legacy JSONL session: read-only; import it into the SQLite store first",
+			));
 		}
 		// Switching targets an existing log, so persistence was requested: a
 		// store that failed to open must not silently run in memory where its
@@ -1493,8 +1505,8 @@ impl RpcSession {
 		Ok(())
 	}
 
-	/// Rename the session: append the `title_change` entry and rewrite the
-	/// 256-byte title slot so list views and resumes see the same name.
+	/// Rename the session: append the `title_change` entry to the durable
+	/// authority so list views and resumes see the same name.
 	pub fn set_session_name(&mut self, name: &str) -> Result<()> {
 		let title = clean_title(name);
 		if title.is_empty() {
@@ -1518,15 +1530,6 @@ impl RpcSession {
 				extra: Value::Object(extra),
 			};
 			self.store.append_entry(entry).map_err(Error::new)?;
-			if let Some(file) = self.store.file().map(Path::to_path_buf) {
-				let slot = session::serialize_title_slot(&title, Some("user"), &iso);
-				if let Ok(content) = std::fs::read_to_string(&file) {
-					let overlay = session::overlay_title_slot(&content, &slot);
-					if let Err(err) = session::overwrite_title_slot_rolled_back(&file, &overlay) {
-						eprintln!("warning: cannot update session title slot: {err}");
-					}
-				}
-			}
 		}
 		self.session_name = Some(title);
 		Ok(())
@@ -2127,7 +2130,7 @@ impl RpcSession {
 		// written first would come back as history and the runner would append
 		// the same prompt (text and images) a second time.
 		let mut request = self.request(input.text.clone(), turn_parts, input.continuation)?;
-		if self.store.enabled() {
+		if self.store.enabled() && self.store.durable_boundary().is_none() {
 			if let Err(err) = entry.validate() {
 				eprintln!("warning: {err}");
 			} else if let Err(err) = self.store.append_message(&entry) {
@@ -2181,15 +2184,11 @@ impl RpcSession {
 			Some(self.in_memory_messages.clone().unwrap_or_default())
 		} else if let Some(messages) = &self.history_messages {
 			Some(messages.clone())
-		} else if self.store.has_branch_context()
-			|| self
-				.store
-				.messages()
-				.iter()
-				.any(|message| message.message.role == "developer")
-		{
-			// Persisted developer reminders (plan) must survive into later turns
-			// even without a branch/custom entry: the message view keeps the role.
+		} else if self.store.is_v1() {
+			None
+		} else {
+			// Always use the entry replay projection so terminal error/aborted
+			// turns are excluded exactly as they are from the durable seed.
 			if let Some(warning) = self.store.branch_chain_warning() {
 				eprintln!("warning: {warning}");
 			}
@@ -2200,8 +2199,6 @@ impl RpcSession {
 					None
 				},
 			}
-		} else {
-			None
 		};
 		let checkpoint_controller = self
 			.config
@@ -2260,6 +2257,7 @@ impl RpcSession {
 			history_messages,
 			checkpoint_controller,
 			turn_ack: None,
+			durable: self.store.durable_boundary(),
 			todo_phases,
 			session_persisted,
 			session_file: session_persisted
@@ -2482,7 +2480,7 @@ impl RpcSession {
 			SessionMessage::user(content, timestamp_ms),
 		);
 		let message = runtime::user_message_from_parts(&joined, &images).ok();
-		if self.store.enabled() {
+		if self.store.enabled() && self.store.durable_boundary().is_none() {
 			if let Err(err) = entry.validate() {
 				eprintln!("warning: {err}");
 			} else if let Err(err) = self.store.append_message(&entry) {
@@ -2513,6 +2511,11 @@ impl RpcSession {
 	/// Re-derive the turn view from the log after an entry landed outside a
 	/// turn record (steering); the active branch decides which entries count.
 	fn refresh_history_from_store(&mut self) {
+		if self.store.durable_boundary().is_some()
+			&& let Err(err) = self.store.reload_from_durable()
+		{
+			eprintln!("warning: cannot reload durable session: {err}");
+		}
 		let rebuilt = if self.store.has_branch_context() {
 			self.store.branch_history()
 		} else {
@@ -2758,7 +2761,43 @@ impl RpcSession {
 		let mut rewound = false;
 		let mut rewind_cut: Option<pi_agent::InMemoryRewind> = None;
 		if self.store.enabled() {
-			let captured = if valid.is_empty() {
+			let durable_live = self.store.durable_boundary().is_some();
+			let captured = if durable_live {
+				// The loop boundary already wrote the assistant turn before the
+				// tool effects and each tool result with its outcome. Reload the
+				// durable view instead of appending a second journal row.
+				if let Err(err) = self.store.reload_from_durable() {
+					eprintln!("warning: cannot reload durable session: {err}");
+				}
+				if priority_downgraded
+					&& let Err(err) =
+						self.store.append_service_tier_change(&self.service_tiers)
+				{
+					eprintln!("warning: cannot record service tier change: {err}");
+				}
+				let call_ids: std::collections::HashSet<&str> =
+					tool_results.iter().map(|result| result.tool_call_id.as_str()).collect();
+				let persisted: Vec<MessageEntry> = self
+					.store
+					.messages()
+					.iter()
+					.filter(|entry| {
+						entry.message.role == "toolResult"
+							&& entry
+								.message
+								.tool_call_id
+								.as_deref()
+								.is_some_and(|id| call_ids.contains(id))
+					})
+					.cloned()
+					.collect();
+				let captured =
+					self.checkpoint_host.note_persisted_tool_results(&self.store, &persisted);
+				if let Err(err) = self.checkpoint_host.persist_active_reminder(&mut self.store) {
+					eprintln!("warning: {err}");
+				}
+				captured
+			} else if valid.is_empty() {
 				false
 			} else {
 				if let Err(err) = self.store.append_messages(&valid) {

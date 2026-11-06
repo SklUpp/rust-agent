@@ -1009,7 +1009,7 @@ fn run() -> std::result::Result<(), CliError> {
 	// process-wide env and tests stay race-free.
 	let no_title = cli.no_title
 		|| std::env::var_os("PI_NO_TITLE").is_some_and(|value| !value.is_empty());
-	let open_opts = if let Some(target) = &chosen_file {
+	let mut open_opts = if let Some(target) = &chosen_file {
 		let dir = target.parent().map(PathBuf::from);
 		let id = target.file_stem().and_then(|s| s.to_str()).map(str::to_string);
 		SessionOptions {
@@ -1133,9 +1133,21 @@ fn run() -> std::result::Result<(), CliError> {
 		for warning in rpc_store.take_warnings() {
 			eprintln!("warning: {warning}");
 		}
-		if !cli.no_session && explicitly_existing && !rpc_store.enabled() {
+		if rpc_store.legacy_read_only() {
 			return Err(CliError::usage(
-				"cannot open session log: persistence disabled due to format error",
+				"legacy JSONL sessions are read-only; import the session into the SQLite store first",
+			));
+		}
+		// Reuse the session the preflight opened instead of creating a second
+		// empty row: the id is the durable identity both stores share.
+		if open_opts.id.is_none() && rpc_store.enabled() {
+			open_opts.id = Some(rpc_store.id().to_string());
+			open_opts.continue_latest = false;
+		}
+		if !cli.no_session && !rpc_store.enabled() {
+			return Err(CliError::usage(
+				"cannot open the session store: persistence was requested but the SQLite \
+				 authority is unavailable (use --no-session for an explicit ephemeral run)",
 			));
 		}
 		let rpc_cache_key = cli
@@ -1206,6 +1218,17 @@ fn run() -> std::result::Result<(), CliError> {
 	for warning in store.take_warnings() {
 		eprintln!("warning: {warning}");
 	}
+	if store.legacy_read_only() {
+		return Err(CliError::usage(
+			"legacy JSONL sessions are read-only; import the session into the SQLite store first",
+		));
+	}
+	if !cli.no_session && !store.enabled() {
+		return Err(CliError::usage(
+			"cannot open the session store: persistence was requested but the SQLite authority \
+			 is unavailable (use --no-session for an explicit ephemeral run)",
+		));
+	}
 	// TS `main.ts:buildSessionOptions`: an explicit `--prompt-cache-key` always
 	// wins; otherwise a resumed/forked header key is inherited only when the
 	// provider route and prompt/tool shape are unchanged.
@@ -1229,11 +1252,6 @@ fn run() -> std::result::Result<(), CliError> {
 		}
 	}
 	session.provider_session_id = cli.provider_session_id.clone().filter(|id| !id.is_empty());
-	if !cli.no_session && explicitly_existing && !store.enabled() {
-		return Err(CliError::usage(
-			"cannot open session log: persistence disabled due to format error",
-		));
-	}
 	session.history = if store.has_branch_context() {
 		store.branch_history().map_err(CliError::fail)?
 	} else {
@@ -1397,7 +1415,18 @@ fn run() -> std::result::Result<(), CliError> {
 
 fn list_sessions_for_picker(dir: &Path) -> Vec<(PathBuf, Option<String>, String, String)> {
 	let mut result = Vec::new();
+	for summary in omp_cli::durable_session::list_session_summaries(dir).unwrap_or_default() {
+		let modified = std::time::UNIX_EPOCH
+			+ std::time::Duration::from_millis(summary.modified_ms.max(0) as u64);
+		result.push((
+			omp_cli::durable_session::session_path(dir, &summary.id),
+			summary.title,
+			summary.id,
+			output::iso8601(modified),
+		));
+	}
 	let Ok(entries) = std::fs::read_dir(dir) else {
+		result.sort_by(|a, b| b.3.cmp(&a.3));
 		return result;
 	};
 	for entry in entries.flatten() {
@@ -1409,6 +1438,9 @@ fn list_sessions_for_picker(dir: &Path) -> Vec<(PathBuf, Option<String>, String,
 			continue;
 		};
 		let id = stem.rfind('_').map_or(stem, |pos| &stem[pos + 1..]).to_string();
+		if result.iter().any(|(_, _, existing, _)| existing == &id) {
+			continue;
+		}
 		let mtime = entry
 			.metadata()
 			.and_then(|m| m.modified())
@@ -2251,6 +2283,7 @@ impl Session<'_> {
 			history_messages,
 			checkpoint_controller,
 			turn_ack: None,
+			durable: self.store.durable_boundary(),
 			todo_phases,
 			session_persisted,
 			session_file,
@@ -2444,6 +2477,11 @@ impl Session<'_> {
 		// prompt the loop is about to append, or every journaled turn replays it
 		// twice. The entry still lands before the provider call for resume.
 		let mut request = self.request(full_prompt.clone(), turn_parts.clone(), mode)?;
+		if hidden_custom_type.is_some() {
+			// Hidden goal continuations are not caller turns: the loop must not
+			// journal the synthetic prompt as user input.
+			request.continuation = true;
+		}
 		if self.store.enabled() {
 			if let Some(custom_type) = hidden_custom_type {
 				// Hidden continuation: never replayed as a user prompt, but it is
@@ -2459,10 +2497,14 @@ impl Session<'_> {
 					Ok(id) => user_id = id,
 					Err(err) => eprintln!("warning: {err}"),
 				}
-			} else if let Err(err) = user_entry.validate() {
-				eprintln!("warning: {err}");
-			} else if let Err(err) = self.store.append_message(&user_entry) {
-				eprintln!("warning: {err}");
+			} else if self.store.durable_boundary().is_none() {
+				// The loop boundary writes the user message before its first
+				// provider request; appending here would duplicate the row.
+				if let Err(err) = user_entry.validate() {
+					eprintln!("warning: {err}");
+				} else if let Err(err) = self.store.append_message(&user_entry) {
+					eprintln!("warning: {err}");
+				}
 			}
 		}
 
@@ -2696,10 +2738,16 @@ impl Session<'_> {
 						}
 					}
 					if !valid_turn_entries.is_empty() {
-						if let Err(err) = store.append_messages(&valid_turn_entries) {
+						if store.durable_boundary().is_some() {
+							// Assistant and tool rows were written by the loop
+							// boundary before the next effect/request. Rebuild the
+							// view instead of writing a second journal copy.
+							if let Err(err) = store.reload_from_durable() {
+								eprintln!("warning: cannot reload durable session: {err}");
+							}
+						} else if let Err(err) = store.append_messages(&valid_turn_entries) {
 							eprintln!("warning: {err}");
 						}
-
 					}
 					// The journal leaf (a downgrade metadata entry included) is the
 					// ancestry for the next assistant turn, so a tool continuation
@@ -2736,7 +2784,26 @@ impl Session<'_> {
 						.map_or(0, |(request, _)| request.turn_start);
 					let mut decision = pi_agent::TurnAckDecision::default();
 					if store.enabled() {
-						let captured = host.note_persisted_tool_results(store, &valid_turn_entries);
+						let persisted_tools: Vec<MessageEntry> = {
+							let call_ids: std::collections::HashSet<&str> = tool_results
+								.iter()
+								.map(|result| result.tool_call_id.as_str())
+								.collect();
+							store
+								.messages()
+								.iter()
+								.filter(|entry| {
+									entry.message.role == "toolResult"
+										&& entry
+											.message
+											.tool_call_id
+											.as_deref()
+											.is_some_and(|id| call_ids.contains(id))
+								})
+								.cloned()
+								.collect()
+						};
+						let captured = host.note_persisted_tool_results(store, &persisted_tools);
 						if let Err(err) = host.persist_active_reminder(store) {
 							eprintln!("warning: {err}");
 						}
@@ -3859,7 +3926,28 @@ fn run_export_command(
 	{
 		let path = dirs::absolute(cwd, Path::new(session));
 		if !path.is_file() {
-			return Err(CliError::fail(format!("File not found: {session}")));
+			// A durable session's path is an identity, not a JSONL file. Accept
+			// it when the SQLite row exists in the same directory.
+			let durable = path
+				.extension()
+				.and_then(|extension| (extension == "jsonl").then_some(()))
+				.and_then(|()| path.parent())
+				.zip(
+					path
+						.file_stem()
+						.and_then(|stem| stem.to_str())
+						.map(str::to_string),
+				)
+				.is_some_and(|(parent, id)| {
+					crate::durable_session::session_exists(
+						&crate::durable_session::database_path(parent),
+						&id,
+					)
+					.unwrap_or(false)
+				});
+			if !durable {
+				return Err(CliError::fail(format!("File not found: {session}")));
+			}
 		}
 		path
 	} else {

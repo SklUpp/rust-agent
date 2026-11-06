@@ -216,29 +216,46 @@ fn omp(agent_dir: &Path, cwd: &Path, sessions: &Path) -> ProcCommand {
 }
 
 fn session_file(sessions: &Path, id: &str) -> PathBuf {
-	let mut files: Vec<PathBuf> = fs::read_dir(sessions)
-		.expect("session dir")
-		.flatten()
-		.map(|entry| entry.path())
-		.filter(|path| {
-			path.extension().and_then(|ext| ext.to_str()) == Some("jsonl")
-				&& path
-					.file_stem()
-					.and_then(|stem| stem.to_str())
-					.is_some_and(|stem| stem.contains(id))
-		})
-		.collect();
-	files.sort();
-	assert_eq!(files.len(), 1, "expected one log for {id}: {files:?}");
-	files.remove(0)
+	let summaries = omp_cli::durable_session::list_session_summaries(sessions)
+		.expect("list durable sessions");
+	let summary = summaries
+		.iter()
+		.find(|summary| summary.id == id)
+		.unwrap_or_else(|| panic!("expected one durable session for {id}: {summaries:?}"));
+	sessions.join(format!("{}.jsonl", summary.id))
 }
 
 fn entries(path: &Path) -> Vec<serde_json::Value> {
-	fs::read_to_string(path)
-		.expect("session log")
-		.lines()
-		.filter(|line| !line.trim().is_empty())
-		.map(|line| serde_json::from_str(line).expect("valid session jsonl"))
+	// Legacy fixtures are still plain JSONL; live sessions are read through the
+	// durable consumer API and their virtual identity is never a file.
+	if path.is_file() {
+		return fs::read_to_string(path)
+			.expect("session log")
+			.lines()
+			.filter(|line| !line.trim().is_empty())
+			.map(|line| serde_json::from_str(line).expect("valid session jsonl"))
+			.collect();
+	}
+	let id = path
+		.file_stem()
+		.and_then(std::ffi::OsStr::to_str)
+		.expect("session id");
+	let store = omp_cli::session::SessionStore::open(&omp_cli::session::SessionOptions {
+		enabled: true,
+		cwd: path.parent().unwrap_or(Path::new("/")).to_path_buf(),
+		model: None,
+		provider: None,
+		dir: path.parent().map(Path::to_path_buf),
+		id: Some(id.to_string()),
+		continue_latest: false,
+		no_title: true,
+		parent_session: None,
+	});
+	assert!(store.enabled(), "durable session {id} must open");
+	store
+		.entries()
+		.iter()
+		.filter_map(|entry| serde_json::to_value(entry).ok())
 		.collect()
 }
 

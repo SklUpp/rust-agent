@@ -436,6 +436,7 @@ fn fake_request(prompt: &str) -> RunRequest {
 		history_messages: None,
 		checkpoint_controller: None,
 		turn_ack: None,
+		durable: None,
 		todo_phases: Vec::new(),
 		session_persisted: false,
 		session_file: None,

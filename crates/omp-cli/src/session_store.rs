@@ -1404,6 +1404,132 @@ impl SqliteStore {
 		}
 		Ok(artifacts)
 	}
+
+	/// All sessions in this database, newest first. Read-only: used by session
+	/// listing and `--continue`; no second index file exists.
+	pub fn list_sessions(&self) -> StoreResult<Vec<SessionRecord>> {
+		let mut statement = self.connection.prepare(
+			"SELECT id, parent_session_id, active_branch_id, payload_json, created_at_ms, updated_at_ms \
+			 FROM sessions ORDER BY updated_at_ms DESC, created_at_ms DESC, id",
+		)?;
+		let rows = statement.query_map([], |row| {
+			Ok((
+				row.get::<_, String>(0)?,
+				row.get::<_, Option<String>>(1)?,
+				row.get::<_, Option<String>>(2)?,
+				row.get::<_, String>(3)?,
+				row.get::<_, i64>(4)?,
+				row.get::<_, i64>(5)?,
+			))
+		})?;
+		let mut sessions = Vec::new();
+		for row in rows {
+			let (id, parent_session_id, active_branch_id, json, created_at_ms, updated_at_ms) =
+				row?;
+			sessions.push(SessionRecord {
+				id,
+				parent_session_id,
+				active_branch_id,
+				payload: decode_json(&json)?,
+				created_at_ms,
+				updated_at_ms,
+			});
+		}
+		Ok(sessions)
+	}
+
+	/// Every branch of one session (including abandoned branches), oldest
+	/// first. Used to enumerate branch context after reopen without guessing
+	/// from the active branch alone.
+	pub fn session_branches(&self, session_id: &str) -> StoreResult<Vec<BranchRecord>> {
+		let mut statement = self.connection.prepare(
+			"SELECT id, session_id, parent_branch_id, parent_message_id, leaf_message_id, \
+			 payload_json, created_at_ms FROM branches WHERE session_id = ?1 \
+			 ORDER BY created_at_ms, id",
+		)?;
+		let rows = statement.query_map(params![session_id], |row| {
+			Ok((
+				row.get::<_, String>(0)?,
+				row.get::<_, String>(1)?,
+				row.get::<_, Option<String>>(2)?,
+				row.get::<_, Option<String>>(3)?,
+				row.get::<_, Option<String>>(4)?,
+				row.get::<_, String>(5)?,
+				row.get::<_, i64>(6)?,
+			))
+		})?;
+		let mut branches = Vec::new();
+		for row in rows {
+			let (id, session_id, parent_branch_id, parent_message_id, leaf_message_id, json, created_at_ms) =
+				row?;
+			branches.push(BranchRecord {
+				id,
+				session_id,
+				parent_branch_id,
+				parent_message_id,
+				leaf_message_id,
+				payload: decode_json(&json)?,
+				created_at_ms,
+			});
+		}
+		Ok(branches)
+	}
+
+	/// Every message of one session in insertion order, all branches included.
+	/// Branch views are derived by following parent links; this is the complete
+	/// durable entry set for enumeration and export.
+	pub fn session_messages(&self, session_id: &str) -> StoreResult<Vec<MessageRecord>> {
+		let mut statement = self.connection.prepare(
+			"SELECT id, session_id, branch_id, parent_message_id, payload_json, seq, created_at_ms \
+			 FROM messages WHERE session_id = ?1 ORDER BY seq",
+		)?;
+		let rows = statement.query_map(params![session_id], |row| {
+			Ok((
+				row.get::<_, String>(0)?,
+				row.get::<_, String>(1)?,
+				row.get::<_, String>(2)?,
+				row.get::<_, Option<String>>(3)?,
+				row.get::<_, String>(4)?,
+				row.get::<_, i64>(5)?,
+				row.get::<_, i64>(6)?,
+			))
+		})?;
+		let mut messages = Vec::new();
+		for row in rows {
+			let (id, session_id, branch_id, parent_message_id, json, seq, created_at_ms) = row?;
+			messages.push(MessageRecord {
+				id,
+				session_id,
+				branch_id,
+				parent_message_id,
+				payload: decode_json(&json)?,
+				seq,
+				created_at_ms,
+			});
+		}
+		Ok(messages)
+	}
+
+	/// Replace a session payload (header/title/state) without touching its id,
+	/// lineage, or active branch.
+	pub fn update_session_payload(
+		&mut self,
+		session_id: &str,
+		payload: Value,
+	) -> StoreResult<()> {
+		validate_id("session id", session_id)?;
+		let encoded = encode_json(&payload)?;
+		let changed = self.connection.execute(
+			"UPDATE sessions SET payload_json = ?1, updated_at_ms = ?2 WHERE id = ?3",
+			params![encoded, now_ms(), session_id],
+		)?;
+		if changed == 0 {
+			return Err(StoreError::NotFound(format!(
+				"session {session_id} does not exist"
+			)));
+		}
+		Ok(())
+	}
 }
 
 fn append_message_tx(

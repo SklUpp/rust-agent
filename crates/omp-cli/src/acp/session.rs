@@ -54,7 +54,7 @@ use crate::{
 		types::RpcImage,
 	},
 	runtime,
-	session::{self as session_store, SessionHeader, SessionOptions, compute_default_session_dir},
+	session::{self as session_store, SessionOptions, compute_default_session_dir},
 	skills::{self, LoadOptions, SkillSnapshot},
 };
 
@@ -266,7 +266,23 @@ impl AcpRuntime {
 		let dir = compute_default_session_dir(&cwd, Some(&self.recipe.sessions_root));
 		let forked = session_store::fork_session(&source_path, Some(&cwd), Some(&dir))
 			.map_err(|error| RequestError::new(INTERNAL_ERROR, error))?;
-		let header = read_session_header(&forked)
+		let forked_store = SessionStore::open(&SessionOptions {
+			enabled: true,
+			cwd: cwd.clone(),
+			model: None,
+			provider: None,
+			dir: forked.parent().map(Path::to_path_buf),
+			id: forked
+				.file_stem()
+				.and_then(|stem| stem.to_str())
+				.map(str::to_string),
+			continue_latest: false,
+			no_title: true,
+			parent_session: None,
+		});
+		let header = forked_store
+			.header()
+			.cloned()
 			.ok_or_else(|| RequestError::new(INTERNAL_ERROR, "cannot read forked session header"))?;
 		let opened = self.open(cwd, caps, Some(header.id), dir, false, mcp_servers)?;
 		Ok(opened)
@@ -489,12 +505,6 @@ impl AcpRuntime {
 		record.start_advisor_card_pump();
 		Ok(record)
 	}
-}
-
-fn read_session_header(path: &Path) -> Option<SessionHeader> {
-	let content = std::fs::read_to_string(path).ok()?;
-	let line = content.lines().nth(1)?;
-	serde_json::from_str::<SessionHeader>(line).ok()
 }
 
 /// One managed ACP session.

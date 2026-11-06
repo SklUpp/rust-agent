@@ -5,7 +5,7 @@ use omp_cli::dirs;
 use omp_cli::session::{
 	ContentPart, MessageContent, MessageEntry, SessionMessage, SessionOptions, SessionStore,
 	ToolCallRecord, TurnRecord, compute_default_session_dir, continue_recent_with_breadcrumb,
-	fork_session, import_legacy_v1, overlay_title_slot, overwrite_title_slot_rolled_back,
+	fork_session, import_legacy_v1, import_v3_session, overlay_title_slot, overwrite_title_slot_rolled_back,
 	parse_title_slot, read_terminal_breadcrumb, resolve_resumable_session, serialize_title_slot,
 	session_matches_resume_arg, write_terminal_breadcrumb,
 };
@@ -163,7 +163,13 @@ fn explicit_import_legacy_v1_creates_valid_v3_copy_without_mutating_v1() {
 
 	let imported_path = import_legacy_v1(&v1_file, &target_dir, None)
 		.expect("import legacy v1");
-	assert!(imported_path.is_file());
+	let imported_id = imported_path
+		.file_stem()
+		.and_then(|stem| stem.to_str())
+		.expect("imported session id")
+		.to_string();
+	assert!(target_dir.join("sessions.db").is_file());
+	assert!(!imported_path.exists(), "import must not write a JSONL journal");
 
 	// v1 original must be untouched
 	assert_eq!(
@@ -172,20 +178,15 @@ fn explicit_import_legacy_v1_creates_valid_v3_copy_without_mutating_v1() {
 		"original v1 must remain untouched"
 	);
 
-	// Imported file must have exact 256-byte title slot
-	let imported_bytes = fs::read(&imported_path).expect("read imported");
-	assert!(imported_bytes.len() > 256);
-	assert_eq!(imported_bytes[255], b'\n');
-
-	// Imported file must be reopenable as v3 and have the same turns
+	// Imported session must be reopenable from SQLite and have the same turns.
 	let store = SessionStore::open(&SessionOptions {
 		enabled: true,
 		cwd: PathBuf::from("/work/legacy"),
 		model: None,
 		provider: None,
 		dir: Some(target_dir.clone()),
-		id: None,
-		continue_latest: true,
+		id: Some(imported_id),
+		continue_latest: false,
 		parent_session: None,
 		no_title: false,
 	});
@@ -394,7 +395,8 @@ fn fork_session_creates_new_session_with_parent_reference() {
 
 	let forked_path = fork_session(&original, None, Some(&target_dir))
 		.expect("fork session");
-	assert!(forked_path.is_file());
+	assert!(!forked_path.exists(), "fork writes SQLite, not a JSONL journal");
+	assert!(target_dir.join("sessions.db").is_file());
 
 	let forked_store = SessionStore::open(&SessionOptions {
 		enabled: true,
@@ -429,23 +431,21 @@ fn moved_worktree_continue_reroots_and_resume_prefix_matches() {
 	fs::create_dir_all(&old_cwd).expect("create old cwd");
 	fs::create_dir_all(&new_cwd).expect("create new cwd");
 
-	let session_file = sessions_dir
-		.join("2026-10-26T10-00-00-000Z_0192a5b0-7e44-7123-8abc-0123456789ab.jsonl");
-	let mut body = serialize_title_slot("Moved", Some("auto"), "2026-10-26T10:00:00.000Z");
-	body.push_str(&format!(
-		"{}\n",
-		serde_json::json!({
-			"type": "session",
-			"version": 3,
-			"id": "0192a5b0-7e44-7123-8abc-0123456789ab",
-			"timestamp": "2026-10-26T10:00:00.000Z",
-			"cwd": old_cwd.display().to_string(),
-		})
-	));
-	body.push_str(
-		"{\"type\":\"message\",\"id\":\"m1\",\"parentId\":null,\"timestamp\":\"2026-10-26T10:00:01.000Z\",\"message\":{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"hi\"}],\"timestamp\":1793095201000}}\n",
-	);
-	fs::write(&session_file, &body).expect("write session");
+	let id = "0192a5b0-7e44-7123-8abc-0123456789ab";
+	let mut seed = SessionStore::open(&SessionOptions {
+		enabled: true,
+		cwd: old_cwd.clone(),
+		model: None,
+		provider: None,
+		dir: Some(sessions_dir.clone()),
+		id: Some(id.to_string()),
+		continue_latest: false,
+		parent_session: None,
+		no_title: false,
+	});
+	assert!(seed.enabled(), "seed durable session");
+	seed.set_title("Moved", Some("auto")).expect("title");
+	let session_file = sessions_dir.join(format!("{id}.jsonl"));
 
 	let crumb = temp.join("term-crumb");
 	write_terminal_breadcrumb(&old_cwd, &session_file, false, Some(&crumb)).expect("write crumb");
@@ -456,13 +456,21 @@ fn moved_worktree_continue_reroots_and_resume_prefix_matches() {
 	let resumed = continue_recent_with_breadcrumb(&new_cwd, Some(&sessions_dir), Some(&crumb))
 		.expect("continue")
 		.expect("session re-rooted");
-	assert_eq!(resumed, session_file, "same-dir move keeps the log path");
+	assert_eq!(resumed, session_file, "same-dir move keeps the identity path");
 
 	// Header cwd is re-rooted to the new worktree (TS `moveTo` semantics).
-	let content = fs::read_to_string(&session_file).expect("read re-rooted");
-	let header_line = content.lines().nth(1).expect("header line");
-	let header: serde_json::Value = serde_json::from_str(header_line).expect("header json");
-	let rerooted = PathBuf::from(header["cwd"].as_str().expect("cwd"));
+	let rerooted = SessionStore::open(&SessionOptions {
+		enabled: true,
+		cwd: new_cwd.clone(),
+		model: None,
+		provider: None,
+		dir: Some(sessions_dir.clone()),
+		id: Some(id.to_string()),
+		continue_latest: false,
+		parent_session: None,
+		no_title: true,
+	});
+	let rerooted = PathBuf::from(rerooted.header().expect("header").cwd.clone());
 	assert_eq!(
 		fs::canonicalize(&rerooted).unwrap_or_else(|_| rerooted.clone()),
 		fs::canonicalize(&new_cwd).expect("canonical new cwd"),
@@ -477,6 +485,7 @@ fn moved_worktree_continue_reroots_and_resume_prefix_matches() {
 
 	fs::remove_dir_all(temp).ok();
 }
+
 #[test]
 fn append_turn_titles_and_appends_entries_and_reopens_cleanly() {
 	let temp = temp_dir("append-test");
@@ -492,8 +501,9 @@ fn append_turn_titles_and_appends_entries_and_reopens_cleanly() {
 		no_title: false,
 	});
 	assert!(store.enabled());
-	let file = store.file().expect("file exists").to_path_buf();
-	let size_before = fs::metadata(&file).expect("stat").len();
+	let file = store.file().expect("file identity exists").to_path_buf();
+	let messages_before = store.messages().len();
+	assert!(!file.exists(), "durable sessions do not create a JSONL file");
 
 	// First turn auto-titles the session slot and appends entries.
 	store
@@ -510,8 +520,8 @@ fn append_turn_titles_and_appends_entries_and_reopens_cleanly() {
 
 	assert_eq!(store.title_slot().expect("title slot").title, "initial prompt");
 	assert_eq!(store.header().expect("header").title.as_deref(), Some("initial prompt"));
-	let size_after = fs::metadata(&file).expect("stat").len();
-	assert!(size_after > size_before);
+	assert!(store.messages().len() > messages_before);
+	assert!(!file.exists(), "durable sessions never create a JSONL journal");
 
 	// Reopening loads the title slot and turn history cleanly.
 	let reopened = SessionStore::open(&SessionOptions {
@@ -535,7 +545,7 @@ fn append_turn_titles_and_appends_entries_and_reopens_cleanly() {
 }
 
 #[test]
-fn slotless_v3_append_never_overwrites_header_and_reopens_untitled() {
+fn slotless_v3_log_imports_read_only_and_reopens_untitled() {
 	let temp = temp_dir("slotless-append");
 	let file = temp.join("2026-10-26T12-00-00-000Z_01a178ce-slotless.jsonl");
 	let header_line = r#"{"type":"session","version":3,"id":"01a178ce-slotless","timestamp":"2026-10-26T12:00:00.000Z","cwd":"/work/slotless"}"#;
@@ -553,10 +563,33 @@ fn slotless_v3_append_never_overwrites_header_and_reopens_untitled() {
 		parent_session: None,
 		no_title: false,
 	};
-	let mut store = SessionStore::open(&options);
-	assert!(store.enabled());
-	assert!(store.title_slot().is_none(), "slotless v3 log has no leading slot");
+	let mut legacy = SessionStore::open(&options);
+	assert!(legacy.enabled());
+	assert!(legacy.legacy_read_only(), "an old log is a read-only view");
+	assert!(legacy.title_slot().is_none(), "slotless v3 log has no leading slot");
+	assert!(
+		legacy
+			.append_turn(&TurnRecord {
+				prompt: "must not overwrite the header".to_string(),
+				assistant: "reply".to_string(),
+				reasoning: String::new(),
+				reasoning_after_text: false,
+				stop_reason: "stop".to_string(),
+				tool_calls: Vec::new(),
+				parts: Vec::new(),
+			})
+			.is_err(),
+		"legacy JSONL is read-only until explicitly imported"
+	);
 
+	// The old file is byte-identical: migration never mutates it.
+	assert_eq!(fs::read(&file).expect("read legacy"), original);
+
+	// Explicit import creates the SQLite authority; no slot is invented.
+	import_v3_session(&file, &temp).expect("import slotless v3");
+	let mut store = SessionStore::open(&SessionOptions { no_title: true, ..options.clone() });
+	assert!(store.enabled());
+	assert!(store.title_slot().is_none(), "import must not create a slot");
 	store
 		.append_turn(&TurnRecord {
 			prompt: "must not overwrite the header".to_string(),
@@ -567,29 +600,15 @@ fn slotless_v3_append_never_overwrites_header_and_reopens_untitled() {
 			tool_calls: Vec::new(),
 			parts: Vec::new(),
 		})
-		.expect("append to slotless v3 log");
+		.expect("append to imported slotless session");
 
-	// No 256-byte slot may be injected over the header.
-	let appended = fs::read_to_string(&file).expect("read appended log");
-	assert!(
-		appended.as_bytes().starts_with(&original),
-		"slotless header bytes must remain untouched"
-	);
-	let header: serde_json::Value =
-		serde_json::from_str(appended.lines().next().expect("header line")).expect("header json");
-	assert_eq!(header["version"], 3);
-	assert_eq!(header["id"], "01a178ce-slotless");
-	assert!(header["title"].is_null(), "header must stay untitled");
-	assert!(store.title_slot().is_none(), "no slot may be created implicitly");
-	assert!(store.header().expect("header").title.is_none());
-
-	let reopened = SessionStore::open(&options);
-	assert!(reopened.enabled(), "slotless log must still reopen");
+	let reopened = SessionStore::open(&SessionOptions { no_title: true, ..options });
+	assert!(reopened.enabled(), "imported session must reopen");
 	assert_eq!(reopened.history().len(), 1, "appended turn must remain readable");
 	assert_eq!(reopened.history()[0].prompt, "must not overwrite the header");
 	assert_eq!(reopened.history()[0].assistant, "reply");
-	assert!(reopened.title_slot().is_none(), "reopen must not invent a slot");
 	assert!(reopened.header().expect("header").title.is_none());
+	assert_eq!(fs::read(&file).expect("read legacy"), original);
 
 	fs::remove_dir_all(temp).ok();
 }
@@ -806,23 +825,14 @@ fn stop_reason_canonicalized_in_persisted_v3_log() {
 		})
 		.expect("append turn 2");
 
-	let content = fs::read_to_string(&file).expect("read log");
-	assert!(
-		content.contains(r#""stopReason":"stop""#),
-		"persisted log must contain canonical 'stop' stopReason: {content}"
-	);
-	assert!(
-		!content.contains(r#""stopReason":"end_turn""#),
-		"persisted log must never contain non-canonical 'end_turn': {content}"
-	);
-	assert!(
-		content.contains(r#""stopReason":"toolUse""#),
-		"persisted log must contain canonical 'toolUse' stopReason: {content}"
-	);
-	assert!(
-		!content.contains(r#""stopReason":"tool_use""#),
-		"persisted log must never contain non-canonical 'tool_use': {content}"
-	);
+	assert!(!file.exists(), "durable sessions do not write a JSONL log");
+	let stored: Vec<&str> = store
+		.messages()
+		.iter()
+		.filter(|entry| entry.message.role == "assistant")
+		.filter_map(|entry| entry.message.stop_reason.as_deref())
+		.collect();
+	assert_eq!(stored, vec!["stop", "toolUse"]);
 
 	// Reopen and verify resumed history records canonical stop reasons
 	let reopened = SessionStore::open(&SessionOptions {
@@ -885,11 +895,15 @@ fn session_storage_preserves_and_replays_tool_result_images() {
 		})
 		.expect("append turn with tool image");
 
-	let file = store.file().expect("file").to_path_buf();
-	let content = fs::read_to_string(&file).expect("read log");
-	assert!(content.contains(r#""role":"toolResult""#));
-	assert!(content.contains(r#""data":"aW1nMQ==""#));
-	assert!(content.contains(r#""mimeType":"image/png""#));
+	let tool = store
+		.messages()
+		.iter()
+		.find(|entry| entry.message.role == "toolResult")
+		.expect("persisted tool result");
+	let parts = tool.message.content.parts();
+	assert!(parts.iter().any(|part| part.is_image()
+		&& part.data.as_deref() == Some("aW1nMQ==")
+		&& part.mime_type.as_deref() == Some("image/png")));
 
 	// Reopen session and check history
 	let reopened = SessionStore::open(&SessionOptions {
@@ -1041,6 +1055,8 @@ fn ts_v3_session_round_trip_preserves_ordered_parts_stop_reasons_and_resume_fork
 	let session_file = temp
 		.join(format!("2026-10-26T15-22-22-179Z_{ORIGINAL_ID}.jsonl"));
 	fs::copy(&fixture_path, &session_file).expect("copy TS fixture");
+	let imported_path = import_v3_session(&session_file, &temp)
+		.expect("import TS fixture into the SQLite authority");
 
 	let part_signature = |content: &MessageContent| -> Vec<String> {
 		content
@@ -1211,13 +1227,15 @@ fn ts_v3_session_round_trip_preserves_ordered_parts_stop_reasons_and_resume_fork
 	)
 	.expect("resolve resume selector")
 	.expect("id-prefix must resolve the TS session");
-	assert_eq!(resolved, session_file);
+	assert_eq!(resolved, imported_path);
 
 	// FORK: the round-tripped TS session still forks with lineage and parts.
 	let ts_fork_dir = temp.join("ts-forks");
 	fs::create_dir_all(&ts_fork_dir).expect("create TS fork dir");
-	let forked_path = fork_session(&session_file, None, Some(&ts_fork_dir)).expect("fork TS session");
-	assert!(forked_path.is_file());
+	let forked_path =
+		fork_session(&imported_path, None, Some(&ts_fork_dir)).expect("fork TS session");
+	assert!(!forked_path.exists(), "fork writes SQLite, not JSONL");
+	assert!(ts_fork_dir.join("sessions.db").is_file());
 	let mut forked = SessionStore::open(&SessionOptions {
 		enabled: true,
 		cwd: PathBuf::from("/work/ts-roundtrip"),
@@ -1293,7 +1311,8 @@ fn ts_v3_session_round_trip_preserves_ordered_parts_stop_reasons_and_resume_fork
 	fs::create_dir_all(&legacy_fork_dir).expect("create legacy fork dir");
 	let legacy_fork_path =
 		fork_session(&imported_path, None, Some(&legacy_fork_dir)).expect("fork imported v1");
-	assert!(legacy_fork_path.is_file());
+	assert!(!legacy_fork_path.exists(), "fork writes SQLite, not JSONL");
+	assert!(legacy_fork_dir.join("sessions.db").is_file());
 	let legacy_fork = SessionStore::open(&SessionOptions {
 		enabled: true,
 		cwd: PathBuf::from("/work/legacy"),
@@ -1381,13 +1400,29 @@ fn signed_reasoning_and_length_terminal_survive_session_resume_and_replay() {
 		))
 		.expect("append tool result");
 
-	// On-disk wire keeps the typed fields, not just the flatten passthrough.
-	let raw = fs::read_to_string(store.file().expect("store file")).expect("read session");
-	assert!(raw.contains("\"thinkingSignature\":\"sig-resume\""));
-	assert!(raw.contains("\"type\":\"redactedThinking\""));
-	assert!(raw.contains("\"stopReason\":\"length\""));
-	assert!(raw.contains("\"errorMessage\":\"max tokens\""));
-	assert!(raw.contains("\"attribution\":\"agent\""));
+	// The durable row keeps the typed fields, not just a flatten passthrough.
+	let persisted = store
+		.messages()
+		.iter()
+		.find(|entry| entry.message.role == "assistant")
+		.expect("assistant row");
+	assert!(persisted.message.content.parts().iter().any(|part| {
+		part.kind == "thinking"
+			&& part
+				.extra
+				.get("thinkingSignature")
+				.and_then(serde_json::Value::as_str)
+				== Some("sig-resume")
+	}));
+	assert!(persisted
+		.message
+		.content
+		.parts()
+		.iter()
+		.any(|part| part.kind == "redactedThinking"));
+	assert_eq!(persisted.message.stop_reason.as_deref(), Some("length"));
+	assert_eq!(persisted.message.error_message.as_deref(), Some("max tokens"));
+	assert_eq!(persisted.message.attribution.as_deref(), Some("agent"));
 
 	drop(store);
 	let reloaded = SessionStore::open(&SessionOptions {

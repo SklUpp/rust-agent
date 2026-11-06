@@ -1,5 +1,8 @@
-//! Session persistence: TypeScript v3 JSONL logs, 256-byte title slots,
-//! encoded directory layouts, terminal breadcrumbs, and legacy v1 compatibility.
+//! Session persistence: the live authority is the SQLite session store
+//! ([`crate::durable_session`]); this module owns the session view, branch
+//! reconstruction, and compatibility readers for legacy TypeScript v3 JSONL
+//! logs. A legacy log is opened read-only and must be imported explicitly; no
+//! live turn writes a second journal.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs::{self, OpenOptions};
@@ -974,6 +977,66 @@ pub struct MessageEntry {
 	pub extra: serde_json::Map<String, serde_json::Value>,
 }
 
+/// Entries the provider replay accepts. A terminal `error`/`aborted` assistant
+/// turn and the tool results belonging to that immediate batch are archived but
+/// never replayed, so the durable resume seed must use the same projection.
+#[must_use]
+pub fn replayable_message_entries(entries: &[MessageEntry]) -> Vec<&MessageEntry> {
+	use std::collections::HashSet;
+
+	let mut kept: Vec<&MessageEntry> = entries.iter().collect();
+	let mut index = kept.len();
+	while index > 0 {
+		index -= 1;
+		let message = &kept[index].message;
+		if message.role != "assistant" {
+			continue;
+		}
+		let terminal = message
+			.stop_reason
+			.as_deref()
+			.and_then(pi_agent::StopReason::parse);
+		if !matches!(
+			terminal,
+			Some(pi_agent::StopReason::Aborted | pi_agent::StopReason::Error)
+		) {
+			continue;
+		}
+		let dropped: HashSet<String> = message
+			.content
+			.parts()
+			.iter()
+			.filter(|part| part.kind == "toolCall")
+			.filter_map(|part| {
+				part
+					.extra
+					.get("id")
+					.and_then(serde_json::Value::as_str)
+					.map(str::to_string)
+			})
+			.collect();
+		kept.remove(index);
+		if dropped.is_empty() {
+			continue;
+		}
+		let mut end = index;
+		while end < kept.len() && kept[end].message.role == "toolResult" {
+			end += 1;
+		}
+		for scan in (index..end).rev() {
+			let paired = kept[scan]
+				.message
+				.tool_call_id
+				.as_deref()
+				.is_some_and(|id| dropped.contains(id));
+			if paired {
+				kept.remove(scan);
+			}
+		}
+	}
+	kept
+}
+
 impl MessageEntry {
 	#[must_use]
 	pub fn new(
@@ -1411,6 +1474,16 @@ pub struct SessionStore {
 	/// Route stamp from [`SessionOptions`] — real configured values only.
 	model: Option<String>,
 	provider: Option<String>,
+	/// Live SQLite authority. `None` while disabled or for a read-only legacy
+	/// JSONL view.
+	durable: Option<std::sync::Arc<crate::durable_session::DurableSession>>,
+	/// A JSONL log opened for compatibility reads only; appends are errors.
+	legacy_read_only: bool,
+	/// Explicit active leaf. Stored separately from journal order so a loaded
+	/// branch keeps its own tail when abandoned entries exist.
+	leaf: Option<String>,
+	/// Selected compacted projection persisted on the durable session.
+	projection: Option<crate::durable_session::StoredProjection>,
 }
 
 impl SessionStore {
@@ -1447,88 +1520,56 @@ impl SessionStore {
 			return store;
 		}
 
-		let mut chosen_file: Option<PathBuf> = file_override;
+		if let Some(file) = file_override {
+			return store.open_legacy_read_only(file);
+		}
 
-		if chosen_file.is_none() && options.continue_latest {
-			match continue_recent(&options.cwd, Some(&dir)) {
-				Ok(Some(path)) => {
-					chosen_file = Some(path);
-				},
+		let db_path = crate::durable_session::database_path(&dir);
+		let continued = if options.continue_latest && options.id.is_none() {
+			match crate::durable_session::latest_session_id(&db_path) {
+				Ok(Some(id)) => Some(id),
 				Ok(None) => {
-					store.warn(format!("no previous session in {}; starting a new one", dir.display()));
-				},
-				Err(err) => store.warn(err),
-			}
-		}
-
-		if chosen_file.is_none() {
-			if let Some(req_id) = &options.id {
-				if !valid_session_id(req_id) {
 					store.warn(format!(
-						"invalid session id `{req_id}`: allowed characters are [A-Za-z0-9._-] and the id may \
-						 not be `.`/`..`; session persistence disabled"
+						"no previous durable session in {}; starting a new one",
+						dir.display()
 					));
-					return store;
-				}
-				// Look for matching file in dir
-				if let Ok(matched) = find_session_by_id_or_stem(&dir, req_id) {
-					chosen_file = matched;
-				}
+					None
+				},
+				Err(err) => {
+					store.warn(format!("cannot read the latest session: {err}"));
+					None
+				},
 			}
-		}
+		} else {
+			None
+		};
 
-		if let Some(file) = &chosen_file
-			&& file.is_file()
+		let id = match options.id.as_ref().or(continued.as_ref()) {
+			Some(id) if !valid_session_id(id) => {
+				store.warn(format!(
+					"invalid session id `{id}`: allowed characters are [A-Za-z0-9._-] and the id may \
+					 not be `.`/`..`; session persistence disabled"
+				));
+				return store;
+			},
+			Some(id) => id.clone(),
+			None => output::session_id(),
+		};
+		// Legacy JSONL stays readable and importable, never a second live
+		// journal. The SQLite row wins; only a session absent from the database
+		// falls back to its old log as a read-only view.
+		let durable_has_session =
+			crate::durable_session::session_exists(&db_path, &id).unwrap_or(false);
+		if !durable_has_session
+			&& let Ok(Some(legacy)) = find_session_by_id_or_stem(&dir, &id)
 		{
-			let content = match fs::read_to_string(file) {
-				Ok(c) => c,
-				Err(err) => {
-					let reason = format!("cannot read session log {}: {err}", file.display());
-					store.file = Some(file.clone());
-					store.corrupt_reason = Some(reason.clone());
-					store.warn(format!("{reason}; session persistence disabled"));
-					return store;
-				},
-			};
-
-			match parse_session_content(file, &content) {
-				Ok(ParsedSession { header, turns, messages, entries, is_v1, title_slot }) => {
-					store.id = header.id.clone();
-					store.header = Some(header);
-					store.history = turns;
-					store.messages = messages;
-					store.entries = entries;
-					store.file = Some(file.clone());
-					store.is_v1 = is_v1;
-					store.title_slot = title_slot;
-					store.enabled = true;
-					store.ensure_artifacts_directory();
-					return store;
-				},
-				Err(err) => {
-					store.file = Some(file.clone());
-					store.corrupt_reason = Some(err.clone());
-					store.warn(format!("{err}; session persistence disabled"));
-					return store;
-				},
-			}
-		}
-
-		// New session
-		let id = options.id.clone().unwrap_or_else(output::session_id);
-		if !valid_session_id(&id) {
-			store.warn(format!(
-				"invalid session id `{id}`: allowed characters are [A-Za-z0-9._-] and the id may \
-				 not be `.`/`..`; session persistence disabled"
-			));
-			return store;
+			return store.open_legacy_read_only(legacy);
 		}
 
 		let now_iso = output::iso8601(SystemTime::now());
-		let ts = file_safe_timestamp(&now_iso);
-		let file = dir.join(format!("{ts}_{id}.{LOG_EXTENSION}"));
-
-		let title_slot_str = serialize_title_slot("", Some("auto"), &now_iso);
+		// Stable path identity for artifacts/breadcrumbs. The content lives in
+		// SQLite; this file is never created as a journal.
+		let identity_file = dir.join(format!("{id}.{LOG_EXTENSION}"));
 		let header = SessionHeader {
 			kind: "session".to_string(),
 			version: CURRENT_SESSION_VERSION,
@@ -1545,50 +1586,212 @@ impl SessionStore {
 			provider_prompt_cache_key: None,
 		};
 
-		let header_line = match serde_json::to_string(&header) {
-			Ok(h) => format!("{h}\n"),
+		match crate::durable_session::DurableSession::open(db_path.clone(), &id, header.clone()) {
+			Ok((durable, loaded)) => {
+				let durable = std::sync::Arc::new(durable);
+				store.id = id;
+				store.file = Some(identity_file);
+				store.durable = Some(std::sync::Arc::clone(&durable));
+				store.is_v1 = false;
+				store.enabled = true;
+				if let Some(loaded) = loaded {
+					store.header = Some(loaded.header);
+					store.entries = loaded.entries;
+					store.messages = loaded.messages;
+					store.leaf = loaded.leaf;
+					store.projection = loaded.projection;
+					store.history = derive_turn_history(&loaded.branch_messages)
+						.unwrap_or_else(|err| {
+							store.warn(format!("cannot rebuild session history: {err}"));
+							Vec::new()
+						});
+					store.title_slot = store
+						.header
+						.as_ref()
+						.and_then(|header| header.title.clone())
+						.map(|title| TitleSlot {
+							title,
+							source: store
+								.header
+								.as_ref()
+								.and_then(|header| header.title_source.clone()),
+							updated_at: store
+								.header
+								.as_ref()
+								.map(|header| header.timestamp.clone())
+								.unwrap_or_default(),
+						});
+					store.refresh_title_from_entries();
+					if store.title_slot.is_none() {
+						store.title_slot = Some(TitleSlot {
+							title: String::new(),
+							source: Some("auto".to_string()),
+							updated_at: store
+								.header
+								.as_ref()
+								.map(|header| header.timestamp.clone())
+								.unwrap_or_default(),
+						});
+					}
+				} else {
+					let updated_at = header.timestamp.clone();
+					store.header = Some(header);
+					store.title_slot = Some(TitleSlot {
+						title: String::new(),
+						source: Some("auto".to_string()),
+						updated_at,
+					});
+				}
+				let unresolved = store
+					.durable
+					.as_ref()
+					.map(|durable| durable.unresolved_intents());
+				match unresolved {
+					Some(Ok(intents)) if !intents.is_empty() => store.warn(format!(
+						"session has {} unresolved tool execution(s); the effect state is \
+						 unconfirmed and will not be replayed automatically",
+						intents.len()
+					)),
+					Some(Ok(_)) | None => {},
+					Some(Err(error)) => store.warn(format!(
+						"cannot read unresolved tool executions: {error}"
+					)),
+				}
+				store.ensure_artifacts_directory();
+				store
+			},
 			Err(err) => {
-				store.warn(format!("cannot serialize session header: {err}; session persistence disabled"));
-				return store;
+				store.warn(format!("cannot open durable session store {}: {err}", db_path.display()));
+				store
+			},
+		}
+	}
+
+	/// Open a legacy JSONL log for reads. Appends return an explicit error:
+	/// importing it into SQLite is a separate command, never an implicit dual
+	/// write from a live turn.
+	fn open_legacy_read_only(mut self, file: PathBuf) -> Self {
+		let content = match fs::read_to_string(&file) {
+			Ok(content) => content,
+			Err(err) => {
+				let reason = format!("cannot read session log {}: {err}", file.display());
+				self.file = Some(file);
+				self.corrupt_reason = Some(reason.clone());
+				self.warn(format!("{reason}; session persistence disabled"));
+				return self;
 			},
 		};
-
-		let mut init_bytes = Vec::with_capacity(SESSION_TITLE_SLOT_BYTES + header_line.len());
-		init_bytes.extend_from_slice(title_slot_str.as_bytes());
-		init_bytes.extend_from_slice(header_line.as_bytes());
-
-		let create_res = create_session_log_exclusive(&file, &init_bytes);
-
-		if let Err(err) = create_res {
-			let reason = if err.kind() == std::io::ErrorKind::AlreadyExists {
-				format!(
-					"session log {} already exists; refusing to overwrite existing file or symlink target",
-					file.display()
-				)
-			} else {
-				format!("cannot initialize session log {}: {err}", file.display())
-			};
-			store.file = Some(file.clone());
-			store.corrupt_reason = Some(reason.clone());
-			store.warn(format!("{reason}; session persistence disabled"));
-			return store;
+		match parse_session_content(&file, &content) {
+			Ok(ParsedSession { header, turns, messages, entries, is_v1, title_slot }) => {
+				self.id = header.id.clone();
+				self.header = Some(header);
+				self.history = turns;
+				self.messages = messages;
+				self.leaf = entries.last().map(|entry| entry.id.clone());
+				self.entries = entries;
+				self.file = Some(file);
+				self.is_v1 = is_v1;
+				self.title_slot = title_slot;
+				self.enabled = true;
+				self.legacy_read_only = true;
+				self.ensure_artifacts_directory();
+				self
+			},
+			Err(err) => {
+				self.file = Some(file);
+				self.corrupt_reason = Some(err.clone());
+				self.warn(format!("{err}; session persistence disabled"));
+				self
+			},
 		}
-
-		let _ = write_terminal_breadcrumb(&options.cwd, &file, true, None);
-
-		store.id = id;
-		store.header = Some(header);
-		store.file = Some(file);
-		store.title_slot = parse_title_slot(&title_slot_str);
-		store.is_v1 = false;
-		store.enabled = true;
-		store.ensure_artifacts_directory();
-		store
 	}
 
 	#[must_use]
 	pub fn enabled(&self) -> bool {
 		self.enabled
+	}
+
+	/// Live SQLite authority for this session, or `None` when persistence is
+	/// disabled. Attach it to the agent loop so message/intent/outcome writes
+	/// are ordered before the next model request or effect.
+	#[must_use]
+	pub fn durable_boundary(&self) -> Option<std::sync::Arc<dyn pi_agent::DurableBoundary>> {
+		self.durable.clone().map(|durable| {
+			let boundary: std::sync::Arc<dyn pi_agent::DurableBoundary> = durable;
+			boundary
+		})
+	}
+
+	/// `true` for a read-only legacy JSONL view: reads are supported, appends
+	/// fail explicitly until the log is imported into SQLite.
+	#[must_use]
+	pub fn legacy_read_only(&self) -> bool {
+		self.legacy_read_only
+	}
+
+	/// The selected compressed conversation, when compaction has persisted a
+	/// projection. Archive rows remain available through [`Self::messages`].
+	#[must_use]
+	pub fn projection(&self) -> Option<&crate::durable_session::StoredProjection> {
+		self.projection.as_ref()
+	}
+
+	/// Rebuild the in-memory view from the SQLite authority after a concurrent
+	/// writer (the agent loop boundary) appended messages or branches.
+	pub fn reload_from_durable(&mut self) -> Result<(), String> {
+		let Some(durable) = self.durable.clone() else {
+			return Err("session persistence has no durable store".to_string());
+		};
+		let loaded = durable.load().map_err(|error| error.to_string())?;
+		self.header = Some(loaded.header);
+		self.entries = loaded.entries;
+		self.messages = loaded.messages;
+		self.leaf = loaded.leaf;
+		self.projection = loaded.projection;
+		self.history = derive_turn_history(&loaded.branch_messages)?;
+		self.title_slot = self
+			.header
+			.as_ref()
+			.and_then(|header| header.title.clone())
+			.map(|title| TitleSlot {
+				title,
+				source: self.header.as_ref().and_then(|header| header.title_source.clone()),
+				updated_at: self
+					.header
+					.as_ref()
+					.map(|header| header.timestamp.clone())
+					.unwrap_or_default(),
+			});
+		self.refresh_title_from_entries();
+		// Auto-title is part of the session header, not a JSONL-only slot. Write
+		// it through the durable owner once the first real user message exists.
+		if self.header.as_ref().is_some_and(|header| header.title.is_none()) && !self.no_title {
+			let branch = self.branch_messages();
+			let title = branch.into_iter().find_map(|entry| {
+				(entry.message.role == "user")
+					.then(|| entry.message.content.text())
+					.filter(|text| !text.is_empty())
+			});
+			if let Some(title) = title {
+				let updated_at = output::iso8601(SystemTime::now());
+				let header = if let Some(header) = &mut self.header {
+					header.title = Some(title.clone());
+					header.title_source = Some("auto".to_string());
+					header.clone()
+				} else {
+					return Ok(());
+				};
+				self.title_slot = Some(TitleSlot {
+					title,
+					source: Some("auto".to_string()),
+					updated_at,
+				});
+				durable
+					.update_header(&header)
+					.map_err(|error| format!("cannot persist session title: {error}"))?;
+			}
+		}
+		Ok(())
 	}
 
 	#[must_use]
@@ -1608,6 +1811,48 @@ impl SessionStore {
 	#[must_use]
 	pub fn title_slot(&self) -> Option<&TitleSlot> {
 		self.title_slot.as_ref()
+	}
+
+	/// Set and persist the display title. The durable header is the authority;
+	/// there is no separate title-slot file to rewrite.
+	pub fn set_title(&mut self, title: &str, source: Option<&str>) -> Result<(), String> {
+		let updated_at = output::iso8601(SystemTime::now());
+		let source = source.unwrap_or("user").to_string();
+		let header = if let Some(header) = &mut self.header {
+			header.title = Some(title.to_string());
+			header.title_source = Some(source.clone());
+			header.clone()
+		} else {
+			return Err("cannot set a title before the session header exists".to_string());
+		};
+		self.title_slot = Some(TitleSlot {
+			title: title.to_string(),
+			source: Some(source),
+			updated_at,
+		});
+		if let Some(durable) = &self.durable {
+			durable
+				.update_header(&header)
+				.map_err(|error| format!("cannot persist session title: {error}"))?;
+		}
+		Ok(())
+	}
+
+	/// Persist the provider prompt-cache identity in the durable header (fork
+	/// and resume inherit it; an explicit flag still wins at request time).
+	pub fn set_provider_prompt_cache_key(&mut self, key: &str) -> Result<(), String> {
+		let header = if let Some(header) = &mut self.header {
+			header.provider_prompt_cache_key = Some(key.to_string());
+			header.clone()
+		} else {
+			return Err("cannot set a provider cache key before the session header exists".to_string());
+		};
+		if let Some(durable) = &self.durable {
+			durable
+				.update_header(&header)
+				.map_err(|error| format!("cannot persist provider cache key: {error}"))?;
+		}
+		Ok(())
 	}
 
 	/// Latest todo phases recorded on this session branch, scanning newest
@@ -1823,10 +2068,16 @@ impl SessionStore {
 	#[must_use]
 	pub fn leaf_id(&self) -> Option<&str> {
 		self
-			.entries
-			.last()
-			.map(|entry| entry.id.as_str())
+			.leaf
+			.as_deref()
 			.filter(|id| !id.is_empty())
+			.or_else(|| {
+				self
+					.entries
+					.last()
+					.map(|entry| entry.id.as_str())
+					.filter(|id| !id.is_empty())
+			})
 	}
 
 	#[must_use]
@@ -1897,7 +2148,11 @@ impl SessionStore {
 		}
 		let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
 		let mut path = Vec::new();
-		let mut cursor = self.entries.last();
+		let mut cursor = self
+			.leaf
+			.as_deref()
+			.and_then(|leaf| by_id.get(leaf).copied())
+			.or_else(|| self.entries.last());
 		while let Some(entry) = cursor {
 			if entry.id.is_empty() || !seen.insert(entry.id.as_str()) {
 				break;
@@ -2341,9 +2596,8 @@ impl SessionStore {
 		self.corrupt_reason.as_deref()
 	}
 
-	/// Append one raw/custom entry (`custom`, `title_change`, ...) with
-	/// rollback: a failed write truncates back to the original size and the
-	/// in-memory state is untouched.
+	/// Append one raw/custom entry (`custom`, `title_change`, ...) to the SQLite
+	/// authority. A failed write leaves the in-memory view untouched.
 	pub fn append_entry(&mut self, entry: SessionEntry) -> Result<(), String> {
 		if let Some(reason) = &self.corrupt_reason {
 			return Err(format!("cannot append to corrupted session log: {reason}"));
@@ -2363,13 +2617,64 @@ impl SessionStore {
 			}
 		}
 		entry.validate()?;
-		let Some(file) = self.file.clone() else {
-			return Ok(());
+		if self.legacy_read_only {
+			return Err(
+				"legacy JSONL session is read-only; import it into the SQLite store before appending"
+					.to_string(),
+			);
+		}
+		let Some(durable) = self.durable.clone() else {
+			return Err("session persistence has no durable store".to_string());
 		};
-		let line = format!("{}\n", serde_json::to_string(&entry).map_err(|e| e.to_string())?);
-		self.append_lines_rolled_back(&file, &[line])?;
+		durable
+			.append_entry(entry.clone())
+			.map_err(|error| error.to_string())?;
+		let title_changed = entry.kind == "title_change";
+		let branch_cut = entry.kind == "branch_summary";
+		self.leaf = Some(entry.id.clone());
 		self.entries.push(entry);
+		self.refresh_title_from_entries();
+		if branch_cut {
+			// A branch cut replaces the selected compressed view.
+			self.projection = None;
+			durable
+				.clear_projection()
+				.map_err(|error| format!("cannot clear compacted projection: {error}"))?;
+		}
+		// A rename is part of the durable header too; listings read the header
+		// without replaying every `title_change` entry.
+		if title_changed
+			&& let Some(header) = &self.header
+		{
+			durable
+				.update_header(header)
+				.map_err(|error| format!("cannot persist session title: {error}"))?;
+		}
 		Ok(())
+	}
+
+	/// A user rename is a `title_change` entry, not a header rewrite. Derive the
+	/// display title from the newest one so resume and listing do not lose it.
+	fn refresh_title_from_entries(&mut self) {
+		for entry in self.entries.iter().rev() {
+			if entry.kind != "title_change" {
+				continue;
+			}
+			let Some(title) = entry.extra.get("title").and_then(serde_json::Value::as_str)
+			else {
+				continue;
+			};
+			if let Some(header) = &mut self.header {
+				header.title = Some(title.to_string());
+				header.title_source = Some("user".to_string());
+			}
+			self.title_slot = Some(TitleSlot {
+				title: title.to_string(),
+				source: Some("user".to_string()),
+				updated_at: entry.timestamp.clone(),
+			});
+			return;
+		}
 	}
 
 	/// Append one typed TS message entry. Validates required metadata first —
@@ -2378,10 +2683,21 @@ impl SessionStore {
 		self.append_messages(std::slice::from_ref(entry))
 	}
 
-	/// Append typed TS message entries as one atomic batch: a single rollback
-	/// window, and no in-memory/history mutation until the write succeeds.
+	/// Append typed TS message entries as one atomic SQLite batch: no
+	/// in-memory/history mutation until the write commits.
 	pub fn append_messages(&mut self, entries: &[MessageEntry]) -> Result<(), String> {
 		self.append_messages_inner(entries, true)
+	}
+
+	/// Compatibility import path: validates only fields the source actually
+	/// carried, never inventing route metadata or usage.
+	pub fn append_messages_compat(&mut self, entries: &[MessageEntry]) -> Result<(), String> {
+		self.append_messages_inner(entries, false)
+	}
+
+	/// One compat message (fork/import of an older entry).
+	pub fn append_message_compat(&mut self, entry: &MessageEntry) -> Result<(), String> {
+		self.append_messages_inner(std::slice::from_ref(entry), false)
 	}
 
 	/// `strict` requires full route metadata (live typed path); the compat path
@@ -2420,20 +2736,14 @@ impl SessionStore {
 		}
 		// Preflight candidate history derivation before ANY disk or memory mutation
 		let candidate_history = {
-			let mut candidate_messages = Vec::with_capacity(self.messages.len() + entries.len());
-			candidate_messages.extend_from_slice(&self.messages);
+			let branch = self.branch_messages();
+			let mut candidate_messages =
+				Vec::with_capacity(branch.len() + entries.len());
+			candidate_messages.extend(branch.into_iter().cloned());
 			candidate_messages.extend(entries.iter().cloned());
 			derive_turn_history(&candidate_messages)?
 		};
 
-		let lines: Vec<String> = entries
-			.iter()
-			.map(|entry| {
-				serde_json::to_string(entry)
-					.map(|line| format!("{line}\n"))
-					.map_err(|err| format!("cannot serialize message entry: {err}"))
-			})
-			.collect::<Result<_, _>>()?;
 		// Automatic first-prompt title: one gate shared by the live
 		// `append_message` path and the compat `append_turn` path. Only a real
 		// user text message qualifies; tool/system/assistant batches never do.
@@ -2442,33 +2752,28 @@ impl SessionStore {
 		let title_slot = title_prompt
 			.as_ref()
 			.map(|prompt| serialize_title_slot(prompt, Some("auto"), &now_iso));
-		let orig_leading_bytes = title_slot
-			.as_ref()
-			.and_then(|_| self.file.as_deref())
-			.and_then(read_title_slot_bytes);
-		if let (Some(file), Some(slot)) = (self.file.as_deref(), title_slot.as_deref())
-			&& let Err(err) = overwrite_title_slot_rolled_back(file, slot)
-		{
-			return Err(err);
+		if self.legacy_read_only {
+			return Err(
+				"legacy JSONL session is read-only; import it into the SQLite store before appending"
+					.to_string(),
+			);
 		}
-		let Some(file) = self.file.clone() else {
-			self.apply_auto_title(title_prompt, title_slot);
-			self.history = candidate_history;
-			return Ok(());
+		let Some(durable) = self.durable.clone() else {
+			return Err("session persistence has no durable store".to_string());
 		};
-		if let Err(err) = self.append_lines_rolled_back(&file, &lines) {
-			if let Some(bytes) = &orig_leading_bytes {
-				restore_title_slot_bytes(&file, bytes);
-			}
-			return Err(err);
-		}
-		for (entry, line) in entries.iter().zip(&lines) {
+		durable
+			.append_message_entries(entries)
+			.map_err(|error| error.to_string())?;
+		for entry in entries {
 			self.messages.push(entry.clone());
-			if let Ok(raw) = serde_json::from_str::<SessionEntry>(line) {
+			self.leaf = Some(entry.id.clone());
+			if let Ok(value) = serde_json::to_value(entry)
+				&& let Ok(raw) = serde_json::from_value::<SessionEntry>(value)
+			{
 				self.entries.push(raw);
 			}
 		}
-		self.apply_auto_title(title_prompt, title_slot);
+		self.apply_auto_title(title_prompt, title_slot)?;
 		self.history = candidate_history;
 		Ok(())
 	}
@@ -2495,15 +2800,28 @@ impl SessionStore {
 		})
 	}
 
-	fn apply_auto_title(&mut self, prompt: Option<String>, slot: Option<String>) {
+	fn apply_auto_title(
+		&mut self,
+		prompt: Option<String>,
+		slot: Option<String>,
+	) -> Result<(), String> {
 		let (Some(prompt), Some(slot)) = (prompt, slot) else {
-			return;
+			return Ok(());
 		};
-		if let Some(header) = &mut self.header {
+		let header = if let Some(header) = &mut self.header {
 			header.title = Some(prompt);
 			header.title_source = Some("auto".to_string());
-		}
+			header.clone()
+		} else {
+			return Ok(());
+		};
 		self.title_slot = parse_title_slot(&slot);
+		if let Some(durable) = &self.durable {
+			durable
+				.update_header(&header)
+				.map_err(|error| format!("cannot persist session title: {error}"))?;
+		}
+		Ok(())
 	}
 
 	/// TS `session-storage.ts#writeNow`: write all lines, truncate back to the
@@ -3967,96 +4285,63 @@ pub fn move_session_to(
 	target_session_dir: Option<&Path>,
 	breadcrumb_override: Option<&Path>,
 ) -> Result<PathBuf, String> {
-	let content = fs::read_to_string(session_file)
-		.map_err(|err| format!("cannot read session log {}: {err}", session_file.display()))?;
-	let parsed = parse_session_content(session_file, &content)?;
-	if parsed.is_v1 {
-		return Err(format!(
-			"cannot move legacy v1 session log {}: read-only; import it first",
-			session_file.display()
-		));
-	}
-	let source = fs::canonicalize(session_file).unwrap_or_else(|_| session_file.to_path_buf());
-	let new_cwd_abs = fs::canonicalize(new_cwd).unwrap_or_else(|_| new_cwd.to_path_buf());
-	let next_dir = target_session_dir
-		.map(PathBuf::from)
-		.unwrap_or_else(|| compute_default_session_dir(&new_cwd_abs, None));
-	fs::create_dir_all(&next_dir)
-		.map_err(|err| format!("cannot create {}: {err}", next_dir.display()))?;
-	let dest = next_dir.join(source.file_name().unwrap_or_default());
-
-	let mut session_moved = false;
-	if dest != source {
-		if dest.exists() {
-			return Err(format!(
-				"cannot move session {}: target {} already exists; refusing to overwrite",
-				source.display(),
-				dest.display()
-			));
-		}
-		fs::rename(&source, &dest)
-			.map_err(|err| format!("cannot move session {}: {err}", source.display()))?;
-		session_moved = true;
-	}
-
-	let artifacts_source = artifacts_directory_for(&source);
-	let artifacts_dest = artifacts_directory_for(&dest);
-	if let (Some(old_art), Some(new_art)) = (&artifacts_source, &artifacts_dest)
-		&& old_art != new_art
-		&& old_art.is_dir()
+	// Durable sessions update the SQLite header in place and keep the virtual
+	// identity; there is no JSONL journal to read or rewrite.
+	let parent = session_file.parent().unwrap_or_else(|| Path::new("."));
+	let id = session_file
+		.file_stem()
+		.and_then(std::ffi::OsStr::to_str)
+		.unwrap_or_default();
+	if !id.is_empty()
+		&& crate::durable_session::session_exists(
+			&crate::durable_session::database_path(parent),
+			id,
+		)
+		.unwrap_or(false)
 	{
-		if new_art.exists() {
-			if session_moved {
-				let _ = fs::rename(&dest, &source);
-			}
+		let new_cwd_abs = fs::canonicalize(new_cwd).unwrap_or_else(|_| new_cwd.to_path_buf());
+		let next_dir = target_session_dir
+			.map(PathBuf::from)
+			.unwrap_or_else(|| compute_default_session_dir(&new_cwd_abs, None));
+		let dest = next_dir.join(session_file.file_name().unwrap_or_default());
+		if dest.parent() != session_file.parent() {
 			return Err(format!(
-				"cannot move session artifacts: target {} already exists; refusing to overwrite",
-				new_art.display()
+				"cannot move durable session {id} between session directories; import or export it first"
 			));
 		}
-		if let Err(err) = fs::rename(old_art, new_art) {
-			if session_moved {
-				let _ = fs::rename(&dest, &source);
-			}
-			return Err(format!("cannot move session artifacts: {err}"));
-		}
-	}
-
-	let mut header = parsed.header;
-	if session_moved {
-		let previous = source.to_string_lossy().to_string();
-		if !header.previous_session_files.contains(&previous) {
-			header.previous_session_files.push(previous);
-		}
-	}
-	header.cwd = new_cwd_abs.display().to_string();
-
-	let slot = parsed
-		.title_slot
-		.as_ref()
-		.map(|slot| serialize_title_slot(&slot.title, slot.source.as_deref(), &slot.updated_at))
-		.unwrap_or_else(|| {
-			serialize_title_slot(
-				header.title.as_deref().unwrap_or(""),
-				header.title_source.as_deref(),
-				&header.timestamp,
-			)
+		let mut store = SessionStore::open(&SessionOptions {
+			enabled: true,
+			cwd: new_cwd_abs.clone(),
+			model: None,
+			provider: None,
+			dir: Some(parent.to_path_buf()),
+			id: Some(id.to_string()),
+			continue_latest: false,
+			no_title: true,
+			parent_session: None,
 		});
-	let mut rewritten = slot;
-	rewritten.push_str(&serde_json::to_string(&header).map_err(|err| err.to_string())?);
-	rewritten.push('\n');
-	for line in content.lines().skip(if parsed.title_slot.is_some() { 2 } else { 1 }) {
-		rewritten.push_str(line);
-		rewritten.push('\n');
+		let Some(mut header) = store.header.clone() else {
+			return Err(format!("cannot move durable session {id}: no header"));
+		};
+		header.cwd = new_cwd_abs.display().to_string();
+		let Some(durable) = &store.durable else {
+			return Err(format!("cannot move durable session {id}: no durable store"));
+		};
+		durable
+			.update_header(&header)
+			.map_err(|error| format!("cannot move durable session {id}: {error}"))?;
+		store.header = Some(header);
+		let _ = write_terminal_breadcrumb(&new_cwd_abs, &dest, false, breadcrumb_override);
+		return Ok(dest);
 	}
 
-	let tmp = dest.with_extension("jsonl.tmp-move");
-	fs::write(&tmp, &rewritten)
-		.map_err(|err| format!("cannot rewrite moved session: {err}"))?;
-	fs::rename(&tmp, &dest)
-		.map_err(|err| format!("cannot rewrite moved session: {err}"))?;
-	let _ = write_terminal_breadcrumb(&new_cwd_abs, &dest, false, breadcrumb_override);
-	Ok(dest)
+	// Legacy JSONL is read-only compatibility data: moving it would mutate the
+	// old journal before an explicit import.
+	return Err(format!(
+		"cannot move legacy session log {}: read-only; import it into the SQLite store first",
+		session_file.display()
+	));
+
 }
 
 /// TS `SessionManager.continueRecent` incl. moved-project re-root: when the
@@ -4126,10 +4411,22 @@ pub fn continue_recent_with_breadcrumb(
 }
 
 fn find_most_recent_session_in_dir(dir: &Path) -> Result<Option<PathBuf>, String> {
+	let mut newest: Option<(SystemTime, String, PathBuf)> = crate::durable_session::list_session_summaries(dir)
+		.unwrap_or_default()
+		.into_iter()
+		.next()
+		.map(|summary| {
+			let modified = SystemTime::UNIX_EPOCH
+				+ std::time::Duration::from_millis(summary.modified_ms.max(0) as u64);
+			(
+				modified,
+				summary.id.clone(),
+				crate::durable_session::session_path(dir, &summary.id),
+			)
+		});
 	let Ok(entries) = fs::read_dir(dir) else {
-		return Ok(None);
+		return Ok(newest.map(|(_, _, path)| path));
 	};
-	let mut newest: Option<(SystemTime, String, PathBuf)> = None;
 	for entry in entries.flatten() {
 		let path = entry.path();
 		if path.extension().and_then(|ext| ext.to_str()) != Some(LOG_EXTENSION) {
@@ -4204,6 +4501,24 @@ fn scan_dir_for_resume(dir: &Path, arg: &str) -> Result<Option<PathBuf>, String>
 	Ok(matches.into_iter().next().map(|(_, path)| path))
 }
 
+/// Match a durable session id/prefix/title inside one directory. Returns the
+/// virtual per-session path used by artifact and resume plumbing.
+fn scan_durable_dir_for_resume(dir: &Path, arg: &str) -> Option<PathBuf> {
+	let summaries = crate::durable_session::list_session_summaries(dir).ok()?;
+	let needle = arg.to_ascii_lowercase();
+	summaries
+		.into_iter()
+		.find(|summary| {
+			summary.id == arg
+				|| summary.id.starts_with(arg)
+				|| summary
+					.title
+					.as_deref()
+					.is_some_and(|title| title.to_ascii_lowercase().contains(&needle))
+		})
+		.map(|summary| crate::durable_session::session_path(dir, &summary.id))
+}
+
 pub fn resolve_resumable_session(
 	arg: &str,
 	cwd: &Path,
@@ -4217,6 +4532,9 @@ pub fn resolve_resumable_session(
 		.map(PathBuf::from)
 		.unwrap_or_else(|| compute_default_session_dir(cwd, None));
 
+	if let Some(matched) = scan_durable_dir_for_resume(&local_dir, arg) {
+		return Ok(Some(matched));
+	}
 	if let Some(matched) = scan_dir_for_resume(&local_dir, arg)? {
 		return Ok(Some(matched));
 	}
@@ -4231,10 +4549,13 @@ pub fn resolve_resumable_session(
 	}
 	for entry in fs::read_dir(&root).map_err(|e| e.to_string())?.flatten() {
 		let path = entry.path();
-		if path.is_dir()
-			&& let Some(matched) = scan_dir_for_resume(&path, arg)?
-		{
-			return Ok(Some(matched));
+		if path.is_dir() {
+			if let Some(matched) = scan_durable_dir_for_resume(&path, arg) {
+				return Ok(Some(matched));
+			}
+			if let Some(matched) = scan_dir_for_resume(&path, arg)? {
+				return Ok(Some(matched));
+			}
 		}
 	}
 
@@ -4246,80 +4567,131 @@ pub fn fork_session(
 	new_cwd: Option<&Path>,
 	target_dir: Option<&Path>,
 ) -> Result<PathBuf, String> {
-	let content = fs::read_to_string(source_path)
-		.map_err(|e| format!("cannot read source session {}: {e}", source_path.display()))?;
-	let ParsedSession { mut header, is_v1, .. } = parse_session_content(source_path, &content)?;
-	if is_v1 {
-		return Err("cannot fork legacy v1 session directly; import it first".to_string());
+	let source_dir = source_path
+		.parent()
+		.map(Path::to_path_buf)
+		.unwrap_or_else(|| PathBuf::from("."));
+	let source_id = source_path
+		.file_stem()
+		.and_then(|stem| stem.to_str())
+		.map(str::to_string);
+	let db_path = crate::durable_session::database_path(&source_dir);
+	let durable = source_id.as_deref().is_some_and(|id| {
+		crate::durable_session::session_exists(&db_path, id).unwrap_or(false)
+	});
+	if !durable && !source_path.is_file() {
+		return Err(format!("cannot read source session {}", source_path.display()));
 	}
+	let mut source = SessionStore::open(&SessionOptions {
+		enabled: true,
+		cwd: new_cwd.map(Path::to_path_buf).unwrap_or_else(|| PathBuf::from(".")),
+		model: None,
+		provider: None,
+		dir: Some(source_dir.clone()),
+		id: source_id.clone(),
+		continue_latest: false,
+		no_title: true,
+		parent_session: None,
+	});
+	if !source.enabled() {
+		return Err(source
+			.corrupt_reason()
+			.unwrap_or("cannot open source session")
+			.to_string());
+	}
+	let original_id = source.id().to_string();
+	let mut header = source
+		.header()
+		.cloned()
+		.ok_or_else(|| "source session has no header".to_string())?;
+	let branch_entries: Vec<SessionEntry> = source.branch_entries().into_iter().cloned().collect();
 
-	let original_id = header.id.clone();
 	let new_id = output::session_id();
 	let now = output::iso8601(SystemTime::now());
-	let ts = file_safe_timestamp(&now);
-
 	let target_dir = target_dir
 		.map(PathBuf::from)
 		.or_else(|| source_path.parent().map(Path::to_path_buf))
 		.unwrap_or_else(|| PathBuf::from("."));
 	fs::create_dir_all(&target_dir).map_err(|e| e.to_string())?;
 
-	let target_file = target_dir.join(format!("{ts}_{new_id}.{LOG_EXTENSION}"));
-
-	header.id = new_id;
+	header.id = new_id.clone();
 	header.parent_session = Some(original_id.clone());
-	// TS fork (`session-manager.ts:1505`): inherit the provider prompt-cache
-	// identity, falling back to the parent session id.
 	header.provider_prompt_cache_key = header
 		.provider_prompt_cache_key
 		.take()
-		.or(Some(original_id));
+		.or(Some(original_id.clone()));
 	header.timestamp = now.clone();
 	if let Some(cwd) = new_cwd {
 		header.cwd = cwd.display().to_string();
 	}
 
-	let title = header.title.as_deref().unwrap_or("Forked Session");
-	let title_slot = serialize_title_slot(title, header.title_source.as_deref(), &now);
-
-	let mut lines = Vec::new();
-	lines.push(title_slot);
-	lines.push(format!("{}\n", serde_json::to_string(&header).map_err(|e| e.to_string())?));
-
-	for line in content.lines() {
-		if line.trim().is_empty() {
+	let mut target = SessionStore::open(&SessionOptions {
+		enabled: true,
+		cwd: PathBuf::from(&header.cwd),
+		model: header.model.clone(),
+		provider: header.provider.clone(),
+		dir: Some(target_dir),
+		id: Some(new_id.clone()),
+		continue_latest: false,
+		no_title: true,
+		parent_session: Some(original_id),
+	});
+	if !target.enabled() {
+		return Err(target
+			.corrupt_reason()
+			.unwrap_or("cannot open fork target")
+			.to_string());
+	}
+	if let Some(title) = header.title.clone() {
+		target.set_title(&title, header.title_source.as_deref())?;
+	}
+	// Fork keeps the source route/cache identity and lineage verbatim.
+	target.header = Some(header.clone());
+	if let Some(durable) = &target.durable {
+		durable
+			.update_header(&header)
+			.map_err(|error| format!("cannot persist forked session header: {error}"))?;
+	}
+	for entry in branch_entries {
+		if entry.kind == "branch_summary" {
+			// The fork is linear: keep only the active branch's content.
 			continue;
 		}
-		if let Ok(val) = serde_json::from_str::<serde_json::Value>(line) {
-			let kind = val.get("type").and_then(serde_json::Value::as_str).unwrap_or_default();
-			if kind == "title" || kind == "session" || kind == "header" {
-				continue;
-			}
-			lines.push(format!("{line}\n"));
+		let parent = target.leaf_id().map(str::to_string);
+		if entry.kind == "message" {
+			let message: MessageEntry =
+				serde_json::from_value(serde_json::to_value(&entry).map_err(|e| e.to_string())?)
+					.map_err(|e| e.to_string())?;
+			let forked = MessageEntry::new(
+				format!("msg-{}", output::session_id()),
+				parent,
+				now.clone(),
+				message.message,
+			);
+			target.append_message_compat(&forked)?;
+		} else {
+			let mut value = serde_json::to_value(&entry).map_err(|e| e.to_string())?;
+			value["id"] = serde_json::json!(format!("entry-{}", output::session_id()));
+			value["parentId"] = serde_json::json!(parent);
+			value["timestamp"] = serde_json::json!(now);
+			let forked: SessionEntry =
+				serde_json::from_value(value).map_err(|e| e.to_string())?;
+			target.append_entry(forked)?;
 		}
 	}
 
-	let mut file = OpenOptions::new()
-		.write(true)
-		.create_new(true)
-		.open(&target_file)
-		.map_err(|e| format!("cannot create fork target {}: {e}", target_file.display()))?;
-	for line in lines {
-		file.write_all(line.as_bytes()).map_err(|e| e.to_string())?;
-	}
-
-	// TS fork copies the session artifacts directory alongside the log.
-	if let (Some(old_art), Some(new_art)) =
-		(artifacts_directory_for(source_path), artifacts_directory_for(&target_file))
-		&& old_art.is_dir()
+	if let (Some(old_art), Some(new_art)) = (
+		artifacts_directory_for(source_path),
+		target.file().and_then(artifacts_directory_for),
+	) && old_art.is_dir()
 	{
-		copy_dir_recursive(&old_art, &new_art).map_err(|e| {
-			let _ = fs::remove_file(&target_file);
-			e
-		})?;
+		copy_dir_recursive(&old_art, &new_art)?;
 	}
 
-	Ok(target_file)
+	target
+		.file()
+		.map(Path::to_path_buf)
+		.ok_or_else(|| "fork target has no stable path".to_string())
 }
 
 /// Recursive directory copy (TS `fs.cp(..., { recursive: true })`).
@@ -4352,13 +4724,14 @@ pub fn import_legacy_v1(
 		.map(|p| p.display().to_string())
 		.unwrap_or_else(|| v1_header.cwd.clone());
 	let id = v1_header.id.clone();
-	let ts = file_safe_timestamp(&v1_header.timestamp);
-	let target_file = target_dir.join(format!("{ts}_{id}.{LOG_EXTENSION}"));
-	if target_file.exists() {
-		return Err(format!("cannot import legacy v1 session: target file {} already exists; refusing to overwrite", target_file.display()));
+	let db_path = crate::durable_session::database_path(target_dir);
+	if crate::durable_session::session_exists(&db_path, &id).unwrap_or(false) {
+		return Err(format!(
+			"cannot import legacy v1 session: session {id} already exists in {}; refusing to overwrite",
+			db_path.display()
+		));
 	}
 	let title = v1_turns.first().map(|t| t.prompt.as_str()).unwrap_or("Imported Session");
-	let title_slot = serialize_title_slot(title, Some("auto"), &v1_header.timestamp);
 
 	let v3_header = SessionHeader {
 		kind: "session".to_string(),
@@ -4377,9 +4750,7 @@ pub fn import_legacy_v1(
 		provider_prompt_cache_key: Some(id.clone()),
 	};
 
-	let mut lines = Vec::new();
-	lines.push(title_slot);
-	lines.push(format!("{}\n", serde_json::to_string(&v3_header).map_err(|e| e.to_string())?));
+	let mut entries: Vec<MessageEntry> = Vec::new();
 
 	let import_custom = serde_json::json!({
 		"type": "custom",
@@ -4395,8 +4766,6 @@ pub fn import_legacy_v1(
 			"turnCount": v1_turns.len(),
 		}
 	});
-	lines.push(format!("{}\n", serde_json::to_string(&import_custom).map_err(|e| e.to_string())?));
-
 	// Truthful metadata only: v1 logs carry provider/model but no api dialect
 	// and no token usage. Unknown fields are omitted, never invented
 	// (matches TS foreign import: only source-known data is preserved).
@@ -4419,7 +4788,7 @@ pub fn import_legacy_v1(
 				..SessionMessage::user(user_content, 0)
 			},
 		);
-		lines.push(format!("{}\n", serde_json::to_string(&user_entry).map_err(|e| e.to_string())?));
+		entries.push(user_entry);
 		parent_id = Some(user_id);
 
 		if !turn.tool_calls.is_empty() {
@@ -4464,7 +4833,7 @@ pub fn import_legacy_v1(
 					extra: serde_json::Map::new(),
 				},
 			);
-			lines.push(format!("{}\n", serde_json::to_string(&asst_tool_entry).map_err(|e| e.to_string())?));
+			entries.push(asst_tool_entry);
 			parent_id = Some(asst_tool_id);
 
 			for (tc_idx, tc) in turn.tool_calls.iter().enumerate() {
@@ -4493,7 +4862,7 @@ pub fn import_legacy_v1(
 					v1_header.timestamp.clone(),
 					message,
 				);
-				lines.push(format!("{}\n", serde_json::to_string(&res_entry).map_err(|e| e.to_string())?));
+				entries.push(res_entry);
 				parent_id = Some(res_id);
 			}
 		}
@@ -4526,31 +4895,107 @@ pub fn import_legacy_v1(
 				extra: serde_json::Map::new(),
 			},
 		);
-		lines.push(format!("{}\n", serde_json::to_string(&asst_entry).map_err(|e| e.to_string())?));
+		entries.push(asst_entry);
 		parent_id = Some(asst_id);
 	}
 
 	fs::create_dir_all(target_dir).map_err(|e| e.to_string())?;
-	let mut file = OpenOptions::new()
-		.write(true)
-		.create_new(true)
-		.open(&target_file)
-		.map_err(|e| format!("cannot create import target {}: {e}", target_file.display()))?;
-	for line in lines {
-		file.write_all(line.as_bytes()).map_err(|e| e.to_string())?;
-	}
+	// Create the target row directly: the source JSONL often shares this
+	// directory, and `SessionStore::open` would fall back to its read-only view.
+	let durable = crate::durable_session::DurableSession::create(
+		crate::durable_session::database_path(target_dir),
+		v3_header,
+	)
+	.map_err(|error| error.to_string())?;
+	let custom: SessionEntry =
+		serde_json::from_value(import_custom).map_err(|e| e.to_string())?;
+	durable.append_entry(custom).map_err(|error| error.to_string())?;
+	durable
+		.append_message_entries(&entries)
+		.map_err(|error| error.to_string())?;
 
-	let validated = fs::read_to_string(&target_file).map_err(|e| e.to_string())?;
-	let val = parse_session_content(&target_file, &validated)?;
-	if val.is_v1 || val.header.id != id || val.turns.len() != v1_turns.len() {
-		let _ = fs::remove_file(&target_file);
-		return Err(format!("validation failed for imported session {}", target_file.display()));
+	let mut store = SessionStore::open(&SessionOptions {
+		enabled: true,
+		cwd: PathBuf::from(&cwd),
+		model,
+		provider,
+		dir: Some(target_dir.to_path_buf()),
+		id: Some(id.clone()),
+		continue_latest: false,
+		no_title: true,
+		parent_session: None,
+	});
+	if !store.enabled()
+		|| store.id() != id
+		|| store.header().map(|header| header.id.as_str()) != Some(id.as_str())
+		|| store.messages().len() != entries.len()
+	{
+		return Err(format!("validation failed for imported session {id}"));
 	}
-
-	Ok(target_file)
+	store
+		.file()
+		.map(Path::to_path_buf)
+		.ok_or_else(|| "imported session has no stable path".to_string())
 }
+/// Import an existing TypeScript v3 JSONL log into the SQLite authority.
+/// The old file is read only and stays untouched; the returned path is the
+/// virtual per-session identity of the new database row.
+pub fn import_v3_session(source_path: &Path, target_dir: &Path) -> Result<PathBuf, String> {
+	let content = fs::read_to_string(source_path)
+		.map_err(|error| format!("cannot read session {}: {error}", source_path.display()))?;
+	let parsed = parse_session_content(source_path, &content)?;
+	if parsed.is_v1 {
+		return Err("legacy v1 sessions must use import_legacy_v1".to_string());
+	}
+	let id = parsed.header.id.clone();
+	let db_path = crate::durable_session::database_path(target_dir);
+	if crate::durable_session::session_exists(&db_path, &id).unwrap_or(false) {
+		return Err(format!(
+			"session {id} already exists in {}; refusing to overwrite",
+			db_path.display()
+		));
+	}
+	fs::create_dir_all(target_dir).map_err(|error| error.to_string())?;
+	// Explicit import target: create the SQLite row directly. Opening through
+	// `SessionStore` would fall back to the source JSONL's read-only view when
+	// source and target share a directory.
+	let mut header = parsed.header;
+	if header.title.is_none() {
+		header.title = parsed.title_slot.as_ref().map(|slot| slot.title.clone());
+	}
+	header.title_source = header
+		.title_source
+		.or_else(|| parsed.title_slot.as_ref().and_then(|slot| slot.source.clone()));
+	let durable = crate::durable_session::DurableSession::create(db_path, header)
+		.map_err(|error| error.to_string())?;
+	for entry in parsed.entries {
+		if entry.kind == "message" {
+			let message: MessageEntry =
+				serde_json::from_value(serde_json::to_value(&entry).map_err(|e| e.to_string())?)
+					.map_err(|e| e.to_string())?;
+			durable
+				.append_message_entries(std::slice::from_ref(&message))
+				.map_err(|error| error.to_string())?;
+		} else {
+			durable
+				.append_entry(entry)
+				.map_err(|error| error.to_string())?;
+		}
+	}
+	Ok(crate::durable_session::session_path(target_dir, &id))
+}
+
+
 /// Newest session in `dir` as `(id, path)` — session listing API for CLI integration.
 pub fn latest_session(dir: &Path) -> Result<Option<(String, PathBuf)>, String> {
+	if let Some(summary) = crate::durable_session::list_session_summaries(dir)
+		.map_err(|error| error.to_string())?
+		.into_iter()
+		.next()
+	{
+		let path = crate::durable_session::session_path(dir, &summary.id);
+		return Ok(Some((summary.id, path)));
+	}
 	let entries = fs::read_dir(dir)
 		.map_err(|err| format!("cannot read session directory {}: {err}", dir.display()))?;
 	let mut newest: Option<(SystemTime, String, PathBuf)> = None;
@@ -5792,92 +6237,37 @@ mod tests {
 		assert!(record.tool_calls[1].is_error);
 	}
 	#[test]
-	fn append_lines_rollback_on_write_failure_preserves_original_bytes_and_memory() {
+	fn append_messages_batch_is_atomic_on_duplicate_id() {
 		let dir = temp_dir();
-		let mut store = SessionStore::open(&options(dir.clone(), Some("rollback-w")));
+		let mut store = SessionStore::open(&options(dir.clone(), Some("sqlite-atomic")));
 		assert!(store.enabled());
-		let file = store.file().expect("file").to_path_buf();
-
 		store.append_turn(&turn("turn1", "answer1")).expect("turn1 ok");
-		let bytes_before = fs::read(&file).expect("read before");
 		let history_before = store.history().to_vec();
 		let messages_before = store.messages().to_vec();
+		let entries_before = store.entries.len();
 
-		set_fault_injection(Some(FaultInjection::FailAppendAfterLines(1)));
-		let res = store.append_turn(&turn("turn2", "answer2"));
-		set_fault_injection(None);
+		let existing = store.messages()[0].id.clone();
+		let fresh = MessageEntry::new(
+			format!("msg-{}", output::session_id()),
+			store.leaf_id().map(str::to_string),
+			output::iso8601(SystemTime::now()),
+			SessionMessage::user(MessageContent::Text("partial".to_string()), 1),
+		);
+		let duplicate = MessageEntry::new(
+			existing,
+			fresh.id.clone(),
+			output::iso8601(SystemTime::now()),
+			SessionMessage::user(MessageContent::Text("duplicate".to_string()), 2),
+		);
+		let res = store.append_messages_compat(&[fresh, duplicate]);
+		assert!(res.is_err(), "duplicate id must reject the whole batch");
+		assert_eq!(store.history(), history_before.as_slice(), "history must not mutate");
+		assert_eq!(store.messages(), messages_before.as_slice(), "messages must not mutate");
+		assert_eq!(store.entries.len(), entries_before, "entries must not mutate");
 
-		assert!(res.is_err());
-		let bytes_after = fs::read(&file).expect("read after");
-		assert_eq!(bytes_after, bytes_before, "disk bytes must match pre-call bytes bit-for-bit");
-		assert_eq!(store.history(), history_before, "in-memory history must not mutate on failure");
-		assert_eq!(store.messages(), messages_before, "in-memory messages must not mutate on failure");
-		assert_eq!(store.history().len(), 1, "history length must stay at 1");
-		assert_eq!(store.history()[0].prompt, "turn1");
-		assert_eq!(store.history()[0].assistant, "answer1");
-
-		let reopened = SessionStore::open(&options(dir.clone(), Some("rollback-w")));
+		let reopened = SessionStore::open(&options(dir.clone(), Some("sqlite-atomic")));
 		assert!(reopened.enabled());
 		assert_eq!(reopened.history().to_vec(), history_before);
-		fs::remove_dir_all(dir).ok();
-	}
-
-	#[test]
-	fn append_lines_rollback_on_flush_failure_preserves_original_bytes_and_memory() {
-		let dir = temp_dir();
-		let mut store = SessionStore::open(&options(dir.clone(), Some("rollback-f")));
-		assert!(store.enabled());
-		let file = store.file().expect("file").to_path_buf();
-
-		store.append_turn(&turn("turn1", "answer1")).expect("turn1 ok");
-		let bytes_before = fs::read(&file).expect("read before");
-		let history_before = store.history().to_vec();
-		let messages_before = store.messages().to_vec();
-
-		set_fault_injection(Some(FaultInjection::FailAppendFlush));
-		let res = store.append_turn(&turn("turn2", "answer2"));
-		set_fault_injection(None);
-
-		assert!(res.is_err());
-		let bytes_after = fs::read(&file).expect("read after");
-		assert_eq!(bytes_after, bytes_before, "disk bytes must match pre-call bytes bit-for-bit");
-		assert_eq!(store.history(), history_before, "in-memory history must not mutate on failure");
-		assert_eq!(store.messages(), messages_before, "in-memory messages must not mutate on failure");
-		assert_eq!(store.history().len(), 1, "history length must stay at 1");
-		assert_eq!(store.history()[0].prompt, "turn1");
-		assert_eq!(store.history()[0].assistant, "answer1");
-
-		let reopened = SessionStore::open(&options(dir.clone(), Some("rollback-f")));
-		assert!(reopened.enabled());
-		assert_eq!(reopened.history().to_vec(), history_before);
-		fs::remove_dir_all(dir).ok();
-	}
-
-	#[test]
-	fn append_turn_rollback_on_title_slot_flush_failure_preserves_original_bytes_and_memory() {
-		let dir = temp_dir();
-		let mut store = SessionStore::open(&options(dir.clone(), Some("title-flush-fail")));
-		assert!(store.enabled());
-		let file = store.file().expect("file").to_path_buf();
-		let bytes_before = fs::read(&file).expect("read before");
-		let history_before = store.history().to_vec();
-		let messages_before = store.messages().to_vec();
-
-		set_fault_injection(Some(FaultInjection::FailTitleSlotFlush));
-		let res = store.append_turn(&turn("first prompt auto titles", "answer"));
-		set_fault_injection(None);
-
-		assert!(res.is_err(), "append_turn must fail when title slot flush fails");
-		let bytes_after = fs::read(&file).expect("read after");
-		assert_eq!(bytes_after, bytes_before, "disk bytes must match pre-call bytes bit-for-bit (no committed entries!)");
-		assert_eq!(store.history(), history_before, "in-memory history must remain empty");
-		assert_eq!(store.messages(), messages_before, "in-memory messages must remain empty");
-		assert!(store.header().expect("header").title.is_none(), "header title must remain None");
-
-		let reopened = SessionStore::open(&options(dir.clone(), Some("title-flush-fail")));
-		assert!(reopened.enabled());
-		assert!(reopened.history().is_empty(), "reopened store must have zero committed turns");
-		assert!(reopened.header().expect("header").title.is_none());
 		fs::remove_dir_all(dir).ok();
 	}
 
@@ -6054,21 +6444,16 @@ mod tests {
 			parts: vec![],
 		};
 		store.append_turn(&turn1).expect("append turn");
-		let file = store.file().expect("file").to_path_buf();
-		drop(store);
-
-		let content = fs::read_to_string(&file).expect("read file");
-		// Ensure user message content is string, not array
-		let user_line = content
-			.lines()
-			.find(|l| l.contains(r#""role":"user""#))
-			.expect("user line");
-		let user_json: serde_json::Value = serde_json::from_str(user_line).expect("parse user json");
-		assert_eq!(
-			user_json["message"]["content"],
-			"hello plain text",
-			"plain text prompt must be serialized as string content, not array"
+		let user = store
+			.messages()
+			.iter()
+			.find(|entry| entry.message.role == "user")
+			.expect("user entry");
+		assert!(
+			matches!(user.message.content, MessageContent::Text(ref text) if text == "hello plain text"),
+			"plain text prompt must stay string content, not a parts array"
 		);
+		drop(store);
 
 		// Reopen and check history
 		let reopened = SessionStore::open(&options(dir.clone(), Some("text-only-session")));
@@ -6109,30 +6494,26 @@ mod tests {
 		};
 
 		store.append_turn(&turn).expect("append ordered turn");
-		let file = store.file().expect("file").to_path_buf();
-		drop(store);
-
-		// 1. Verify JSONL on disk: data field must contain raw base64, NEVER full data: URI
-		let content = fs::read_to_string(&file).expect("read file");
-		let user_line = content
-			.lines()
-			.find(|l| l.contains(r#""role":"user""#))
-			.expect("user line");
-		let user_json: serde_json::Value = serde_json::from_str(user_line).expect("parse user line");
-		let disk_parts = user_json["message"]["content"].as_array().expect("parts array");
-		assert_eq!(disk_parts.len(), 3);
-		assert_eq!(disk_parts[0]["type"], "image");
+		let user = store
+			.messages()
+			.iter()
+			.find(|entry| entry.message.role == "user")
+			.expect("user entry");
+		let parts = user.message.content.parts();
+		assert_eq!(parts.len(), 3);
+		assert_eq!(parts[0].kind, "image");
 		assert_eq!(
-			disk_parts[0]["data"],
-			"aW1nMQ==",
-			"TS session log must store raw base64, NOT data: URI"
+			parts[0].data.as_deref(),
+			Some("aW1nMQ=="),
+			"durable session must store raw base64, NOT a data: URI"
 		);
-		assert_eq!(disk_parts[0]["mimeType"], "image/png");
-		assert_eq!(disk_parts[1]["type"], "text");
-		assert_eq!(disk_parts[1]["text"], "middle description");
-		assert_eq!(disk_parts[2]["type"], "image");
-		assert_eq!(disk_parts[2]["data"], "aW1nMg==");
-		assert_eq!(disk_parts[2]["mimeType"], "image/jpeg");
+		assert_eq!(parts[0].mime_type.as_deref(), Some("image/png"));
+		assert_eq!(parts[1].kind, "text");
+		assert_eq!(parts[1].text.as_deref(), Some("middle description"));
+		assert_eq!(parts[2].kind, "image");
+		assert_eq!(parts[2].data.as_deref(), Some("aW1nMg=="));
+		assert_eq!(parts[2].mime_type.as_deref(), Some("image/jpeg"));
+		drop(store);
 
 		// 2. Reopen / resume session and verify in-memory ordering
 		let reopened = SessionStore::open(&options(dir.clone(), Some("ordered-session")));
@@ -6177,8 +6558,7 @@ mod tests {
 			parts: vec![],
 		};
 		store.append_turn(&initial_turn).expect("append initial");
-		let file = store.file().expect("file").to_path_buf();
-		let size_before = fs::metadata(&file).expect("metadata").len();
+		let messages_before = store.messages().len();
 
 		// Attempt to append turn with an external URL image
 		let bad_turn = TurnRecord {
@@ -6198,8 +6578,11 @@ mod tests {
 		};
 		let res = store.append_turn(&bad_turn);
 		assert!(res.is_err(), "append_turn must fail before mutation on invalid image");
-		let size_after = fs::metadata(&file).expect("metadata").len();
-		assert_eq!(size_before, size_after, "session file must remain unmodified on rejected turn");
+		assert_eq!(
+			store.messages().len(),
+			messages_before,
+			"durable session must remain unmodified on a rejected turn"
+		);
 		assert_eq!(store.history().len(), 1, "in-memory history must not mutate on failure");
 
 		fs::remove_dir_all(dir).ok();
@@ -6248,7 +6631,7 @@ mod tests {
 		let size_before = fs::metadata(&file).expect("metadata").len();
 
 		let mut store = SessionStore::open(&options(dir.clone(), Some("test-unknown-shape")));
-		assert!(!store.enabled(), "store must be disabled when unknown content shape is present");
+		assert!(!store.enabled(), "a corrupt old log disables persistence");
 		let reason = store.corrupt_reason().expect("corrupt_reason must be populated");
 		assert!(
 			reason.contains("unsupported or malformed raw message content shape"),
@@ -6292,10 +6675,6 @@ mod tests {
 			parts: vec![],
 		};
 		store.append_turn(&initial_turn).expect("append initial turn");
-		let file = store.file().expect("file").to_path_buf();
-
-		let file_content_before = fs::read_to_string(&file).expect("read file");
-		let file_size_before = fs::metadata(&file).expect("metadata").len();
 		let messages_len_before = store.messages.len();
 		let entries_len_before = store.entries.len();
 		let history_len_before = store.history().len();
@@ -6320,11 +6699,7 @@ mod tests {
 		let res = store.append_message(&bad_entry);
 		assert!(res.is_err(), "append_message must fail before mutation on unknown part");
 
-		// Verify exact equality of file and in-memory state
-		let file_content_after = fs::read_to_string(&file).expect("read file after");
-		assert_eq!(file_content_before, file_content_after, "session file must remain 100% identical");
-		let file_size_after = fs::metadata(&file).expect("metadata after").len();
-		assert_eq!(file_size_before, file_size_after, "session file size must not change");
+		// Verify in-memory state is untouched.
 		assert_eq!(store.messages.len(), messages_len_before, "messages must not mutate");
 		assert_eq!(store.entries.len(), entries_len_before, "entries must not mutate");
 		assert_eq!(store.history().len(), history_len_before, "history must not mutate");
@@ -6360,12 +6735,16 @@ mod tests {
 		};
 		store.append_turn(&turn_record).expect("append turn with tool image");
 
-		// 1. Verify JSONL content on disk
-		let file = store.file().expect("file").to_path_buf();
-		let file_content = fs::read_to_string(&file).expect("read file");
-		assert!(file_content.contains(r#""role":"toolResult""#));
-		assert!(file_content.contains(r#""mimeType":"image/png""#));
-		assert!(file_content.contains(r#""data":"aW1nMQ==""#));
+		// 1. Verify the durable toolResult row.
+		let tool = store
+			.messages()
+			.iter()
+			.find(|entry| entry.message.role == "toolResult")
+			.expect("toolResult row");
+		let parts = tool.message.content.parts();
+		assert!(parts.iter().any(|part| part.kind == "image"
+			&& part.data.as_deref() == Some("aW1nMQ==")
+			&& part.mime_type.as_deref() == Some("image/png")));
 
 		// 2. Reopen session and check history
 		let reopened = SessionStore::open(&options(dir.clone(), Some("tool-image-roundtrip")));
@@ -6489,17 +6868,21 @@ mod tests {
 		let dir = temp_dir();
 		let mut store = SessionStore::open(&options(dir.clone(), Some("todo-details")));
 		store.append_turn(&record).expect("append turn");
-		let file = store.file().expect("session file").to_path_buf();
 
 		let reopened = SessionStore::open(&options(dir.clone(), Some("todo-details")));
 		assert!(reopened.enabled());
 		assert_eq!(reopened.history().len(), 1);
 		assert_eq!(reopened.history()[0].tool_calls[0].details.as_ref(), Some(&details));
 
-		let raw = fs::read_to_string(&file).expect("read session log");
-		assert!(
-			raw.contains(r#""details":{"op":"init""#),
-			"tool details must be written into the toolResult session entry: {raw}"
+		let tool = reopened
+			.messages()
+			.iter()
+			.find(|entry| entry.message.role == "toolResult")
+			.expect("toolResult row");
+		assert_eq!(
+			tool.message.extra.get("details"),
+			Some(&details),
+			"tool details must be written into the toolResult session entry"
 		);
 
 		fs::remove_dir_all(dir).ok();
@@ -6613,53 +6996,45 @@ mod tests {
 		let target_dir = dir.join("v3-target");
 		let imported = import_legacy_v1(&v1_path, &target_dir, None).expect("import v1");
 
-		let disk = fs::read_to_string(&imported).expect("read imported");
-		assert!(!disk.contains("end_turn"), "imported log must not carry raw v1 stop reasons");
-		let mut user_content = None;
-		let mut stop_reasons = Vec::new();
-		let mut tool_image = None;
-		let mut tool_details = None;
-		for line in disk.lines().filter(|line| !line.trim().is_empty()) {
-			let value: serde_json::Value = serde_json::from_str(line).expect("json line");
-			let Some(message) = value.get("message") else {
-				continue;
-			};
-			match message["role"].as_str() {
-				Some("user") => user_content = Some(message["content"].clone()),
-				Some("assistant") => {
-					if let Some(reason) = message["stopReason"].as_str() {
-						stop_reasons.push(reason.to_string());
-					}
-				},
-				Some("toolResult") => {
-					tool_image = message["content"]
-						.as_array()
-						.and_then(|parts| parts.iter().find(|part| part["type"] == "image"))
-						.cloned();
-					tool_details = message.get("details").cloned();
-				},
-				_ => {},
-			}
-		}
-
-		let user_content = user_content.expect("user message must be written");
-		let user_parts = user_content.as_array().expect("user content must stay a parts array");
-		assert_eq!(user_parts.len(), 2, "text and image must both survive: {user_parts:?}");
-		assert_eq!(user_parts[0]["type"], "text");
-		assert_eq!(user_parts[0]["text"], "look at chart");
-		assert_eq!(user_parts[1]["type"], "image");
-		assert_eq!(user_parts[1]["data"], "aGVsbG8=");
-		assert_eq!(user_parts[1]["mimeType"], "image/png");
-		assert_eq!(
-			stop_reasons,
-			vec!["toolUse".to_string(), "stop".to_string()],
-			"raw end_turn must be canonicalized on disk"
-		);
-		let tool_image = tool_image.expect("tool result image must survive import");
-		assert_eq!(tool_image["data"], "aW1nMQ==");
-		assert_eq!(tool_image["mimeType"], "image/png");
+		let imported_store = SessionStore::open(&options(target_dir.clone(), Some("v1-parts-case")));
+		let messages = imported_store.messages();
+		let user = messages
+			.iter()
+			.find(|entry| entry.message.role == "user")
+			.expect("user message must be written");
+		let user_parts = user.message.content.parts();
+		assert_eq!(user_parts.len(), 2, "text and image must both survive");
+		assert_eq!(user_parts[0].kind, "text");
+		assert_eq!(user_parts[0].text.as_deref(), Some("look at chart"));
+		assert_eq!(user_parts[1].kind, "image");
+		assert_eq!(user_parts[1].data.as_deref(), Some("aGVsbG8="));
+		assert_eq!(user_parts[1].mime_type.as_deref(), Some("image/png"));
+		let stop_reasons: Vec<&str> = messages
+			.iter()
+			.filter(|entry| entry.message.role == "assistant")
+			.filter_map(|entry| entry.message.stop_reason.as_deref())
+			.collect();
+		assert_eq!(stop_reasons, vec!["toolUse", "stop"], "raw end_turn must be canonicalized");
+		let tool = messages
+			.iter()
+			.find(|entry| entry.message.role == "toolResult")
+			.expect("tool result must survive import");
+		let tool_image = tool
+			.message
+			.content
+			.parts()
+			.into_iter()
+			.find(|part| part.kind == "image")
+			.expect("tool image");
+		assert_eq!(tool_image.data.as_deref(), Some("aW1nMQ=="));
+		assert_eq!(tool_image.mime_type.as_deref(), Some("image/png"));
 		let expected_details = json!({"phases": [{"id": "p1", "status": "done"}]});
-		assert_eq!(tool_details, Some(expected_details.clone()), "tool details must survive import");
+		assert_eq!(
+			tool.message.extra.get("details"),
+			Some(&expected_details),
+			"tool details must survive import"
+		);
+		drop(imported_store);
 
 		let mut reopened = SessionStore::open(&options(target_dir.clone(), Some("v1-parts-case")));
 		assert!(reopened.enabled(), "reopened import must load: {:?}", reopened.take_warnings());
@@ -6674,8 +7049,7 @@ mod tests {
 		assert!(reopened.has_image_content());
 
 		let fork_file = fork_session(&imported, None, Some(&target_dir)).expect("fork import");
-		let fork_disk = fs::read_to_string(&fork_file).expect("read fork");
-		assert!(!fork_disk.contains("end_turn"), "fork must not carry raw v1 stop reasons");
+		assert!(!fork_file.exists(), "fork writes SQLite, not JSONL");
 		let fork_stem = fork_file
 			.file_stem()
 			.and_then(std::ffi::OsStr::to_str)

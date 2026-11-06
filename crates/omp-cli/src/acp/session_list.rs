@@ -9,6 +9,7 @@
 //! nothing here writes.
 
 use std::{
+	collections::HashSet,
 	fs,
 	io::{BufRead, BufReader},
 	path::{Path, PathBuf},
@@ -56,6 +57,27 @@ pub fn list_sessions(cwd: Option<&Path>, sessions_root: Option<&Path>) -> Vec<St
 	};
 	let mut sessions: Vec<StoredSession> = Vec::new();
 	for dir in dirs {
+		let mut durable_ids = HashSet::new();
+		if let Ok(summaries) = crate::durable_session::list_session_summaries(&dir) {
+			let db_size = fs::metadata(crate::durable_session::database_path(&dir))
+				.map(|metadata| metadata.len())
+				.unwrap_or(0);
+			for summary in summaries {
+				durable_ids.insert(summary.id.clone());
+				sessions.push(StoredSession {
+					id: summary.id.clone(),
+					cwd: summary.cwd,
+					title: summary.title,
+					path: crate::durable_session::session_path(&dir, &summary.id),
+					modified: SystemTime::UNIX_EPOCH
+						+ std::time::Duration::from_millis(
+							summary.modified_ms.max(0) as u64,
+						),
+					message_count: summary.message_count,
+					size: db_size,
+				});
+			}
+		}
 		let Ok(entries) = fs::read_dir(&dir) else {
 			continue;
 		};
@@ -65,6 +87,11 @@ pub fn list_sessions(cwd: Option<&Path>, sessions_root: Option<&Path>) -> Vec<St
 				continue;
 			}
 			if let Some(session) = scan_session_file(&path) {
+				// The SQLite row is authoritative; the old log is only an
+				// import source once migration wins.
+				if durable_ids.contains(&session.id) {
+					continue;
+				}
 				sessions.push(session);
 			}
 		}

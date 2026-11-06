@@ -1,6 +1,7 @@
 pub mod compaction;
 pub mod dap;
 pub mod delivery;
+pub mod durable;
 pub mod eval;
 pub mod lsp;
 pub mod mailbox;
@@ -20,7 +21,8 @@ pub mod tokenizer;
 pub mod tool;
 pub mod tools;
 
-pub use compaction::Compactor;
+pub use compaction::{CompactionReport, Compactor};
+pub use durable::{DURABILITY_FAILURE_CODE, DurableBoundary, DurableError};
 pub use loop_module::{
 	AgentError, AgentEvent, AgentLoop, AssistantGuard, InMemoryRewind, SteeringEvent, TurnAck,
 	TurnAckDecision, TurnAckRequest, TurnRewrite, TurnToolSelection, INTERRUPTED_TOOL_RESULT,
@@ -28,7 +30,7 @@ pub use loop_module::{
 };
 pub use tokio_util::sync::CancellationToken;
 pub use provider::{
-	ChunkStream, ModelProvider, OpenAiChatRequest, OpenAiCompatibleProvider, OpenAiContent,
+	ChunkStream, ModelProvider, OpenAiChatRequest, OpenAiContent,
 	OpenAiContentPart, OpenAiImageUrl, OpenAiMessage, OpenAiStreamOptions, OpenAiToolChoice,
 	OpenAiToolChoiceFunction, OpenAiUsage, ProviderError, StreamAssembler, StreamBlockCursor,
 	StreamBlockKind, StreamChunk, ToolCallDelta, ToolChoice, normalize_usage, parse_sse_line,

@@ -227,17 +227,6 @@ fn run_omp(setup: &Setup, extra: &[&str]) -> Output {
 	cmd.output().expect("run omp")
 }
 
-fn session_files(dir: &Path) -> Vec<PathBuf> {
-	let mut files: Vec<PathBuf> = fs::read_dir(dir)
-		.expect("read sessions dir")
-		.flatten()
-		.map(|entry| entry.path())
-		.filter(|path| path.extension().and_then(|ext| ext.to_str()) == Some("jsonl"))
-		.collect();
-	files.sort();
-	files
-}
-
 /// The flag enables the roster, the advisor runs on its own route with only its
 /// configured tools, and the project `WATCHDOG.yml` instructions reach its
 /// system prompt. A blocker that arrives after the primary turn settled is
@@ -307,16 +296,42 @@ fn advisor_flag_runs_isolated_roster_and_preserves_late_blocker_card() {
 	assert_eq!(card_messages, 1, "exactly one advisor card pair: {stdout}");
 
 	// Persisted once as a `custom_message`, never replayed as a user prompt.
-	let files = session_files(&setup.sessions);
-	assert_eq!(files.len(), 1, "one session log: {files:?}");
-	let log = fs::read_to_string(&files[0]).expect("session log");
-	assert!(log.contains("\"type\":\"custom_message\""), "journal must carry the card");
-	assert!(log.contains("\"customType\":\"advisor\""), "journal card type");
-	assert!(log.contains("write target deleted"), "journal card body");
+	let summaries = omp_cli::durable_session::list_session_summaries(&setup.sessions)
+		.expect("list durable sessions");
+	assert_eq!(summaries.len(), 1, "one durable session: {summaries:?}");
+	let id = summaries[0].id.clone();
+	let store = omp_cli::session::SessionStore::open(&omp_cli::session::SessionOptions {
+		enabled: true,
+		cwd: setup.cwd.clone(),
+		model: None,
+		provider: None,
+		dir: Some(setup.sessions.clone()),
+		id: Some(id.clone()),
+		continue_latest: false,
+		no_title: true,
+		parent_session: None,
+	});
+	let entries = store.entries();
+	let card = entries
+		.iter()
+		.find(|entry| entry.kind == "custom_message")
+		.expect("journal must carry the card");
+	assert_eq!(
+		card.extra.get("customType").and_then(serde_json::Value::as_str),
+		Some("advisor"),
+		"journal card type"
+	);
+	assert_eq!(
+		card.extra.get("content").and_then(serde_json::Value::as_str),
+		Some("write target deleted"),
+		"journal card body"
+	);
 
 	// Per-advisor transcript inside the session stem directory, named for its
 	// slug (TS `<session>/__advisor.<slug>.jsonl`).
-	let transcript = files[0]
+	let transcript = setup
+		.sessions
+		.join(format!("{id}.jsonl"))
 		.with_extension("")
 		.join("__advisor.reviewer.jsonl");
 	assert!(

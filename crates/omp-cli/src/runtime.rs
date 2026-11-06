@@ -18,8 +18,9 @@ use pi_agent::{
 	AgentConfig, AgentError, AgentEvent, AgentLoop, AgentState, AskTool, AstGrepTool, BashTool,
 	CheckpointTool, DelegationLimits, RewindTool,
 	ChildToolSettings, EditTool, GlobTool, GrepTool, ModelProvider,
-	OpenAiCompatibleProvider, PendingStore, ReadTool,
+	PendingStore, ReadTool,
 	SteeringEvent, Supervisor, TodoTool, Tool, ToolApprover, ToolRegistry, WriteTool,
+	provider::http::OpenAiCompatibleProvider,
 	provider_anthropic::{AnthropicConfig, AnthropicMessagesProvider, AnthropicThinkingConfig},
 	provider_ollama::OllamaProvider,
 	dap::{DapSessionManager, DapTool},
@@ -1775,7 +1776,12 @@ impl AgentRunner for PiAgentRunner {
 		if let Some(context) = &request.goal_context {
 			messages.push(pi_agent::Message::user(context.clone()));
 		}
-		let user_message = user_message_from_parts(&prompt, &request.parts)?;
+		let mut user_message = user_message_from_parts(&prompt, &request.parts)?;
+		if request.continuation {
+			// Hidden goal continuations are runtime instructions, never fake user
+			// turns in the durable journal.
+			user_message.custom_type = Some("goal-continuation".to_string());
+		}
 
 		if !request.continuation
 			&& !plan.supports_images
@@ -2135,6 +2141,7 @@ impl AgentRunner for PiAgentRunner {
 		if let Some(ack) = &request.turn_ack {
 			agent = agent.with_turn_ack(Arc::clone(ack));
 		}
+		agent = agent.with_durable(request.durable.clone());
 		// Captured before the match below consumes the handle: ledger drains happen
 		// at every event boundary, not only at shutdown, so a child that settled
 		// (or was cancelled) since the last boundary reaches goal accounting — and
@@ -6429,58 +6436,10 @@ fn session_message_usage(usage: &crate::session::Usage) -> pi_agent::TokenUsage 
 fn replayable_entries(
 	entries: &[crate::session::MessageEntry],
 ) -> Vec<&crate::session::MessageEntry> {
-	use pi_agent::StopReason;
-
-	let mut kept: Vec<&crate::session::MessageEntry> = entries.iter().collect();
-	let mut index = kept.len();
-	while index > 0 {
-		index -= 1;
-		let message = &kept[index].message;
-		if message.role != "assistant" {
-			continue;
-		}
-		let terminal = message.stop_reason.as_deref().and_then(StopReason::parse);
-		if !matches!(terminal, Some(StopReason::Aborted | StopReason::Error)) {
-			continue;
-		}
-		let dropped: HashSet<String> = message
-			.content
-			.parts()
-			.iter()
-			.filter(|part| part.kind == "toolCall")
-			.filter_map(|part| {
-				part.extra
-					.get("id")
-					.and_then(serde_json::Value::as_str)
-					.map(str::to_string)
-			})
-			.collect();
-		kept.remove(index);
-		if dropped.is_empty() {
-			continue;
-		}
-		// Only the batch that immediately follows the removed turn can belong to
-		// it: stop at the first non-result so a later turn that reuses an id keeps
-		// its own result. The block end is fixed before any removal.
-		let mut end = index;
-		while end < kept.len() && kept[end].message.role == "toolResult" {
-			end += 1;
-		}
-		for scan in (index..end).rev() {
-			let paired = {
-				let candidate = &kept[scan].message;
-				candidate
-					.tool_call_id
-					.as_deref()
-					.is_some_and(|id| dropped.contains(id))
-			};
-			if paired {
-				kept.remove(scan);
-			}
-		}
-	}
-	kept
+	// One projection shared with the durable resume seed; see the session helper.
+	crate::session::replayable_message_entries(entries)
 }
+
 
 /// Replay persisted branch entries as provider-ready history.
 ///
@@ -7009,6 +6968,7 @@ mod tests {
 			history_messages: None,
 			checkpoint_controller: None,
 			turn_ack: None,
+			durable: None,
 			todo_phases: Vec::new(),
 			session_persisted: false,
 			session_file: None,

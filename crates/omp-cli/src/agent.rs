@@ -168,6 +168,10 @@ pub struct RunRequest {
 	pub checkpoint_controller: Option<std::sync::Arc<pi_agent::tools::CheckpointController>>,
 	/// Per-turn persistence/rewind handshake channel.
 	pub turn_ack: Option<std::sync::Arc<pi_agent::TurnAck>>,
+	/// Host-injected durable session boundary. The loop awaits message,
+	/// intent, and outcome writes through this handle; `None` is only for an
+	/// explicitly ephemeral run (`--no-session`).
+	pub durable: Option<std::sync::Arc<dyn pi_agent::DurableBoundary>>,
 	/// Todo phases restored from the session branch (TS
 	/// `getLatestTodoPhasesFromEntries`): the newest `user_todo_edit` custom
 	/// entry or successful `todo` tool result, whichever comes last in the log.

@@ -72,6 +72,7 @@ fn wire_request(catalog: Catalog, provider: &str, model: &str, api_key: Option<&
 		history_messages: None,
 		checkpoint_controller: None,
 		turn_ack: None,
+		durable: None,
 		todo_phases: Vec::new(),
 		session_persisted: false,
 		session_file: None,

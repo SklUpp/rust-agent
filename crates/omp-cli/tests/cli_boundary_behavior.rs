@@ -205,20 +205,35 @@ impl Fixture {
 	}
 
 	fn session_entries(&self) -> Vec<serde_json::Value> {
-		let mut files: Vec<PathBuf> = fs::read_dir(&self.sessions_dir)
-			.expect("session dir")
-			.flatten()
-			.map(|entry| entry.path())
-			.filter(|path| path.extension().and_then(|ext| ext.to_str()) == Some("jsonl"))
-			.collect();
-		files.sort();
-		assert_eq!(files.len(), 1, "expected exactly one session log: {files:?}");
-		fs::read_to_string(&files[0])
-			.expect("session log")
-			.lines()
-			.filter(|line| !line.trim().is_empty())
-			.map(|line| serde_json::from_str(line).expect("valid session jsonl"))
-			.collect()
+		let summaries =
+			omp_cli::durable_session::list_session_summaries(&self.sessions_dir)
+				.expect("list durable sessions");
+		assert_eq!(summaries.len(), 1, "expected exactly one durable session: {summaries:?}");
+		let store = omp_cli::session::SessionStore::open(
+			&omp_cli::session::SessionOptions {
+				enabled: true,
+				cwd: self.base.clone(),
+				model: None,
+				provider: None,
+				dir: Some(self.sessions_dir.clone()),
+				id: Some(summaries[0].id.clone()),
+				continue_latest: false,
+				no_title: true,
+				parent_session: None,
+			},
+		);
+		assert!(store.enabled(), "durable session must open");
+		let mut values = Vec::new();
+		if let Some(header) = store.header() {
+			values.push(serde_json::to_value(header).expect("header json"));
+		}
+		values.extend(
+			store
+				.entries()
+				.iter()
+				.map(|entry| serde_json::to_value(entry).expect("entry json")),
+		);
+		values
 	}
 }
 
@@ -418,14 +433,14 @@ fn fork_creates_a_new_identity_and_leaves_the_source_untouched() {
 	);
 
 	assert_eq!(fs::read(&source).expect("re-read source"), before, "fork must not rewrite the source");
-	let files: Vec<PathBuf> = fs::read_dir(&fixture.sessions_dir)
-		.expect("sessions dir")
-		.flatten()
-		.map(|entry| entry.path())
-		.filter(|path| path.extension().and_then(|ext| ext.to_str()) == Some("jsonl"))
-		.collect();
-	assert_eq!(files.len(), 1, "fork must create exactly one new log");
-	let new_file = &files[0];
+	let summaries =
+		omp_cli::durable_session::list_session_summaries(&fixture.sessions_dir)
+			.expect("list durable sessions");
+	assert_eq!(summaries.len(), 1, "fork must create exactly one new session");
+	let new_file = omp_cli::durable_session::session_path(
+		&fixture.sessions_dir,
+		&summaries[0].id,
+	);
 	let entries = fixture.session_entries();
 	let header = entries
 		.iter()

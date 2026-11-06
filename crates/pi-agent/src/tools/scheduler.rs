@@ -3,6 +3,7 @@ use std::sync::Arc;
 use futures::future::join_all;
 
 use super::registry::{ToolRegistry, excluded_tool_reason};
+use crate::durable::{DURABILITY_FAILURE_CODE, DurableBoundary};
 use crate::tool::ToolError;
 use crate::state::{AgentContext, ToolApprover, ToolCall, ToolResult};
 /// Scheduler partitions a tool batch into concurrent non-exclusive runs and
@@ -13,11 +14,19 @@ pub struct ToolScheduler {
 	/// Internal tools hidden at a turn boundary. A delta preserves mounted
 	/// MCP/host tools that were never in the config allowlist.
 	hidden: std::sync::Mutex<Vec<String>>,
+	/// Host durability boundary: admission writes an intent before the effect
+	/// and an outcome after it. `None` means the host has no durable session.
+	durable: Option<Arc<dyn DurableBoundary>>,
 }
 
 impl ToolScheduler {
 	pub fn new(registry: ToolRegistry) -> Self {
-		Self { registry, approver: None, hidden: std::sync::Mutex::new(Vec::new()) }
+		Self {
+			registry,
+			approver: None,
+			hidden: std::sync::Mutex::new(Vec::new()),
+			durable: None,
+		}
 	}
 
 	pub fn with_approver(registry: ToolRegistry, approver: Arc<dyn ToolApprover>) -> Self {
@@ -25,11 +34,18 @@ impl ToolScheduler {
 			registry,
 			approver: Some(approver),
 			hidden: std::sync::Mutex::new(Vec::new()),
+			durable: None,
 		}
 	}
 
 	pub fn approver(&self) -> Option<&Arc<dyn ToolApprover>> {
 		self.approver.as_ref()
+	}
+
+	/// Install or clear the host durability boundary. The loop attaches this
+	/// when the session owner supplies a store.
+	pub fn set_durable(&mut self, durable: Option<Arc<dyn DurableBoundary>>) {
+		self.durable = durable;
 	}
 
 	/// Hide internal tool names before the next provider request.
@@ -148,11 +164,89 @@ impl ToolScheduler {
 			}
 		}
 
+		// Final cancellation check at the admission boundary, with or without an
+		// approver: no intent/effect starts after a cancel.
+		if ctx.cancellation_token.is_cancelled() {
+			return ToolResult {
+				tool_call_id: call.id.clone(),
+				content: "Tool execution aborted before start".to_string(),
+				is_error: true,
+				terminate: false,
+				details: None,
+			};
+		}
+
+		// Worker extension is S4: child agent turns are not yet covered by the
+		// durable boundary, so the spawn tool is explicitly gated rather than
+		// running unpersisted effects.
+		if self.durable.is_some() && call.name == "task" {
+			return ToolResult {
+				tool_call_id: call.id.clone(),
+				content: "The task tool is unavailable while durable session persistence is \
+					active: child agent turns are not yet part of the persistence boundary."
+					.to_string(),
+				is_error: true,
+				terminate: false,
+				details: Some(serde_json::json!({
+					"code": "worker_durability_pending",
+				})),
+			};
+		}
+
+		let execution_id = match &self.durable {
+			Some(durable) => match durable.begin_execution(call).await {
+				Ok(id) => Some(id),
+				Err(error) => {
+					// Admission failed: the effect must not start. The durable
+					// intent row is the only evidence; there is nothing to replay.
+					return durable_failure_result(
+						&call.id,
+						format!(
+							"tool not started: durable intent write failed: {error}"
+						),
+					);
+				},
+			},
+			None => None,
+		};
+
+		// The durable admission await may have raced a cancel (or a policy
+		// change observed by the caller): recheck before any effect starts.
+		if ctx.cancellation_token.is_cancelled() {
+			let aborted = ToolResult {
+				tool_call_id: call.id.clone(),
+				content: "Tool execution aborted before start".to_string(),
+				is_error: true,
+				terminate: false,
+				details: None,
+			};
+			if let (Some(durable), Some(execution_id)) = (&self.durable, execution_id.as_deref())
+				&& let Err(error) = durable.finish_execution(execution_id, call, &aborted).await
+			{
+				return durable_failure_result(
+					&call.id,
+					format!("tool cancellation outcome could not be persisted: {error}"),
+				);
+			}
+			return aborted;
+		}
+
 		let result = match tool.execute_with_call_id(&call.id, &call.arguments, ctx).await {
 			Ok(result) => result,
 			Err(err) => tool_error_result(&call.id, err),
 		};
-		ToolResult { tool_call_id: call.id.clone(), ..result }
+		let result = ToolResult { tool_call_id: call.id.clone(), ..result };
+		if let (Some(durable), Some(execution_id)) = (&self.durable, execution_id.as_deref())
+			&& let Err(error) = durable.finish_execution(execution_id, call, &result).await
+		{
+			// The effect may already have run. The intent stays unresolved; the
+			// loop terminates without another model request and never retries.
+			return durable_failure_result(
+				&call.id,
+				format!("tool effect outcome could not be persisted: {error}"),
+			);
+		}
+		result
 	}
 
 	async fn run_concurrent(&self, calls: &[&ToolCall], ctx: &AgentContext) -> Vec<ToolResult> {
@@ -167,6 +261,21 @@ fn tool_error_result(tool_call_id: &str, err: ToolError) -> ToolResult {
 		is_error: true,
 		terminate: false,
 		details: None,
+	}
+}
+
+/// Terminal result for a durability failure. The loop detects the marker and
+/// converts the batch into [`crate::AgentError::Durable`] before any further
+/// model request; `terminate` also stops a host that only reads results.
+fn durable_failure_result(tool_call_id: &str, message: String) -> ToolResult {
+	ToolResult {
+		tool_call_id: tool_call_id.to_string(),
+		content: message,
+		is_error: true,
+		terminate: true,
+		details: Some(serde_json::json!({
+			"code": DURABILITY_FAILURE_CODE,
+		})),
 	}
 }
 

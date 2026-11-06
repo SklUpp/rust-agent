@@ -192,22 +192,28 @@ impl Drop for Fixture {
 	}
 }
 
+/// Seed the durable session the CLI will resume. Header state lives in SQLite;
+/// the returned path is the virtual identity, not a journal file.
 fn write_session_header(sessions_dir: &Path, id: &str, cache_key: Option<&str>) -> PathBuf {
-	let timestamp = "2026-10-28T00:00:00.000Z";
-	let path = sessions_dir.join(format!("2026-10-28T00-00-00-000Z_{id}.jsonl"));
-	let mut header = serde_json::json!({
-		"type": "session",
-		"version": 3,
-		"id": id,
-		"timestamp": timestamp,
-		"cwd": "/tmp",
-	});
+	let options = omp_cli::session::SessionOptions {
+		enabled: true,
+		cwd: PathBuf::from("/tmp"),
+		model: None,
+		provider: None,
+		dir: Some(sessions_dir.to_path_buf()),
+		id: Some(id.to_string()),
+		continue_latest: false,
+		no_title: true,
+		parent_session: None,
+	};
+	let mut store = omp_cli::session::SessionStore::open(&options);
+	assert!(store.enabled(), "seed session must open");
 	if let Some(key) = cache_key {
-		header["providerPromptCacheKey"] = serde_json::Value::String(key.to_string());
+		store
+			.set_provider_prompt_cache_key(key)
+			.expect("persist cache key");
 	}
-	let title_slot = omp_cli::session::serialize_title_slot("", Some("auto"), timestamp);
-	fs::write(&path, format!("{title_slot}{header}\n")).expect("write session header");
-	path
+	store.file().expect("virtual session identity").to_path_buf()
 }
 
 fn assert_success(output: &Output) {
@@ -295,7 +301,7 @@ fn resume_inherits_header_key_and_explicit_flag_overrides_it() {
 #[test]
 fn resume_old_header_without_cache_key_stays_compatible() {
 	let fx = Fixture::new("legacy-header");
-	let path = write_session_header(&fx.sessions_dir, "legacy-session", None);
+	write_session_header(&fx.sessions_dir, "legacy-session", None);
 
 	let (body, output) = fx.run_capture(&["--resume", "legacy-session"], "hello");
 	assert_success(&output);
@@ -304,22 +310,25 @@ fn resume_old_header_without_cache_key_stays_compatible() {
 		"an old session without providerPromptCacheKey must not invent one, got: {body}"
 	);
 
-	let text = fs::read_to_string(&path).expect("read resumed session");
-	let header: serde_json::Value = text
-		.lines()
-		.find_map(|line| {
-			serde_json::from_str(line)
-				.ok()
-				.filter(|value: &serde_json::Value| value["type"] == "session")
-		})
-		.expect("session header");
-	assert_eq!(header["id"], "legacy-session");
+	let reopened = omp_cli::session::SessionStore::open(&omp_cli::session::SessionOptions {
+		enabled: true,
+		cwd: PathBuf::from("/tmp"),
+		model: None,
+		provider: None,
+		dir: Some(fx.sessions_dir.clone()),
+		id: Some("legacy-session".to_string()),
+		continue_latest: false,
+		no_title: true,
+		parent_session: None,
+	});
+	let header = reopened.header().expect("session header");
+	assert_eq!(header.id, "legacy-session");
 	assert!(
-		header.get("providerPromptCacheKey").is_none(),
-		"resume must not add a provider cache key to an old header: {header}"
+		header.provider_prompt_cache_key.is_none(),
+		"resume must not add a provider cache key to an old header"
 	);
 	assert!(
-		text.lines().count() > 1,
+		!reopened.messages().is_empty(),
 		"resumed old session must still append the new turn"
 	);
 }
@@ -466,24 +475,31 @@ fn fork_inherits_source_header_cache_key() {
 		"fork must inherit the source header's provider prompt-cache key"
 	);
 
-	let forked = fs::read_dir(&fx.sessions_dir)
-		.expect("read sessions")
-		.flatten()
-		.map(|entry| entry.path())
-		.filter(|path| path.extension().and_then(|ext| ext.to_str()) == Some("jsonl"))
-		.filter(|path| !path.to_string_lossy().contains("fork-source"))
-		.collect::<Vec<_>>();
-	assert_eq!(forked.len(), 1, "fork must create one new session log");
-	let text = fs::read_to_string(&forked[0]).expect("read forked log");
-	let header: serde_json::Value = text
-		.lines()
-		.find_map(|line| {
-			serde_json::from_str(line)
-				.ok()
-				.filter(|value: &serde_json::Value| value["type"] == "session")
-		})
-		.expect("forked session header");
-	assert_eq!(header["providerPromptCacheKey"], "source-cache-1");
+	let summaries = omp_cli::durable_session::list_session_summaries(&fx.sessions_dir)
+		.expect("list durable sessions");
+	assert_eq!(summaries.len(), 2, "fork must create one new durable session");
+	let fork_id = summaries
+		.iter()
+		.find(|summary| summary.id != "fork-source")
+		.map(|summary| summary.id.clone())
+		.expect("forked session id");
+	let forked = omp_cli::session::SessionStore::open(&omp_cli::session::SessionOptions {
+		enabled: true,
+		cwd: PathBuf::from("/tmp"),
+		model: None,
+		provider: None,
+		dir: Some(fx.sessions_dir.clone()),
+		id: Some(fork_id),
+		continue_latest: false,
+		no_title: true,
+		parent_session: None,
+	});
+	assert_eq!(
+		forked
+			.header()
+			.and_then(|header| header.provider_prompt_cache_key.as_deref()),
+		Some("source-cache-1")
+	);
 }
 
 #[test]

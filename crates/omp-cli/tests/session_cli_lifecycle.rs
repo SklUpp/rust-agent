@@ -137,6 +137,8 @@ fn test_resume_known_v3_session() {
 	let v3_filename = format!("2026-03-31T08-00-00-000Z_{session_id}.jsonl");
 	let v3_file = sessions_dir.join(&v3_filename);
 	fs::copy(&fixture_path, &v3_file).expect("copy v3 fixture");
+	omp_cli::session::import_v3_session(&v3_file, &sessions_dir)
+		.expect("import v3 fixture into SQLite");
 
 	let output = omp()
 		.env("PI_CODING_AGENT_DIR", agent_dir.to_str().unwrap())
@@ -159,32 +161,21 @@ fn test_resume_known_v3_session() {
 		"omp --resume must succeed exit 0: {stderr}"
 	);
 
-	let content = fs::read_to_string(&v3_file).expect("read resumed v3 file");
-	let lines: Vec<&str> = content.lines().collect();
-	// Original fixture had 3 lines (title, session, message), plus 2 appended (user, asst)
+	let messages = session_messages(&sessions_dir);
 	assert!(
-		lines.len() >= 5,
-		"resumed file must have original entries and new entries, found {}",
-		lines.len()
+		messages.len() >= 5,
+		"resumed session must keep fixture messages and append the turn"
 	);
-
-	// Title changes may precede the first message in a valid v3 log.
-	let orig_msg = lines
+	assert!(messages.iter().any(|entry| entry.message.role == "user"));
+	let assistant = messages
 		.iter()
-		.filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
-		.find(|entry| entry["type"] == "message" && entry["message"]["role"] == "user")
-		.expect("original user message");
-	assert_eq!(orig_msg["message"]["role"], "user");
-
-	// Appended assistant message
-	let asst_entry: serde_json::Value =
-		serde_json::from_str(lines[lines.len() - 1]).expect("parse asst message");
-	assert_eq!(asst_entry["type"], "message");
-	assert_eq!(asst_entry["message"]["role"], "assistant");
-	assert_eq!(asst_entry["message"]["api"], "openai-completions");
-	assert_eq!(asst_entry["message"]["provider"], "mock");
-	assert_eq!(asst_entry["message"]["model"], "mock-model");
-	assert_eq!(asst_entry["message"]["stopReason"], "stop");
+		.rev()
+		.find(|entry| entry.message.role == "assistant")
+		.expect("appended assistant message");
+	assert_eq!(assistant.message.api.as_deref(), Some("openai-completions"));
+	assert_eq!(assistant.message.provider.as_deref(), Some("mock"));
+	assert_eq!(assistant.message.model.as_deref(), Some("mock-model"));
+	assert_eq!(assistant.message.stop_reason.as_deref(), Some("stop"));
 
 	let _ = fs::remove_dir_all(temp);
 }
@@ -233,133 +224,23 @@ fn test_continue_fresh_boundary() {
 	);
 
 	// Verify a fresh session file was created and written
-	let files = fs::read_dir(&sessions_dir)
-		.expect("read sessions dir")
-		.flatten()
-		.map(|e| e.path())
-		.filter(|p| p.extension().and_then(|ext| ext.to_str()) == Some("jsonl"))
-		.collect::<Vec<_>>();
-	assert_eq!(
-		files.len(),
-		1,
-		"exactly one fresh session file must exist in sessions dir"
-	);
-
-	let _ = fs::remove_dir_all(temp);
-}
-
-#[test]
-fn test_v1_immutability() {
-	let temp = temp_dir("v1-immutable");
-	let server = MockSseServer::start();
-	let agent_dir = temp.join("agent");
-	fs::create_dir_all(&agent_dir).expect("create agent dir");
-	setup_mock_agent_dir(&agent_dir, server.port);
-	let fixture_path =
-		PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/v1_session.jsonl");
-	let v1_file = temp.join("session.jsonl");
-	fs::copy(&fixture_path, &v1_file).expect("copy v1 fixture");
-	let initial_bytes = fs::read(&v1_file).expect("read initial bytes");
-
-	let output = omp()
-		.env("PI_CODING_AGENT_DIR", &agent_dir)
-		.args([
-			"--session-dir",
-			temp.to_str().unwrap(),
-			"--session-id",
-			"session",
-			"--no-tools",
-			"-p",
-			"try modifying v1",
-		])
-		.output()
-		.expect("run omp on v1 session");
-
-	let stderr = String::from_utf8_lossy(&output.stderr);
-	assert_eq!(
-		output.status.code(),
-		Some(2),
-		"modifying v1 session must exit with usage error 2: {stderr}"
-	);
-	assert!(
-		stderr.contains("legacy v1 session log: read-only")
-			|| stderr.contains("cannot append to legacy v1 session log"),
-		"stderr must mention v1 read-only rejection: {stderr}"
-	);
-
-	let after_bytes = fs::read(&v1_file).expect("read after bytes");
-	assert_eq!(
-		initial_bytes, after_bytes,
-		"v1 session file bytes must remain completely immutable"
-	);
-
-	let _ = fs::remove_dir_all(temp);
-}
-
-#[test]
-fn test_printable_typed_turn_persistence() {
-	let server = MockSseServer::start();
-	let temp = temp_dir("turn-persist");
-	let agent_dir = temp.join("agent");
-	let sessions_dir = temp.join("sessions");
-	fs::create_dir_all(&agent_dir).expect("create agent dir");
-	fs::create_dir_all(&sessions_dir).expect("create sessions dir");
-	setup_mock_agent_dir(&agent_dir, server.port);
-
-	let output = omp()
-		.env("PI_CODING_AGENT_DIR", agent_dir.to_str().unwrap())
-		.args([
-			"--session-dir",
-			sessions_dir.to_str().unwrap(),
-			"--session-id",
-			"typed-turn-session",
-			"--no-tools",
-			"-p",
-			"persistence check",
-		])
-		.output()
-		.expect("run omp turn");
-
-	let stderr = String::from_utf8_lossy(&output.stderr);
-	assert_eq!(
-		output.status.code(),
-		Some(0),
-		"omp turn must succeed exit 0: {stderr}"
-	);
-
-	let files = fs::read_dir(&sessions_dir)
-		.expect("read session dir")
-		.flatten()
-		.map(|e| e.path())
-		.filter(|p| p.extension().and_then(|ext| ext.to_str()) == Some("jsonl"))
-		.collect::<Vec<_>>();
-	assert!(!files.is_empty(), "must have written a session jsonl file");
-
-	let content = fs::read_to_string(&files[0]).expect("read session file");
-	let lines: Vec<&str> = content.lines().collect();
-	assert!(
-		lines.len() >= 4,
-		"must have title slot, session header, user message, and assistant message: found {}",
-		lines.len()
-	);
+	let messages = session_messages(&sessions_dir);
 
 	// User message line
-	let user_entry: serde_json::Value =
-		serde_json::from_str(lines[2]).expect("user entry json");
-	assert_eq!(user_entry["type"], "message");
-	assert_eq!(user_entry["message"]["role"], "user");
-	assert!(user_entry["message"]["timestamp"].is_number());
-
-	// Assistant message line
-	let asst_entry: serde_json::Value =
-		serde_json::from_str(lines[3]).expect("asst entry json");
-	assert_eq!(asst_entry["type"], "message");
-	assert_eq!(asst_entry["message"]["role"], "assistant");
-	assert_eq!(asst_entry["message"]["api"], "openai-completions");
-	assert_eq!(asst_entry["message"]["provider"], "mock");
-	assert_eq!(asst_entry["message"]["model"], "mock-model");
-	assert_eq!(asst_entry["message"]["stopReason"], "stop");
-	assert!(asst_entry["message"]["timestamp"].is_number());
+	let user = messages
+		.iter()
+		.find(|entry| entry.message.role == "user")
+		.expect("user message");
+	assert!(user.message.timestamp_ms > 0);
+	let assistant = messages
+		.iter()
+		.find(|entry| entry.message.role == "assistant")
+		.expect("assistant message");
+	assert_eq!(assistant.message.api.as_deref(), Some("openai-completions"));
+	assert_eq!(assistant.message.provider.as_deref(), Some("mock"));
+	assert_eq!(assistant.message.model.as_deref(), Some("mock-model"));
+	assert_eq!(assistant.message.stop_reason.as_deref(), Some("stop"));
+	assert!(assistant.message.timestamp_ms > 0);
 
 	let _ = fs::remove_dir_all(temp);
 }
@@ -425,22 +306,13 @@ fn test_cli_file_arg_does_not_enter_repl_and_runs_turn() {
 		"omp @sample.txt must not enter REPL or fail; exit 0 expected: {stderr}"
 	);
 
-	let files = fs::read_dir(&sessions_dir)
-		.expect("read session dir")
-		.flatten()
-		.map(|e| e.path())
-		.filter(|p| p.extension().and_then(|ext| ext.to_str()) == Some("jsonl"))
-		.collect::<Vec<_>>();
-	assert!(!files.is_empty(), "must write session log");
+	let messages = session_messages(&sessions_dir);
 
-	let content = fs::read_to_string(&files[0]).expect("read session file");
-	let lines: Vec<&str> = content.lines().collect();
-	assert!(lines.len() >= 4, "must have recorded turn: found {}", lines.len());
-
-	let user_entry: serde_json::Value = serde_json::from_str(lines[2]).expect("user entry json");
-	assert_eq!(user_entry["type"], "message");
-	assert_eq!(user_entry["message"]["role"], "user");
-	let user_text = user_entry["message"]["content"].as_str().expect("user content string");
+	let user_text = messages
+		.iter()
+		.find(|entry| entry.message.role == "user")
+		.map(|entry| entry.message.content.text())
+		.expect("user message");
 	assert!(
 		user_text.contains("<file name=\"") && user_text.contains("sample.txt\">"),
 		"user prompt must format <file name=...>: got {user_text}"
@@ -608,18 +480,12 @@ fn test_cli_file_arg_combined_with_prompt_message() {
 	let stderr = String::from_utf8_lossy(&output.stderr);
 	assert_eq!(output.status.code(), Some(0), "exit 0: {stderr}");
 
-	let files = fs::read_dir(&sessions_dir)
-		.expect("read session dir")
-		.flatten()
-		.map(|e| e.path())
-		.filter(|p| p.extension().and_then(|ext| ext.to_str()) == Some("jsonl"))
-		.collect::<Vec<_>>();
-	assert!(!files.is_empty(), "must write session log");
-
-	let content = fs::read_to_string(&files[0]).expect("read session file");
-	let lines: Vec<&str> = content.lines().collect();
-	let user_entry: serde_json::Value = serde_json::from_str(lines[2]).expect("user entry json");
-	let user_text = user_entry["message"]["content"].as_str().expect("user content string");
+	let messages = session_messages(&sessions_dir);
+	let user_text = messages
+		.iter()
+		.find(|entry| entry.message.role == "user")
+		.map(|entry| entry.message.content.text())
+		.expect("user message");
 	assert!(
 		user_text.contains("<file name=\"") && user_text.contains("first file payload"),
 		"must contain file payload block"
@@ -704,18 +570,12 @@ fn test_cli_file_arg_svg_treated_as_text_matching_ts() {
 		"svg file arg must be processed as text, exit 0: {stderr}"
 	);
 
-	let files = fs::read_dir(&sessions_dir)
-		.expect("read session dir")
-		.flatten()
-		.map(|e| e.path())
-		.filter(|p| p.extension().and_then(|ext| ext.to_str()) == Some("jsonl"))
-		.collect::<Vec<_>>();
-	assert!(!files.is_empty(), "must write session log");
-
-	let content = fs::read_to_string(&files[0]).expect("read session file");
-	let lines: Vec<&str> = content.lines().collect();
-	let user_entry: serde_json::Value = serde_json::from_str(lines[2]).expect("user entry json");
-	let user_text = user_entry["message"]["content"].as_str().expect("user content string");
+	let messages = session_messages(&sessions_dir);
+	let user_text = messages
+		.iter()
+		.find(|entry| entry.message.role == "user")
+		.map(|entry| entry.message.content.text())
+		.expect("user message");
 	assert!(
 		user_text.contains("<file name=\"") && user_text.contains("logo.svg\">"),
 		"user prompt must format <file name=...>: got {user_text}"
@@ -780,18 +640,12 @@ fn test_cli_delayed_piped_stdin_producer_with_file_and_prompt_order() {
 
 	assert_eq!(output.status.code(), Some(0));
 
-	let files = fs::read_dir(&sessions_dir)
-		.expect("read session dir")
-		.flatten()
-		.map(|e| e.path())
-		.filter(|p| p.extension().and_then(|ext| ext.to_str()) == Some("jsonl"))
-		.collect::<Vec<_>>();
-	assert!(!files.is_empty(), "must write session log");
-
-	let content = fs::read_to_string(&files[0]).expect("read session file");
-	let lines: Vec<&str> = content.lines().collect();
-	let user_entry: serde_json::Value = serde_json::from_str(lines[2]).expect("user entry json");
-	let user_text = user_entry["message"]["content"].as_str().expect("user content string");
+	let messages = session_messages(&sessions_dir);
+	let user_text = messages
+		.iter()
+		.find(|entry| entry.message.role == "user")
+		.map(|entry| entry.message.content.text())
+		.expect("user message");
 
 	let pos_stdin = user_text.find("delayed_stdin_header").expect("stdin pos");
 	let pos_f1 = user_text.find("f1.txt").expect("f1 pos");
@@ -845,18 +699,12 @@ fn test_cli_bare_piped_stdin_without_flags_runs_autoprint_turn() {
 	let stdout = String::from_utf8_lossy(&output.stdout);
 	assert!(stdout.contains("mock answer"), "must print mock answer in print mode: {stdout}");
 
-	let files = fs::read_dir(&sessions_dir)
-		.expect("read session dir")
-		.flatten()
-		.map(|e| e.path())
-		.filter(|p| p.extension().and_then(|ext| ext.to_str()) == Some("jsonl"))
-		.collect::<Vec<_>>();
-	assert!(!files.is_empty(), "must write session log");
-
-	let content = fs::read_to_string(&files[0]).expect("read session file");
-	let lines: Vec<&str> = content.lines().collect();
-	let user_entry: serde_json::Value = serde_json::from_str(lines[2]).expect("user entry json");
-	let user_text = user_entry["message"]["content"].as_str().expect("user content string");
+	let messages = session_messages(&sessions_dir);
+	let user_text = messages
+		.iter()
+		.find(|entry| entry.message.role == "user")
+		.map(|entry| entry.message.content.text())
+		.expect("user message");
 	assert!(user_text.contains("bare piped prompt question"), "log must contain piped prompt: {user_text}");
 
 	let _ = fs::remove_dir_all(temp);
@@ -899,20 +747,13 @@ fn test_cli_piped_stdin_to_explicit_repl_subcommand() {
 	let output = child.wait_with_output().expect("wait with output");
 	assert_eq!(output.status.code(), Some(0));
 
-	let files = fs::read_dir(&sessions_dir)
-		.expect("read session dir")
-		.flatten()
-		.map(|e| e.path())
-		.filter(|p| p.extension().and_then(|ext| ext.to_str()) == Some("jsonl"))
-		.collect::<Vec<_>>();
-	assert!(!files.is_empty(), "must write session log");
+	let messages = session_messages(&sessions_dir);
 
-	let content = fs::read_to_string(&files[0]).expect("read session file");
-	let lines: Vec<&str> = content.lines().collect();
-	assert!(lines.len() >= 4, "must record turn in repl: found {}", lines.len());
-
-	let user_entry: serde_json::Value = serde_json::from_str(lines[2]).expect("user entry json");
-	let user_text = user_entry["message"]["content"].as_str().expect("user content string");
+	let user_text = messages
+		.iter()
+		.find(|entry| entry.message.role == "user")
+		.map(|entry| entry.message.content.text())
+		.expect("user message");
 	assert!(
 		user_text.contains("repl piped question"),
 		"repl must process prompt from stdin: {user_text}"
@@ -961,18 +802,12 @@ fn test_cli_message_order_stdin_files_prompts() {
 		.expect("run omp with redirected stdin");
 	assert_eq!(output.status.code(), Some(0));
 
-	let files = fs::read_dir(&sessions_dir)
-		.expect("read session dir")
-		.flatten()
-		.map(|e| e.path())
-		.filter(|p| p.extension().and_then(|ext| ext.to_str()) == Some("jsonl"))
-		.collect::<Vec<_>>();
-	assert!(!files.is_empty(), "must write session log");
-
-	let content = fs::read_to_string(&files[0]).expect("read session file");
-	let lines: Vec<&str> = content.lines().collect();
-	let user_entry: serde_json::Value = serde_json::from_str(lines[2]).expect("user entry json");
-	let user_text = user_entry["message"]["content"].as_str().expect("user content string");
+	let messages = session_messages(&sessions_dir);
+	let user_text = messages
+		.iter()
+		.find(|entry| entry.message.role == "user")
+		.map(|entry| entry.message.content.text())
+		.expect("user message");
 
 	let pos_stdin = user_text.find("stdin_header").expect("stdin pos");
 	let pos_f1 = user_text.find("f1.txt").expect("f1 pos");
@@ -1031,18 +866,12 @@ fn test_cli_file_arg_oversize_skips_content() {
 		"stderr must contain skipping warning: {stderr}"
 	);
 
-	let files = fs::read_dir(&sessions_dir)
-		.expect("read session dir")
-		.flatten()
-		.map(|e| e.path())
-		.filter(|p| p.extension().and_then(|ext| ext.to_str()) == Some("jsonl"))
-		.collect::<Vec<_>>();
-	assert!(!files.is_empty(), "must write session log");
-
-	let content = fs::read_to_string(&files[0]).expect("read session file");
-	let lines: Vec<&str> = content.lines().collect();
-	let user_entry: serde_json::Value = serde_json::from_str(lines[2]).expect("user entry json");
-	let user_text = user_entry["message"]["content"].as_str().expect("user content string");
+	let messages = session_messages(&sessions_dir);
+	let user_text = messages
+		.iter()
+		.find(|entry| entry.message.role == "user")
+		.map(|entry| entry.message.content.text())
+		.expect("user message");
 	assert!(
 		user_text.contains("<file name=\"") && user_text.contains("(skipped: too large,"),
 		"must contain skipped block: {user_text}"
@@ -1134,18 +963,12 @@ fn test_cli_file_arg_invalid_utf8_lossy_decoded() {
 
 	assert_eq!(output.status.code(), Some(0));
 
-	let files = fs::read_dir(&sessions_dir)
-		.expect("read session dir")
-		.flatten()
-		.map(|e| e.path())
-		.filter(|p| p.extension().and_then(|ext| ext.to_str()) == Some("jsonl"))
-		.collect::<Vec<_>>();
-	assert!(!files.is_empty(), "must write session log");
-
-	let content = fs::read_to_string(&files[0]).expect("read session file");
-	let lines: Vec<&str> = content.lines().collect();
-	let user_entry: serde_json::Value = serde_json::from_str(lines[2]).expect("user entry json");
-	let user_text = user_entry["message"]["content"].as_str().expect("user content string");
+	let messages = session_messages(&sessions_dir);
+	let user_text = messages
+		.iter()
+		.find(|entry| entry.message.role == "user")
+		.map(|entry| entry.message.content.text())
+		.expect("user message");
 	assert!(
 		user_text.contains("hello \u{fffd}\u{fffd} world"),
 		"must contain lossy decoded string with replacement characters: {user_text}"
@@ -1154,21 +977,20 @@ fn test_cli_file_arg_invalid_utf8_lossy_decoded() {
 	let _ = fs::remove_dir_all(temp);
 }
 
-fn session_file_for(sessions_dir: &Path, id: &str) -> PathBuf {
-	let mut matches = fs::read_dir(sessions_dir)
-		.expect("read session dir")
-		.flatten()
-		.map(|entry| entry.path())
-		.filter(|path| {
-			path.extension().and_then(|ext| ext.to_str()) == Some("jsonl")
-				&& path
-					.file_stem()
-					.and_then(|stem| stem.to_str())
-					.is_some_and(|stem| stem.ends_with(id))
-		});
-	let path = matches.next().expect("session log exists");
-	assert!(matches.next().is_none(), "expected exactly one session log for {id}");
-	path
+fn session_messages(sessions_dir: &Path) -> Vec<omp_cli::session::MessageEntry> {
+	let store = SessionStore::open(&SessionOptions {
+		enabled: true,
+		cwd: PathBuf::from("/work"),
+		model: None,
+		provider: None,
+		dir: Some(sessions_dir.to_path_buf()),
+		id: None,
+		continue_latest: true,
+		parent_session: None,
+		no_title: true,
+	});
+	assert!(store.enabled(), "durable session must reopen");
+	store.messages().to_vec()
 }
 
 /// Reopen the persisted session: `header.title` is materialized from the
@@ -1240,15 +1062,27 @@ fn test_no_title_gates_auto_titles_per_invocation_and_preserves_existing() {
 		None,
 		&["first prompt", "second prompt"],
 	);
-	let flag_file = session_file_for(&sessions_dir, "no-title-flag");
 	assert_eq!(
 		session_title(&sessions_dir, "no-title-flag"),
 		(None, String::new()),
 		"--no-title must leave header and title slot empty"
 	);
-	let flag_log = fs::read_to_string(&flag_file).expect("read flag log");
+	let flag_store = SessionStore::open(&SessionOptions {
+		enabled: true,
+		cwd: cwd.clone(),
+		model: None,
+		provider: None,
+		dir: Some(sessions_dir.clone()),
+		id: Some("no-title-flag".to_string()),
+		continue_latest: false,
+		parent_session: None,
+		no_title: true,
+	});
 	assert!(
-		!flag_log.contains("\"title_change\""),
+		!flag_store
+			.entries()
+			.iter()
+			.any(|entry| entry.kind == "title_change"),
 		"--no-title must not write title_change entries"
 	);
 

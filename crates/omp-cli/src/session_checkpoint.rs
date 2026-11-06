@@ -16,7 +16,7 @@
 //!    which appends a `branch_summary` at the checkpoint entry (or root when it
 //!    no longer resolves), appends the hidden retained `rewind-report`
 //!    `custom_message`, moves the leaf, and returns the rebuilt branch history.
-//!    Abandoned JSONL entries stay on disk untouched, so nothing is lost and
+//!    Abandoned SQLite rows stay in the archive untouched, so nothing is lost and
 //!    usage/cost data on retained messages is preserved verbatim.
 //! 4. On resume/tree navigation [`CheckpointHost::rehydrate`] rebuilds either
 //!    the open checkpoint or the completed-rewind guard from the active branch.
@@ -450,6 +450,33 @@ impl CheckpointHost {
 			.iter()
 			.map(|message| (message.id.as_str(), message))
 			.collect();
+		if let Some(projection) = store.projection() {
+			// The selected compacted view: synthetic runtime-only notices plus
+			// the retained archive rows, in projection order. The original
+			// system prompt is re-injected by the runner.
+			let mut messages = Vec::with_capacity(projection.kept.len() + projection.synthetic.len());
+			for value in &projection.synthetic {
+				messages.push(
+					serde_json::from_value::<Message>(value.clone()).map_err(|error| {
+						format!("cannot restore compacted session context: {error}")
+					})?,
+				);
+			}
+			let mut entries = Vec::with_capacity(projection.kept.len());
+			for id in &projection.kept {
+				let Some(entry) = by_id.get(id.as_str()) else {
+					return Err(format!(
+						"compacted session projection references missing message {id}"
+					));
+				};
+				entries.push((*entry).clone());
+			}
+			messages.extend(
+				crate::runtime::history_messages_from_entries(&entries)
+					.map_err(|error| error.to_string())?,
+			);
+			return Ok(messages);
+		}
 		let mut messages = Vec::new();
 		let mut run: Vec<MessageEntry> = Vec::new();
 		let mut emitted: std::collections::HashSet<&str> = std::collections::HashSet::new();
@@ -890,7 +917,8 @@ mod tests {
 		let fork_dir = dir.join("forks");
 		let forked_path = fork_session(&source, Some(&forked_cwd), Some(&fork_dir))
 			.expect("fork session");
-		assert!(forked_path.is_file());
+		assert!(!forked_path.exists(), "fork writes SQLite, not JSONL");
+		assert!(fork_dir.join("sessions.db").is_file());
 		assert_eq!(
 			fs::read(&tracked).expect("worktree file after fork"),
 			worktree_before,
@@ -901,34 +929,32 @@ mod tests {
 			"fork must not populate the new worktree"
 		);
 
-		let forked_content = fs::read_to_string(&forked_path).expect("read fork");
-		let forked_header: Value = forked_content
-			.lines()
-			.filter_map(|line| serde_json::from_str::<Value>(line).ok())
-			.find(|value| value.get("type").and_then(Value::as_str) == Some("session"))
-			.expect("forked header");
-		assert_eq!(
-			forked_header["parentSession"].as_str(),
-			Some(reopened.id()),
-			"fork keeps the parent reference"
-		);
-		assert_eq!(
-			forked_header["cwd"].as_str(),
-			Some(forked_cwd.to_str().expect("utf-8 cwd")),
-			"fork re-roots the header at the new worktree"
-		);
 		let forked = SessionStore::open(&SessionOptions {
 			enabled: true,
-			cwd: forked_cwd,
+			cwd: forked_cwd.clone(),
 			model: None,
 			provider: None,
 			dir: Some(fork_dir),
-			id: forked_header["id"].as_str().map(str::to_string),
+			id: forked_path
+				.file_stem()
+				.and_then(|stem| stem.to_str())
+				.map(str::to_string),
 			continue_latest: false,
 			parent_session: None,
 			no_title: true,
 		});
 		assert!(forked.enabled(), "forked store: {:?}", forked.corrupt_reason());
+		let forked_header = forked.header().expect("forked header");
+		assert_eq!(
+			forked_header.parent_session.as_deref(),
+			Some(reopened.id()),
+			"fork keeps the parent reference"
+		);
+		assert_eq!(
+			forked_header.cwd,
+			forked_cwd.to_str().expect("utf-8 cwd"),
+			"fork re-roots the header at the new worktree"
+		);
 
 		let forked_host = CheckpointHost::new();
 		forked_host.rehydrate(&forked);

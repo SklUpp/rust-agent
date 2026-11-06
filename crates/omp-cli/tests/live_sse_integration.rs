@@ -20,6 +20,30 @@ use std::time::{Duration, Instant};
 
 static COUNTER: AtomicU32 = AtomicU32::new(0);
 
+/// Open the single durable session under `sessions_dir` through the consumer
+/// API; a session identity is virtual, so no JSONL journal is expected.
+fn durable_session(
+	sessions_dir: &Path,
+) -> (String, Vec<omp_cli::session::MessageEntry>) {
+	let summaries = omp_cli::durable_session::list_session_summaries(sessions_dir)
+		.expect("list durable sessions");
+	assert_eq!(summaries.len(), 1, "exactly one durable session: {summaries:?}");
+	let id = summaries[0].id.clone();
+	let store = omp_cli::session::SessionStore::open(&omp_cli::session::SessionOptions {
+		enabled: true,
+		cwd: sessions_dir.to_path_buf(),
+		model: None,
+		provider: None,
+		dir: Some(sessions_dir.to_path_buf()),
+		id: Some(id.clone()),
+		continue_latest: false,
+		no_title: true,
+		parent_session: None,
+	});
+	assert!(store.enabled(), "durable session must open");
+	(id, store.messages().to_vec())
+}
+
 struct TempDirGuard {
 	path: PathBuf,
 }
@@ -522,43 +546,24 @@ fn test_live_sse_two_turn_read_early_delta_and_resume() {
 	assert_eq!(tool_end["result"]["content"][0]["text"], read_output);
 	assert_eq!(tool_end["isError"], false);
 
-	// Verify session JSONL file on disk
-	let entries = fs::read_dir(&sessions_dir)
-		.expect("read sessions dir")
-		.flatten()
-		.filter(|e| e.path().extension().and_then(|s| s.to_str()) == Some("jsonl"))
-		.collect::<Vec<_>>();
-	assert_eq!(entries.len(), 1, "exactly one session file created");
-
-	let session_path = entries[0].path();
-	let session_content = fs::read_to_string(&session_path).expect("read session file");
-	let jsonl_lines: Vec<serde_json::Value> = session_content
-		.lines()
-		.filter(|l| !l.trim().is_empty())
-		.map(|l| serde_json::from_str(l).expect("valid jsonl line"))
-		.collect();
-
-	// Session file must contain exactly ONE toolResult entry
-	let tool_results: Vec<&serde_json::Value> = jsonl_lines
+	// The durable store must contain exactly ONE toolResult entry.
+	let (session_id, messages) = durable_session(&sessions_dir);
+	let tool_results: Vec<&omp_cli::session::MessageEntry> = messages
 		.iter()
-		.filter(|e| e["type"] == "message" && e["message"]["role"] == "toolResult")
+		.filter(|entry| entry.message.role == "toolResult")
 		.collect();
 	assert_eq!(
 		tool_results.len(),
 		1,
-		"session file must have exactly ONE toolResult entry, found {}",
+		"session must have exactly ONE toolResult entry, found {}",
 		tool_results.len()
 	);
-	assert_eq!(tool_results[0]["message"]["toolCallId"], "call_read_1");
 	assert_eq!(
-		tool_results[0]["message"]["content"],
-		read_output
+		tool_results[0].message.tool_call_id.as_deref(),
+		Some("call_read_1")
 	);
-	assert_eq!(tool_results[0]["message"]["isError"], false);
-
-	// Extract session id from session filename or header
-	let stem = session_path.file_stem().unwrap().to_str().unwrap();
-	let session_id = stem.rfind('_').map_or(stem, |idx| &stem[idx + 1..]);
+	assert_eq!(tool_results[0].message.content.text(), read_output);
+	assert_eq!(tool_results[0].message.is_error, Some(false));
 
 	// Now RESUME the session with a follow-up prompt using bounded timeout runner
 	let resume_output = run_omp_with_timeout(
@@ -804,44 +809,28 @@ fn test_live_sse_sigint_interrupt_during_tool_closes_tool_and_records_aborted() 
 		thread::sleep(Duration::from_millis(50));
 	}
 
-	// Verify session file records stopReason: aborted and synthetic tool result
-	let entries = fs::read_dir(&sessions_dir)
-		.expect("read sessions dir")
-		.flatten()
-		.filter(|e| e.path().extension().and_then(|s| s.to_str()) == Some("jsonl"))
-		.collect::<Vec<_>>();
-	assert_eq!(entries.len(), 1, "exactly one session file created");
+	// The durable record keeps `aborted` plus the synthetic tool result.
+	let (session_id, messages) = durable_session(&sessions_dir);
 
-	let session_path = entries[0].path();
-	let session_content = fs::read_to_string(&session_path).expect("read session file");
-	let jsonl_lines: Vec<serde_json::Value> = session_content
-		.lines()
-		.filter(|l| !l.trim().is_empty())
-		.map(|l| serde_json::from_str(l).expect("valid jsonl line"))
-		.collect();
-
-	// Assistant message must have stopReason: aborted
-	let asst_msg = jsonl_lines
+	let asst_msg = messages
 		.iter()
-		.find(|e| e["type"] == "message" && e["message"]["role"] == "assistant")
+		.find(|entry| entry.message.role == "assistant")
 		.expect("assistant message entry");
-	assert_eq!(asst_msg["message"]["stopReason"], "aborted");
+	assert_eq!(asst_msg.message.stop_reason.as_deref(), Some("aborted"));
 	assert_eq!(
-		asst_msg["message"]["errorMessage"],
-		"Interrupted by user"
+		asst_msg.message.error_message.as_deref(),
+		Some("Interrupted by user")
 	);
 
-	// ToolResult must be recorded with isError: true and indicate cancellation
-	let tool_res = jsonl_lines
+	let tool_res = messages
 		.iter()
-		.find(|e| e["type"] == "message" && e["message"]["role"] == "toolResult")
+		.find(|entry| entry.message.role == "toolResult")
 		.expect("toolResult message entry");
-	assert_eq!(tool_res["message"]["toolCallId"], "call_external_long");
-	assert_eq!(tool_res["message"]["isError"], true);
-
-	// Resume from this aborted session to ensure it resumes cleanly using bounded runner
-	let stem = session_path.file_stem().unwrap().to_str().unwrap();
-	let session_id = stem.rfind('_').map_or(stem, |idx| &stem[idx + 1..]);
+	assert_eq!(
+		tool_res.message.tool_call_id.as_deref(),
+		Some("call_external_long")
+	);
+	assert_eq!(tool_res.message.is_error, Some(true));
 
 	let resume_output = run_omp_with_timeout(
 		&agent_dir,

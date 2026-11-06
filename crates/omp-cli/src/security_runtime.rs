@@ -260,6 +260,7 @@ impl SecurityRunSession {
 			history_messages: None,
 			checkpoint_controller: None,
 			turn_ack: None,
+			durable: None,
 			todo_phases: Vec::new(),
 			session_persisted: true,
 			session_file: Some(self.session_file.clone()),

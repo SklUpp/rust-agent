@@ -737,17 +737,13 @@ fn launch_checkpoint_in_memory(port: u16) -> RpcLaunch {
 	launch
 }
 
-/// Only session log in `dir`; fails loudly when a scenario wrote none or two.
-fn session_log(dir: &Path) -> PathBuf {
-	let mut logs: Vec<PathBuf> = fs::read_dir(dir)
-		.expect("session dir")
-		.filter_map(|entry| entry.ok().map(|entry| entry.path()))
-		.filter(|path| {
-			path.extension().and_then(|extension| extension.to_str()) == Some("jsonl")
-		})
-		.collect();
-	assert_eq!(logs.len(), 1, "expected one session log in {}", dir.display());
-	logs.pop().expect("session log")
+/// The single durable session id in `dir`; a session identity is virtual, so
+/// no live JSONL journal is expected.
+fn session_id(dir: &Path) -> String {
+	let summaries = omp_cli::durable_session::list_session_summaries(dir)
+		.expect("list durable sessions");
+	assert_eq!(summaries.len(), 1, "expected one durable session in {}", dir.display());
+	summaries[0].id.clone()
 }
 
 /// The exact scenario the parent asked for, run through `RpcMode`:
@@ -755,7 +751,7 @@ fn session_log(dir: &Path) -> PathBuf {
 ///
 /// Returns the persisted log, every provider request body in order, and the
 /// RPC frames emitted for the run.
-fn run_checkpoint_rewind(root: &Path) -> (PathBuf, Vec<Value>, Vec<Value>) {
+fn run_checkpoint_rewind(root: &Path) -> (String, Vec<Value>, Vec<Value>) {
 	let worktree = root.join("worktree");
 	let sessions = root.join("sessions");
 	let (port, requests) = spawn_tool_model(vec![
@@ -777,9 +773,9 @@ fn run_checkpoint_rewind(root: &Path) -> (PathBuf, Vec<Value>, Vec<Value>) {
 		.lock()
 		.unwrap_or_else(std::sync::PoisonError::into_inner)
 		.clone();
-	let log = session_log(&sessions);
+	let id = session_id(&sessions);
 	drop(harness);
-	(log, bodies, frames)
+	(id, bodies, frames)
 }
 
 #[test]
@@ -1247,7 +1243,7 @@ fn rpc_checkpoint_rewind_replaces_context_and_keeps_abandoned_entries() {
 		entries
 	};
 
-	let (log, bodies, frames) = run_checkpoint_rewind(&root);
+	let (session_id, bodies, frames) = run_checkpoint_rewind(&root);
 
 	assert_eq!(bodies.len(), 4, "provider requests: {bodies:#?}");
 	let body = |index: usize| bodies[index].to_string();
@@ -1289,15 +1285,34 @@ fn rpc_checkpoint_rewind_replaces_context_and_keeps_abandoned_entries() {
 		"abandoned turn leaked into agent_end: {agent_end}"
 	);
 
-	// Conversation-only rewind: the log keeps every abandoned entry.
-	let persisted = fs::read_to_string(&log).expect("read session log");
+	// Conversation-only rewind: the store keeps every abandoned entry.
+	let store = SessionStore::open(&checkpoint_session_options(
+		&root.join("worktree"),
+		&root.join("sessions"),
+		Some(&session_id),
+	));
+	let entries = store.entries();
 	assert!(
-		persisted.contains("EXPLORATORY-SECRET"),
+		entries.iter().any(|entry| {
+			entry.kind == "message"
+				&& serde_json::to_string(entry)
+					.is_ok_and(|text| text.contains("EXPLORATORY-SECRET"))
+		}),
 		"abandoned assistant entry must stay persisted"
 	);
-	assert!(persisted.contains("CONCISE-FINDINGS"));
-	assert!(persisted.contains("branch_summary"));
-	assert!(persisted.contains("rewind-report"));
+	assert!(entries.iter().any(|entry| entry.kind == "branch_summary"));
+	assert!(entries.iter().any(|entry| {
+		entry
+			.extra
+			.get("customType")
+			.and_then(Value::as_str)
+			== Some("rewind-report")
+			&& entry
+				.extra
+				.get("content")
+				.and_then(Value::as_str)
+				.is_some_and(|text| text.contains("CONCISE-FINDINGS"))
+	}));
 
 	// No filesystem rollback: the worktree is byte-identical and unchanged.
 	assert_eq!(
@@ -1530,22 +1545,12 @@ fn rpc_rewind_todo_state_follows_the_active_branch() {
 	fs::remove_dir_all(&root).ok();
 }
 
-fn first_header_id(path: &Path) -> String {
-	let content = fs::read_to_string(path).expect("read forked session");
-	content
-		.lines()
-		.filter_map(|line| serde_json::from_str::<Value>(line).ok())
-		.find(|value| value["type"] == "session")
-		.and_then(|value| value["id"].as_str().map(str::to_string))
-		.expect("forked session header id")
-}
-
 /// A reopened log (restart) and a forked log must both restore the completed
 /// rewind: the retained report is context, and `rewind` is rejected.
 #[test]
 fn rpc_completed_rewind_survives_restart_and_fork() {
 	let root = checkpoint_root("resume");
-	let (log, _, _) = run_checkpoint_rewind(&root);
+	let (session_id, _, _) = run_checkpoint_rewind(&root);
 	let worktree = root.join("worktree");
 	let sessions = root.join("sessions");
 
@@ -1582,8 +1587,13 @@ fn rpc_completed_rewind_survives_restart_and_fork() {
 	);
 
 	let fork_dir = root.join("forks");
-	let forked = fork_session(&log, Some(&worktree), Some(&fork_dir)).expect("fork session");
-	let fork_id = first_header_id(&forked);
+	let source = sessions.join(format!("{session_id}.jsonl"));
+	let forked = fork_session(&source, Some(&worktree), Some(&fork_dir)).expect("fork session");
+	let fork_id = forked
+		.file_stem()
+		.and_then(std::ffi::OsStr::to_str)
+		.expect("fork stem")
+		.to_string();
 	let forked_requests = reopen(&fork_dir, &fork_id, "fork");
 	assert_eq!(forked_requests.len(), 2, "fork requests: {forked_requests:#?}");
 	assert!(
@@ -1902,11 +1912,15 @@ fn rpc_prewalk_switches_after_todo_and_first_write() {
 		"consumed plan guidance must be scrubbed: {switched}"
 	);
 
-	let log = session_log(&sessions);
-	let entries: Vec<Value> = fs::read_to_string(&log)
-		.expect("session log")
-		.lines()
-		.filter_map(|line| serde_json::from_str(line).ok())
+	let store = SessionStore::open(&checkpoint_session_options(
+		&worktree,
+		&sessions,
+		Some("prewalk-rpc"),
+	));
+	let entries: Vec<Value> = store
+		.entries()
+		.iter()
+		.filter_map(|entry| serde_json::to_value(entry).ok())
 		.collect();
 	let change = entries
 		.iter()
@@ -2016,11 +2030,15 @@ fn rpc_plan_yolo_guards_proposes_switches_and_journals_fallback() {
 	);
 	assert_eq!(fs::read_to_string(worktree.join("probe.txt")).expect("probe"), "done");
 
-	let log = session_log(&sessions);
-	let entries: Vec<Value> = fs::read_to_string(&log)
-		.expect("session log")
-		.lines()
-		.filter_map(|line| serde_json::from_str(line).ok())
+	let store = SessionStore::open(&checkpoint_session_options(
+		&worktree,
+		&sessions,
+		Some("plan-yolo-rpc"),
+	));
+	let entries: Vec<Value> = store
+		.entries()
+		.iter()
+		.filter_map(|entry| serde_json::to_value(entry).ok())
 		.collect();
 	let change = entries
 		.iter()
@@ -2127,30 +2145,28 @@ fn rpc_failed_plan_switch_surfaces_an_error_instead_of_success() {
 		"provider build fails before any implementation request"
 	);
 	assert!(!worktree.join("probe.txt").exists());
-	let log = session_log(&sessions);
-	let entries: Vec<Value> = fs::read_to_string(&log)
-		.expect("session log")
-		.lines()
-		.filter_map(|line| serde_json::from_str(line).ok())
-		.collect();
-	let failure = entries
-		.iter()
-		.find(|entry| {
-			entry["type"] == "custom_message"
-				&& entry["customType"] == "plan-yolo-switch-error"
-		})
-		.expect("failed cutover must leave a durable journal entry");
-	assert!(
-		failure["content"]
-			.as_str()
-			.is_some_and(|content| content.contains("plan-yolo switch failed")),
-		"failure entry must carry the consumer-visible error: {failure}"
-	);
 	let resumed = SessionStore::open(&checkpoint_session_options(
 		&worktree,
 		&sessions,
 		Some("plan-yolo-rpc-build-error"),
 	));
+	let entries = resumed.entries();
+	let failure = entries
+		.iter()
+		.find(|entry| {
+			entry.kind == "custom_message"
+				&& entry.extra.get("customType").and_then(Value::as_str)
+					== Some("plan-yolo-switch-error")
+		})
+		.expect("failed cutover must leave a durable journal entry");
+	assert!(
+		failure
+			.extra
+			.get("content")
+			.and_then(Value::as_str)
+			.is_some_and(|content| content.contains("plan-yolo switch failed")),
+		"failure entry must carry the consumer-visible error: {failure:?}"
+	);
 	assert!(
 		resumed.branch_entries().iter().any(|entry| {
 			entry.kind == "custom_message"

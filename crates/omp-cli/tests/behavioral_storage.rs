@@ -30,6 +30,13 @@ fn read_real_ts_v3_session_and_preserve_typed_content() {
 	let temp = temp_dir("v3");
 	let test_file = temp.join("session.jsonl");
 	fs::copy(&fixture_path, &test_file).expect("copy fixture");
+	let imported_path = omp_cli::session::import_v3_session(&test_file, &temp)
+		.expect("import TS fixture");
+	let imported_id = imported_path
+		.file_stem()
+		.and_then(|stem| stem.to_str())
+		.expect("imported id")
+		.to_string();
 
 	let mut store = SessionStore::open(&SessionOptions {
 		enabled: true,
@@ -37,7 +44,7 @@ fn read_real_ts_v3_session_and_preserve_typed_content() {
 		model: Some("claude-opus-4-5".to_string()),
 		provider: Some("anthropic".to_string()),
 		dir: Some(temp.clone()),
-		id: Some("session".to_string()),
+		id: Some(imported_id),
 		continue_latest: false,
 		parent_session: None,
 		no_title: false,
@@ -67,29 +74,23 @@ fn read_real_ts_v3_session_and_preserve_typed_content() {
 	};
 	store.append_turn(&turn).expect("append turn");
 
-	let content = fs::read_to_string(&test_file).expect("read appended file");
-	let lines: Vec<&str> = content.lines().collect();
-	assert!(lines.len() >= 4);
+	let stored = store.messages();
+	assert!(stored.len() >= 5, "fixture plus appended turn");
+	let user = &stored[stored.len() - 2].message;
+	assert_eq!(user.role, "user");
+	assert!(user.timestamp_ms > 0, "must have a numeric timestamp");
 
-	// Check user message line
-	let user_line: serde_json::Value = serde_json::from_str(lines[lines.len() - 2]).expect("user json");
-	assert_eq!(user_line["type"], "message");
-	assert_eq!(user_line["message"]["role"], "user");
-	assert!(user_line["message"]["timestamp"].is_number(), "must have numeric timestamp");
-
-	// Check assistant message line
-	let asst_line: serde_json::Value = serde_json::from_str(lines[lines.len() - 1]).expect("asst json");
-	assert_eq!(asst_line["type"], "message");
-	let asst_msg = &asst_line["message"];
-	assert_eq!(asst_msg["role"], "assistant");
-	assert_eq!(asst_msg["provider"], "anthropic");
-	assert_eq!(asst_msg["model"], "claude-opus-4-5");
+	let assistant = &stored[stored.len() - 1].message;
+	assert_eq!(assistant.role, "assistant");
+	assert_eq!(assistant.provider.as_deref(), Some("anthropic"));
+	assert_eq!(assistant.model.as_deref(), Some("claude-opus-4-5"));
 	// TurnRecord carries no route/usage: storage omits them, never invents.
-	assert!(asst_msg.get("api").is_none(), "api unknown from TurnRecord — must be absent");
-	assert!(asst_msg.get("usage").is_none(), "usage unavailable — must be absent, never zero-filled");
-	assert_eq!(asst_msg["stopReason"], "aborted");
-	assert_eq!(asst_msg["errorMessage"], "Interrupted by user");
-	assert!(asst_msg["timestamp"].is_number(), "must have numeric timestamp");
+	assert!(assistant.api.is_none(), "api unknown from TurnRecord — must be absent");
+	assert!(assistant.usage.is_none(), "usage unavailable — must be absent, never zero-filled");
+	assert_eq!(assistant.stop_reason.as_deref(), Some("aborted"));
+	assert_eq!(assistant.error_message.as_deref(), Some("Interrupted by user"));
+	assert!(assistant.timestamp_ms > 0, "must have a numeric timestamp");
+	assert!(!test_file.exists(), "appends go to SQLite, not the JSONL fixture");
 
 	fs::remove_dir_all(temp).ok();
 }
@@ -267,7 +268,8 @@ fn import_legacy_v1_refuses_overwrite() {
 	// First import succeeds
 	let first_path = import_legacy_v1(&v1_file, &target_dir, None)
 		.expect("first import must succeed");
-	assert!(first_path.is_file());
+	assert!(!first_path.exists(), "import writes SQLite, not JSONL");
+	assert!(target_dir.join("sessions.db").is_file());
 
 	// Second import must fail with overwrite error
 	let second_result = import_legacy_v1(&v1_file, &target_dir, None);
