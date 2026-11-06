@@ -31,6 +31,7 @@ fn context(cwd: &Path) -> AgentContext {
 		progress: None,
 		plan: None,
 		conflicts: std::sync::Arc::new(crate::tools::conflict::ConflictHistory::new()),
+		shell: None,
 	}
 }
 

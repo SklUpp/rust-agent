@@ -11,6 +11,7 @@ pub mod cancel;
 pub mod minimizer;
 pub mod process;
 pub mod shell;
+pub mod state;
 #[cfg(windows)]
 pub mod windows;
 
@@ -24,3 +25,4 @@ pub use shell::{
 	MinimizerResult, Shell, ShellExecuteOptions, ShellExecuteResult, ShellOptions, ShellRunOptions,
 	ShellRunResult, StreamSinks, execute_shell, execute_shell_streams,
 };
+pub use state::ShellStateSnapshot;

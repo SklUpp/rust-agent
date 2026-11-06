@@ -27,7 +27,7 @@ use crate::{
 	loop_module::AgentLoop,
 	provider::ModelProvider,
 	state::{
-		AgentConfig, AgentState, Message, PlanModeGuard, Role, ToolApprover, TurnResult,
+		AgentConfig, AgentShell, AgentState, Message, PlanModeGuard, Role, ToolApprover, TurnResult,
 	},
 	supervisor::Supervisor,
 	tools::{
@@ -625,6 +625,9 @@ impl PersistedChildReviverFactory for DefaultPersistedReviverFactory {
 			),
 			None => AgentLoop::new(config, Arc::clone(&provider), registry),
 		};
+		// A revived child is a distinct agent instance: its shell starts fresh
+		// from the replayed contract's cwd instead of inheriting any parent.
+		agent_loop = agent_loop.with_shell(Some(Arc::new(AgentShell::new())));
 		if let Some(plan) = &self.plan {
 			agent_loop = agent_loop.with_plan(Some(Arc::clone(plan)));
 		}

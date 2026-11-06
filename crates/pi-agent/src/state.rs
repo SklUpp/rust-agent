@@ -2,7 +2,7 @@ use std::{
 	collections::HashMap,
 	ffi::OsStr,
 	path::PathBuf,
-	sync::Arc,
+	sync::{Arc, OnceLock},
 };
 
 use async_trait::async_trait;
@@ -1380,6 +1380,42 @@ where
 		.collect()
 }
 
+/// Owner of one agent's persistent shell session.
+///
+/// The session is materialized on first use with the agent's explicit
+/// environment (`AgentContext::env`), never the host process environment.
+/// Clones of the handle share the session; separate instances never do, so a
+/// child agent must construct its own.
+pub struct AgentShell {
+	shell: OnceLock<Arc<pi_shell::Shell>>,
+}
+
+impl AgentShell {
+	#[must_use]
+	pub fn new() -> Self {
+		Self { shell: OnceLock::new() }
+	}
+
+	/// Return this agent's shell, creating the session configuration from
+	/// `env` on first use. Later calls ignore `env`, so exports and `cd`
+	/// performed inside the session are never overwritten by a fresh copy.
+	#[must_use]
+	pub fn handle(&self, env: &HashMap<String, String>) -> Arc<pi_shell::Shell> {
+		Arc::clone(self.shell.get_or_init(|| {
+			Arc::new(pi_shell::Shell::new(Some(pi_shell::ShellOptions {
+				session_env: Some(env.clone()),
+				..Default::default()
+			})))
+		}))
+	}
+}
+
+impl Default for AgentShell {
+	fn default() -> Self {
+		Self::new()
+	}
+}
+
 /// Shared context accessible to tools and execution loop.
 #[derive(Clone)]
 pub struct AgentContext {
@@ -1401,6 +1437,9 @@ pub struct AgentContext {
 	/// of one context share it. The session owner that outlives a single turn
 	/// can mount a long-lived handle with [`AgentContext::with_conflicts`].
 	pub conflicts: Arc<crate::tools::conflict::ConflictHistory>,
+	/// Persistent shell owned by this agent. `None` means foreground `bash`
+	/// must be an explicitly opted-in one-shot (`BashTool::legacy_one_shot`).
+	pub shell: Option<Arc<pi_shell::Shell>>,
 }
 
 impl std::fmt::Debug for AgentContext {
@@ -1416,6 +1455,7 @@ impl std::fmt::Debug for AgentContext {
 			.field("has_progress", &self.progress.is_some())
 			.field("has_plan", &self.plan.is_some())
 			.field("conflicts", &self.conflicts.len())
+			.field("has_shell", &self.shell.is_some())
 			.finish()
 	}
 }
@@ -1431,6 +1471,7 @@ impl AgentContext {
 			progress: None,
 			plan: None,
 			conflicts: Arc::new(crate::tools::conflict::ConflictHistory::new()),
+			shell: None,
 		}
 	}
 
@@ -1444,6 +1485,7 @@ impl AgentContext {
 			progress: None,
 			plan: None,
 			conflicts: Arc::new(crate::tools::conflict::ConflictHistory::new()),
+			shell: None,
 		}
 	}
 
@@ -1462,6 +1504,7 @@ impl AgentContext {
 			progress: None,
 			plan: None,
 			conflicts: Arc::new(crate::tools::conflict::ConflictHistory::new()),
+			shell: None,
 		}
 	}
 
@@ -1469,6 +1512,14 @@ impl AgentContext {
 	#[must_use]
 	pub fn with_conflicts(mut self, conflicts: Arc<crate::tools::conflict::ConflictHistory>) -> Self {
 		self.conflicts = conflicts;
+		self
+	}
+
+	/// Mount this agent's persistent shell. One handle per agent; never reuse a
+	/// parent's handle for a child.
+	#[must_use]
+	pub fn with_shell(mut self, shell: Option<Arc<pi_shell::Shell>>) -> Self {
+		self.shell = shell;
 		self
 	}
 

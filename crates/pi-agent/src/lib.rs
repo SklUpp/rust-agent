@@ -38,7 +38,8 @@ pub use provider::{
 	sse_stream, to_openai_messages,
 };
 pub use state::{
-	AcpClientBridge, AcpClientError, AgentConfig, AgentContext, AgentState, Attribution,
+	AcpClientBridge, AcpClientError, AgentConfig, AgentContext, AgentShell, AgentState,
+	Attribution,
 	CacheTtlUsage, ContentPart, ImagePart, Message, Role, ServerToolUsage, StopReason, TokenUsage,
 	ToolApprover, ToolCall, ToolResult, TurnResult, TurnStatus,
 };

@@ -37,13 +37,13 @@ use crate::{
 	minimizer, process,
 };
 
-struct ShellSessionCore {
-	shell: BrushShell,
+pub(crate) struct ShellSessionCore {
+	pub(crate) shell: BrushShell,
 	/// Set while a run owns this session, before the command is dispatched.
 	/// Cleared on clean completion. If it survives — panic, hard abort, or a
 	/// dropped caller future — the next lock holder discards this generation
 	/// instead of reusing a shell that may be mid-pipeline.
-	in_flight: bool,
+	pub(crate) in_flight: bool,
 }
 
 impl Drop for ShellSessionCore {
@@ -190,12 +190,14 @@ pub struct ShellRunResult {
 	pub exit_code:   Option<i32>,
 	pub cancelled:   bool,
 	pub timed_out:   bool,
-	/// The run was cancelled/timed out after it owned the persistent session,
-	/// so that session (cwd, exported variables, functions, background jobs)
-	/// was discarded. The next call starts from a fresh shell; a cancelled
-	/// command's partial effects are never inherited. `false` on cancellation
-	/// means the command completed cleanly before the cancel was observed, so
-	/// the session stayed reusable.
+	/// The run discarded its persistent session, so cwd, exported variables,
+	/// functions, and job tracking were lost. This covers cancellation or
+	/// timeout after the command owned the session, and a command that cannot
+	/// keep the shell alive at the top level (`exit`, `break`, `continue`,
+	/// `return`). The next call starts from a fresh shell; partial effects of
+	/// a cancelled or exiting command are never inherited. `false` on
+	/// cancellation means the command completed cleanly before the cancel was
+	/// observed, so the session stayed reusable.
 	#[serde(default)]
 	pub session_reset: bool,
 	pub minimized:     Option<MinimizerResult>,
@@ -226,16 +228,18 @@ pub type ShellExecuteResult = ShellRunResult;
 /// never executes its command and leaves the session untouched. Cancelling a
 /// call after it acquired the session reports [`ShellRunResult::session_reset`]
 /// and discards the session, because an interrupted command may have left the
-/// shell mid-pipeline. The same invalidation applies when a run is hard-aborted,
+/// shell mid-pipeline. A command that cannot keep the shell alive at the top
+/// level (`exit`, `break`, `continue`, `return`) also discards it and reports
+/// `session_reset`. The same invalidation applies when a run is hard-aborted,
 /// panics, or its caller future is dropped: the next call discards that
 /// generation before use.
 ///
 /// Separate `Shell` instances are fully independent: they never share the
 /// shell, the environment, or the working directory.
 pub struct Shell {
-	session:     Arc<TokioMutex<Option<ShellSessionCore>>>,
-	abort_state: ShellAbortState,
-	config:      ShellConfig,
+	pub(crate) session: Arc<TokioMutex<Option<ShellSessionCore>>>,
+	abort_state:        ShellAbortState,
+	config:             ShellConfig,
 }
 
 impl Shell {
@@ -387,6 +391,7 @@ enum SessionRunOutcome {
 	Completed {
 		result:         Result<(ExecutionResult, Option<MinimizerResult>, Option<String>)>,
 		session_reset:  bool,
+		cancelled:      bool,
 	},
 }
 
@@ -453,7 +458,11 @@ async fn run_shell_session(
 				{
 					Ok(session) => session_guard.insert(session),
 					Err(err) => {
-						return SessionRunOutcome::Completed { result: Err(err), session_reset: false };
+						return SessionRunOutcome::Completed {
+							result:        Err(err),
+							session_reset: false,
+							cancelled:     false,
+						};
 					},
 				},
 			};
@@ -482,7 +491,11 @@ async fn run_shell_session(
 				session.in_flight = false;
 			}
 			abort_state.clear_if(&at_run).await;
-			SessionRunOutcome::Completed { result, session_reset: cancelled }
+			SessionRunOutcome::Completed {
+				result,
+				session_reset: cancelled || !keepalive,
+				cancelled,
+			}
 		}
 	});
 
@@ -562,8 +575,8 @@ async fn run_shell_session(
 			minimized:      None,
 			working_dir:    None,
 		}),
-		SessionRunOutcome::Completed { result, session_reset } => {
-			if session_reset {
+		SessionRunOutcome::Completed { result, session_reset, cancelled } => {
+			if cancelled {
 				// The task observed the cancel after the command was dispatched;
 				// it discarded the session under the lock.
 				let reason = ct.wait().await;
@@ -581,7 +594,7 @@ async fn run_shell_session(
 				exit_code:     Some(exit_code(&exec)),
 				cancelled:     false,
 				timed_out:     false,
-				session_reset: false,
+				session_reset,
 				working_dir,
 				minimized,
 			})

@@ -11,7 +11,7 @@ use crate::{
 	mailbox::{Mailbox, format_incoming},
 	provider::{ModelProvider, ProviderError, StreamAssembler, ToolChoice},
 	state::{
-		AgentConfig, AgentContext, AgentState, ContentPart, Exhaustion, Message, Role,
+		AgentConfig, AgentContext, AgentShell, AgentState, ContentPart, Exhaustion, Message, Role,
 		SoftToolRequirement, StopReason, TokenUsage, ToolApprover, ToolCall, ToolPolicy, ToolResult,
 		TurnResult, TurnStatus,
 	},
@@ -707,6 +707,10 @@ pub struct AgentLoop {
 	/// Session-owned conflict history, when the host outlives a single turn.
 	/// Without it each run starts from an empty per-context history.
 	conflicts: Option<Arc<crate::tools::conflict::ConflictHistory>>,
+	/// One persistent shell per agent instance. A loop constructed fresh for a
+	/// child gets its own; a host that outlives turns replaces it with the
+	/// session-owned handle, never with the parent's.
+	shell: Option<Arc<AgentShell>>,
 	/// Detached plan continuation: history already carries the persisted
 	/// developer reminder, so no caller message is appended and the first
 	/// request is the policy's one-shot forced choice.
@@ -750,6 +754,7 @@ impl AgentLoop {
 			turn_ack: None,
 			plan: None,
 			conflicts: None,
+			shell: Some(Arc::new(AgentShell::new())),
 			continuation: false,
 			assistant_guard: None,
 			turn_observer: None,
@@ -776,6 +781,7 @@ impl AgentLoop {
 			turn_ack: None,
 			plan: None,
 			conflicts: None,
+			shell: Some(Arc::new(AgentShell::new())),
 			continuation: false,
 			assistant_guard: None,
 			turn_observer: None,
@@ -805,6 +811,15 @@ impl AgentLoop {
 		conflicts: Option<Arc<crate::tools::conflict::ConflictHistory>>,
 	) -> Self {
 		self.conflicts = conflicts;
+		self
+	}
+
+	/// Mount the session-owned persistent shell. `None` makes the default
+	/// persistent `BashTool` reject foreground commands; an explicit
+	/// `BashTool::legacy_one_shot` remains available to embedders.
+	#[must_use]
+	pub fn with_shell(mut self, shell: Option<Arc<AgentShell>>) -> Self {
+		self.shell = shell;
 		self
 	}
 
@@ -1078,6 +1093,8 @@ impl AgentLoop {
 			Some(conflicts) => ctx.with_conflicts(Arc::clone(conflicts)),
 			None => ctx,
 		};
+		let shell = self.shell.as_ref().map(|shell| shell.handle(&ctx.env));
+		let ctx = ctx.with_shell(shell);
 		let mut turn_results = Vec::new();
 		let mut soft = SoftRequirementState::default();
 		let mut continuation_pending = self.continuation;

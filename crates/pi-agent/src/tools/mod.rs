@@ -274,9 +274,22 @@ fn reject_unsupported_bash_args(args: &Value, run_async: bool) -> Result<(), Too
 	Ok(())
 }
 
+/// Where a foreground command executes.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum BashEngine {
+	/// The agent's persistent [`pi_shell::Shell`] from [`AgentContext::shell`].
+	Persistent,
+	/// Stateless compatibility path for embedders and contract tests. Never
+	/// selected implicitly by a product registry.
+	LegacyOneShot,
+}
+
 /// Builtin bash execution tool.
 ///
-/// Foreground execution is unchanged. When a process backend is wired in
+/// Foreground execution uses the agent's persistent shell handle mounted on
+/// [`AgentContext::shell`], so `cd`, exported variables, functions, and live
+/// background jobs survive between calls. `BashTool::legacy_one_shot` is the
+/// explicit opt-in for stateless execution. When a process backend is wired in
 /// (`with_processes`), `async:true` starts a real supervised OS process through
 /// the same [`ProcessBackend`] that serves `hub` process ops, so `hub ps`,
 /// `logs`, `wait`, `send`, and `stop` operate on the exact job id returned here.
@@ -285,22 +298,42 @@ pub struct BashTool {
 	owner: Option<String>,
 	/// ACP client reverse bridge; `None` keeps every command local.
 	acp: Option<Arc<dyn AcpClientBridge>>,
+	engine: BashEngine,
 }
 
 impl BashTool {
 	#[must_use]
 	pub fn new() -> Self {
-		Self { processes: None, owner: None, acp: None }
+		Self { processes: None, owner: None, acp: None, engine: BashEngine::Persistent }
+	}
+
+	/// Explicit stateless mode: each foreground call gets a fresh shell and a
+	/// missing [`AgentContext::shell`] is not an error.
+	#[must_use]
+	pub fn legacy_one_shot() -> Self {
+		Self {
+			processes: None,
+			owner: None,
+			acp: None,
+			engine: BashEngine::LegacyOneShot,
+		}
 	}
 
 	#[must_use]
 	pub fn with_processes(processes: Arc<dyn ProcessBackend>, owner: Option<String>) -> Self {
-		Self { processes: Some(processes), owner, acp: None }
+		Self {
+			processes: Some(processes),
+			owner,
+			acp: None,
+			engine: BashEngine::Persistent,
+		}
 	}
 
-	/// Mount an ACP client bridge. Foreground commands then run through
-	/// `terminal/*` when the client advertised the capability; asynchronous
-	/// jobs keep the native process supervisor because ACP has no job handle.
+	/// Mount an ACP client bridge. Only the explicit `legacy_one_shot` engine
+	/// delegates foreground commands to `terminal/*`; the persistent engine
+	/// stays local and reports that the remote terminal was not used.
+	/// Asynchronous jobs keep the native process supervisor because ACP has no
+	/// job handle.
 	#[must_use]
 	pub fn with_acp_bridge(mut self, bridge: Option<Arc<dyn AcpClientBridge>>) -> Self {
 		self.acp = bridge;
@@ -325,19 +358,32 @@ impl BashTool {
 			));
 		}
 		let timeout_ms = bash_timeout_ms(args.get("timeout"))?;
-		let env = bash_env(args.get("env"), &ctx.env)?;
 		let cwd_arg = match args.get("cwd") {
 			None | Some(Value::Null) => None,
 			Some(Value::String(cwd)) => Some(cwd.as_str()),
 			Some(_) => return Err(ToolError::InvalidArguments("'cwd' must be a string".to_string())),
 		};
-		let cwd = match resolve_bash_cwd(cwd_arg, ctx) {
-			Ok(cwd) => cwd,
-			Err(message) => return Ok(tool_result(message, true)),
+		// A background job is a new process, not a command in the persistent
+		// shell, so it must inherit the session's effective cwd and exported
+		// environment rather than the host process environment.
+		let snapshot = match &ctx.shell {
+			Some(shell) => shell.snapshot_state().await,
+			None => None,
+		};
+		let cwd = match cwd_arg {
+			Some(raw) => match resolve_bash_cwd(Some(raw), ctx) {
+				Ok(cwd) => cwd,
+				Err(message) => return Ok(tool_result(message, true)),
+			},
+			None => snapshot
+				.as_ref()
+				.map_or_else(|| ctx.cwd.clone(), |state| PathBuf::from(&state.cwd)),
 		};
 		if let Some(error) = invalid_bash_cwd(&cwd).await {
 			return Ok(error);
 		}
+		let base_env = snapshot.map_or_else(|| ctx.env.clone(), |state| state.env);
+		let env = bash_env(args.get("env"), &base_env)?;
 		let pty = match args.get("pty") {
 			None | Some(Value::Null) => false,
 			Some(value) => value
@@ -573,41 +619,65 @@ impl Tool for BashTool {
 			return self.execute_background(command, args, ctx).await;
 		}
 
-		// Foreground commands belong to the client when it advertised
-		// `terminal`; asynchronous jobs keep the native supervisor (ACP has no
-		// job handle or follow-up stream).
+		// An ACP terminal is an optional UI surface, not authority over local
+		// execution state. Persistent foreground commands stay local so `cd`,
+		// exports, functions, and jobs remain available; only the explicit
+		// stateless engine delegates to the client's terminal.
+		let mut acp_terminal_bypassed = false;
 		if let Some(bridge) = &self.acp
 			&& bridge.supports_terminal()
 		{
-			if let Some(result) = self.execute_terminal(bridge, command, args, ctx).await? {
-				return Ok(result);
+			if self.engine == BashEngine::LegacyOneShot {
+				if let Some(result) = self.execute_terminal(bridge, command, args, ctx).await? {
+					return Ok(result);
+				}
+			} else {
+				acp_terminal_bypassed = true;
 			}
 		}
 
 		let timeout_ms = bash_timeout_ms(args.get("timeout"))?;
-		let env = bash_env(args.get("env"), &ctx.env)?;
 		let cwd_arg = match args.get("cwd") {
 			None | Some(Value::Null) => None,
 			Some(Value::String(cwd)) => Some(cwd.as_str()),
 			Some(_) => return Err(ToolError::InvalidArguments("'cwd' must be a string".to_string())),
 		};
-		let cwd = match resolve_bash_cwd(cwd_arg, ctx) {
-			Ok(cwd) => cwd,
-			Err(message) => return Ok(tool_result(message, true)),
+		let explicit_cwd = match cwd_arg {
+			Some(raw) => match resolve_bash_cwd(Some(raw), ctx) {
+				Ok(cwd) => Some(cwd),
+				Err(message) => return Ok(tool_result(message, true)),
+			},
+			None => None,
 		};
-		if let Some(error) = invalid_bash_cwd(&cwd).await {
+
+		// Persistent mode: the session already owns the initial environment, so
+		// never re-apply `ctx.env` here (that would undo exports). Its cwd is set
+		// once to the project on the first run; later calls only reset it when
+		// the caller supplies an explicit `cwd`.
+		let (cwd, env, shell) = match self.engine {
+			BashEngine::Persistent => {
+				let Some(shell) = ctx.shell.as_ref() else {
+					return Ok(tool_result(
+						"Foreground bash requires a persistent shell on the agent context. Use AgentLoop (which mounts one) or BashTool::legacy_one_shot for an explicitly stateless command.",
+						true,
+					));
+				};
+				let materialized = shell.snapshot_state().await.is_some();
+				let cwd = explicit_cwd.or_else(|| (!materialized).then(|| ctx.cwd.clone()));
+				let overlay = bash_env(args.get("env"), &HashMap::new())?;
+				(cwd, (!overlay.is_empty()).then_some(overlay), Some(shell))
+			},
+			BashEngine::LegacyOneShot => (
+				Some(explicit_cwd.unwrap_or_else(|| ctx.cwd.clone())),
+				Some(bash_env(args.get("env"), &ctx.env)?),
+				None,
+			),
+		};
+		if let Some(cwd) = &cwd
+			&& let Some(error) = invalid_bash_cwd(cwd).await
+		{
 			return Ok(error);
 		}
-
-		let options = pi_shell::ShellExecuteOptions {
-			command: command.to_string(),
-			cwd: Some(cwd.to_string_lossy().to_string()),
-			env: Some(env),
-			session_env: None,
-			timeout_ms,
-			snapshot_path: None,
-			minimizer: None,
-		};
 
 		// Bridge the run's cancellation into the shell's own abort flag. A
 		// `None` deadline (timeout 0) still honours that cancellation.
@@ -630,7 +700,29 @@ impl Tool for BashTool {
 			sink.finish()
 		});
 
-		let outcome = pi_shell::execute_shell(options, Some(tx), cancel_token).await;
+		let outcome = match shell {
+			Some(shell) => {
+				let options = pi_shell::ShellRunOptions {
+					command: command.to_string(),
+					cwd: cwd.as_ref().map(|cwd| cwd.to_string_lossy().into_owned()),
+					env,
+					timeout_ms,
+				};
+				shell.run(options, Some(tx), cancel_token).await
+			},
+			None => {
+				let options = pi_shell::ShellExecuteOptions {
+					command: command.to_string(),
+					cwd: cwd.map(|cwd| cwd.to_string_lossy().into_owned()),
+					env,
+					session_env: None,
+					timeout_ms,
+					snapshot_path: None,
+					minimizer: None,
+				};
+				pi_shell::execute_shell(options, Some(tx), cancel_token).await
+			},
+		};
 		watcher.abort();
 		let captured = match drain.await {
 			Ok(captured) => captured,
@@ -647,16 +739,27 @@ impl Tool for BashTool {
 		};
 
 		let status = format!(
-			"exit code: {} | cancelled: {} | timed out: {}",
+			"exit code: {} | cancelled: {} | timed out: {} | session reset: {}",
 			result.exit_code.unwrap_or(-1),
 			result.cancelled,
-			result.timed_out
+			result.timed_out,
+			result.session_reset
 		);
-		let content = if captured.is_empty() {
+		let mut content = if captured.is_empty() {
 			status
 		} else {
 			format!("{captured}\n[{status}]")
 		};
+		if result.session_reset {
+			content.push_str(
+				"\n[persistent shell session was reset; cwd, exported variables, functions, and job tracking were discarded. Already-running background processes are not killed.]",
+			);
+		}
+		if acp_terminal_bypassed {
+			content.push_str(
+				"\n[ACP terminal capability advertised; foreground command ran in the local persistent shell and the remote terminal was not used]",
+			);
+		}
 		// A missing exit code means the child was killed, never success.
 		let is_error = result.exit_code != Some(0) || result.cancelled || result.timed_out;
 		Ok(tool_result(content, is_error))

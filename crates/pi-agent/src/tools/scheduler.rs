@@ -346,7 +346,7 @@ mod tests {
 
 	fn bash_scheduler(approver: Arc<dyn ToolApprover>) -> ToolScheduler {
 		let mut registry = ToolRegistry::new();
-		registry.register(Arc::new(BashTool::new()));
+		registry.register(Arc::new(BashTool::legacy_one_shot()));
 		ToolScheduler::with_approver(registry, approver)
 	}
 
@@ -356,7 +356,7 @@ mod tests {
 		let marker = dir.join("ran");
 		let scheduler = ToolScheduler::new({
 			let mut registry = ToolRegistry::new();
-			registry.register(Arc::new(BashTool::new()));
+			registry.register(Arc::new(BashTool::legacy_one_shot()));
 			registry
 		});
 		scheduler.hide_tools(vec!["bash".to_string()]);

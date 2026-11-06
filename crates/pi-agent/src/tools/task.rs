@@ -27,7 +27,9 @@ use super::{
 use crate::{
 	compaction::CompactionReport,
 	loop_module::{AgentError, AgentEvent, AgentLoop, SteeringEvent},
-	state::{AgentConfig, AgentContext, AgentState, Message, TokenUsage, ToolResult, TurnResult},
+	state::{
+		AgentConfig, AgentContext, AgentShell, AgentState, Message, TokenUsage, ToolResult, TurnResult,
+	},
 	subagent_lifecycle::TranscriptJournal,
 	supervisor::{ChildGuard, ChildSpawn, Supervisor, cap_result_text},
 	task_persisted_revive::{PersistedChildSession, RevivedChild},
@@ -855,6 +857,8 @@ impl TaskTool {
 				None => AgentLoop::new(child_config, child_provider, child_registry),
 			}
 			.with_plan(child_plan)
+			// Each child owns a fresh shell; never inherit the parent's handle.
+			.with_shell(Some(Arc::new(AgentShell::new())))
 			// Mail that could not be handed to the closing run is buffered by the
 			// hub; the adopted actor drains it here at its next turn boundary, so
 			// a send that raced the hand-off is not stranded.
@@ -1926,7 +1930,9 @@ async fn run_background_child(
 		},
 		None => AgentLoop::new(child_config, child_provider, child_registry),
 	}
-	.with_plan(plan);
+	.with_plan(plan)
+	// Each child owns a fresh shell; never inherit the parent's handle.
+	.with_shell(Some(Arc::new(AgentShell::new())));
 	let child_loop = child_loop
 		.with_background_results(supervisor.owner_results_sink(Some(&child_id)))
 		.with_peer_inbox(supervisor.mailbox(), child_id.clone());

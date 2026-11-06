@@ -15,8 +15,8 @@ use std::{
 
 use async_trait::async_trait;
 use pi_agent::{
-	AgentConfig, AgentError, AgentEvent, AgentLoop, AgentState, AskTool, AstGrepTool, BashTool,
-	CheckpointTool, DelegationLimits, RewindTool,
+	AgentConfig, AgentError, AgentEvent, AgentLoop, AgentShell, AgentState, AskTool, AstGrepTool,
+	BashTool, CheckpointTool, DelegationLimits, RewindTool,
 	ChildToolSettings, EditTool, GlobTool, GrepTool, ModelProvider,
 	PendingStore, ReadTool,
 	SteeringEvent, Supervisor, TodoTool, Tool, ToolApprover, ToolRegistry, WriteTool,
@@ -231,6 +231,9 @@ pub struct PiAgentRunner {
 struct RunnerSession {
 	snapshots: Arc<SnapshotStore>,
 	conflicts: Arc<pi_agent::tools::ConflictHistory>,
+	/// One persistent shell for this root session, created lazily from the
+	/// first turn's explicit environment. Child agents construct their own.
+	shell:     Arc<AgentShell>,
 	edit:      Arc<EditTool>,
 	pending:   Arc<PendingStore>,
 	/// Process-stable eval identity for in-memory sessions; replaced by the
@@ -286,6 +289,7 @@ impl RunnerSession {
 		Self {
 			snapshots,
 			conflicts: Arc::new(pi_agent::tools::ConflictHistory::new()),
+			shell: Arc::new(AgentShell::new()),
 			edit,
 			pending,
 			eval_session_id: Mutex::new(crate::output::session_id()),
@@ -2055,7 +2059,10 @@ impl AgentRunner for PiAgentRunner {
 		{
 			processes.set_async_enabled(request.config.async_config.enabled());
 			registry.remove("bash");
-			registry.register(Arc::new(BashTool::with_processes(Arc::clone(processes), None)));
+			registry.register(Arc::new(
+				BashTool::with_processes(Arc::clone(processes), None)
+					.with_acp_bridge(acp_bridge.clone()),
+			));
 		}
 		if plan.tools.contains(&"ask") {
 			registry.register(Arc::new(AskTool::new()));
@@ -2137,6 +2144,7 @@ impl AgentRunner for PiAgentRunner {
 		let mut agent = AgentLoop::with_approver(config, provider, registry, approvals)
 			.with_plan(request.plan_mode.guard.clone())
 			.with_conflicts(Some(Arc::clone(&session.conflicts)))
+			.with_shell(Some(Arc::clone(&session.shell)))
 			.with_continuation(request.continuation);
 		if let Some(ack) = &request.turn_ack {
 			agent = agent.with_turn_ack(Arc::clone(ack));

@@ -1754,10 +1754,10 @@ impl Supervisor {
 		let processes = self.processes();
 		if reg.get("bash").is_some() {
 			reg.remove("bash");
-			reg.register(Arc::new(BashTool::with_processes(
-				Arc::clone(&processes),
-				None,
-			)));
+			reg.register(Arc::new(
+				BashTool::with_processes(Arc::clone(&processes), None)
+					.with_acp_bridge(self.acp_bridge()),
+			));
 		}
 		if self.external_thinking() {
 			reg.register(Arc::new(ThinkTool::new()));
