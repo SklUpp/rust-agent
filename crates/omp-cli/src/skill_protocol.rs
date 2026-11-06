@@ -9,9 +9,12 @@
 //! Read-only. Every resolution is confined to the skill's base directory:
 //! absolute paths and `..` components are rejected up front, the joined path
 //! must stay lexically inside the base, and the canonical path must too (a
-//! symlink cannot redirect a read outside the skill). Plugin-provided skills
-//! carry a [`SkillEntry::contain_root`]; their canonical path must additionally
-//! stay inside that plugin root, and a dangling link there fails closed.
+//! symlink cannot redirect a read outside the skill). Non-plugin entries are
+//! also checked against the canonical root stored at discovery. Plugin-provided
+//! skills carry a [`SkillEntry::contain_root`]; their canonical path must
+//! additionally stay inside that plugin root, and a dangling link there fails
+//! closed. These are read-time checks: a concurrent replacement between the
+//! check and the read is not prevented.
 //!
 //! Skills come from the *caller's* [`SkillSnapshot`], never a process-global
 //! registry, so concurrent sessions cannot read each other's skill set.
@@ -104,31 +107,38 @@ fn resolve_entry(
 		if !resolved.starts_with(&base) {
 			return Err("Path traversal is not allowed".to_string());
 		}
-		let canonical_base = fs::canonicalize(&base_dir).map_err(|error| {
-			format!("File not found: {} ({error})", base_dir.display())
-		})?;
-		let canonical = match fs::canonicalize(&resolved) {
-			Ok(canonical) => canonical,
-			Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-				return Err(format!("File not found: {}", resolved.display()));
-			},
-			Err(error) => return Err(format!("{}: {error}", resolved.display())),
-		};
-		if let Some(root) = &entry.contain_root {
-			// Agent Plugin skills (§4.1): the resource must canonically resolve
-			// within the plugin root; a dangling or unresolvable path fails
-			// closed. Symlinks may target other files inside the same package,
-			// so the base-directory check relaxes to the plugin root.
-			let canonical_root = fs::canonicalize(root)
-				.map_err(|error| format!("skill:// plugin root is unavailable: {} ({error})", root.display()))?;
-			if !canonical.starts_with(&canonical_root) {
-				return Err(format!("skill:// path resolves outside the plugin root: {}", url.href));
-			}
-		} else if !canonical.starts_with(&canonical_base) {
+		resolved
+	};
+	let canonical_base = fs::canonicalize(&base_dir)
+		.map_err(|error| format!("File not found: {} ({error})", base_dir.display()))?;
+	let canonical = match fs::canonicalize(&target) {
+		Ok(canonical) => canonical,
+		Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+			return Err(format!("File not found: {}", target.display()));
+		},
+		Err(error) => return Err(format!("{}: {error}", target.display())),
+	};
+	if let Some(root) = &entry.contain_root {
+		// Agent Plugin skills (§4.1): the resource must canonically resolve
+		// within the plugin root; a dangling or unresolvable path fails
+		// closed. Symlinks may target other files inside the same package,
+		// so the base-directory check relaxes to the plugin root.
+		let canonical_root = fs::canonicalize(root)
+			.map_err(|error| format!("skill:// plugin root is unavailable: {} ({error})", root.display()))?;
+		if !canonical.starts_with(&canonical_root) {
+			return Err(format!("skill:// path resolves outside the plugin root: {}", url.href));
+		}
+	} else {
+		if !canonical.starts_with(&canonical_base) {
 			return Err("Path traversal is not allowed".to_string());
 		}
-		canonical
-	};
+		// Compare against the canonical root stored at discovery: re-canonicalizing
+		// the mutable root would follow a root/ancestor symlink swapped in after
+		// discovery and accept the replacement.
+		if entry.root.as_os_str().is_empty() || !canonical.starts_with(&entry.root) {
+			return Err(format!("skill:// path resolves outside the skills root: {}", url.href));
+		}
+	}
 
 	let metadata = fs::metadata(&target).map_err(|error| {
 		if error.kind() == std::io::ErrorKind::NotFound {
@@ -263,6 +273,7 @@ mod tests {
 		let skill_dir = root.join(name);
 		let path = skill_dir.join("SKILL.md");
 		write(&path, &format!("---\nname: {name}\ndescription: test\n---\n{body}\n"));
+		let canonical_root = fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
 		SkillEntry {
 			skill: Skill {
 				name: name.to_string(),
@@ -273,6 +284,7 @@ mod tests {
 			source: "native:user".to_string(),
 			hide: false,
 			contain_root: None,
+			root: canonical_root,
 		}
 	}
 
@@ -361,6 +373,24 @@ mod tests {
 		assert_eq!(ok.content, "a: 1\n");
 		let error = resolve_entry(&entry, &url("skill://deploy/bad.txt"), &context()).expect_err("outside root");
 		assert!(error.contains("outside the plugin root"), "{error}");
+	}
+
+	#[cfg(unix)]
+	#[test]
+	fn root_replacement_after_discovery_fails_closed() {
+		use std::os::unix::fs::symlink;
+
+		let root = temp_dir();
+		let entry = entry(&root, "deploy", "body");
+		let ok = resolve_entry(&entry, &url("skill://deploy"), &context()).expect("resolve");
+		assert!(ok.content.contains("body"));
+
+		let replacement = temp_dir();
+		write(&replacement.join("deploy/SKILL.md"), "replacement");
+		fs::remove_dir_all(&root).expect("remove root");
+		symlink(&replacement, &root).expect("root swap");
+		let error = resolve_entry(&entry, &url("skill://deploy"), &context()).expect_err("fail closed");
+		assert!(error.contains("outside the skills root"), "{error}");
 	}
 
 	#[tokio::test]

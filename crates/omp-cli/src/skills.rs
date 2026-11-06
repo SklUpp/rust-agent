@@ -27,11 +27,18 @@
 //! No snapshot is process-global: callers hold their own [`SkillSnapshot`]
 //! (`Arc<RwLock<...>>`), so concurrent RPC/ACP sessions and child agents cannot
 //! observe each other's loaded skills.
+//!
+//! Discovery is metadata-only (D52): `SKILL.md` is parsed for frontmatter, but
+//! the Markdown body is not retained. [`open_entry`] / [`open_skill`] read the
+//! body on demand and re-check canonical containment, so a symlink swapped in
+//! after discovery cannot redirect the read outside the skill directory or the
+//! root it was discovered under. This is a read-time check: a concurrent
+//! replacement between the check and the read is not prevented.
 
 use std::{
 	collections::{BTreeMap, HashSet},
 	fs,
-	path::{Path, PathBuf},
+	path::{Component, Path, PathBuf},
 	sync::{Arc, RwLock},
 };
 
@@ -56,6 +63,9 @@ pub struct Skill {
 	pub name: String,
 	pub description: String,
 	pub path: PathBuf,
+	/// Preloaded body. Discovery is metadata-only and leaves this empty; callers
+	/// that need the text use [`open_entry`] / [`open_skill`] (or set it
+	/// explicitly, e.g. a caller-provided `RunRequest`).
 	pub body: String,
 }
 
@@ -79,6 +89,11 @@ pub struct SkillEntry {
 	/// Filesystem-resolved plugin root for Agent Plugin skills; a `skill://`
 	/// read must canonically resolve inside it.
 	pub contain_root: Option<PathBuf>,
+	/// Canonical root the skill was discovered under. Lazy reads compare the
+	/// re-canonicalized target against this stored path (never re-canonicalize
+	/// the root), so replacing the root or an ancestor after discovery fails
+	/// closed.
+	pub root: PathBuf,
 }
 
 impl SkillEntry {
@@ -92,6 +107,73 @@ impl SkillEntry {
 	pub fn is_managed(&self) -> bool {
 		self.source.starts_with(&format!("{MANAGED_SKILLS_PROVIDER_ID}:"))
 	}
+}
+
+/// Lazy skill body plus the resolved path it was read from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SkillContent {
+	pub name: String,
+	pub path: PathBuf,
+	/// Markdown body with the YAML frontmatter stripped.
+	pub body: String,
+}
+
+/// Read a skill's body on demand (D52: full text only on explicit invocation).
+///
+/// Re-reads `SKILL.md` so edits after discovery are honoured, and re-checks
+/// canonical containment against both the skill directory and the canonical
+/// root stored on the entry. Replacing the skill directory, the root, or an
+/// ancestor with a symlink after discovery fails closed instead of redirecting
+/// the read. Concurrent replacement between the check and the read is not
+/// prevented.
+pub fn open_entry(entry: &SkillEntry) -> Result<SkillContent> {
+	read_skill_body(&entry.skill, Some(entry.root.as_path()))
+}
+
+/// [`open_entry`] for callers that only carry a [`Skill`] (e.g. a
+/// caller-provided `RunRequest.skills`): containment is checked against the
+/// skill directory only, so a replaced ancestor cannot be detected. Callers
+/// with discovery provenance should use [`open_entry`].
+pub fn open_skill(skill: &Skill) -> Result<SkillContent> {
+	read_skill_body(skill, None)
+}
+
+fn read_skill_body(skill: &Skill, root: Option<&Path>) -> Result<SkillContent> {
+	if skill.path.components().any(|component| matches!(component, Component::ParentDir))
+		|| skill.path.file_name().and_then(|name| name.to_str()) != Some("SKILL.md")
+	{
+		return Err(Error::new(format!("invalid skill path: {}", skill.path.display())));
+	}
+	let base_dir = skill.base_dir();
+	let canonical_base = fs::canonicalize(&base_dir).map_err(|err| {
+		Error::with_source(format!("cannot resolve skill directory: {}", base_dir.display()), err)
+	})?;
+	let canonical = fs::canonicalize(&skill.path)
+		.map_err(|err| Error::with_source(format!("cannot read {}", skill.path.display()), err))?;
+	if !canonical.starts_with(&canonical_base) {
+		return Err(Error::new(format!(
+			"skill path escapes its directory: {}",
+			canonical.display()
+		)));
+	}
+	if let Some(root) = root {
+		// Compare against the canonical root stored at discovery. Re-canonicalizing
+		// the mutable root here would follow a root/ancestor symlink swapped in
+		// after discovery and silently accept the replacement.
+		if root.as_os_str().is_empty() || !canonical.starts_with(root) {
+			return Err(Error::new(format!(
+				"skill path escapes the skills root: {}",
+				canonical.display()
+			)));
+		}
+	}
+	if !canonical.is_file() {
+		return Err(Error::new(format!("skill path is not a file: {}", canonical.display())));
+	}
+	let content = fs::read_to_string(&canonical)
+		.map_err(|err| Error::with_source(format!("cannot read {}", canonical.display()), err))?;
+	let body = split_frontmatter(&content).map_or(content.as_str(), |(_, body)| body).trim();
+	Ok(SkillContent { name: skill.name.clone(), path: canonical, body: body.to_string() })
 }
 
 /// Validation warning with the file it came from.
@@ -110,6 +192,8 @@ pub struct LoadResult {
 
 impl LoadResult {
 	/// Skills eligible for the system-prompt listing (hidden ones excluded).
+	/// Bodies are not loaded; the prompt renders name + description and
+	/// [`open_entry`] supplies the text on explicit invocation.
 	#[must_use]
 	pub fn prompt_skills(&self) -> Vec<Skill> {
 		self
@@ -258,7 +342,7 @@ impl SkillSnapshot {
 		self.entries.read().unwrap_or_else(std::sync::PoisonError::into_inner).clone()
 	}
 
-	/// Skills eligible for the prompt listing.
+	/// Skills eligible for the prompt listing. Bodies are not loaded.
 	#[must_use]
 	pub fn prompt_skills(&self) -> Vec<Skill> {
 		self
@@ -346,6 +430,7 @@ pub fn load_with(options: &LoadOptions) -> Result<LoadResult> {
 				source: format!("{}:{}", scan.provider, scan.level),
 				hide: scanned.hide,
 				contain_root: None,
+				root: scanned.root,
 			});
 		}
 	}
@@ -385,6 +470,7 @@ pub fn load_with(options: &LoadOptions) -> Result<LoadResult> {
 				skill: scanned.skill,
 				source: "custom:user".to_string(),
 				contain_root: None,
+				root: scanned.root,
 			};
 			let real = real_path_or(&entry.skill.path);
 			if real_paths.contains(&real) {
@@ -439,6 +525,7 @@ pub fn load_with(options: &LoadOptions) -> Result<LoadResult> {
 			skill: Skill { description, ..scanned.skill },
 			source: format!("{MANAGED_SKILLS_PROVIDER_ID}:user"),
 			contain_root: None,
+			root: scanned.root,
 		};
 		real_paths.insert(real);
 		map.insert(entry.skill.name.clone(), entry);
@@ -485,7 +572,7 @@ impl pi_agent::tools::task::AutoloadSkillResolver for SnapshotAutoloadResolver {
 		let Some(entry) = self.snapshot.find(name) else {
 			return Ok(None);
 		};
-		let built = build_skill_prompt_message(&entry.skill, "", SkillInvocationKind::Autoload)
+		let built = build_skill_prompt_message(entry, "", SkillInvocationKind::Autoload)
 			.map_err(|error| format!("cannot autoload skill \"{name}\": {error}"))?;
 		Ok(Some(built.message))
 	}
@@ -505,11 +592,7 @@ pub fn expand_skill_invocation(snapshot: &SkillSnapshot, text: &str) -> Result<O
 	let Some(entry) = snapshot.find(&invocation.name) else {
 		return Ok(None);
 	};
-	let built = build_skill_prompt_message(
-		&entry.skill,
-		&invocation.args,
-		SkillInvocationKind::User,
-	)?;
+	let built = build_skill_prompt_message(entry, &invocation.args, SkillInvocationKind::User)?;
 	Ok(Some(built.message))
 }
 
@@ -693,6 +776,8 @@ pub fn compare_skill_order(
 struct ScannedSkill {
 	skill: Skill,
 	hide:  bool,
+	/// Canonical scan root, carried onto [`SkillEntry::root`].
+	root:  PathBuf,
 }
 
 fn scan_dir(dir: &Path, require_description: bool) -> Result<(Vec<ScannedSkill>, Vec<String>)> {
@@ -705,6 +790,14 @@ fn scan_dir(dir: &Path, require_description: bool) -> Result<(Vec<ScannedSkill>,
 			return Ok((Vec::new(), warnings));
 		},
 	};
+	let canonical_root = match fs::canonicalize(dir) {
+		Ok(path) => path,
+		Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok((Vec::new(), warnings)),
+		Err(err) => {
+			warnings.push(format!("Failed to resolve skills directory: {} ({err})", dir.display()));
+			return Ok((Vec::new(), warnings));
+		},
+	};
 	let mut skills = Vec::new();
 	for entry in entries {
 		let entry = entry?;
@@ -713,21 +806,50 @@ fn scan_dir(dir: &Path, require_description: bool) -> Result<(Vec<ScannedSkill>,
 			continue;
 		}
 		let path = entry.path();
-		if !path.is_dir() {
+		let canonical_dir = match fs::canonicalize(&path) {
+			Ok(path) => path,
+			Err(err) => {
+				warnings.push(format!("Failed to resolve skill directory: {} ({err})", path.display()));
+				continue;
+			},
+		};
+		if !canonical_dir.starts_with(&canonical_root) {
+			warnings.push(format!(
+				"Skill directory resolves outside the skills root: {}",
+				path.display()
+			));
+			continue;
+		}
+		if !canonical_dir.is_dir() {
 			continue;
 		}
 		let skill_path = path.join("SKILL.md");
-		if !skill_path.is_file() {
+		let canonical_file = match fs::canonicalize(&skill_path) {
+			Ok(path) => path,
+			Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
+			Err(err) => {
+				warnings.push(format!("Failed to resolve skill file: {} ({err})", skill_path.display()));
+				continue;
+			},
+		};
+		if !canonical_file.starts_with(&canonical_dir) {
+			warnings.push(format!(
+				"SKILL.md resolves outside the skill directory: {}",
+				skill_path.display()
+			));
 			continue;
 		}
-		let content = match fs::read_to_string(&skill_path) {
+		if !canonical_file.is_file() {
+			continue;
+		}
+		let content = match fs::read_to_string(&canonical_file) {
 			Ok(content) => content,
 			Err(_) => {
 				warnings.push(format!("Failed to read skill file: {}", skill_path.display()));
 				continue;
 			},
 		};
-		let (skill, warning) = parse_skill(&skill_path, &content, require_description);
+		let (skill, warning) = parse_skill(&skill_path, &content, require_description, &canonical_root);
 		if let Some(warning) = warning {
 			warnings.push(warning);
 		}
@@ -750,11 +872,12 @@ fn parse_skill(
 	path: &Path,
 	content: &str,
 	require_description: bool,
+	root: &Path,
 ) -> (Option<ScannedSkill>, Option<String>) {
 	// TS `parseFrontmatter` never rejects a missing or unclosed `---` block: the
 	// metadata is empty and the whole file is the body, so a frontmatter-less
 	// third-party `SKILL.md` still loads under its directory name.
-	let (frontmatter, body) = split_frontmatter(content).unwrap_or(("", content));
+	let (frontmatter, _body) = split_frontmatter(content).unwrap_or(("", content));
 	let mut warning = None;
 	let meta = if frontmatter.trim().is_empty() {
 		Value::Null
@@ -794,8 +917,9 @@ fn parse_skill(
 	let hide = meta.get("hide").and_then(Value::as_bool) == Some(true)
 		|| meta.get("disableModelInvocation").and_then(Value::as_bool) == Some(true);
 	let scanned = ScannedSkill {
-		skill: Skill { name, description, path: path.to_path_buf(), body: body.to_string() },
+		skill: Skill { name, description, path: path.to_path_buf(), body: String::new() },
 		hide,
+		root: root.to_path_buf(),
 	};
 	(Some(scanned), warning)
 }
@@ -960,16 +1084,16 @@ pub struct SkillPromptMessage {
 /// (`packages/coding-agent/src/prompts/skills/user-invocation.md` and
 /// `autoload.md`).
 ///
-/// The body is re-read from disk so a skill edited after discovery is injected
-/// in its current form; frontmatter is stripped.
+/// The body is read lazily through [`open_entry`] so a skill edited after
+/// discovery is injected in its current form; frontmatter is stripped.
 pub fn build_skill_prompt_message(
-	skill: &Skill,
+	entry: &SkillEntry,
 	args: &str,
 	kind: SkillInvocationKind,
 ) -> Result<SkillPromptMessage> {
-	let content = fs::read_to_string(&skill.path)
-		.map_err(|err| Error::with_source(format!("cannot read {}", skill.path.display()), err))?;
-	let body = split_frontmatter(&content).map_or(content.as_str(), |(_, body)| body).trim();
+	let skill = &entry.skill;
+	let content = open_entry(entry)?;
+	let body = content.body.as_str();
 	let trimmed_args = args.trim();
 	let message = match kind {
 		SkillInvocationKind::User => {
@@ -1095,7 +1219,8 @@ mod tests {
 		let all = load_with(&isolated_options(&dir)).expect("skills").prompt_skills();
 		let names: Vec<&str> = all.iter().map(|skill| skill.name.as_str()).collect();
 		assert_eq!(names, ["review", "test"]);
-		assert!(all[0].body.contains("body"));
+		assert!(all[0].body.is_empty(), "discovery keeps metadata only");
+		assert!(open_skill(&all[0]).expect("open").body.contains("body"));
 
 		let mut filtered_options = isolated_options(&dir);
 		filtered_options.patterns = vec!["test".to_string()];
@@ -1121,7 +1246,8 @@ mod tests {
 		);
 		let result = load_with(&isolated_options(&dir)).expect("skills");
 		let deploy = result.find("deploy").expect("deploy");
-		assert_eq!(deploy.skill.body.trim(), "authored");
+		assert!(deploy.skill.body.is_empty());
+		assert_eq!(open_entry(deploy).expect("open deploy").body, "authored");
 		assert!(!deploy.is_managed());
 		let notes = result.find("notes").expect("notes");
 		assert!(notes.is_managed());
@@ -1182,7 +1308,7 @@ mod tests {
 		let result = load_with(&options).expect("skills");
 		let review = result.find("review").expect("review");
 		assert_eq!(review.source, "custom:user");
-		assert_eq!(review.skill.body.trim(), "custom body");
+		assert_eq!(open_entry(review).expect("open review").body, "custom body");
 
 		// The same real path is loaded only once even when two roots reach it.
 		let mut options = isolated_options(&dir);
@@ -1289,7 +1415,12 @@ mod tests {
 		let result = load_with(&isolated_options(&dir)).expect("skills");
 		let bare = result.find("bare").expect("frontmatter-less claude skill loads");
 		assert_eq!(bare.skill.name, "bare", "the directory name is the name fallback");
-		assert_eq!(bare.skill.body, body, "the whole file becomes the body");
+		assert!(bare.skill.body.is_empty(), "the body is read lazily");
+		assert_eq!(
+			open_entry(bare).expect("open").body,
+			body.trim(),
+			"the whole file becomes the body"
+		);
 		assert_eq!(bare.source, "claude:user");
 		assert_eq!(
 			result.prompt_skills().iter().map(|skill| skill.name.as_str()).collect::<Vec<_>>(),
@@ -1424,10 +1555,11 @@ mod tests {
 		let path = dir.join(".omp/skills/review/SKILL.md");
 		write(&path, &skill("review", "Code review", "# Review\nbody"));
 		let result = load_with(&isolated_options(&dir)).expect("skills");
-		let skill = result.find("review").expect("review").skill.clone();
+		let entry = result.find("review").expect("review");
+		let skill = &entry.skill;
 		assert_eq!(slash_command_name(&skill.name), "skill:review");
 
-		let user = build_skill_prompt_message(&skill, " check auth ", SkillInvocationKind::User)
+		let user = build_skill_prompt_message(entry, " check auth ", SkillInvocationKind::User)
 			.expect("message");
 		assert!(user.message.starts_with(
 			"[IMPORTANT: User invoked the \"review\" skill; follow its instructions. Full skill below.]"
@@ -1438,16 +1570,129 @@ mod tests {
 		assert_eq!(user.args.as_deref(), Some("check auth"));
 		assert_eq!(user.line_count, 2);
 
-		let bare = build_skill_prompt_message(&skill, "", SkillInvocationKind::User).expect("message");
+		let bare = build_skill_prompt_message(entry, "", SkillInvocationKind::User).expect("message");
 		assert!(!bare.message.contains("\nUser:"));
 		assert!(bare.args.is_none());
 
-		let autoload = build_skill_prompt_message(&skill, "go", SkillInvocationKind::Autoload)
+		let autoload = build_skill_prompt_message(entry, "go", SkillInvocationKind::Autoload)
 			.expect("message");
 		assert!(autoload
 			.message
 			.starts_with(&format!("# Review\nbody\n\n---\n\nSkill: {}", path.display())));
 		assert!(autoload.message.ends_with("User: go"));
 		assert!(!autoload.message.contains("IMPORTANT"));
+	}
+
+	#[test]
+	fn discovery_is_metadata_only_and_open_reads_lazily() {
+		let dir = temp_dir();
+		let path = dir.join("agent/skills/review/SKILL.md");
+		write(&path, &skill("review", "Code review", "first body"));
+
+		let result = load_with(&isolated_options(&dir)).expect("skills");
+		let entry = result.find("review").expect("review");
+		assert!(entry.skill.body.is_empty(), "discovery must not retain the body");
+		assert_eq!(entry.skill.description, "Code review");
+		assert_eq!(open_entry(entry).expect("open").body, "first body");
+		assert_eq!(open_skill(&entry.skill).expect("skill open").body, "first body");
+
+		// open re-reads the file, so edits after discovery are honoured.
+		write(&path, &skill("review", "Code review", "second body"));
+		assert_eq!(open_entry(entry).expect("reopen").body, "second body");
+	}
+
+	#[test]
+	fn open_rejects_traversal_and_non_skill_paths() {
+		let dir = temp_dir();
+		write(&dir.join("agent/skills/review/SKILL.md"), &skill("review", "Review", "body"));
+		let result = load_with(&isolated_options(&dir)).expect("skills");
+		let entry = result.find("review").expect("review");
+
+		let mut traversal = entry.skill.clone();
+		traversal.path = entry.base_dir().join("..").join("review/SKILL.md");
+		let error = open_skill(&traversal).expect_err("traversal");
+		assert!(error.to_string().contains("invalid skill path"), "{error}");
+
+		let mut wrong_file = entry.skill.clone();
+		wrong_file.path = entry.base_dir().join("notes.md");
+		assert!(open_skill(&wrong_file).is_err(), "only SKILL.md is a skill body");
+	}
+
+	#[cfg(unix)]
+	#[test]
+	fn discovery_and_open_reject_symlink_escapes() {
+		use std::os::unix::fs::symlink;
+
+		let dir = temp_dir();
+		let root = dir.join(".omp/skills");
+		let outside = dir.join("outside");
+		write(&outside.join("SKILL.md"), &skill("outside", "Outside", "outside body"));
+		fs::create_dir_all(&root).expect("skills root");
+		symlink(&outside, root.join("linked")).expect("dir symlink");
+		fs::create_dir_all(root.join("leak")).expect("leak dir");
+		symlink(outside.join("SKILL.md"), root.join("leak/SKILL.md")).expect("file symlink");
+		write(&root.join("safe/SKILL.md"), &skill("safe", "Safe", "safe body"));
+
+		let result = load_with(&isolated_options(&dir)).expect("skills");
+		assert!(result.find("linked").is_none(), "directory escape is skipped");
+		assert!(result.find("leak").is_none(), "file escape is skipped");
+		assert!(
+			result.warnings.iter().any(|warning| warning.message.contains("outside the skills root")),
+			"{:?}",
+			result.warnings
+		);
+		assert!(
+			result
+				.warnings
+				.iter()
+				.any(|warning| warning.message.contains("outside the skill directory")),
+			"{:?}",
+			result.warnings
+		);
+		let safe = result.find("safe").expect("safe");
+		assert_eq!(open_entry(safe).expect("open").body, "safe body");
+
+		// Swap SKILL.md after discovery: open must fail closed.
+		fs::remove_file(root.join("safe/SKILL.md")).expect("remove");
+		symlink(outside.join("SKILL.md"), root.join("safe/SKILL.md")).expect("swap");
+		assert!(open_entry(safe).is_err(), "open re-checks file containment");
+
+		// Swap the whole skill directory after discovery: the stored root catches it.
+		fs::remove_dir_all(root.join("safe")).expect("remove dir");
+		symlink(&outside, root.join("safe")).expect("dir swap");
+		assert!(open_entry(safe).is_err(), "open re-checks root containment");
+	}
+
+	#[cfg(unix)]
+	#[test]
+	fn open_fails_closed_when_the_discovered_root_is_replaced() {
+		use std::os::unix::fs::symlink;
+
+		let dir = temp_dir();
+		let root = dir.join(".omp/skills");
+		write(&root.join("review/SKILL.md"), &skill("review", "Review", "body"));
+		let result = load_with(&isolated_options(&dir)).expect("skills");
+		let entry = result.find("review").expect("review");
+		assert_eq!(open_entry(entry).expect("open").body, "body");
+
+		// Replace the discovered root itself.
+		let replacement = dir.join("replacement");
+		write(
+			&replacement.join("review/SKILL.md"),
+			&skill("review", "Review", "replacement body"),
+		);
+		fs::remove_dir_all(&root).expect("remove root");
+		symlink(&replacement, &root).expect("root swap");
+		assert!(open_entry(entry).is_err(), "a replaced root must fail closed");
+
+		// Replace an ancestor of the discovered root.
+		let ancestor = dir.join("ancestor");
+		write(
+			&ancestor.join("skills/review/SKILL.md"),
+			&skill("review", "Review", "ancestor body"),
+		);
+		fs::remove_dir_all(dir.join(".omp")).expect("remove .omp");
+		symlink(&ancestor, dir.join(".omp")).expect("ancestor swap");
+		assert!(open_entry(entry).is_err(), "a replaced ancestor must fail closed");
 	}
 }

@@ -6344,7 +6344,15 @@ fn compose_system_prompt(request: &RunRequest) -> Option<String> {
 		parts.push(format!("# {}\n\n{}", file.path.display(), file.content.trim_end()));
 	}
 	for skill in &request.skills {
-		parts.push(format!("# Skill: {}\n\n{}", skill.name, skill.body.trim()));
+		// D52 metadata-first: discovered skills carry no body, so the prompt gets
+		// name + description. A body is included only when the caller explicitly
+		// preloaded one; `/skill` and autoload read the full text on invocation.
+		let text = if skill.body.trim().is_empty() {
+			skill.description.trim()
+		} else {
+			skill.body.trim()
+		};
+		parts.push(format!("# Skill: {}\n\n{text}", skill.name));
 	}
 	(!parts.is_empty()).then(|| parts.join("\n\n"))
 }
