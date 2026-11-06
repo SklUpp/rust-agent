@@ -54,6 +54,8 @@ jobs:
         run: cargo check --locked -p pi-agent -p omp-cli
       - name: Test agent core and CLI
         run: cargo test --locked -p pi-agent -p omp-cli
+      - name: Test persistent shell session and env allowlist
+        run: cargo test --locked -p pi-shell --test persistent_session --test session_env_allowlist
       - name: Build CLI for the smoke run
         run: cargo build --locked -p omp-cli
       - name: Run real CLI against local OpenAI-compatible fixture
