@@ -29,8 +29,8 @@ use serde_json::{Value, json};
 
 use super::{
 	ParsedFindPattern, extract_raw_paths, fix_unclosed_braces, format_path_relative_to_cwd,
-	has_glob_path_chars, is_root_path, normalize_path, normalize_path_like_input,
-	parse_find_pattern,
+	has_glob_path_chars, hashline::snapshot::SNAPSHOT_MAX_BYTES, is_root_path, normalize_path,
+	normalize_path_like_input, parse_find_pattern,
 	read::{FileDisplayInputs, ReadSnapshotSink, normalize_snapshot_text},
 	resolve_to_cwd, split_top_level_delimited,
 };
@@ -358,11 +358,20 @@ fn run_ast_grep(tool: &AstGrepTool, args: &Value, ctx: &AgentContext) -> Result<
 				let Some(absolute) = absolute_by_display.get(path.as_str()) else {
 					continue;
 				};
+				// Same 4 MiB cap as the store: never buffer a giant file only
+				// to have the sink reject it, and keep raw accounting bounded.
+				let Ok(metadata) = std::fs::metadata(absolute) else {
+					continue;
+				};
+				if metadata.len() > SNAPSHOT_MAX_BYTES as u64 {
+					continue;
+				}
 				let Ok(bytes) = std::fs::read(absolute) else {
 					continue;
 				};
-				let text = normalize_snapshot_text(&bytes);
-				if let Some(tag) = sink.record_file(absolute, &text) {
+				let raw: Arc<[u8]> = bytes.into();
+				let text = normalize_snapshot_text(&raw);
+				if let Some(tag) = sink.record_file(absolute, &text, raw) {
 					tags.insert(path.clone(), tag);
 				}
 			}
@@ -1395,7 +1404,12 @@ mod tests {
 	}
 
 	impl ReadSnapshotSink for TestSink {
-		fn record_file(&self, absolute_path: &Path, full_text: &str) -> Option<String> {
+		fn record_file(
+			&self,
+			absolute_path: &Path,
+			full_text: &str,
+			_raw: Arc<[u8]>,
+		) -> Option<String> {
 			self
 				.files
 				.lock()

@@ -15,11 +15,14 @@ use std::{
 
 use pi_agent::{
 	AgentContext, CancellationToken, EditTool, Tool, ToolResult,
-	tools::hashline::{
-		apply, block,
-		clipboard::Clipboard,
-		hash::{self, LineEnding},
-		parser, snapshot,
+	tools::{
+		ReadTool,
+		hashline::{
+			NativeSnapshotSink, apply, block,
+			clipboard::Clipboard,
+			hash::{self, LineEnding},
+			parser, snapshot,
+		},
 	},
 };
 use serde_json::json;
@@ -354,6 +357,47 @@ async fn edit_applies_a_tagged_range_and_returns_the_new_header() {
 	assert_eq!(dir.read("note.txt"), "alpha\nBETA\ngamma\n");
 	let fresh = tag_of(&path);
 	assert!(result.content.contains(&format!("[note.txt#{fresh}]")), "{}", result.content);
+}
+
+#[tokio::test]
+async fn read_then_edit_uses_exact_raw_bytes_and_rejects_raw_only_drift() {
+	let dir = TempDir::new("read-edit-raw");
+	let store = Arc::new(snapshot::SnapshotStore::new());
+	let path = dir.write("win.txt", "\u{feff}alpha\r\nbeta\r\n");
+	let ctx = AgentContext::new(dir.path.clone());
+	let read = ReadTool::with_snapshot_sink(Arc::new(NativeSnapshotSink::new(Arc::clone(&store))));
+
+	let result = read
+		.execute(&json!({ "path": "win.txt:2-2" }), &ctx)
+		.await
+		.expect("read");
+	assert!(!result.is_error, "{}", result.content);
+	let tag = tag_of(&path);
+	assert!(result.content.starts_with(&format!("[win.txt#{tag}]")), "{}", result.content);
+
+	// A BOM+CRLF read records the exact raw bytes, so an edit anchored to the
+	// tag it displayed applies and preserves the original encoding.
+	let input = format!("[win.txt#{tag}]\nPUT 2.=2:\n+BETA\n");
+	let edited = run_edit(&dir.path, &store, &input).await;
+	assert!(!edited.is_error, "{}", edited.content);
+	assert_eq!(
+		std::fs::read(&path).expect("post-edit bytes"),
+		"\u{feff}alpha\r\nBETA\r\n".as_bytes()
+	);
+
+	// Same normalized text, different raw bytes: the exact-version guard must
+	// reject instead of applying against a version the model never read.
+	let fresh = tag_of(&path);
+	dir.write("win.txt", "alpha\nBETA\n");
+	let drift = run_edit(
+		&dir.path,
+		&store,
+		&format!("[win.txt#{fresh}]\nPUT 1.=1:\n+ALPHA\n"),
+	)
+	.await;
+	assert!(drift.is_error, "{}", drift.content);
+	assert!(drift.content.contains("full raw bytes differ"), "{}", drift.content);
+	assert_eq!(dir.read("win.txt"), "alpha\nBETA\n");
 }
 
 #[tokio::test]

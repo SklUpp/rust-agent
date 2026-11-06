@@ -17,9 +17,10 @@
 //! Display mode is resolved per call from [`FileDisplayInputs`] plus the
 //! per-read `raw` / `immutable` flags (`resolve_file_display_mode`), exactly as
 //! upstream `file-display-mode.ts`. A [`ReadSnapshotSink`] (the hashline module
-//! owns the concrete store) records the whole normalized file plus the
-//! displayed line numbers and returns the `[path#TAG]` header, but only when
-//! hashline is active. A tool built without inputs keeps the historical
+//! owns the concrete store) records the whole normalized file, the exact
+//! pre-normalization raw bytes, and the displayed line numbers, then returns
+//! the `[path#TAG]` header, but only when hashline is active. A tool built
+//! without inputs keeps the historical
 //! sink-driven display: a sink means hashline, otherwise plain `N|TEXT`.
 //!
 //! Cancellation is checked at entry and between scanner chunks for Rust
@@ -95,10 +96,13 @@ const IMAGE_EXTENSIONS: &[&str] = &[
 /// trait only lets `read` record what it displayed. Implementations receive the
 /// absolute display path and canonicalize it themselves.
 pub trait ReadSnapshotSink: Send + Sync {
-	/// Whole file text (BOM stripped, LF-normalized), at most the 4 MiB
-	/// snapshot cap. Returns the 4-hex uppercase tag, or `None` when the file
-	/// cannot be snapshotted.
-	fn record_file(&self, absolute_path: &Path, full_text: &str) -> Option<String>;
+	/// Whole file text (BOM stripped, LF-normalized) plus the exact raw bytes
+	/// it was normalized from (BOM and line endings intact), at most the 4 MiB
+	/// snapshot cap. The raw bytes are the strict version authority: `edit`
+	/// compares them against the live file so a 16-bit tag collision or a
+	/// normalized-only change cannot authorize an overwrite. Returns the
+	/// 4-hex uppercase tag, or `None` when the file cannot be snapshotted.
+	fn record_file(&self, absolute_path: &Path, full_text: &str, raw: Arc<[u8]>) -> Option<String>;
 
 	/// Source line numbers (1-indexed) whose text this read displayed.
 	fn record_seen_lines(&self, absolute_path: &Path, tag: &str, lines: &[u32]);
@@ -364,9 +368,12 @@ impl ReadTool {
 			&& let Some(sink) = self.sink.as_deref()
 			&& let Some(bytes) = read_bounded_regular(&entry.absolute_path, SNAPSHOT_MAX_BYTES).await
 		{
-			let full_text = normalize_snapshot_text(&bytes);
+			let raw: Arc<[u8]> = bytes.into();
+			let full_text = normalize_snapshot_text(&raw);
 			// A region read displays no authored line provenance.
-			if let Some(header) = record_snapshot_text(sink, &entry.absolute_path, &ctx.cwd, &full_text, &[]) {
+			if let Some(header) =
+				record_snapshot_text(sink, &entry.absolute_path, &ctx.cwd, &full_text, &raw, &[])
+			{
 				output = format!("{header}\n{output}");
 			}
 		}
@@ -1904,7 +1911,7 @@ pub(super) async fn read_single_range(
 	let max_lines_to_collect = selected_line_limit.min(DEFAULT_MAX_LINES);
 	let max_bytes = DEFAULT_MAX_BYTES.max(max_lines_to_collect * 512);
 
-	let buffered = match source {
+	let buffered: Option<Arc<[u8]>> = match source {
 		TextSource::File { path, size } if *size <= SNAPSHOT_MAX_BYTES => {
 			read_bounded_regular(path, SNAPSHOT_MAX_BYTES).await
 		},
@@ -1913,13 +1920,14 @@ pub(super) async fn read_single_range(
 		},
 		TextSource::Memory { bytes, .. } => Some(bytes.to_vec()),
 		_ => None,
-	};
-	let (window, snapshot_text) = match buffered {
+	}
+	.map(Arc::<[u8]>::from);
+	let (window, snapshot_text) = match buffered.as_ref() {
 		Some(bytes) => {
-			let text = normalize_snapshot_text(&bytes);
+			let text = normalize_snapshot_text(bytes);
 			// Raw display stays byte-exact; non-raw uses the normalized text
 			// whose hash the snapshot records (BOM stripped, CRLF → LF).
-			let source: &[u8] = if raw { &bytes } else { text.as_bytes() };
+			let source: &[u8] = if raw { bytes.as_ref() } else { text.as_bytes() };
 			let window = scan_bytes(
 				source,
 				start_line,
@@ -2115,7 +2123,9 @@ pub(super) async fn read_single_range(
 	}
 
 	if hash_lines {
-		if let (Some(sink), Some(text), Some(path)) = (sink, snapshot_text.as_deref(), source.path()) {
+		if let (Some(sink), Some(text), Some(raw), Some(path)) =
+			(sink, snapshot_text.as_deref(), buffered.as_ref(), source.path())
+		{
 			if !first_line_exceeds && !window.lines.is_empty() {
 				let seen: Vec<u64> = (0..window.lines.len() as u64)
 					.map(|offset| display_start + offset)
@@ -2123,8 +2133,8 @@ pub(super) async fn read_single_range(
 				let header = match source.memory_url() {
 					// Internal artifacts keep their authored URL in the header;
 					// the snapshot key stays the real path so `edit` matches.
-					Some(url) => record_snapshot_text_display(sink, path, url, text, &seen),
-					None => record_snapshot_text(sink, path, &ctx.cwd, text, &seen),
+					Some(url) => record_snapshot_text_display(sink, path, url, text, raw, &seen),
+					None => record_snapshot_text(sink, path, &ctx.cwd, text, raw, &seen),
 				};
 				if let Some(header) = header {
 					output = format!("{header}\n{output}");
@@ -2217,7 +2227,7 @@ pub(super) async fn read_multi_range(
 	let mut byte_capped: Vec<LineRange> = Vec::new();
 	let mut total_lines: Option<u64> = None;
 
-	let buffered = match source {
+	let buffered: Option<Arc<[u8]>> = match source {
 		TextSource::File { path, size } if *size <= SNAPSHOT_MAX_BYTES => {
 			read_bounded_regular(path, SNAPSHOT_MAX_BYTES).await
 		},
@@ -2226,8 +2236,9 @@ pub(super) async fn read_multi_range(
 		},
 		TextSource::Memory { bytes, .. } => Some(bytes.to_vec()),
 		_ => None,
-	};
-	let snapshot_text = buffered.as_ref().map(|bytes| normalize_snapshot_text(bytes));
+	}
+	.map(Arc::<[u8]>::from);
+	let snapshot_text = buffered.as_deref().map(normalize_snapshot_text);
 
 	for &range in ranges {
 		let requested_length = range
@@ -2371,11 +2382,13 @@ pub(super) async fn read_multi_range(
 	}
 
 	if hash_lines {
-		if let (Some(sink), Some(text), Some(path)) = (sink, snapshot_text.as_deref(), source.path()) {
+		if let (Some(sink), Some(text), Some(raw), Some(path)) =
+			(sink, snapshot_text.as_deref(), buffered.as_ref(), source.path())
+		{
 			if !seen_lines.is_empty() {
 				let header = match source.memory_url() {
-					Some(url) => record_snapshot_text_display(sink, path, url, text, &seen_lines),
-					None => record_snapshot_text(sink, path, &ctx.cwd, text, &seen_lines),
+					Some(url) => record_snapshot_text_display(sink, path, url, text, raw, &seen_lines),
+					None => record_snapshot_text(sink, path, &ctx.cwd, text, raw, &seen_lines),
 				};
 				if let Some(header) = header {
 					output = format!("{header}\n{output}");
@@ -2563,9 +2576,10 @@ fn record_snapshot_text(
 	path: &Path,
 	cwd: &Path,
 	full_text: &str,
+	raw: &Arc<[u8]>,
 	seen: &[u64],
 ) -> Option<String> {
-	let tag = sink.record_file(path, full_text)?;
+	let tag = sink.record_file(path, full_text, Arc::clone(raw))?;
 	if !seen.is_empty() {
 		// The store keys seen lines as u32; a window past that bound is not
 		// representable, so record the snapshot without provenance.
@@ -2583,9 +2597,10 @@ fn record_snapshot_text_display(
 	path: &Path,
 	display: &str,
 	full_text: &str,
+	raw: &Arc<[u8]>,
 	seen: &[u64],
 ) -> Option<String> {
-	let tag = sink.record_file(path, full_text)?;
+	let tag = sink.record_file(path, full_text, Arc::clone(raw))?;
 	if !seen.is_empty() {
 		let seen_32: Option<Vec<u32>> = seen.iter().map(|line| u32::try_from(*line).ok()).collect();
 		if let Some(seen_32) = seen_32 {
@@ -2607,9 +2622,9 @@ async fn record_read_snapshot(
 	if file_size > SNAPSHOT_MAX_BYTES {
 		return None;
 	}
-	let bytes = read_bounded_regular(path, SNAPSHOT_MAX_BYTES).await?;
-	let full_text = normalize_snapshot_text(&bytes);
-	record_snapshot_text(sink, path, cwd, &full_text, seen)
+	let raw: Arc<[u8]> = read_bounded_regular(path, SNAPSHOT_MAX_BYTES).await?.into();
+	let full_text = normalize_snapshot_text(&raw);
+	record_snapshot_text(sink, path, cwd, &full_text, &raw, seen)
 }
 
 // ---------------------------------------------------------------------------
@@ -3285,7 +3300,12 @@ mod display_tests {
 	}
 
 	impl ReadSnapshotSink for TestSink {
-		fn record_file(&self, absolute_path: &Path, full_text: &str) -> Option<String> {
+		fn record_file(
+			&self,
+			absolute_path: &Path,
+			full_text: &str,
+			_raw: Arc<[u8]>,
+		) -> Option<String> {
 			self
 				.files
 				.lock()

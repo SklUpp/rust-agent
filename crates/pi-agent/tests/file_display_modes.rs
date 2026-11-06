@@ -408,6 +408,11 @@ async fn bom_crlf_text_is_normalized_before_hashing() {
 	// The tag and the snapshot text come from the same normalized bytes, so a
 	// later `edit` validates against LF content without a BOM.
 	assert_eq!(snapshot.text, "a\nb\nc\n");
+	assert_eq!(
+		snapshot.raw_bytes(),
+		Some("\u{feff}a\r\nb\r\nc\r\n".as_bytes()),
+		"the exact pre-normalization bytes are the version authority"
+	);
 	assert_eq!(header_tag(&result.content), snapshot.hash);
 	assert!(result.content.ends_with("1:a\n2:b\n3:c"), "{}", result.content);
 	assert_eq!(snapshot.seen_lines, seen(&[1, 2, 3]));

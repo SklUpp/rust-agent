@@ -284,9 +284,9 @@ impl Tool for AstEditTool {
 			return Ok(result);
 		}
 
-		// Hashline previews record the pre-edit bytes so the tag the model sees
-		// is the one a follow-up `edit` validates against (upstream records the
-		// live file the same way before rendering).
+		// Hashline previews record the pre-edit raw bytes so the tag the model
+		// sees is the one a follow-up `edit` validates against (upstream records
+		// the live file the same way before rendering).
 		let tags: BTreeMap<String, String> = if self.hash_lines() {
 			computed
 				.prepared
@@ -295,7 +295,12 @@ impl Tool for AstEditTool {
 					let text = normalize_snapshot_text(&file.original);
 					self
 						.snapshots
-						.record(&canonical_key(&file.absolute), &text, None)
+						.record_with_raw(
+							&canonical_key(&file.absolute),
+							&file.original,
+							&text,
+							None,
+						)
 						.map(|tag| (file.display.clone(), tag))
 				})
 				.collect()
@@ -1047,7 +1052,7 @@ impl PendingAction for AstEditPending {
 					// post-apply bytes), but only hashline output shows the headers,
 					// matching upstream's `useHashLines` gate.
 					let text = normalize_snapshot_text(output);
-					let tag = self.snapshots.record(&key, &text, None);
+					let tag = self.snapshots.record_with_raw(&key, output, &text, None);
 					if self.hash_lines {
 						fresh_tags.extend(tag.map(|tag| format_header(&file.display, &tag)));
 					}

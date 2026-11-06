@@ -35,10 +35,19 @@ impl NativeSnapshotSink {
 		Self { store }
 	}
 
-	/// Record the full normalized text a read observed; returns its 4-hex tag
-	/// (`None` above the 4 MiB snapshot cap).
-	pub fn record_file(&self, absolute_path: &Path, full_text: &str) -> Option<String> {
-		self.store.record(&canonical_key(absolute_path), full_text, None)
+	/// Record the full normalized text a read observed together with the exact
+	/// raw bytes it was normalized from (BOM and line endings intact). The raw
+	/// bytes are the strict version authority `edit` validates against.
+	/// Returns the 4-hex tag (`None` above the 4 MiB snapshot cap).
+	pub fn record_file(
+		&self,
+		absolute_path: &Path,
+		full_text: &str,
+		raw: Arc<[u8]>,
+	) -> Option<String> {
+		self
+			.store
+			.record_shared_raw(&canonical_key(absolute_path), raw, full_text, None)
 	}
 
 	/// Attach the 1-indexed source lines the read actually displayed.

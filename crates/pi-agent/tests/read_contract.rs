@@ -377,7 +377,12 @@ struct TestSink {
 }
 
 impl ReadSnapshotSink for TestSink {
-	fn record_file(&self, absolute_path: &std::path::Path, full_text: &str) -> Option<String> {
+	fn record_file(
+		&self,
+		absolute_path: &std::path::Path,
+		full_text: &str,
+		_raw: Arc<[u8]>,
+	) -> Option<String> {
 		self.files
 			.lock()
 			.expect("files")
@@ -598,12 +603,19 @@ async fn non_raw_buffered_reads_strip_bom_and_normalize_crlf() {
 #[derive(Default)]
 struct RecordingSink {
 	files: Mutex<Vec<String>>,
+	raw:   Mutex<Vec<Vec<u8>>>,
 	seen:  Mutex<Vec<Vec<u32>>>,
 }
 
 impl ReadSnapshotSink for RecordingSink {
-	fn record_file(&self, _: &std::path::Path, full_text: &str) -> Option<String> {
+	fn record_file(
+		&self,
+		_: &std::path::Path,
+		full_text: &str,
+		raw: Arc<[u8]>,
+	) -> Option<String> {
 		self.files.lock().expect("files").push(full_text.to_string());
+		self.raw.lock().expect("raw").push(raw.to_vec());
 		Some("ABCD".to_string())
 	}
 
@@ -629,6 +641,11 @@ async fn snapshot_records_exactly_the_bytes_that_were_scanned() {
 		.expect("read");
 	assert!(result.content.ends_with("\n1:alpha\n2:beta"), "{}", result.content);
 	assert_eq!(sink.files.lock().expect("files")[0], "alpha\nbeta\n");
+	// The raw version authority stays byte-exact before BOM/CRLF normalization.
+	assert_eq!(
+		sink.raw.lock().expect("raw")[0],
+		"\u{feff}alpha\r\nbeta\r\n".as_bytes()
+	);
 	assert_eq!(sink.seen.lock().expect("seen")[0], vec![1, 2]);
 }
 
