@@ -4,15 +4,21 @@
 //! tag-validated, and applied in memory before the first write hits disk, so a
 //! batch never writes a partially-validated set. Commits then land one section
 //! at a time: a later failure or cancellation reports the sections already
-//! written (upstream `patcher.ts` behavior). Each commit re-checks the target's
-//! canonical identity and content tag, so bytes replaced or a symlink retargeted
-//! after validation are not overwritten. Writes preserve BOM, the dominant line
-//! ending, file mode, and symlink targets; moves carry the source permissions.
+//! written (upstream `patcher.ts` behavior). A short tag is never a full
+//! version: for workspace files the requested tag must have a recorded raw
+//! version and the live bytes must still match it, otherwise the edit is
+//! rejected before block resolution and before donor line recovery — even when
+//! the short tags differ. Plan artifacts keep their separate descriptor guard.
+//! Each commit takes the cross-process workspace lease, re-checks canonical
+//! identity, exact raw bytes and inode, and only then publishes. That check
+//! window is best-effort stale detection, not an atomic CAS claim: an external
+//! editor is not excluded. Writes preserve BOM, the dominant line ending, file
+//! mode, and symlink targets; moves carry the source permissions.
 
 use std::{
 	collections::BTreeMap,
 	path::{Path, PathBuf},
-	sync::Mutex,
+	sync::{Arc, Mutex},
 };
 
 use tokio_util::sync::CancellationToken;
@@ -32,6 +38,7 @@ use crate::{
 	state::{AgentContext, ToolResult},
 	tool::{ToolError, tool_result},
 	tools::{MAX_EDIT_BYTES, read_capped, write_atomic_with_mode},
+	workspace_writer::{self, FileVersion, LockError, WorkspaceWriter},
 };
 
 /// Inline cap on unseen anchor lines echoed back by the rejection.
@@ -81,7 +88,10 @@ struct Prepared {
 	noop: bool,
 	/// Exact validated text (UTF-8 bytes; non-UTF-8 is rejected at read);
 	/// commits compare this, never the 16-bit tag.
-	source_raw: String,
+	source_raw: Arc<[u8]>,
+	/// Read-bound full raw version used by the guarded commit. `None` for
+	/// sandbox artifacts, which commit through descriptor-relative helpers.
+	source_version: Option<FileVersion>,
 	/// Unix mode of the validated source (moves publish it on the temp file).
 	source_mode: Option<u32>,
 	/// `(dev, ino)` of the validated target where the platform exposes it.
@@ -331,6 +341,26 @@ fn missing_tag_message(path: &str) -> String {
 	)
 }
 
+/// Rejection for a live file whose short tag still matches but whose full raw
+/// bytes differ from the version the read recorded.
+fn full_version_mismatch_message(path: &str, tag: &str, live_tag: &str) -> String {
+	format!(
+		"{path} changed since it was read: the short tag #{tag} still matches normalized content \
+		 (live #{live_tag}), but the full raw bytes differ. Refusing to apply an edit anchored to a \
+		 different version. Re-read the file and re-issue the edit."
+	)
+}
+
+/// Rejection when the matching tag has no retained raw version. This is the
+/// eviction/missing case: the 16-bit tag alone must not authorize a write.
+fn missing_raw_version_message(path: &str, tag: &str) -> String {
+	format!(
+		"{path} has short tag #{tag}, but its exact raw version is missing or was evicted from the \
+		 session snapshot store. Refusing to apply the edit on the 16-bit tag alone. Re-read the \
+		 file so a full version is recorded, then re-issue the edit."
+	)
+}
+
 fn no_change_diagnostic(path: &str) -> String {
 	format!(
 		"Edits to {path} parsed and applied cleanly, but produced no change: your body row(s) are byte-identical \
@@ -426,8 +456,6 @@ async fn prepare(
 		dest_canonical = Some(dest_key);
 	}
 
-	let source_raw = raw.clone();
-
 	#[cfg(unix)]
 	let (source_mode, source_id) = {
 		use std::os::unix::fs::MetadataExt;
@@ -442,10 +470,22 @@ async fn prepare(
 	let bom = bom.to_string();
 	let line_ending = hash::detect_line_ending(text);
 	let normalized = hash::normalize_to_lf(text);
+	// Move the exact read bytes into the shared representation once; the
+	// snapshot and the guarded version both clone the `Arc`.
+	let source_raw: Arc<[u8]> = Arc::from(raw.into_bytes());
 
 	let live_tag = hash::compute_file_hash(&normalized);
 	let live_matches = live_tag == tag;
 	let stored = store.by_hash(&canonical, &tag);
+	let source_version = if artifact.is_some() {
+		None
+	} else {
+		Some(FileVersion::from_parts(
+			PathBuf::from(&canonical),
+			Arc::clone(&source_raw),
+			source_id,
+		))
+	};
 	let line_vec: Vec<String> = normalized.split('\n').map(str::to_string).collect();
 	let line_refs: Vec<&str> = line_vec.iter().map(String::as_str).collect();
 	let anchor_lines = parser::collect_anchor_lines(&parsed.edits);
@@ -459,6 +499,34 @@ async fn prepare(
 			&line_refs,
 		))
 	};
+
+	// Strict D44 runs before any block resolution or recovery: the requested
+	// tag must have a recorded full raw version and the current source must
+	// still match it byte-for-byte. A missing/evicted raw version or different
+	// raw bytes is stale even when the short tags differ, so a donor line
+	// remap cannot rewrite content the caller never read. Plan artifacts keep
+	// their descriptor-relative donor guard.
+	if artifact.is_none() {
+		match store.raw_status(&canonical, &tag, &source_raw[..]) {
+			snapshot::RawVersionStatus::Missing => {
+				return Err(PrepareError::Failed(missing_raw_version_message(
+					&section.path,
+					&tag,
+				)));
+			},
+			snapshot::RawVersionStatus::Differs => {
+				if live_matches {
+					return Err(PrepareError::Failed(full_version_mismatch_message(
+						&section.path,
+						&tag,
+						&live_tag,
+					)));
+				}
+				return Err(rejected(stored.is_some()));
+			},
+			snapshot::RawVersionStatus::Matches => {},
+		}
+	}
 
 	// Block anchors index the text the tag names, so a drifted file still
 	// resolves them against the recorded snapshot before recovery remaps.
@@ -529,8 +597,14 @@ async fn prepare(
 				}
 				None => {
 					// Record the live version so a later retry sees it as the
-					// current snapshot (upstream `#mismatchError`).
-					store.record(&canonical, &normalized, None);
+					// current snapshot (upstream `#mismatchError`), including
+					// its exact raw bytes for strict version checks.
+					store.record_shared_raw(
+						&canonical,
+						Arc::clone(&source_raw),
+						&normalized,
+						None,
+					);
 					return Err(rejected(stored.is_some()));
 				}
 			}
@@ -558,6 +632,7 @@ async fn prepare(
 		file_op: parsed.file_op,
 		noop,
 		source_raw,
+		source_version,
 		source_mode,
 		source_id,
 		move_dest,
@@ -757,7 +832,7 @@ async fn assert_prepared_target(
 			))
 		})?,
 	};
-	if raw != prepared.source_raw {
+	if raw.as_bytes() != &prepared.source_raw[..] {
 		let now_tag = hash::compute_file_hash(&hash::normalize_to_lf(
 			hash::strip_bom(&raw).1,
 		));
@@ -805,6 +880,42 @@ async fn commit(
 		));
 	}
 
+	// Serialize every writer of these canonical files that uses this API. The
+	// lock is non-blocking: another holder is an explicit refusal, not a wait.
+	// Destinations are locked too, in sorted order, so a move cannot land
+	// while another writer owns the destination.
+	let writer = WorkspaceWriter::new().map_err(|err| {
+		CommitError::Failed(format!("Cannot open the workspace writer lease root: {err}"))
+	})?;
+	let mut lock_targets = Vec::with_capacity(2);
+	lock_targets.push(target.clone());
+	if let Some(dest) = &prepared.move_dest {
+		lock_targets.push(dest.clone());
+	}
+	lock_targets.sort();
+	lock_targets.dedup();
+	let mut leases = Vec::with_capacity(lock_targets.len());
+	for path in &lock_targets {
+		match writer.acquire(path) {
+			Ok(lease) => leases.push(lease),
+			Err(LockError::Occupied { canonical }) => {
+				return Err(CommitError::Failed(format!(
+					"Another writer holds the workspace lease for {} ({}); no bytes were written. \
+					 Retry after it finishes.",
+					path.display(),
+					canonical.display()
+				)));
+			},
+			Err(LockError::Io(err)) => {
+				return Err(CommitError::Failed(format!(
+					"Failed to acquire the workspace lease for {}: {err}",
+					path.display()
+				)));
+			},
+		}
+	}
+	let _leases = leases;
+
 	if matches!(&prepared.file_op, Some(FileOp::Rem)) {
 		// Type-check before reading/validating: a replacement directory must
 		// fail closed, never be treated as removable content.
@@ -850,8 +961,9 @@ async fn commit(
 			"{}{}",
 			prepared.bom,
 			hash::restore_line_endings(&prepared.after, prepared.line_ending)
-		);
-		write_file_mode(&dest_path, persisted.as_bytes(), token, prepared.source_mode)
+		)
+		.into_bytes();
+		write_file_mode(&dest_path, &persisted, token, prepared.source_mode)
 			.await
 			.map_err(|err| match err {
 				CommitError::Failed(message) => CommitError::Failed(format!(
@@ -886,7 +998,12 @@ async fn commit(
 			.unwrap_or_else(|| snapshot::canonical_key(&dest_path));
 		store.relocate(&prepared.canonical, &dest_canonical);
 		let tag = store
-			.record(&dest_canonical, &prepared.after, None)
+			.record_shared_raw(
+				&dest_canonical,
+				Arc::from(persisted),
+				&prepared.after,
+				None,
+			)
 			.unwrap_or_else(|| hash::compute_file_hash(&prepared.after));
 		return Ok(Outcome::Moved {
 			from: prepared.section.path,
@@ -898,7 +1015,12 @@ async fn commit(
 	}
 
 	if prepared.noop {
-		store.record(&prepared.canonical, &prepared.normalized, None);
+		store.record_shared_raw(
+			&prepared.canonical,
+			Arc::clone(&prepared.source_raw),
+			&prepared.normalized,
+			None,
+		);
 		return Ok(Outcome::Noop { path: prepared.section.path, warnings: prepared.warnings });
 	}
 
@@ -910,7 +1032,8 @@ async fn commit(
 		"{}{}",
 		prepared.bom,
 		hash::restore_line_endings(&prepared.after, prepared.line_ending)
-	);
+	)
+	.into_bytes();
 	let canonical_target = PathBuf::from(&prepared.canonical);
 	if let Some(relative) = &prepared.artifact {
 		let root = artifact_root.ok_or_else(|| {
@@ -919,7 +1042,7 @@ async fn commit(
 				prepared.section.path
 			))
 		})?;
-		crate::tools::write_artifact(root, relative, persisted.as_bytes(), token)
+		crate::tools::write_artifact(root, relative, &persisted, token)
 			.await
 			.map_err(|err| match err.kind() {
 				std::io::ErrorKind::Interrupted => CommitError::Cancelled,
@@ -929,10 +1052,27 @@ async fn commit(
 				)),
 			})?;
 	} else {
-		write_file(&canonical_target, persisted.as_bytes(), token).await?;
+		let expected = prepared.source_version.as_ref().ok_or_else(|| {
+			CommitError::Failed(format!(
+				"Internal error: no read-bound version was recorded for {}.",
+				prepared.section.path
+			))
+		})?;
+		workspace_writer::replace_if_unchanged(
+			&canonical_target,
+			expected,
+			&persisted,
+			None,
+		)
+		.map_err(|err| map_guarded_write(&prepared.section.path, err))?;
 	}
 	let tag = store
-		.record(&prepared.canonical, &prepared.after, None)
+		.record_shared_raw(
+			&prepared.canonical,
+			Arc::from(persisted),
+			&prepared.after,
+			None,
+		)
 		.unwrap_or_else(|| hash::compute_file_hash(&prepared.after));
 	Ok(Outcome::Updated {
 		path: prepared.section.path,
@@ -942,8 +1082,15 @@ async fn commit(
 	})
 }
 
-async fn write_file(path: &Path, bytes: &[u8], token: &CancellationToken) -> Result<(), CommitError> {
-	write_file_mode(path, bytes, token, None).await
+fn map_guarded_write(path: &str, error: workspace_writer::WriteError) -> CommitError {
+	if error.is_stale() {
+		CommitError::Failed(format!(
+			"{path} changed after it was read (full raw content or inode no longer matches); \
+			 refusing to overwrite. Re-read and retry."
+		))
+	} else {
+		CommitError::Failed(format!("Failed to write {path}: {error}"))
+	}
 }
 
 /// Atomic write carrying an explicit mode into the temp file, so a moved
@@ -1032,7 +1179,12 @@ mod bind_tests {
 		let path = dir.join("note.txt");
 		std::fs::write(&path, "alpha\n").unwrap();
 		let store = SnapshotStore::new();
-		let _ = store.record(&snapshot::canonical_key(&path), "alpha\n", Some(&[1]));
+		let _ = store.record_with_raw(
+			&snapshot::canonical_key(&path),
+			b"alpha\n",
+			"alpha\n",
+			Some(&[1]),
+		);
 		let tag = hash::compute_file_hash("alpha\n");
 		let token = CancellationToken::new();
 		let mut batch = clipboard::start_batch(BTreeMap::new());
@@ -1073,7 +1225,12 @@ mod bind_tests {
 		std::fs::write(&other, "beta\n").unwrap();
 		std::os::unix::fs::symlink(&safe, &link).unwrap();
 		let store = SnapshotStore::new();
-		let _ = store.record(&snapshot::canonical_key(&link), "alpha\n", Some(&[1]));
+		let _ = store.record_with_raw(
+			&snapshot::canonical_key(&link),
+			b"alpha\n",
+			"alpha\n",
+			Some(&[1]),
+		);
 		let tag = hash::compute_file_hash("alpha\n");
 		let token = CancellationToken::new();
 		let mut batch = clipboard::start_batch(BTreeMap::new());
@@ -1104,13 +1261,146 @@ mod bind_tests {
 	}
 
 	#[tokio::test]
+	async fn prepare_rejects_same_tag_different_raw_snapshot() {
+		let dir = std::env::temp_dir().join(format!("hl-bind-raw-collision-{}", std::process::id()));
+		std::fs::create_dir_all(&dir).unwrap();
+		let path = dir.join("note.txt");
+		std::fs::write(&path, "alpha\n").unwrap();
+		let store = SnapshotStore::new();
+		let canonical = snapshot::canonical_key(&path);
+		// The minting read records the exact raw bytes, not only the tag.
+		let _ = store.record_with_raw(&canonical, b"alpha\n", "alpha\n", Some(&[1]));
+		let tag = hash::compute_file_hash("alpha\n");
+		let token = CancellationToken::new();
+		let mut batch = clipboard::start_batch(BTreeMap::new());
+		let mut budget = Budget::default();
+
+		// Different raw bytes with the SAME normalized 4-hex tag.
+		let mut collision = None;
+		for index in 0..1_000_000u32 {
+			let candidate = format!("alpha\n#{}", index);
+			if hash::compute_file_hash(&candidate) == tag {
+				collision = Some(candidate);
+				break;
+			}
+		}
+		let collision = collision.expect("find a 16-bit tag collision");
+		std::fs::write(&path, &collision).unwrap();
+
+		let result = prepare(
+			section(&dir, "note.txt", &tag, "PUT 1.=1:\n+ALPHA\n"),
+			&dir,
+			&token,
+			&mut batch,
+			&store,
+			&EditToolOptions::default(),
+			&mut budget,
+			None,
+		)
+		.await;
+		match result {
+			Err(PrepareError::Failed(message)) => {
+				assert!(message.contains("full raw bytes differ"), "{message}")
+			},
+			Err(PrepareError::Cancelled) => panic!("unexpected cancel"),
+			Ok(_) => panic!("a normalized tag collision must not authorize the edit"),
+		}
+		assert_eq!(std::fs::read_to_string(&path).unwrap(), collision);
+		let _ = std::fs::remove_dir_all(&dir);
+	}
+
+	#[tokio::test]
+	async fn prepare_rejects_missing_raw_snapshot() {
+		let dir = std::env::temp_dir().join(format!("hl-bind-raw-missing-{}", std::process::id()));
+		std::fs::create_dir_all(&dir).unwrap();
+		let path = dir.join("note.txt");
+		std::fs::write(&path, "alpha\n").unwrap();
+		let store = SnapshotStore::new();
+		let canonical = snapshot::canonical_key(&path);
+		// Legacy/normalized-only record: the 16-bit tag exists, raw does not.
+		let _ = store.record(&canonical, "alpha\n", Some(&[1]));
+		let tag = hash::compute_file_hash("alpha\n");
+		let token = CancellationToken::new();
+		let mut batch = clipboard::start_batch(BTreeMap::new());
+		let mut budget = Budget::default();
+
+		let result = prepare(
+			section(&dir, "note.txt", &tag, "PUT 1.=1:\n+ALPHA\n"),
+			&dir,
+			&token,
+			&mut batch,
+			&store,
+			&EditToolOptions::default(),
+			&mut budget,
+			None,
+		)
+		.await;
+		match result {
+			Err(PrepareError::Failed(message)) => {
+				assert!(message.contains("exact raw version is missing"), "{message}")
+			},
+			Err(PrepareError::Cancelled) => panic!("unexpected cancel"),
+			Ok(_) => panic!("a missing raw version must not fall back to the 16-bit tag"),
+		}
+		assert_eq!(std::fs::read_to_string(&path).unwrap(), "alpha\n");
+		let _ = std::fs::remove_dir_all(&dir);
+	}
+
+	#[tokio::test]
+	async fn prepare_rejects_evicted_raw_snapshot() {
+		let dir = std::env::temp_dir().join(format!("hl-bind-raw-evicted-{}", std::process::id()));
+		std::fs::create_dir_all(&dir).unwrap();
+		let path = dir.join("note.txt");
+		std::fs::write(&path, "alpha\n").unwrap();
+		let store = SnapshotStore::new();
+		let canonical = snapshot::canonical_key(&path);
+		let _ = store.record_with_raw(&canonical, b"alpha\n", "alpha\n", Some(&[1]));
+		// Push the alpha version out of the bounded history while the live file
+		// still carries its content and tag.
+		for index in 0..5 {
+			let text = format!("beta{index}\n");
+			let _ = store.record_with_raw(&canonical, text.as_bytes(), &text, None);
+		}
+		let tag = hash::compute_file_hash("alpha\n");
+		let token = CancellationToken::new();
+		let mut batch = clipboard::start_batch(BTreeMap::new());
+		let mut budget = Budget::default();
+
+		let result = prepare(
+			section(&dir, "note.txt", &tag, "PUT 1.=1:\n+ALPHA\n"),
+			&dir,
+			&token,
+			&mut batch,
+			&store,
+			&EditToolOptions::default(),
+			&mut budget,
+			None,
+		)
+		.await;
+		match result {
+			Err(PrepareError::Failed(message)) => {
+				assert!(message.contains("missing or was evicted"), "{message}")
+			},
+			Err(PrepareError::Cancelled) => panic!("unexpected cancel"),
+			Ok(_) => panic!("an evicted raw version must not fall back to the 16-bit tag"),
+		}
+		assert_eq!(std::fs::read_to_string(&path).unwrap(), "alpha\n");
+		let _ = std::fs::remove_dir_all(&dir);
+	}
+
+	#[tokio::test]
 	async fn commit_rejects_same_tag_different_bytes() {
 		let dir = std::env::temp_dir().join(format!("hl-bind-collision-{}", std::process::id()));
 		std::fs::create_dir_all(&dir).unwrap();
 		let path = dir.join("note.txt");
 		std::fs::write(&path, "alpha\n").unwrap();
 		let store = SnapshotStore::new();
-		let _ = store.record(&snapshot::canonical_key(&path), "alpha\n", Some(&[1]));
+		let _ = store.record_with_raw(
+			&snapshot::canonical_key(&path),
+			b"alpha\n",
+			"alpha\n",
+			Some(&[1]),
+		);
 		let tag = hash::compute_file_hash("alpha\n");
 		let token = CancellationToken::new();
 		let mut batch = clipboard::start_batch(BTreeMap::new());
@@ -1158,7 +1448,12 @@ mod bind_tests {
 		let path = dir.join("gone.txt");
 		std::fs::write(&path, "alpha\n").unwrap();
 		let store = SnapshotStore::new();
-		let _ = store.record(&snapshot::canonical_key(&path), "alpha\n", Some(&[1]));
+		let _ = store.record_with_raw(
+			&snapshot::canonical_key(&path),
+			b"alpha\n",
+			"alpha\n",
+			Some(&[1]),
+		);
 		let tag = hash::compute_file_hash("alpha\n");
 		let token = CancellationToken::new();
 		let mut batch = clipboard::start_batch(BTreeMap::new());
@@ -1195,7 +1490,12 @@ mod bind_tests {
 		let path = dir.join("gone.txt");
 		std::fs::write(&path, "alpha\n").unwrap();
 		let store = SnapshotStore::new();
-		let _ = store.record(&snapshot::canonical_key(&path), "alpha\n", Some(&[1]));
+		let _ = store.record_with_raw(
+			&snapshot::canonical_key(&path),
+			b"alpha\n",
+			"alpha\n",
+			Some(&[1]),
+		);
 		let tag = hash::compute_file_hash("alpha\n");
 		let token = CancellationToken::new();
 		let mut batch = clipboard::start_batch(BTreeMap::new());
@@ -1235,7 +1535,12 @@ mod bind_tests {
 		std::fs::write(&private, "secret\n").unwrap();
 		std::fs::set_permissions(&private, std::fs::Permissions::from_mode(0o600)).unwrap();
 		let store = SnapshotStore::new();
-		let _ = store.record(&snapshot::canonical_key(&private), "secret\n", Some(&[1]));
+		let _ = store.record_with_raw(
+			&snapshot::canonical_key(&private),
+			b"secret\n",
+			"secret\n",
+			Some(&[1]),
+		);
 		let tag = hash::compute_file_hash("secret\n");
 		let token = CancellationToken::new();
 		let mut batch = clipboard::start_batch(BTreeMap::new());

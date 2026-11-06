@@ -9,7 +9,7 @@
 use std::{
 	collections::{BTreeSet, HashMap},
 	path::Path,
-	sync::Mutex,
+	sync::{Arc, Mutex},
 };
 
 use super::hash::compute_file_hash;
@@ -31,11 +31,33 @@ pub struct Snapshot {
 	pub path: String,
 	/// Full normalized (LF, no BOM) file text as observed.
 	pub text: String,
+	/// Exact raw bytes read from disk (BOM and line endings intact), when the
+	/// producer supplied them. This is the strict version authority: the short
+	/// [`Snapshot::hash`] is only a UI tag and can collide.
+	pub raw: Option<Arc<[u8]>>,
 	/// Content-derived tag for [`Snapshot::text`].
 	pub hash: String,
 	/// 1-indexed lines a producer actually displayed. `None` means no
 	/// provenance was recorded, which disables the seen-line guard.
 	pub seen_lines: Option<BTreeSet<u32>>,
+}
+
+impl Snapshot {
+	/// Exact raw bytes this version was recorded from, when available.
+	pub fn raw_bytes(&self) -> Option<&[u8]> {
+		self.raw.as_deref()
+	}
+}
+
+/// Exact raw-version comparison for a requested snapshot tag.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RawVersionStatus {
+	/// No retained version for the tag, or it has no raw provenance.
+	Missing,
+	/// The latest retained version for the tag has these exact raw bytes.
+	Matches,
+	/// Raw bytes differ from the latest retained version for the tag.
+	Differs,
 }
 
 #[derive(Debug, Default)]
@@ -56,7 +78,9 @@ impl Inner {
 		self.versions
 			.values()
 			.flat_map(|history| history.iter())
-			.map(|snapshot| snapshot.text.len())
+			.map(|snapshot| {
+				snapshot.text.len() + snapshot.raw.as_ref().map_or(0, |raw| raw.len())
+			})
 			.sum()
 	}
 
@@ -89,9 +113,46 @@ impl SnapshotStore {
 	///
 	/// Recording byte-identical content again refreshes recency and unions any
 	/// newly displayed lines; distinct texts that collide on the 16-bit tag are
-	/// kept as separate versions because the tag is only an index.
+	/// kept as separate versions because the tag is only an index. A snapshot
+	/// recorded without raw bytes keeps any raw version already attached.
 	pub fn record(&self, path: &str, text: &str, seen_lines: Option<&[u32]>) -> Option<String> {
-		if text.len() > SNAPSHOT_MAX_BYTES {
+		self.record_inner(path, None, text, seen_lines)
+	}
+
+	/// Record the exact raw bytes a read observed together with the normalized
+	/// text and its tag. Strict version checks compare these bytes, so a
+	/// normalized 4-hex tag collision cannot authorize an overwrite.
+	pub fn record_with_raw(
+		&self,
+		path: &str,
+		raw: &[u8],
+		text: &str,
+		seen_lines: Option<&[u32]>,
+	) -> Option<String> {
+		self.record_inner(path, Some(Arc::from(raw)), text, seen_lines)
+	}
+
+	/// Record already-shared raw bytes without copying them again.
+	pub fn record_shared_raw(
+		&self,
+		path: &str,
+		raw: Arc<[u8]>,
+		text: &str,
+		seen_lines: Option<&[u32]>,
+	) -> Option<String> {
+		self.record_inner(path, Some(raw), text, seen_lines)
+	}
+
+	fn record_inner(
+		&self,
+		path: &str,
+		raw: Option<Arc<[u8]>>,
+		text: &str,
+		seen_lines: Option<&[u32]>,
+	) -> Option<String> {
+		if text.len() > SNAPSHOT_MAX_BYTES
+			|| raw.as_ref().is_some_and(|bytes| bytes.len() > SNAPSHOT_MAX_BYTES)
+		{
 			return None;
 		}
 		let hash = compute_file_hash(text);
@@ -104,6 +165,9 @@ impl SnapshotStore {
 				.iter()
 				.position(|snapshot| snapshot.hash == hash && snapshot.text == text)
 			{
+				if let Some(raw) = &raw {
+					history[index].raw = Some(Arc::clone(raw));
+				}
 				merge_seen_lines(&mut history[index], seen_lines);
 				let existing = history.remove(index);
 				history.insert(0, existing);
@@ -114,6 +178,7 @@ impl SnapshotStore {
 			let mut snapshot = Snapshot {
 				path: path.to_string(),
 				text: text.to_string(),
+				raw,
 				hash: hash.clone(),
 				seen_lines: None,
 			};
@@ -124,6 +189,24 @@ impl SnapshotStore {
 		}
 		inner.evict();
 		Some(hash)
+	}
+
+	/// Status of the most recent retained version tagged `hash` against the
+	/// live raw bytes. `Missing` covers both no version and no raw provenance.
+	pub fn raw_status(&self, path: &str, hash: &str, raw: &[u8]) -> RawVersionStatus {
+		let inner = self.inner.lock().unwrap_or_else(|poison| poison.into_inner());
+		let Some(snapshot) = inner
+			.versions
+			.get(path)
+			.and_then(|history| history.iter().find(|snapshot| snapshot.hash == hash))
+		else {
+			return RawVersionStatus::Missing;
+		};
+		match snapshot.raw.as_deref() {
+			None => RawVersionStatus::Missing,
+			Some(stored) if stored == raw => RawVersionStatus::Matches,
+			Some(_) => RawVersionStatus::Differs,
+		}
 	}
 
 	/// Merge displayed lines into the version tagged `hash`.
@@ -140,6 +223,14 @@ impl SnapshotStore {
 	pub fn head(&self, path: &str) -> Option<Snapshot> {
 		let inner = self.inner.lock().unwrap_or_else(|poison| poison.into_inner());
 		inner.versions.get(path)?.first().cloned()
+	}
+
+	/// Exact raw bytes of the latest recorded version, when it has them. The
+	/// `write` overwrite hook compares this with a fresh
+	/// [`FileVersion`](crate::workspace_writer::FileVersion) before publishing.
+	pub fn latest_raw(&self, path: &str) -> Option<Arc<[u8]>> {
+		let inner = self.inner.lock().unwrap_or_else(|poison| poison.into_inner());
+		inner.versions.get(path)?.first()?.raw.clone()
 	}
 
 	/// Retained version for `path` whose tag equals `hash`.
@@ -183,7 +274,10 @@ impl SnapshotStore {
 		let history = inner.versions.entry(to.to_string()).or_default();
 		let mut merged: Vec<Snapshot> = Vec::new();
 		for snapshot in moved.into_iter().chain(history.drain(..)) {
-			if merged.iter().any(|seen| seen.hash == snapshot.hash) {
+			if let Some(existing) = merged.iter_mut().find(|seen| seen.hash == snapshot.hash) {
+				if existing.raw.is_none() {
+					existing.raw = snapshot.raw;
+				}
 				continue;
 			}
 			merged.push(snapshot);

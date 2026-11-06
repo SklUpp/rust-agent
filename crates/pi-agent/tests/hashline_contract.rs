@@ -71,10 +71,11 @@ fn normalized(content: &str) -> String {
 /// Record a file the way `read` does: full normalized text + displayed lines,
 /// into the session store the edit tool will validate against.
 fn record(store: &snapshot::SnapshotStore, path: &Path, seen: &[u32]) -> String {
-	let content = std::fs::read_to_string(path).expect("read for record");
+	let raw = std::fs::read(path).expect("read for record");
+	let content = String::from_utf8_lossy(&raw);
 	let text = normalized(&content);
 	let key = snapshot::canonical_key(path);
-	let tag = store.record(&key, &text, None).expect("record snapshot");
+	let tag = store.record_with_raw(&key, &raw, &text, None).expect("record snapshot");
 	store.record_seen_lines(&key, &tag, seen);
 	tag
 }
@@ -408,24 +409,20 @@ async fn missing_tag_and_noop_are_reported_without_writes() {
 }
 
 #[tokio::test]
-async fn stale_tag_recovers_shifted_anchors() {
+async fn stale_tag_shifted_anchors_are_rejected_without_write() {
 	let dir = TempDir::new("recover-shift");
 	let store = Arc::new(snapshot::SnapshotStore::new());
 	let path = dir.write("note.txt", "alpha\nbeta\ngamma\n");
 	let tag = record(&store, &path, &[1, 2, 3]);
-	// External drift prepends one line: every anchor shifts by +1 uniformly.
+	// External drift prepends one line: every anchor would shift by +1, which
+	// the donor recovery used to remap. Strict raw-version admission refuses
+	// it because the current bytes differ from the tagged read.
 	dir.write("note.txt", "header\nalpha\nbeta\ngamma\n");
 
 	let input = format!("[note.txt#{tag}]\nPUT 2.=2:\n+BETA\n");
 	let result = run_edit(&dir.path, &store, &input).await;
-	assert!(!result.is_error, "{}", result.content);
-	assert!(
-		result.content.contains("Recovered by remapping stale line anchors"),
-		"{}",
-		result.content
-	);
-	assert!(result.content.contains("first changed line 3"), "{}", result.content);
-	assert_eq!(dir.read("note.txt"), "header\nalpha\nBETA\ngamma\n");
+	assert_failed(&result, "file changed between read and edit");
+	assert_eq!(dir.read("note.txt"), "header\nalpha\nbeta\ngamma\n");
 }
 
 #[tokio::test]

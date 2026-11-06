@@ -20,6 +20,7 @@ pub mod task_persisted_revive;
 pub mod tokenizer;
 pub mod tool;
 pub mod tools;
+pub mod workspace_writer;
 
 pub use compaction::{CompactionReport, Compactor};
 pub use durable::{DURABILITY_FAILURE_CODE, DurableBoundary, DurableError};

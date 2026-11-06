@@ -32,11 +32,14 @@ fn registry_with_builtins() -> ToolRegistry {
 /// source lines — into the session store the `edit` tool validates against.
 fn record_edit_snapshot(store: &pi_agent::tools::hashline::SnapshotStore, path: &std::path::Path) -> String {
 	use pi_agent::tools::hashline::{canonical_key, hash};
-	let raw = std::fs::read_to_string(path).expect("read fixture for snapshot");
-	let (_, text) = hash::strip_bom(&raw);
+	let raw = std::fs::read(path).expect("read fixture for snapshot");
+	let content = String::from_utf8_lossy(&raw);
+	let (_, text) = hash::strip_bom(&content);
 	let text = hash::normalize_to_lf(text);
 	let key = canonical_key(path);
-	let tag = store.record(&key, &text, None).expect("record snapshot");
+	let tag = store
+		.record_with_raw(&key, &raw, &text, None)
+		.expect("record snapshot");
 	let lines: Vec<u32> = (1..=text.lines().count().max(1) as u32).collect();
 	store.record_seen_lines(&key, &tag, &lines);
 	tag
