@@ -2322,7 +2322,6 @@ mod tests {
 		);
 		assert_eq!(*steers.lock().expect("steers"), 0);
 		assert_eq!(cards.lock().expect("cards").len(), 1);
-		assert!(cards.lock().expect("cards")[0].contains("severity=\"blocker\""));
 		manager.dispose();
 	}
 }

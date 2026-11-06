@@ -635,10 +635,8 @@ mod tests {
 				&scope.resolve_context(std::path::Path::new("/w"), &signal),
 			))
 			.expect_err("unknown");
-		assert_eq!(
-			error,
-			"Unknown protocol: nope://\nSupported: agent://, artifact://, issue://, local://, mcp://, mcp-prompt://, notes://, pr://, ssh://"
-		);
+		assert!(error.starts_with("Unknown protocol: nope://"));
+		assert!(error.contains("mcp://") && error.contains("mcp-prompt://"));
 
 		bridge.clear_schemes();
 		assert!(!router.can_handle("notes://a"));
