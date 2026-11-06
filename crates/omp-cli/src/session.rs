@@ -4738,7 +4738,7 @@ pub fn import_legacy_v1(
 		version: CURRENT_SESSION_VERSION,
 		id: id.clone(),
 		timestamp: v1_header.timestamp.clone(),
-		cwd,
+		cwd: cwd.clone(),
 		model: v1_header.model.clone(),
 		provider: v1_header.provider.clone(),
 		title: Some(title.to_string()),

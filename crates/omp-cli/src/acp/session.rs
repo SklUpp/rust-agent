@@ -54,7 +54,7 @@ use crate::{
 		types::RpcImage,
 	},
 	runtime,
-	session::{self as session_store, SessionOptions, compute_default_session_dir},
+	session::{self as session_store, SessionOptions, SessionStore, compute_default_session_dir},
 	skills::{self, LoadOptions, SkillSnapshot},
 };
 

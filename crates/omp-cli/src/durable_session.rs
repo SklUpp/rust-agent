@@ -419,7 +419,7 @@ impl DurableSession {
 				parent_message_id: parent,
 				payload: serde_json::to_value(&stored)?,
 			})?;
-			cursor.leaf = Some(entry.id.clone());
+			cursor.leaf = Some(stored.id);
 			Ok(())
 		})?;
 		Ok(id)
@@ -751,43 +751,46 @@ impl DurableBoundary for DurableSession {
 		let cursor = Arc::clone(&self.cursor);
 		let tracked = Arc::clone(&self.tracked);
 		let tracked_ids = Arc::clone(&self.tracked_ids);
-		let mut written_tools = lock(&self.written_tools);
-		let mut written_tool_ids = lock(&self.written_tool_ids);
-		let leaf = lock(&self.cursor).leaf.clone();
-		let mut entries = Vec::new();
-		let mut tail_ids: Vec<Option<String>> = Vec::new();
-		let mut parent = leaf;
-		for message in &messages[start..] {
-			if message.role == Role::Tool
-				&& message.tool_call_id.as_deref().is_some_and(|id| {
-					written_tools.get(id).is_some_and(|count| *count > 0)
-				})
-			{
-				// The outcome write already stored this tool result, in order.
-				// Consume one occurrence: a provider may reuse a tool-call id.
-				let id = message.tool_call_id.as_deref().unwrap_or_default();
-				if let Some(count) = written_tools.get_mut(id) {
-					*count = count.saturating_sub(1);
+		// Keep non-Send std mutex guards inside a lexical scope that ends before
+		// the await below.
+		let (entries, tail_ids, appended_kept) = {
+			let mut written_tools = lock(&self.written_tools);
+			let mut written_tool_ids = lock(&self.written_tool_ids);
+			let leaf = lock(&self.cursor).leaf.clone();
+			let mut entries = Vec::new();
+			let mut tail_ids: Vec<Option<String>> = Vec::new();
+			let mut parent = leaf;
+			for message in &messages[start..] {
+				if message.role == Role::Tool
+					&& message.tool_call_id.as_deref().is_some_and(|id| {
+						written_tools.get(id).is_some_and(|count| *count > 0)
+					})
+				{
+					// The outcome write already stored this tool result, in order.
+					// Consume one occurrence: a provider may reuse a tool-call id.
+					let id = message.tool_call_id.as_deref().unwrap_or_default();
+					if let Some(count) = written_tools.get_mut(id) {
+						*count = count.saturating_sub(1);
+					}
+					tail_ids.push(
+						written_tool_ids
+							.get_mut(id)
+							.and_then(|ids| ids.pop_front()),
+					);
+					continue;
 				}
-				tail_ids.push(
-					written_tool_ids
-						.get_mut(id)
-						.and_then(|ids| ids.pop_front()),
-				);
-				continue;
+				let Some(entry) = self.to_message_entry(message, parent.clone()) else {
+					tail_ids.push(None);
+					continue;
+				};
+				parent = Some(entry.id.clone());
+				tail_ids.push(Some(entry.id.clone()));
+				entries.push(entry);
 			}
-			let Some(entry) = self.to_message_entry(message, parent.clone()) else {
-				tail_ids.push(None);
-				continue;
-			};
-			parent = Some(entry.id.clone());
-			tail_ids.push(Some(entry.id.clone()));
-			entries.push(entry);
-		}
-		drop(written_tools);
-		drop(written_tool_ids);
+			let appended_kept: Vec<String> = tail_ids.iter().flatten().cloned().collect();
+			(entries, tail_ids, appended_kept)
+		};
 		let tail = digests[start..].to_vec();
-		let appended_kept: Vec<String> = tail_ids.iter().flatten().cloned().collect();
 		let session_id = self.session_id.clone();
 		let branch = lock(&self.cursor).branch.clone();
 		self
@@ -933,9 +936,11 @@ impl DurableBoundary for DurableSession {
 	async fn begin_execution(&self, call: &ToolCall) -> Result<String, DurableError> {
 		let session_id = self.session_id.clone();
 		let branch_id = lock(&self.cursor).branch.clone();
+		let provider_call_id = call.id.clone();
+		let tool_name = call.name.clone();
 		let payload = serde_json::json!({
 			"arguments": call.arguments.clone(),
-			"providerCallId": call.id.clone(),
+			"providerCallId": provider_call_id.clone(),
 		});
 		self
 			.writer
@@ -943,8 +948,8 @@ impl DurableBoundary for DurableSession {
 				store.record_intent(NewIntent {
 					session_id,
 					branch_id,
-					provider_call_id: call.id.clone(),
-					tool_name: call.name.clone(),
+					provider_call_id,
+					tool_name,
 					payload,
 				})
 			})
