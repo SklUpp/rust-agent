@@ -570,7 +570,7 @@ fn test_live_sse_two_turn_read_early_delta_and_resume() {
 		&agent_dir,
 		&project_dir,
 		&sessions_dir,
-		session_id,
+		&session_id,
 		"What was in the secret file?",
 		Duration::from_secs(10),
 	);
@@ -836,7 +836,7 @@ fn test_live_sse_sigint_interrupt_during_tool_closes_tool_and_records_aborted() 
 		&agent_dir,
 		&project_dir,
 		&sessions_dir,
-		session_id,
+		&session_id,
 		"Continue after aborted turn",
 		Duration::from_secs(10),
 	);

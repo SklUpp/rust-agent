@@ -78,7 +78,7 @@ fn read_real_ts_v3_session_and_preserve_typed_content() {
 	assert!(stored.len() >= 5, "fixture plus appended turn");
 	let user = &stored[stored.len() - 2].message;
 	assert_eq!(user.role, "user");
-	assert!(user.timestamp_ms > 0, "must have a numeric timestamp");
+	assert!(user.timestamp_ms.is_some_and(|ts| ts > 0), "must have a numeric timestamp");
 
 	let assistant = &stored[stored.len() - 1].message;
 	assert_eq!(assistant.role, "assistant");
@@ -89,7 +89,7 @@ fn read_real_ts_v3_session_and_preserve_typed_content() {
 	assert!(assistant.usage.is_none(), "usage unavailable — must be absent, never zero-filled");
 	assert_eq!(assistant.stop_reason.as_deref(), Some("aborted"));
 	assert_eq!(assistant.error_message.as_deref(), Some("Interrupted by user"));
-	assert!(assistant.timestamp_ms > 0, "must have a numeric timestamp");
+	assert!(assistant.timestamp_ms.is_some_and(|ts| ts > 0), "must have a numeric timestamp");
 	assert!(!test_file.exists(), "appends go to SQLite, not the JSONL fixture");
 
 	fs::remove_dir_all(temp).ok();
