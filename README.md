@@ -2,8 +2,8 @@
 
 Standalone Rust workspace for the coding-agent runtime: one Linux/Termux
 (Bionic, arm64) binary (`omp`) plus embedded text assets. This tree is an
-extraction baseline, not a finished product; it has not been built on this
-device yet.
+extraction baseline, not a finished product. Android release artifact at
+`d9c6078` was built in CI and its CLI tool roundtrip passed on Termux.
 
 ## Provenance
 
@@ -55,3 +55,16 @@ cargo build --release --offline
 ```
 
 No claim is made that the build or tests pass until they are actually run.
+
+## Observed verification
+
+- CI run `42240498060`: Linux `cargo check` and Android release build passed;
+  host test compilation failed and was fixed separately. Full suite not yet green.
+- Android artifact SHA-256:
+  `423aff2912245478d94ba44bd0a93ae0d093562f1ed144bd4c0630e56ca01e79`.
+- On Termux, `omp --version` returned `omp 18.0.9` (exit 0).
+- `python scripts/standalone-smoke.py --binary <downloaded-omp> --timeout 120`
+  passed (exit 0): two local fixture API requests, streamed `read` call, real
+  tool result, final response. No external provider credentials used.
+- Newer shell/writer changes are not covered by that artifact; they require
+  a new CI build and device smoke.
