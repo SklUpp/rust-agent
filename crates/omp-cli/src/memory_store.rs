@@ -1223,7 +1223,7 @@ mod tests {
 			.execute_batch(&format!("PRAGMA user_version = {}", SCHEMA_VERSION + 1))
 			.expect("bump version");
 		drop(connection);
-		let error = MemoryStore::open(&dir).expect_err("newer schema");
+		let error = MemoryStore::open(&dir).err().expect("newer schema");
 		assert!(error.to_string().contains("newer than supported"), "{error}");
 
 		let unversioned = temp_dir();
@@ -1233,7 +1233,7 @@ mod tests {
 			.execute_batch("CREATE TABLE memories (id TEXT PRIMARY KEY)")
 			.expect("seed table");
 		drop(connection);
-		let error = MemoryStore::open(&unversioned).expect_err("unversioned table");
+		let error = MemoryStore::open(&unversioned).err().expect("unversioned table");
 		assert!(error.to_string().contains("refusing to recreate"), "{error}");
 	}
 
