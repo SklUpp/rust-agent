@@ -628,7 +628,8 @@ impl DurableSession {
 			.iter()
 			.filter_map(SessionPart::from_agent_part)
 			.collect();
-		if parts.is_empty() && !message.content.is_empty() {
+		let preserve_plain_text = role == "toolResult";
+		if parts.is_empty() && !message.content.is_empty() && !preserve_plain_text {
 			parts.push(SessionPart::text(message.content.clone()));
 		}
 		if role == "assistant"

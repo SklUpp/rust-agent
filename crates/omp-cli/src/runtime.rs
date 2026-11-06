@@ -6594,7 +6594,13 @@ pub fn history_messages_from_entries(
 				messages.push(message);
 			},
 			"toolResult" => {
-				let parts = source.content.parts();
+				// Preserve the stored text shape: a plain-text result must not
+				// become a Parts([Text]) message on replay, or the durable seed
+				// revision (which projects the stored shape) will diverge.
+				let parts = match &source.content {
+					crate::session::MessageContent::Parts(parts) => parts.clone(),
+					_ => Vec::new(),
+				};
 				let content = source.content.text();
 				let name = source.tool_name.as_deref().unwrap_or("tool");
 				let id = source.tool_call_id.clone().unwrap_or_default();

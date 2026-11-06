@@ -484,3 +484,26 @@ async fn resume_seed_skips_terminal_error_turns_like_provider_replay() {
 		"the next request appends its new user turn"
 	);
 }
+
+#[test]
+fn replay_keeps_plain_text_tool_result_shape() {
+	let entry: omp_cli::session::MessageEntry = serde_json::from_value(serde_json::json!({
+		"type": "message",
+		"id": "t1",
+		"timestamp": "2026-01-01T00:00:00.000Z",
+		"message": {
+			"role": "toolResult",
+			"toolCallId": "c1",
+			"toolName": "bash",
+			"content": "ok",
+			"isError": false,
+			"timestamp": 1
+		}
+	}))
+	.expect("tool result fixture");
+	let replayed = omp_cli::runtime::history_messages_from_entries(std::slice::from_ref(&entry))
+		.expect("replay");
+	assert_eq!(replayed.len(), 1);
+	assert!(replayed[0].parts.is_empty(), "plain text stays a text content");
+	assert_eq!(replayed[0].content, "ok");
+}
