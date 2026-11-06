@@ -284,16 +284,22 @@ fn advisor_flag_runs_isolated_roster_and_preserves_late_blocker_card() {
 		stdout.contains("\"customType\":\"advisor\""),
 		"card must reach the wire: {stdout}"
 	);
-	assert!(
-		stdout.contains("write target deleted"),
-		"blocker text must be visible, not silently dropped: {stdout}"
-	);
-	let card_messages = stdout
+	let wire_card = stdout
 		.lines()
 		.filter(|line| line.contains("\"type\":\"message_end\""))
-		.filter(|line| line.contains("advisor"))
-		.count();
-	assert_eq!(card_messages, 1, "exactly one advisor card pair: {stdout}");
+		.filter(|line| line.contains("\"customType\":\"advisor\""))
+		.map(|line| serde_json::from_str::<serde_json::Value>(line).expect("card json"))
+		.map(|frame| frame["message"].clone())
+		.collect::<Vec<_>>();
+	assert_eq!(wire_card.len(), 1, "exactly one advisor card pair: {stdout}");
+	let wire_text = wire_card[0]["content"][0]["text"]
+		.as_str()
+		.unwrap_or_default()
+		.to_string();
+	assert!(
+		wire_text.contains("write target deleted"),
+		"blocker text must be visible, not silently dropped: {wire_text}"
+	);
 
 	// Persisted once as a `custom_message`, never replayed as a user prompt.
 	let summaries = omp_cli::durable_session::list_session_summaries(&setup.sessions)
@@ -321,11 +327,23 @@ fn advisor_flag_runs_isolated_roster_and_preserves_late_blocker_card() {
 		Some("advisor"),
 		"journal card type"
 	);
-	assert_eq!(
-		card.extra.get("content").and_then(serde_json::Value::as_str),
-		Some("write target deleted"),
-		"journal card body"
+	// The archive keeps the advisor's own words; the `<advisory>` wrapper is a
+	// model-context projection and must never be persisted or displayed.
+	let archived = card
+		.extra
+		.get("content")
+		.and_then(serde_json::Value::as_str)
+		.expect("journal card body");
+	assert_eq!(archived.trim(), "write target deleted", "journal card body");
+	assert!(
+		!archived.contains("<advisory"),
+		"model context projection leaked into the archive: {archived}"
 	);
+	assert_eq!(wire_text, archived, "wire card must mirror the archive");
+	// Structured attribution lives beside the body, not encoded in it.
+	let notes = &card.extra["details"]["notes"];
+	assert_eq!(notes[0]["note"], "write target deleted", "details note");
+	assert_eq!(notes[0]["severity"], "blocker", "details severity");
 
 	// Per-advisor transcript inside the session stem directory, named for its
 	// slug (TS `<session>/__advisor.<slug>.jsonl`).

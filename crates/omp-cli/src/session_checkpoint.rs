@@ -574,6 +574,18 @@ impl CheckpointHost {
 						&& let Some(content) = custom_message_text(entry)
 						&& !content.is_empty()
 					{
+						// Advisor cards archive the raw body; the wrapper is a
+						// model-boundary projection and is restored here.
+						let is_advisor =
+							custom_type == Some(crate::advisor_runtime::CARD_CUSTOM_TYPE);
+						let content = if is_advisor {
+							crate::advisor_emit::archive_projection(
+								&content,
+								entry.extra.get("details").unwrap_or(&Value::Null),
+							)
+						} else {
+							content
+						};
 						match (is_prewalk, custom_type) {
 							(true, Some(custom_type)) => messages
 								.push(Message::guidance(custom_type.to_string(), content)),

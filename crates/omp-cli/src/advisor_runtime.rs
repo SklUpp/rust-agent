@@ -23,8 +23,8 @@ use pi_agent::{Message, Role, StopReason};
 
 use crate::advisor_config::{AdvisorEntry, slugify};
 use crate::advisor_emit::{
-	self, Channel, ChannelInputs, EmissionGuard, Note, Severity, details_json, format_batch,
-	immune_active,
+	self, Channel, ChannelInputs, EmissionGuard, Note, Severity, card_body, details_json,
+	format_batch, immune_active,
 };
 use crate::advisor_identity::{self, AdvisorIdentities};
 use crate::advisor_render::{fingerprint, render_delta};
@@ -117,7 +117,8 @@ pub struct AdvisorCallResult {
 	pub error:              Option<String>,
 }
 
-/// Card sink: `(formatted advisory body, details {notes:[…]})`.
+/// Card sink: `(raw advisory body, details {notes:[…]})`. The body is the
+/// advisor's own text; the `<advisory>` projection never reaches the journal.
 pub type CardSink = Arc<dyn Fn(&str, &serde_json::Value) + Send + Sync>;
 /// Persisted `custom_message` type for one delivered advice card.
 pub const CARD_CUSTOM_TYPE: &str = "advisor";
@@ -1057,14 +1058,13 @@ impl AdvisorManager {
 		if notes.is_empty() {
 			return;
 		}
-		let content = format_batch(&notes);
 		let details = details_json(&notes);
-		self.emit_card(&content, &details);
+		self.emit_card(&card_body(&notes), &details);
 		*self
 			.inner
 			.pending_injection
 			.lock()
-			.unwrap_or_else(|poison| poison.into_inner()) = Some(content);
+			.unwrap_or_else(|poison| poison.into_inner()) = Some(format_batch(&notes));
 	}
 
 	/// Hourly-safe card emission: one card per note batch, persisted/displayed
@@ -1129,19 +1129,19 @@ impl AdvisorManager {
 					.extend(batch);
 			},
 			Channel::Preserve => {
-				self.emit_card(&format_batch(&batch), &details_json(&batch));
+				self.emit_card(&card_body(&batch), &details_json(&batch));
 			},
 			Channel::Steer => {
-				let content = format_batch(&batch);
+				let projection = format_batch(&batch);
 				let steered = self
 					.inner
 					.steer_sink
 					.lock()
 					.unwrap_or_else(|poison| poison.into_inner())
 					.as_ref()
-					.is_some_and(|sink| sink(&content));
+					.is_some_and(|sink| sink(&projection));
 				if steered {
-					self.emit_card(&content, &details_json(&batch));
+					self.emit_card(&card_body(&batch), &details_json(&batch));
 					let completed = self.inner.completed_turns.load(Ordering::SeqCst);
 					*self
 						.inner
@@ -1150,7 +1150,7 @@ impl AdvisorManager {
 						.unwrap_or_else(|poison| poison.into_inner()) = Some(completed + 1);
 				} else {
 					// No live turn: this build never starts an agent-initiated turn.
-					self.emit_card(&content, &details_json(&batch));
+					self.emit_card(&card_body(&batch), &details_json(&batch));
 				}
 			},
 		}
