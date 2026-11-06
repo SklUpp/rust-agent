@@ -3939,8 +3939,8 @@ fn run_export_command(
 						.map(str::to_string),
 				)
 				.is_some_and(|(parent, id)| {
-					crate::durable_session::session_exists(
-						&crate::durable_session::database_path(parent),
+					omp_cli::durable_session::session_exists(
+						&omp_cli::durable_session::database_path(parent),
 						&id,
 					)
 					.unwrap_or(false)
