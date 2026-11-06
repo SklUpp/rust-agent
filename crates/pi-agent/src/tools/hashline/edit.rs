@@ -1012,15 +1012,6 @@ fn append_warnings(text: &mut String, warnings: &[String]) {
 	}
 }
 
-fn tool_result(content: String, is_error: bool) -> ToolResult {
-	ToolResult {
-		tool_call_id: String::new(),
-		content,
-		is_error,
-		terminate: false,
-		details: None,
-	}
-}
 
 #[cfg(test)]
 mod bind_tests {
