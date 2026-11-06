@@ -572,7 +572,7 @@ impl pi_agent::tools::task::AutoloadSkillResolver for SnapshotAutoloadResolver {
 		let Some(entry) = self.snapshot.find(name) else {
 			return Ok(None);
 		};
-		let built = build_skill_prompt_message(entry, "", SkillInvocationKind::Autoload)
+		let built = build_skill_prompt_message(&entry, "", SkillInvocationKind::Autoload)
 			.map_err(|error| format!("cannot autoload skill \"{name}\": {error}"))?;
 		Ok(Some(built.message))
 	}
@@ -592,7 +592,7 @@ pub fn expand_skill_invocation(snapshot: &SkillSnapshot, text: &str) -> Result<O
 	let Some(entry) = snapshot.find(&invocation.name) else {
 		return Ok(None);
 	};
-	let built = build_skill_prompt_message(entry, &invocation.args, SkillInvocationKind::User)?;
+	let built = build_skill_prompt_message(&entry, &invocation.args, SkillInvocationKind::User)?;
 	Ok(Some(built.message))
 }
 
