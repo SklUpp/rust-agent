@@ -154,6 +154,16 @@ impl CancelToken {
 pub struct AbortToken(Option<Weak<Flag>>);
 
 impl AbortToken {
+	/// Whether both tokens point at the same abort flag. Used to clear the
+	/// shared token only when it still belongs to the run that is finishing.
+	#[must_use]
+	pub fn same_flag(&self, other: &Self) -> bool {
+		match (&self.0, &other.0) {
+			(Some(a), Some(b)) => Weak::ptr_eq(a, b),
+			_ => false,
+		}
+	}
+
 	pub fn abort(&self, reason: AbortReason) {
 		if let Some(flag) = &self.0
 			&& let Some(flag) = flag.upgrade()

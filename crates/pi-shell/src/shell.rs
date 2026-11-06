@@ -7,7 +7,10 @@ use std::{
 	fs,
 	io::{self},
 	str,
-	sync::Arc,
+	sync::{
+		Arc,
+		atomic::{AtomicBool, Ordering},
+	},
 	time::Duration,
 };
 
@@ -36,6 +39,11 @@ use crate::{
 
 struct ShellSessionCore {
 	shell: BrushShell,
+	/// Set while a run owns this session, before the command is dispatched.
+	/// Cleared on clean completion. If it survives — panic, hard abort, or a
+	/// dropped caller future — the next lock holder discards this generation
+	/// instead of reusing a shell that may be mid-pipeline.
+	in_flight: bool,
 }
 
 impl Drop for ShellSessionCore {
@@ -91,8 +99,16 @@ impl ShellAbortState {
 		*self.0.lock().await = Some(abort_token);
 	}
 
-	async fn clear(&self) {
-		*self.0.lock().await = None;
+	/// Clears the shared token only when it belongs to `expected`. A run that
+	/// was already superseded must not disarm the next run's `Shell::abort`.
+	async fn clear_if(&self, expected: &AbortToken) {
+		let mut guard = self.0.lock().await;
+		if guard
+			.as_ref()
+			.is_some_and(|current| current.same_flag(expected))
+		{
+			*guard = None;
+		}
 	}
 
 	async fn abort(&self) {
@@ -130,6 +146,11 @@ struct ShellConfig {
 
 #[derive(Debug, Clone, Default)]
 pub struct ShellOptions {
+	/// Initial environment for the persistent session. When set, the ambient
+	/// host environment is not inherited wholesale: only platform essentials
+	/// (`PATH`, `HOME`, temp dirs, locale, `TERM`, Termux's `PREFIX`) are
+	/// copied. These entries are overlaid on top, so pass anything else a
+	/// command needs explicitly.
 	pub session_env:   Option<HashMap<String, String>>,
 	pub snapshot_path: Option<String>,
 	pub minimizer:     Option<minimizer::MinimizerOptions>,
@@ -145,7 +166,12 @@ struct ShellRunConfig {
 #[derive(Debug, Clone, Default)]
 pub struct ShellRunOptions {
 	pub command:    String,
+	/// Working directory for this call. It becomes the persistent session's
+	/// working directory, so later calls without `cwd` inherit it.
 	pub cwd:        Option<String>,
+	/// Environment overlay scoped to this command only. It is removed after
+	/// the command, so it never leaks into later calls (use
+	/// [`ShellOptions::session_env`] for session-wide variables).
 	pub env:        Option<HashMap<String, String>>,
 	pub timeout_ms: Option<u32>,
 }
@@ -164,8 +190,16 @@ pub struct ShellRunResult {
 	pub exit_code:   Option<i32>,
 	pub cancelled:   bool,
 	pub timed_out:   bool,
-	pub minimized:   Option<MinimizerResult>,
-	pub working_dir: Option<String>,
+	/// The run was cancelled/timed out after it owned the persistent session,
+	/// so that session (cwd, exported variables, functions, background jobs)
+	/// was discarded. The next call starts from a fresh shell; a cancelled
+	/// command's partial effects are never inherited. `false` on cancellation
+	/// means the command completed cleanly before the cancel was observed, so
+	/// the session stayed reusable.
+	#[serde(default)]
+	pub session_reset: bool,
+	pub minimized:     Option<MinimizerResult>,
+	pub working_dir:   Option<String>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -173,6 +207,8 @@ pub struct ShellExecuteOptions {
 	pub command:       String,
 	pub cwd:           Option<String>,
 	pub env:           Option<HashMap<String, String>>,
+	/// Session environment. When set, only platform essentials are inherited
+	/// from the host; pass anything else a command needs here.
 	pub session_env:   Option<HashMap<String, String>>,
 	pub timeout_ms:    Option<u32>,
 	pub snapshot_path: Option<String>,
@@ -181,6 +217,21 @@ pub struct ShellExecuteOptions {
 
 pub type ShellExecuteResult = ShellRunResult;
 
+/// A persistent shell session bound to one owner (agent/user).
+///
+/// Calls to [`Shell::run`] are serialized on the session mutex: a call made
+/// while another is running waits for its turn instead of falling back to a
+/// fresh shell, so `cd`, exported variables, and functions set by one call are
+/// visible to the next. Cancelling a call that is still waiting for the mutex
+/// never executes its command and leaves the session untouched. Cancelling a
+/// call after it acquired the session reports [`ShellRunResult::session_reset`]
+/// and discards the session, because an interrupted command may have left the
+/// shell mid-pipeline. The same invalidation applies when a run is hard-aborted,
+/// panics, or its caller future is dropped: the next call discards that
+/// generation before use.
+///
+/// Separate `Shell` instances are fully independent: they never share the
+/// shell, the environment, or the working directory.
 pub struct Shell {
 	session:     Arc<TokioMutex<Option<ShellSessionCore>>>,
 	abort_state: ShellAbortState,
@@ -250,6 +301,11 @@ impl Shell {
 		let Some(core) = guard.as_mut() else {
 			return 0;
 		};
+		// A core left in-flight was abandoned mid-command (panic/hard abort):
+		// it will be discarded by the next run, so never pin it as retained.
+		if core.in_flight {
+			return 0;
+		}
 		let jobs = core.shell.jobs_mut();
 		// Fail closed: a poll error leaves the job table in an unknown state, so
 		// report 0 (drop the shell) rather than pin a retained session forever on
@@ -323,6 +379,17 @@ pub async fn execute_shell_streams(
 	run_shell_oneshot_streams(config, run_config, streams, cancel_token).await
 }
 
+enum SessionRunOutcome {
+	/// The request was cancelled before it dispatched any command (it was
+	/// still waiting for the session mutex, or the cancel arrived while the
+	/// session was being materialized). The persistent session is untouched.
+	CancelledBeforeStart(AbortReason),
+	Completed {
+		result:         Result<(ExecutionResult, Option<MinimizerResult>, Option<String>)>,
+		session_reset:  bool,
+	},
+}
+
 async fn run_shell_session(
 	session: Arc<TokioMutex<Option<ShellSessionCore>>>,
 	abort_state: ShellAbortState,
@@ -342,28 +409,80 @@ async fn run_shell_session(
 		}
 	});
 
+	let at_outer = ct.emplace_abort_token();
+	let at_run = at_outer.clone();
+	let ct_wait = ct.clone();
+	// True once the task actually dispatches the command. Cancellation before
+	// this point must leave the persistent session untouched.
+	let run_started = Arc::new(AtomicBool::new(false));
 	let mut run_task = tokio::spawn({
 		let session = session.clone();
 		let abort_state = abort_state.clone();
 		let tokio_cancel = tokio_cancel.clone();
-		let at = ct.emplace_abort_token();
 		let spawn_registry = spawn_registry.clone();
+		let run_started = run_started.clone();
 		async move {
-			let mut session_guard = session.lock().await;
+			// A call queued behind another call is cancellable while it waits:
+			// the request is dropped instead of running after the lock frees.
+			let mut session_guard = tokio::select! {
+				guard = session.lock() => guard,
+				reason = ct_wait.wait() => {
+					return SessionRunOutcome::CancelledBeforeStart(reason);
+				},
+			};
+
+			// An in-flight mark that survived means the previous owner was
+			// aborted or panicked mid-command. Discard that core now; a clean
+			// completion clears the mark, so a neighbour's fresh session is
+			// never touched.
+			if session_guard.as_ref().is_some_and(|session| session.in_flight) {
+				*session_guard = None;
+			}
+			if ct_wait.aborted() {
+				return SessionRunOutcome::CancelledBeforeStart(ct_wait.wait().await);
+			}
 
 			let session = match &mut *session_guard {
 				Some(session) => session,
-				None => session_guard.insert(
-					create_session_for_run(
-						&config,
-						Some(spawn_registry.clone()),
-						Some(tokio_cancel.clone()),
-					)
-					.await?,
-				),
+				None => match create_session_for_run(
+					&config,
+					Some(spawn_registry.clone()),
+					Some(tokio_cancel.clone()),
+				)
+				.await
+				{
+					Ok(session) => session_guard.insert(session),
+					Err(err) => {
+						return SessionRunOutcome::Completed { result: Err(err), session_reset: false };
+					},
+				},
 			};
-			abort_state.set(at).await;
-			run_shell_command(session, &run_config, on_chunk, tokio_cancel, spawn_registry).await
+			// Cancellation can land while the session is materialized (e.g.
+			// while a snapshot is sourced), still before any command runs.
+			if ct_wait.aborted() {
+				return SessionRunOutcome::CancelledBeforeStart(ct_wait.wait().await);
+			}
+
+			abort_state.set(at_run.clone()).await;
+			// Ownership is marked under the lock before dispatch. Any abrupt
+			// exit (panic, hard abort, dropped caller) leaves it set, and the
+			// next lock holder invalidates exactly this core.
+			session.in_flight = true;
+			run_started.store(true, Ordering::SeqCst);
+			let result =
+				run_shell_command(session, &run_config, on_chunk, tokio_cancel, spawn_registry)
+					.await;
+			let cancelled = ct_wait.aborted();
+			let keepalive = result.as_ref().is_ok_and(|(exec, ..)| session_keepalive(exec));
+			// Reset while still holding the lock: the next call must not inherit
+			// a shell an interrupted command left mid-pipeline.
+			if cancelled || !keepalive {
+				*session_guard = None;
+			} else if let Some(session) = session_guard.as_mut() {
+				session.in_flight = false;
+			}
+			abort_state.clear_if(&at_run).await;
+			SessionRunOutcome::Completed { result, session_reset: cancelled }
 		}
 	});
 
@@ -373,49 +492,101 @@ async fn run_shell_session(
 	let res = tokio::select! {
 		res = &mut run_task => res,
 		reason = ct.wait() => {
+			let started_before = run_started.load(Ordering::SeqCst);
 			tokio_cancel.cancel();
 			let graceful = time::timeout(Duration::from_secs(2), &mut run_task).await;
-			if graceful.is_err() {
-				run_task.abort();
-				let _ = run_task.await;
-			}
-			abort_state.clear().await;
-			// Use try_lock to avoid deadlocking if another task holds the session.
-			// If we can't acquire the lock, the session will be cleaned up when the
-			// holding task finishes.
-			if let Ok(mut session_guard) = session.try_lock() {
-				*session_guard = None;
-			}
+			let elapsed = graceful.is_err();
+			// A task that returned on its own reports the truth: it reset the
+			// session only when it observed the cancel. A hard abort or panic
+			// leaves the in-flight mark set; invalidate that marked core here
+			// (a queued call that acquired the lock may already have done so,
+			// and its fresh core has the mark clear, so it is never touched).
+			let session_reset = match graceful {
+				Ok(Ok(SessionRunOutcome::Completed { session_reset, .. })) => session_reset,
+				Ok(Ok(SessionRunOutcome::CancelledBeforeStart(_))) => false,
+				Ok(Err(_)) | Err(_) => {
+					if elapsed {
+						run_task.abort();
+						let _ = run_task.await;
+					}
+					let started = started_before || run_started.load(Ordering::SeqCst);
+					if started
+						&& let Ok(mut session_guard) = session.try_lock()
+						&& session_guard.as_ref().is_some_and(|core| core.in_flight)
+					{
+						*session_guard = None;
+					}
+					started
+				},
+			};
+			abort_state.clear_if(&at_outer).await;
 			let _ = process_cancel_bridge.await;
 			guard.disarm();
 			return Ok(ShellRunResult {
-				exit_code:   None,
-				cancelled:   matches!(reason, AbortReason::Signal),
-				timed_out:   matches!(reason, AbortReason::Timeout),
-				minimized:   None,
+				exit_code: None,
+				cancelled: matches!(reason, AbortReason::Signal),
+				timed_out: matches!(reason, AbortReason::Timeout),
+				session_reset,
+				minimized: None,
 				working_dir: None,
 			});
 		}
 	};
-	let res =
-		res.unwrap_or_else(|err| Err(Error::msg(format!("Shell execution task failed: {err}"))));
 	guard.disarm();
 	process_cancel_bridge.abort();
 	let _ = process_cancel_bridge.await;
-	abort_state.clear().await;
 
-	let keepalive = res.as_ref().is_ok_and(|(exec, ..)| session_keepalive(exec));
-	if !keepalive {
-		*session.lock().await = None;
+	abort_state.clear_if(&at_outer).await;
+	let outcome = match res {
+		Ok(outcome) => outcome,
+		Err(err) => {
+			// A panicked task releases the lock with its in-flight mark still
+			// set. Drop only that interrupted core; if a queued call already
+			// owns the lock it will invalidate the mark itself, and a fresh
+			// core has the mark clear, so `try_lock` here can never clear a
+			// neighbour's healthy session.
+			if let Ok(mut session_guard) = session.try_lock()
+				&& session_guard.as_ref().is_some_and(|session| session.in_flight)
+			{
+				*session_guard = None;
+			}
+			return Err(Error::msg(format!("Shell execution task failed: {err}")));
+		},
+	};
+	match outcome {
+		SessionRunOutcome::CancelledBeforeStart(reason) => Ok(ShellRunResult {
+			exit_code:      None,
+			cancelled:      matches!(reason, AbortReason::Signal),
+			timed_out:      matches!(reason, AbortReason::Timeout),
+			session_reset:  false,
+			minimized:      None,
+			working_dir:    None,
+		}),
+		SessionRunOutcome::Completed { result, session_reset } => {
+			if session_reset {
+				// The task observed the cancel after the command was dispatched;
+				// it discarded the session under the lock.
+				let reason = ct.wait().await;
+				return Ok(ShellRunResult {
+					exit_code:     None,
+					cancelled:     matches!(reason, AbortReason::Signal),
+					timed_out:     matches!(reason, AbortReason::Timeout),
+					session_reset: true,
+					minimized:     None,
+					working_dir:   None,
+				});
+			}
+			let (exec, minimized, working_dir) = result?;
+			Ok(ShellRunResult {
+				exit_code:     Some(exit_code(&exec)),
+				cancelled:     false,
+				timed_out:     false,
+				session_reset: false,
+				working_dir,
+				minimized,
+			})
+		},
 	}
-	let (exec, minimized, working_dir) = res?;
-	Ok(ShellRunResult {
-		exit_code: Some(exit_code(&exec)),
-		cancelled: false,
-		timed_out: false,
-		working_dir,
-		minimized,
-	})
 }
 
 async fn run_shell_oneshot(
@@ -464,11 +635,12 @@ async fn run_shell_oneshot(
 			let _ = process_cancel_bridge.await;
 			guard.disarm();
 			return Ok(ShellExecuteResult {
-				exit_code:   None,
-				cancelled:   matches!(reason, AbortReason::Signal),
-				timed_out:   matches!(reason, AbortReason::Timeout),
-				minimized:   None,
-				working_dir: None,
+				exit_code:     None,
+				cancelled:     matches!(reason, AbortReason::Signal),
+				timed_out:     matches!(reason, AbortReason::Timeout),
+				session_reset: false,
+				minimized:     None,
+				working_dir:   None,
 			});
 		},
 	};
@@ -480,9 +652,10 @@ async fn run_shell_oneshot(
 		.unwrap_or_else(|err| Err(Error::msg(format!("Shell execution task failed: {err}"))));
 	let (exec, minimized, working_dir) = res?;
 	Ok(ShellExecuteResult {
-		exit_code: Some(exit_code(&exec)),
-		cancelled: false,
-		timed_out: false,
+		exit_code:     Some(exit_code(&exec)),
+		cancelled:     false,
+		timed_out:     false,
+		session_reset: false,
 		working_dir,
 		minimized,
 	})
@@ -535,11 +708,12 @@ async fn run_shell_oneshot_streams(
 			let _ = process_cancel_bridge.await;
 			guard.disarm();
 			return Ok(ShellExecuteResult {
-				exit_code: None,
-				cancelled: matches!(reason, AbortReason::Signal),
-				timed_out: matches!(reason, AbortReason::Timeout),
-				minimized: None,
-				working_dir: None,
+				exit_code:     None,
+				cancelled:     matches!(reason, AbortReason::Signal),
+				timed_out:     matches!(reason, AbortReason::Timeout),
+				session_reset: false,
+				minimized:     None,
+				working_dir:   None,
 			});
 		},
 	};
@@ -551,11 +725,12 @@ async fn run_shell_oneshot_streams(
 		.unwrap_or_else(|err| Err(Error::msg(format!("Shell execution task failed: {err}"))));
 	let (exec, working_dir) = res?;
 	Ok(ShellExecuteResult {
-		exit_code: Some(exit_code(&exec)),
-		cancelled: false,
-		timed_out: false,
+		exit_code:     Some(exit_code(&exec)),
+		cancelled:     false,
+		timed_out:     false,
+		session_reset: false,
 		working_dir,
-		minimized: None,
+		minimized:     None,
 	})
 }
 
@@ -641,7 +816,56 @@ async fn create_session(config: &ShellConfig) -> Result<ShellSessionCore> {
 	create_session_for_run(config, None, None).await
 }
 
-/// Copies the host environment into `shell`, merging duplicate `PATH` values
+/// Ambient variables that survive into a session with an explicit
+/// `session_env`. Everything else on the host (API tokens, credential files,
+/// tool-specific configuration) must be opted into via `session_env`.
+fn is_allowlisted_ambient_env(key: &str) -> bool {
+	let key = normalize_env_key(key);
+	matches!(
+		key,
+		"PATH"
+			| "HOME"
+			| "TMPDIR"
+			| "TMP"
+			| "TEMP"
+			| "PREFIX"
+			| "TERM"
+			| "LANG"
+			| "LC_ALL"
+			| "LC_CTYPE"
+			| "LC_MESSAGES"
+			| "TZ"
+	) || is_windows_platform_env(key)
+}
+
+#[cfg(windows)]
+fn is_windows_platform_env(key: &str) -> bool {
+	[
+		"SystemRoot",
+		"windir",
+		"SystemDrive",
+		"COMSPEC",
+		"PATHEXT",
+		"USERPROFILE",
+		"APPDATA",
+		"LOCALAPPDATA",
+		"HOMEDRIVE",
+		"HOMEPATH",
+		"ProgramData",
+		"NUMBER_OF_PROCESSORS",
+		"PROCESSOR_ARCHITECTURE",
+		"OS",
+	]
+	.iter()
+	.any(|candidate| key.eq_ignore_ascii_case(candidate))
+}
+
+#[cfg(not(windows))]
+const fn is_windows_platform_env(_key: &str) -> bool {
+	false
+}
+
+/// Copies the given environment into `shell`, merging duplicate `PATH` values
 /// and registering the merged `PATH` last.
 ///
 /// Entries whose key or value is not valid Unicode are skipped: a corrupt
@@ -754,7 +978,19 @@ async fn create_session_for_run(
 		}
 	}
 
-	copy_env_into_shell(&mut shell, std::env::vars_os())?;
+	// With an explicit `session_env` the caller owns the environment: inherit
+	// only the platform basics (PATH/HOME/temp/locale) and never ambient
+	// credentials or tool config. Without one, one-shot wrappers keep the
+	// historical full host environment.
+	if config.session_env.is_some() {
+		copy_env_into_shell(
+			&mut shell,
+			std::env::vars_os()
+				.filter(|(key, _)| key.to_str().is_some_and(is_allowlisted_ambient_env)),
+		)?;
+	} else {
+		copy_env_into_shell(&mut shell, std::env::vars_os())?;
+	}
 
 	if let Some(env) = config.session_env.as_ref() {
 		for (key, value) in env {
@@ -780,7 +1016,7 @@ async fn create_session_for_run(
 		source_snapshot(&mut shell, snapshot_path, spawn_registry, cancel_token).await?;
 	}
 
-	Ok(ShellSessionCore { shell })
+	Ok(ShellSessionCore { shell, in_flight: false })
 }
 
 async fn source_snapshot(

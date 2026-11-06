@@ -1,3 +1,12 @@
+//! Shell execution for pi.
+//!
+//! [`shell::Shell`] owns a persistent, per-instance session: `cd`, exported
+//! variables, and functions survive between calls, and concurrent calls are
+//! serialized instead of falling back to a fresh shell. A call cancelled
+//! before it dispatches leaves the session untouched; a call cancelled
+//! mid-command discards it, reported by `ShellRunResult::session_reset`.
+//! One-shot helpers ([`execute_shell`], [`execute_shell_streams`]) stay
+//! stateless.
 pub mod cancel;
 pub mod minimizer;
 pub mod process;
