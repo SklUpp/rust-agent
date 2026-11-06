@@ -11,7 +11,7 @@
 //! beside it.
 
 use std::{
-	collections::{HashMap, VecDeque},
+	collections::{HashMap, HashSet, VecDeque},
 	path::{Path, PathBuf},
 	sync::{
 		Arc, Mutex,
@@ -1434,7 +1434,50 @@ fn seed_entries(
 				.filter_map(|id| by_id.get(id.as_str()).map(|entry| (*entry).clone()))
 				.collect()
 		},
-		None => branch.to_vec(),
+		None => {
+			// Mirror `CheckpointHost::context_messages`: an assistant batch may
+			// have sibling tool results on another branch; they are replayed
+			// immediately after the call. The seed must include them or resume
+			// sees a shorter/different projection than the host.
+			let mut ordered = Vec::with_capacity(branch.len());
+			let mut emitted: HashSet<String> = HashSet::new();
+			for entry in branch {
+				if !emitted.insert(entry.id.clone()) {
+					continue;
+				}
+				ordered.push(entry.clone());
+				if entry.message.role != "assistant" {
+					continue;
+				}
+				let call_ids: HashSet<String> = entry
+					.message
+					.content
+					.parts()
+					.iter()
+					.filter(|part| part.kind == "toolCall")
+					.filter_map(|part| {
+						part
+							.extra
+							.get("id")
+							.and_then(Value::as_str)
+							.map(str::to_string)
+					})
+					.collect();
+				for sibling in all.iter().filter(|sibling| {
+					sibling.message.role == "toolResult"
+						&& sibling
+							.message
+							.tool_call_id
+							.as_deref()
+							.is_some_and(|id| call_ids.contains(id))
+				}) {
+					if emitted.insert(sibling.id.clone()) {
+						ordered.push(sibling.clone());
+					}
+				}
+			}
+			ordered
+		},
 	};
 	// Use the exact provider-replay projection: terminal error/aborted turns
 	// and their paired tool results stay archived but are not part of the seed.
@@ -1648,5 +1691,80 @@ mod tests {
 			"revive inserts the real contract prompt, not a stale System from the transcript"
 		);
 		let _ = std::fs::remove_dir_all(dir);
+	}
+}
+
+#[cfg(test)]
+mod projection_tests {
+	use super::{MessageEntry, seed_entries};
+	use serde_json::{Value, json};
+
+	fn entry(value: Value) -> MessageEntry {
+		serde_json::from_value(value).expect("session entry fixture")
+	}
+
+	fn user(id: &str) -> MessageEntry {
+		entry(json!({
+			"type": "message",
+			"id": id,
+			"timestamp": "2026-01-01T00:00:00.000Z",
+			"message": { "role": "user", "content": id, "timestamp": 1 }
+		}))
+	}
+
+	#[test]
+	fn seed_replays_sibling_tool_results_in_context_order() {
+		let assistant = entry(json!({
+			"type": "message",
+			"id": "a1",
+			"timestamp": "2026-01-01T00:00:00.000Z",
+			"message": {
+				"role": "assistant",
+				"content": [{ "type": "toolCall", "id": "c1", "name": "bash", "arguments": {} }],
+				"stopReason": "toolUse",
+				"timestamp": 1
+			}
+		}));
+		let sibling = entry(json!({
+			"type": "message",
+			"id": "t1",
+			"timestamp": "2026-01-01T00:00:00.000Z",
+			"message": {
+				"role": "toolResult",
+				"toolCallId": "c1",
+				"toolName": "bash",
+				"content": "ok",
+				"isError": false,
+				"timestamp": 1
+			}
+		}));
+		let branch = vec![user("u1"), assistant];
+		let all = vec![user("u1"), branch[1].clone(), sibling];
+		let ids: Vec<String> = seed_entries(&branch, None, &all)
+			.into_iter()
+			.filter_map(|(_, id)| id)
+			.collect();
+		assert_eq!(ids, vec!["u1", "a1", "t1"], "sibling result is replayed after its call");
+	}
+
+	#[test]
+	fn seed_drops_terminal_error_turns_but_keeps_archive_input() {
+		let failed = entry(json!({
+			"type": "message",
+			"id": "a1",
+			"timestamp": "2026-01-01T00:00:00.000Z",
+			"message": {
+				"role": "assistant",
+				"content": "boom",
+				"stopReason": "error",
+				"timestamp": 1
+			}
+		}));
+		let branch = vec![user("u1"), failed];
+		let ids: Vec<String> = seed_entries(&branch, None, &branch)
+			.into_iter()
+			.filter_map(|(_, id)| id)
+			.collect();
+		assert_eq!(ids, vec!["u1"], "terminal error turns are archive-only");
 	}
 }

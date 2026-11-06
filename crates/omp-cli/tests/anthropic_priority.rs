@@ -335,24 +335,19 @@ fn service_tier_change_journals_strings_and_reset_survives_resume() {
 		"an explicit re-arm restores priority"
 	);
 
-	let log = std::fs::read_dir(&dir)
-		.expect("session dir")
-		.flatten()
-		.map(|entry| entry.path())
-		.find(|path| path.extension().and_then(|ext| ext.to_str()) == Some("jsonl"))
-		.expect("session log");
-	let contents = std::fs::read_to_string(&log).expect("read log");
-	let entries: Vec<serde_json::Value> = contents
-		.lines()
-		.filter(|line| !line.trim().is_empty())
-		.map(|line| serde_json::from_str(line).expect("json entry"))
-		.collect();
-	let tiers_json: Vec<&serde_json::Value> = entries
+	let journal = SessionStore::open(&tier_options(dir.clone(), "priority-tier"));
+	let tiers_json: Vec<&serde_json::Value> = journal
+		.entries()
 		.iter()
-		.filter(|entry| entry["type"] == "service_tier_change")
-		.map(|entry| &entry["serviceTier"])
+		.filter(|entry| entry.kind == "service_tier_change")
+		.map(|entry| {
+			entry
+				.extra
+				.get("serviceTier")
+				.expect("service tier entry payload")
+		})
 		.collect();
-	assert_eq!(tiers_json.len(), 3, "selection, reset, re-arm were all journaled");
+	assert_eq!(tiers_json.len(), 3, "selection, reset, re-arm were all durable");
 	assert_eq!(tiers_json[0]["anthropic"], "priority", "values are ServiceTier strings");
 	assert!(tiers_json[1].is_null(), "the reset is null, never false");
 	let _ = std::fs::remove_dir_all(&dir);
@@ -377,15 +372,22 @@ fn fork_restores_the_recorded_service_tier() {
 		.expect("append selection");
 	let source = store.file().map(std::path::Path::to_path_buf).expect("session file");
 	let fork = omp_cli::session::fork_session(&source, None, Some(&dir)).expect("fork");
-	let contents = std::fs::read_to_string(&fork).expect("fork log");
+	let fork_id = fork
+		.file_stem()
+		.and_then(std::ffi::OsStr::to_str)
+		.expect("fork id")
+		.to_string();
+	let mut options = tier_options(dir.clone(), "unused");
+	options.id = Some(fork_id);
+	options.continue_latest = false;
+	let forked = SessionStore::open(&options);
 	assert!(
-		contents.contains("\"type\":\"service_tier_change\""),
+		forked
+			.entries()
+			.iter()
+			.any(|entry| entry.kind == "service_tier_change"),
 		"the fork carries the recorded selection"
 	);
-	let mut options = tier_options(dir.clone(), "unused");
-	options.id = None;
-	options.continue_latest = true;
-	let forked = SessionStore::open(&options);
 	assert_eq!(
 		forked.service_tier_by_family(),
 		tiers(&[("anthropic", "priority")]),
