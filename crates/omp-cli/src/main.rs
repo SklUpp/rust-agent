@@ -1,5 +1,7 @@
 //! `omp` binary entry point: resolve files, then hand turns to the runner.
 
+mod tui;
+
 use std::io::{self, BufRead, IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -1028,6 +1030,8 @@ fn run() -> std::result::Result<(), CliError> {
 		plan_yolo_tools: None,
 		advisor_cards_tx: Arc::new(std::sync::Mutex::new(advisor_cards_tx)),
 		advisor_cards_rx,
+		turn_cancel: Arc::new(std::sync::Mutex::new(TurnCancelState::default())),
+		subagent_observer: None,
 	};
 	if let Some(model) = requested_model.or(default_model) {
 		session.select_model(model);
@@ -1367,7 +1371,14 @@ fn run() -> std::result::Result<(), CliError> {
 		&& piped_stdin.is_none()
 		&& !cli.print;
 	if repl_mode {
-		let result = run_repl(&mut session, mode, &mut reporter).map_err(CliError::from);
+		// Default interactive entry: a full-screen TUI when the terminal can
+		// host one. `omp repl`, piped stdin, `--print` and non-text modes keep
+		// their line/NDJSON behavior unchanged.
+		let result = if interactive_tui_available(mode) {
+			tui::run(&mut session, &native_runner).map_err(CliError::from)
+		} else {
+			run_repl(&mut session, mode, &mut reporter).map_err(CliError::from)
+		};
 		// Post-shutdown child accounting reaches the log before it closes.
 		session.finish(&native_runner);
 		return result;
@@ -1495,6 +1506,17 @@ fn list_sessions_for_picker(dir: &Path) -> Vec<(PathBuf, Option<String>, String,
 	}
 	result.sort_by(|a, b| b.3.cmp(&a.3));
 	result
+}
+
+/// The full-screen TUI needs a real terminal on stdin *and* stdout, and a text
+/// output mode. Everything else (pipes, `--print`, JSON/RPC, `TERM=dumb`,
+/// `omp repl`) keeps its existing behavior.
+fn interactive_tui_available(mode: OutputMode) -> bool {
+	mode == OutputMode::Text
+		&& io::stdin().is_terminal()
+		&& io::stdout().is_terminal()
+		&& std::env::var_os("TERM")
+			.is_some_and(|term| !term.is_empty() && term.to_string_lossy() != "dumb")
 }
 
 fn run_repl<W: Write, E: Write>(
@@ -1749,6 +1771,57 @@ struct Session<'a> {
 	/// turn settles (or during the headless drain) is never lost.
 	advisor_cards_tx: Arc<std::sync::Mutex<std::sync::mpsc::Sender<(String, serde_json::Value)>>>,
 	advisor_cards_rx: std::sync::mpsc::Receiver<(String, serde_json::Value)>,
+	/// The token of the turn currently running, published for an interactive
+	/// front-end. `turn_inner` owns the only writer; a TUI clones the handle and
+	/// cancels without touching the loop or the event stream.
+	turn_cancel: Arc<std::sync::Mutex<TurnCancelState>>,
+	/// Optional child-agent observer for this session (TUI worker panel).
+	subagent_observer: Option<agent::ObserverHandle>,
+}
+
+/// Published turn cancellation: the running token plus a pending bit that
+/// records a cancel arriving before the token exists (TUI Ctrl-C racing the
+/// turn start). The next published turn consumes it.
+#[derive(Default)]
+struct TurnCancelState {
+	token: Option<pi_agent::CancellationToken>,
+	pending: bool,
+}
+
+impl TurnCancelState {
+	/// Publish the running turn. A pending cancel is applied immediately so a
+	/// request that arrived before publication is never lost.
+	fn publish(&mut self, token: pi_agent::CancellationToken) {
+		if self.pending {
+			token.cancel();
+			self.pending = false;
+		}
+		self.token = Some(token);
+	}
+
+	/// Cancel the running turn, or remember the request until one starts.
+	fn request(&mut self) {
+		match self.token.as_ref() {
+			Some(token) => token.cancel(),
+			None => self.pending = true,
+		}
+	}
+
+	fn clear(&mut self) {
+		self.token = None;
+		self.pending = false;
+	}
+}
+
+/// Clears the published turn token on every exit path of `turn_inner`.
+struct TurnCancelLease(Arc<std::sync::Mutex<TurnCancelState>>);
+
+impl Drop for TurnCancelLease {
+	fn drop(&mut self) {
+		if let Ok(mut slot) = self.0.lock() {
+			slot.clear();
+		}
+	}
 }
 
 /// Scope selector matching a run request, derived from the live store rather
@@ -2096,6 +2169,17 @@ impl Session<'_> {
 		}
 	}
 
+	/// Handle a front-end can hold to cancel the running turn without owning
+	/// the `Session` (the turn runs on another thread in the interactive TUI).
+	fn cancel_slot(&self) -> Arc<std::sync::Mutex<TurnCancelState>> {
+		Arc::clone(&self.turn_cancel)
+	}
+
+	/// Install the child-agent observer used by the interactive worker panel.
+	fn set_subagent_observer(&mut self, observer: Option<agent::ObserverHandle>) {
+		self.subagent_observer = observer;
+	}
+
 	/// Between-turn headless continuation, gated by `goal.continuationModes`
 	/// (`"interactive"` by default, so nothing loops unless the user opted in).
 	fn drive_goal_continuation<W: Write, E: Write>(
@@ -2359,7 +2443,7 @@ impl Session<'_> {
 			extra_mcp_servers: Vec::new(),
 			internal_urls: Some(Arc::clone(&self.internal_urls)),
 			url_scope: Some(Arc::new(url_scope)),
-			subagent_observer: None,
+			subagent_observer: self.subagent_observer.clone(),
 			child_session_root,
 			goal: Some(Arc::clone(&self.goal)),
 			goal_context,
@@ -2413,6 +2497,15 @@ impl Session<'_> {
 			// turn; the gate still requires a fresh proposal.
 			shared.cancel_pending();
 		}
+		// Publish cancellation before any journal fsync/request build: a TUI
+		// Ctrl-C right after Enter must not race the token into existence. A
+		// pending request is applied at publication.
+		let cancel_token = pi_agent::CancellationToken::new();
+		let cancel_slot = Arc::clone(&self.turn_cancel);
+		if let Ok(mut slot) = cancel_slot.lock() {
+			slot.publish(cancel_token.clone());
+		}
+		let _cancel_lease = TurnCancelLease(cancel_slot);
 		reporter.begin_turn()?;
 
 		let now_start = std::time::SystemTime::now();
@@ -2571,7 +2664,6 @@ impl Session<'_> {
 		let mut turn_tool_calls = 0usize;
 		let turn_started_in_goal = self.goal.has_goal();
 
-		let cancel_token = pi_agent::CancellationToken::new();
 		if !self.store.enabled() {
 			let user_message = runtime::user_message_from_parts(&full_prompt, &turn_parts)?;
 			self

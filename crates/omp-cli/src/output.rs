@@ -23,11 +23,30 @@ pub enum OutputMode {
 	Rpc,
 }
 
+/// Optional per-event sinks for an interactive front-end. The reporter keeps
+/// owning the headless rendering; hooks observe the same events the agent loop
+/// produced, so a TUI never needs a second loop or a reparse of text output.
+#[derive(Default)]
+struct Hooks {
+	event: Option<Box<dyn FnMut(&Event) + Send>>,
+	advisor: Option<Box<dyn FnMut(&str, &serde_json::Value) + Send>>,
+}
+
+impl std::fmt::Debug for Hooks {
+	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		f.debug_struct("Hooks")
+			.field("event", &self.event.is_some())
+			.field("advisor", &self.advisor.is_some())
+			.finish()
+	}
+}
+
 #[derive(Debug)]
 pub struct Reporter<W: Write, E: Write> {
 	mode: OutputMode,
 	out: W,
 	err: E,
+	hooks: Hooks,
 	working_announced: bool,
 	/// Final assistant blocks in message order (thinking/text as streamed).
 	final_blocks: Vec<(pi_agent::StreamBlockKind, String)>,
@@ -47,6 +66,7 @@ impl<W: Write, E: Write> Reporter<W, E> {
 			mode,
 			out,
 			err,
+			hooks: Hooks::default(),
 			working_announced: false,
 			final_blocks: Vec::new(),
 			stream_blocks: pi_agent::StreamBlockCursor::default(),
@@ -78,6 +98,21 @@ impl<W: Write, E: Write> Reporter<W, E> {
 		self.api = api.into();
 		self.provider = provider.into();
 		self.model = model.into();
+	}
+
+	/// Install (or clear) the per-event sink. Called before the owned rendering
+	/// of each mode, for every event the turn produced.
+	pub fn set_event_hook(&mut self, hook: Option<Box<dyn FnMut(&Event) + Send>>) {
+		self.hooks.event = hook;
+	}
+
+	/// Install (or clear) the advisor-card sink. Cards keep their normal text /
+	/// NDJSON rendering in addition to being observed here.
+	pub fn set_advisor_hook(
+		&mut self,
+		hook: Option<Box<dyn FnMut(&str, &serde_json::Value) + Send>>,
+	) {
+		self.hooks.advisor = hook;
 	}
 
 	/// Text mode only: also print public reasoning from the persisted message.
@@ -115,6 +150,9 @@ impl<W: Write, E: Write> Reporter<W, E> {
 
 	/// Emit one event: NDJSON in JSON mode, stderr progress in text mode.
 	pub fn event(&mut self, event: &Event) -> Result<()> {
+		if let Some(hook) = self.hooks.event.as_mut() {
+			hook(event);
+		}
 		if self.mode == OutputMode::Json {
 			let ts = current_timestamp_ms();
 			match event {
@@ -329,6 +367,9 @@ impl<W: Write, E: Write> Reporter<W, E> {
 		content: &str,
 		details: &serde_json::Value,
 	) -> Result<()> {
+		if let Some(hook) = self.hooks.advisor.as_mut() {
+			hook(content, details);
+		}
 		match self.mode {
 			OutputMode::Json => {
 				let mut message = serde_json::json!({

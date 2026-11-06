@@ -257,10 +257,23 @@ impl Approvals {
 		}
 	}
 
-	/// Install or clear the alternate approver. The alternate decides the whole
-	/// approval outcome, including honouring `mode`/`allow` when it wants to.
+	/// Install or clear the alternate approver. The matrix still resolves
+	/// explicit `Auto` decisions (`yolo`, `--allow`, per-run registered MCP
+	/// names); the alternate decides every `Ask` outcome. This keeps a remote
+	/// peer (ACP) and a local front-end (TUI) from re-implementing the allow
+	/// list while neither can silently read the terminal.
 	pub fn set_approver(&mut self, approver: Option<std::sync::Arc<dyn pi_agent::ToolApprover>>) {
 		self.approver = approver;
+	}
+
+	/// The alternate approver, when a front-end installed one. Hosts that ask
+	/// outside the tool-execution path (MCP stdio launch) must route through it;
+	/// the front-end owns the terminal, so reading stdin here would race it.
+	#[must_use]
+	pub(crate) fn alternate_approver(
+		&self,
+	) -> Option<std::sync::Arc<dyn pi_agent::ToolApprover>> {
+		self.approver.clone()
 	}
 
 	/// Install or clear an injected approval input. Injected input never consults
@@ -369,10 +382,16 @@ impl pi_agent::ToolApprover for Approvals {
 	}
 
 	async fn approve(&self, name: &str, args: &serde_json::Value) -> std::result::Result<(), String> {
+		let tier = classify_tool(name, args);
 		if let Some(approver) = self.approver.as_ref() {
+			// The matrix still owns the explicit auto decisions: `yolo`, `--allow`
+			// and per-run registered MCP names all resolve before a front-end is
+			// asked. The alternate decides every *ask* outcome.
+			if self.decide_tier(name, tier) == Decision::Auto {
+				return Ok(());
+			}
 			return approver.approve(name, args).await;
 		}
-		let tier = classify_tool(name, args);
 		match self.decide_tier(name, tier) {
 			Decision::Auto => Ok(()),
 			Decision::Ask => {

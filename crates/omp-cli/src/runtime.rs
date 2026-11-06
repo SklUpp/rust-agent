@@ -5830,14 +5830,28 @@ async fn check_or_prompt_stdio_mcp_launch(
 		return Ok(true);
 	}
 
+	let prompt_name = format!("mcp-server:{server_name}");
+	let detail = format!("{} {}", stdio.command, stdio.args.join(" "));
+	if let Some(approver) = approvals.alternate_approver() {
+		// A front-end (TUI) owns the terminal: ask through its approval surface
+		// instead of spawning a second stdin reader that would steal its keys.
+		let args = serde_json::json!({
+			"command": stdio.command.clone(),
+			"args": stdio.args.clone(),
+		});
+		let approved = approver.approve(&prompt_name, &args).await.is_ok();
+		if cancel_token.is_cancelled() {
+			return Err(Error::new("MCP discovery interrupted"));
+		}
+		return Ok(approved);
+	}
+
 	use std::io::IsTerminal;
 	if !std::io::stdin().is_terminal() {
 		return Ok(false);
 	}
 
 	use std::io::Write;
-	let prompt_name = format!("mcp-server:{server_name}");
-	let detail = format!("{} {}", stdio.command, stdio.args.join(" "));
 	eprint!("Approve {prompt_name} ({detail})? [y/N] ");
 	let _ = std::io::stderr().flush();
 
