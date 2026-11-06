@@ -1,0 +1,39 @@
+[package]
+name = "pi-agent"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+tokio = { workspace = true, features = ["full"] }
+tokio-util = { workspace = true, features = ["full"] }
+flume = { workspace = true }
+futures = { workspace = true }
+async-trait = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true, features = ["preserve_order"] }
+thiserror = { workspace = true }
+regex = { workspace = true }
+libc = { workspace = true }
+reqwest = { workspace = true }
+pi-shell = { workspace = true }
+pi-walker = { workspace = true }
+pi-iso = { workspace = true }
+pi-ast = { workspace = true }
+portable-pty = { workspace = true }
+xxhash-rust = { workspace = true }
+similar = { workspace = true }
+# Same package/version as `omp-cli`; `hooks` enables the read-only authorizer.
+rusqlite = { version = "0.33.0", features = ["bundled", "hooks"] }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["full"] }
+futures = { workspace = true }
+async-trait = { workspace = true }
+serde_json = { workspace = true, features = ["preserve_order"] }
+rusqlite = { version = "0.33.0", features = ["bundled", "hooks"] }

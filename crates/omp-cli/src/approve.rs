@@ -1,0 +1,667 @@
+//! Tool approval matrix (`--approval-mode`, `--allow`).
+//!
+//! `always-ask` auto-approves the read tier and prompts on stdin for writes and
+//! execs, `write` auto-approves read-only tools, and `yolo` approves everything;
+//! an explicit `--allow <tool>` always approves that tool. Mirrors
+//! `packages/coding-agent` approval semantics.
+
+use std::collections::BTreeSet;
+use std::io::{BufRead, Write};
+use std::sync::atomic::{AtomicBool, Ordering};
+
+use async_trait::async_trait;
+use clap::ValueEnum;
+
+use crate::{Error, Result};
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, ValueEnum)]
+pub enum ApprovalMode {
+	/// Auto-approve read-tier tools; ask before write/exec calls.
+	#[default]
+	#[value(name = "always-ask")]
+	AlwaysAsk,
+	/// Auto-approve read-tier tools; ask before write/exec calls.
+	/// Note: In TS `approval.ts`, `write` mode approves up to `write` tier.
+	/// The Android headless parity plan explicitly defines `write` mode as
+	/// read-only auto-permitted, requiring explicit approval for writes and execs.
+	Write,
+	/// Auto-approve everything.
+	Yolo,
+}
+
+impl ApprovalMode {
+	#[must_use]
+	pub fn parse(raw: &str) -> Option<Self> {
+		match raw {
+			"always-ask" => Some(Self::AlwaysAsk),
+			"write" => Some(Self::Write),
+			"yolo" => Some(Self::Yolo),
+			_ => None,
+		}
+	}
+
+	#[must_use]
+	pub fn as_str(self) -> &'static str {
+		match self {
+			Self::AlwaysAsk => "always-ask",
+			Self::Write => "write",
+			Self::Yolo => "yolo",
+		}
+	}
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Decision {
+	/// Run without asking.
+	Auto,
+	/// Ask the operator on stdin.
+	Ask,
+}
+
+/// Capability tier of a tool invocation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum ToolTier {
+	Read,
+	Write,
+	Exec,
+}
+
+/// Check if arguments target an ssh:// URI.
+pub fn has_ssh_target(args: &serde_json::Value) -> bool {
+	let is_ssh = |s: &str| s.starts_with("ssh://");
+	if let Some(p) = args.get("path").and_then(|v| v.as_str()) {
+		if is_ssh(p) {
+			return true;
+		}
+	}
+	if let Some(paths) = args.get("paths") {
+		if let Some(s) = paths.as_str() {
+			if is_ssh(s) {
+				return true;
+			}
+		} else if let Some(arr) = paths.as_array() {
+			for item in arr {
+				if let Some(s) = item.as_str() {
+					if is_ssh(s) {
+						return true;
+					}
+				}
+			}
+		}
+	}
+	false
+}
+
+/// Classify tool invocation into a capability tier.
+pub fn classify_tool(name: &str, args: &serde_json::Value) -> ToolTier {
+	match name {
+		"todo" | "glob" | "ask" | "ast_grep" | "web_search" => ToolTier::Read,
+		"read" => {
+			if has_ssh_target(args) {
+				ToolTier::Exec
+			} else {
+				ToolTier::Read
+			}
+		},
+		"grep" => {
+			if has_ssh_target(args) {
+				ToolTier::Exec
+			} else {
+				ToolTier::Read
+			}
+		},
+		"write" => {
+			let path = args.get("path").and_then(|v| v.as_str());
+			if has_ssh_target(args) {
+				ToolTier::Exec
+			} else if path.is_some_and(pi_agent::tools::pending::is_resolution_device_path) {
+				// `xd://resolve|reject` only finalizes an already-approved
+				// staged preview: the queued action carries the approval that
+				// staged it, so the dispatch itself is read tier (upstream
+				// `write.ts` parity). Unknown xd:// targets stay write tier and
+				// fail closed in the tool.
+				ToolTier::Read
+			} else {
+				ToolTier::Write
+			}
+		},
+		"edit" | "apply_patch" => {
+			if has_ssh_target(args) {
+				ToolTier::Exec
+			} else {
+				ToolTier::Write
+			}
+		},
+		// Previewing an AST rewrite mutates files only after `write
+		// xd://resolve`; the staging call itself is a write-tier action, and the
+		// dispatch stays Read like `write`.
+		"ast_edit" => ToolTier::Write,
+		// Security publication mutates the results index / artifacts. The tool
+		// only exists in the restricted scan worker, but its approval tier must
+		// still be a write when a host inspects it.
+		// The root coordinator tool only reads/preflights/starts; the worker
+		// owns publication and is the only write surface.
+		"security_scan" => ToolTier::Read,
+		"security_publish" => ToolTier::Write,
+		"bash" => ToolTier::Exec,
+		// Upstream classifies LSP per action: rename/reload/raw `request`/format
+		// mutate state, so they need explicit approval even though the tool is
+		// mostly read-only.
+		"lsp" => {
+			let action = args
+				.get("action")
+				.and_then(|v| v.as_str())
+				.unwrap_or_default()
+				.to_ascii_lowercase();
+			if pi_agent::lsp::is_readonly_lsp_action(&action) {
+				ToolTier::Read
+			} else {
+				ToolTier::Write
+			}
+		},
+		// Debug mutate/debuggee actions are exec-tier, matching `debug.ts`.
+		"debug" => {
+			let action = args.get("action").and_then(|v| v.as_str()).unwrap_or_default();
+			if pi_agent::dap::is_readonly_action(action) {
+				ToolTier::Read
+			} else {
+				ToolTier::Exec
+			}
+		},
+		// Auto-learn mutates durable memory and the managed-skill library.
+		// Upstream `learn` is write-tier for a skill payload or the local
+		// backend (the only backend wired here); `manage_skill` is always write.
+		"learn" | "manage_skill" => ToolTier::Write,
+		// MCP tools and unknown tools default to conservative Exec
+		_ => ToolTier::Exec,
+	}
+}
+
+/// Extract detail description for approval prompts.
+pub fn extract_tool_detail(name: &str, args: &serde_json::Value) -> Option<String> {
+	match name {
+		"bash" => args.get("command").and_then(|v| v.as_str()).map(|cmd| {
+			let trimmed = cmd.trim();
+			if trimmed.chars().count() > 60 {
+				let prefix: String = trimmed.chars().take(57).collect();
+				format!("{prefix}...")
+			} else {
+				trimmed.to_string()
+			}
+		}),
+		"write" | "edit" | "read" => {
+			args.get("path").and_then(|v| v.as_str()).map(|p| p.trim().to_string())
+		},
+		// Upstream `formatApprovalDetails`: the action (and file/target) is what
+		// the operator needs to judge an `lsp`/`debug` prompt.
+		"lsp" => {
+			let action = args.get("action").and_then(|v| v.as_str()).unwrap_or("(missing)");
+			match args.get("file").and_then(|v| v.as_str()).filter(|file| !file.is_empty()) {
+				Some(file) => Some(format!("action: {action}, file: {file}")),
+				None => Some(format!("action: {action}")),
+			}
+		},
+		"debug" => {
+			let action = args.get("action").and_then(|v| v.as_str()).unwrap_or("(missing)");
+			match args
+				.get("program")
+				.and_then(|v| v.as_str())
+				.filter(|program| !program.is_empty())
+			{
+				Some(program) => Some(format!("action: {action}, program: {program}")),
+				None => Some(format!("action: {action}")),
+			}
+		},
+		_ => None,
+	}
+}
+
+pub type ApprovalInput = std::sync::Arc<std::sync::Mutex<Box<dyn BufRead + Send>>>;
+
+#[derive(Clone, Default)]
+pub struct Approvals {
+	pub mode: ApprovalMode,
+	pub allow: BTreeSet<String>,
+	/// Interactive `ask` surface; absent in headless runs and child agents.
+	pub ask: Option<std::sync::Arc<dyn pi_agent::tools::ask::AskChannel>>,
+	/// Injected approval input (tests, embedders). `None` reads the process
+	/// terminal, which stays interactive-only.
+	input: Option<ApprovalInput>,
+	/// Alternate approver for transports that ask a remote peer (ACP
+	/// `session/request_permission`). The alternate owns the policy decision;
+	/// this matrix is not consulted when it is installed.
+	approver: Option<std::sync::Arc<dyn pi_agent::ToolApprover>>,
+}
+
+impl std::fmt::Debug for Approvals {
+	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		f.debug_struct("Approvals")
+			.field("mode", &self.mode)
+			.field("allow", &self.allow)
+			.field("has_ask", &self.ask.is_some())
+			.field("has_input", &self.input.is_some())
+			.field("has_approver", &self.approver.is_some())
+			.finish()
+	}
+}
+
+impl Approvals {
+	#[must_use]
+	pub fn new(mode: ApprovalMode, allow: impl IntoIterator<Item = String>) -> Self {
+		Self {
+			mode,
+			allow: allow.into_iter().collect(),
+			ask: None,
+			input: None,
+			approver: None,
+		}
+	}
+
+	/// Install or clear the alternate approver. The alternate decides the whole
+	/// approval outcome, including honouring `mode`/`allow` when it wants to.
+	pub fn set_approver(&mut self, approver: Option<std::sync::Arc<dyn pi_agent::ToolApprover>>) {
+		self.approver = approver;
+	}
+
+	/// Install or clear an injected approval input. Injected input never consults
+	/// the process terminal, so tests and embedders control the answer.
+	pub fn set_input(&mut self, input: Option<ApprovalInput>) {
+		self.input = input;
+	}
+
+	#[must_use]
+	pub fn with_input(mut self, input: Option<ApprovalInput>) -> Self {
+		self.set_input(input);
+		self
+	}
+
+	/// Install or clear the interactive `ask` surface.
+	pub fn set_ask(&mut self, ask: Option<std::sync::Arc<dyn pi_agent::tools::ask::AskChannel>>) {
+		self.ask = ask;
+	}
+
+	/// Copy without the interactive surface, for delegated children.
+	#[must_use]
+	pub fn without_ask(&self) -> Self {
+		let mut clone = self.clone();
+		clone.ask = None;
+		// A child must never inherit the parent's remote approver: that would
+		// prompt the ACP client for delegated work. Without it the matrix
+		// applies and Ask-tier work fails closed on closed stdin.
+		clone.approver = None;
+		clone
+	}
+
+	#[must_use]
+	pub fn ask_channel(&self) -> Option<std::sync::Arc<dyn pi_agent::tools::ask::AskChannel>> {
+		self
+			.ask
+			.clone()
+			.or_else(|| self.approver.as_ref().and_then(|approver| approver.ask_channel()))
+	}
+
+	/// Authorize a registered MCP tool name if the exact colon tool allow
+	/// `mcp:<server_name>:<tool_name>` was permitted.
+	pub fn allow_mcp_tool_origin(&mut self, server_name: &str, tool_name: &str, registered_name: &str) {
+		let colon_allow = format!("mcp:{server_name}:{tool_name}");
+		if self.allow.contains(&colon_allow) {
+			self.allow.insert(registered_name.to_string());
+		}
+	}
+
+	/// Resolve approval decision given explicit tool tier.
+	///
+	/// Both non-yolo modes auto-approve the `read` tier, matching
+	/// `APPROVAL_MODE_MAX_TIER` upstream: `always-ask` permits reads and prompts
+	/// for writes/execs; this port's `write` mode deliberately stays
+	/// read-only-auto and prompts for writes/execs.
+	///
+	/// The `apply_patch` wire name also matches an explicit allow for its
+	/// internal tool name `edit`; the raw name is checked first so an explicit
+	/// `--allow apply_patch` keeps working.
+	#[must_use]
+	pub fn decide_tier(&self, tool: &str, tier: ToolTier) -> Decision {
+		let allowed =
+			self.allow.contains(tool) || (tool == "apply_patch" && self.allow.contains("edit"));
+		if allowed || self.mode == ApprovalMode::Yolo {
+			return Decision::Auto;
+		}
+		if tier == ToolTier::Read {
+			return Decision::Auto;
+		}
+		Decision::Ask
+	}
+
+	/// Pure matrix: explicit allow, then `yolo`, then the `read` tier.
+	#[must_use]
+	pub fn decide(&self, tool: &str, read_only: bool) -> Decision {
+		let tier = if read_only { ToolTier::Read } else { ToolTier::Write };
+		self.decide_tier(tool, tier)
+	}
+
+	/// Decide, prompting on `input`/`prompt` when the matrix says ask.
+	pub fn confirm(
+		&self,
+		tool: &str,
+		read_only: bool,
+		detail: Option<&str>,
+		input: &mut impl BufRead,
+		prompt: &mut impl Write,
+	) -> Result<bool> {
+		if self.decide(tool, read_only) == Decision::Auto {
+			return Ok(true);
+		}
+		write!(prompt, "{}", approval_prompt(tool, detail))?;
+		prompt.flush()?;
+		let mut line = String::new();
+		if input.read_line(&mut line)? == 0 {
+			return Err(Error::new("approval required but stdin closed"));
+		}
+		let answer = line.trim().to_ascii_lowercase();
+		Ok(matches!(answer.as_str(), "y" | "yes"))
+	}
+}
+
+#[async_trait]
+impl pi_agent::ToolApprover for Approvals {
+	fn ask_channel(&self) -> Option<std::sync::Arc<dyn pi_agent::tools::ask::AskChannel>> {
+		Approvals::ask_channel(self)
+	}
+
+	async fn approve(&self, name: &str, args: &serde_json::Value) -> std::result::Result<(), String> {
+		if let Some(approver) = self.approver.as_ref() {
+			return approver.approve(name, args).await;
+		}
+		let tier = classify_tool(name, args);
+		match self.decide_tier(name, tier) {
+			Decision::Auto => Ok(()),
+			Decision::Ask => {
+				let detail = extract_tool_detail(name, args);
+				if let Some(input) = self.input.clone() {
+					// Injected input: never consults the process terminal and never
+					// blocks a runtime worker waiting on a real operator.
+					let mut input =
+						input.lock().map_err(|_| "approval input poisoned".to_string())?;
+					let mut prompt = std::io::stderr().lock();
+					return match self.confirm(
+						name,
+						tier == ToolTier::Read,
+						detail.as_deref(),
+						&mut *input,
+						&mut prompt,
+					) {
+						Ok(true) => Ok(()),
+						Ok(false) => Err(format!("approval denied for {name}")),
+						Err(err) => Err(err.to_string()),
+					};
+				}
+				use std::io::IsTerminal;
+				// In non-interactive environments (pipes, /dev/null, daemons, background),
+				// closed stdin cannot prompt the operator; deny immediately before side effects.
+				// MCP tool discovery already registered schemas via read-only tools/list;
+				// this gate intercepts the execution before any side-effecting tools/call occurs.
+				if !std::io::stdin().is_terminal() {
+					return Err("approval required but stdin closed".to_string());
+				}
+				eprint!("{}", approval_prompt(name, detail.as_deref()));
+				let _ = std::io::stderr().flush();
+				let cancelled = std::sync::Arc::new(AtomicBool::new(false));
+				// Dropping the approval future (turn cancellation) flips this flag;
+				// the reader stops polling stdin instead of eating the next prompt.
+				let _abort = PromptAbort(std::sync::Arc::clone(&cancelled));
+				let answer = tokio::task::spawn_blocking(move || read_prompt_answer(cancelled)).await;
+				match answer {
+					Ok(Ok(true)) => Ok(()),
+					Ok(Ok(false)) => Err(format!("approval denied for {name}")),
+					Ok(Err(err)) => Err(err),
+					Err(err) => Err(format!("approval prompt failed: {err}")),
+				}
+			},
+		}
+	}
+}
+
+fn approval_prompt(tool: &str, detail: Option<&str>) -> String {
+	match detail {
+		Some(detail) => format!("Approve {tool} ({detail})? [y/N] "),
+		None => format!("Approve {tool}? [y/N] "),
+	}
+}
+
+/// Flags a dropped approval future so its blocking stdin reader stops polling.
+struct PromptAbort(std::sync::Arc<AtomicBool>);
+
+impl Drop for PromptAbort {
+	fn drop(&mut self) {
+		self.0.store(true, Ordering::SeqCst);
+	}
+}
+
+/// Read one approval line without blocking cancellation for the whole line.
+/// Returns `Err` only when stdin is closed before an answer; an empty line is a
+/// denial. The cancellation flag is checked before every read so a cancelled
+/// prompt never consumes input intended for the next prompt.
+fn read_prompt_answer(cancelled: std::sync::Arc<AtomicBool>) -> std::result::Result<bool, String> {
+	let mut buf: Vec<u8> = Vec::new();
+	loop {
+		if cancelled.load(Ordering::SeqCst) {
+			return Ok(false);
+		}
+		#[cfg(unix)]
+		{
+			if crate::runtime::poll_stdin_readable(100) {
+				if cancelled.load(Ordering::SeqCst) {
+					return Ok(false);
+				}
+				match crate::runtime::read_stdin_byte() {
+					Some(b'\n') => break,
+					Some(b'\r') => {},
+					Some(byte) => buf.push(byte),
+					None => return Err("approval required but stdin closed".to_string()),
+				}
+			}
+		}
+		#[cfg(not(unix))]
+		{
+			return Err("approval prompt requires a POSIX terminal".to_string());
+		}
+	}
+	let answer = String::from_utf8_lossy(&buf).trim().to_ascii_lowercase();
+	Ok(matches!(answer.as_str(), "y" | "yes"))
+}
+#[cfg(test)]
+mod tests {
+	use std::io::Cursor;
+
+	use super::*;
+
+	fn approvals(mode: ApprovalMode, allow: &[&str]) -> Approvals {
+		Approvals::new(mode, allow.iter().map(ToString::to_string))
+	}
+
+	#[test]
+	fn matrix_auto_approves_read_and_prompts_side_effects() {
+		let ask = approvals(ApprovalMode::AlwaysAsk, &[]);
+		assert_eq!(ask.decide("read", true), Decision::Auto);
+		assert_eq!(ask.decide("bash", false), Decision::Ask);
+
+		let auto = approvals(ApprovalMode::AlwaysAsk, &["bash"]);
+		assert_eq!(auto.decide("bash", false), Decision::Auto);
+		assert_eq!(auto.decide("write", false), Decision::Ask);
+
+		let write = approvals(ApprovalMode::Write, &[]);
+		assert_eq!(write.decide("read", true), Decision::Auto);
+		assert_eq!(write.decide("write", false), Decision::Ask);
+
+		let yolo = approvals(ApprovalMode::Yolo, &[]);
+		assert_eq!(yolo.decide("bash", false), Decision::Auto);
+	}
+
+	#[test]
+	fn child_approvals_strip_the_ask_channel() {
+		let mut approvals = approvals(ApprovalMode::AlwaysAsk, &[]);
+		assert!(approvals.ask_channel().is_none());
+		approvals.set_ask(Some(crate::ask::terminal_channel(None)));
+		assert!(approvals.ask_channel().is_some());
+		assert!(approvals.without_ask().ask_channel().is_none());
+		assert_eq!(approvals.without_ask().mode, approvals.mode);
+	}
+
+	#[test]
+	fn confirm_reads_yes_from_stdin() {
+		let approvals = approvals(ApprovalMode::AlwaysAsk, &[]);
+		let mut input = Cursor::new(b"y\n");
+		let mut prompt = Vec::new();
+		assert!(
+			approvals
+				.confirm("bash", false, Some("rm -rf build"), &mut input, &mut prompt)
+				.expect("confirm")
+		);
+		assert!(
+			String::from_utf8(prompt)
+				.expect("utf8")
+				.starts_with("Approve bash")
+		);
+
+		let mut input = Cursor::new(b"\n");
+		let mut prompt = Vec::new();
+		assert!(
+			!approvals
+				.confirm("bash", false, None, &mut input, &mut prompt)
+				.expect("confirm")
+		);
+	}
+
+	#[test]
+	fn allowed_tool_skips_the_prompt() {
+		let approvals = approvals(ApprovalMode::AlwaysAsk, &["read"]);
+		let mut input = Cursor::new(Vec::new());
+		let mut prompt = Vec::new();
+		assert!(
+			approvals
+				.confirm("read", true, None, &mut input, &mut prompt)
+				.expect("confirm")
+		);
+	}
+
+	#[test]
+	fn arg_sensitive_classification_and_decide_tier() {
+		use serde_json::json;
+
+		// Local vs SSH paths
+		assert_eq!(classify_tool("todo", &json!({})), ToolTier::Read);
+		assert_eq!(classify_tool("glob", &json!({})), ToolTier::Read);
+		assert_eq!(classify_tool("ask", &json!({})), ToolTier::Read);
+		assert_eq!(
+			classify_tool("read", &json!({"path": "/local/file.txt"})),
+			ToolTier::Read
+		);
+		assert_eq!(
+			classify_tool("read", &json!({"path": "ssh://host/file.txt"})),
+			ToolTier::Exec
+		);
+		assert_eq!(
+			classify_tool("grep", &json!({"paths": ["local", "ssh://remote"]})),
+			ToolTier::Exec
+		);
+		assert_eq!(
+			classify_tool("write", &json!({"path": "file.txt"})),
+			ToolTier::Write
+		);
+		assert_eq!(
+			classify_tool("write", &json!({"path": "ssh://box/f.txt"})),
+			ToolTier::Exec
+		);
+		// Staging an AST preview is a write; only the later `write xd://resolve`
+		// is read tier.
+		assert_eq!(
+			classify_tool("ast_edit", &json!({"ops": [], "paths": ["src"]})),
+			ToolTier::Write
+		);
+		assert_eq!(classify_tool("bash", &json!({"command": "ls"})), ToolTier::Exec);
+		assert_eq!(classify_tool("mcp__server_tool", &json!({})), ToolTier::Exec);
+
+		// LSP is per action: reads stay auto in the read tier, rename/format/raw
+		// request need explicit approval.
+		for action in [
+			"diagnostics",
+			"definition",
+			"type_definition",
+			"implementation",
+			"references",
+			"hover",
+			"symbols",
+			"status",
+			"capabilities",
+		] {
+			assert_eq!(
+				classify_tool("lsp", &json!({"action": action})),
+				ToolTier::Read,
+				"lsp action {action}"
+			);
+		}
+		for action in ["rename", "rename_file", "format", "reload", "request", "code_actions"] {
+			assert_eq!(
+				classify_tool("lsp", &json!({"action": action})),
+				ToolTier::Write,
+				"lsp action {action}"
+			);
+		}
+		// Debug mutates the debuggee or session: exec tier except pure reads.
+		for action in ["output", "threads", "stack_trace", "scopes", "variables", "sessions"] {
+			assert_eq!(
+				classify_tool("debug", &json!({"action": action})),
+				ToolTier::Read,
+				"debug action {action}"
+			);
+		}
+		for action in ["launch", "attach", "continue", "evaluate", "set_breakpoint", "terminate"] {
+			assert_eq!(
+				classify_tool("debug", &json!({"action": action})),
+				ToolTier::Exec,
+				"debug action {action}"
+			);
+		}
+
+		assert_eq!(
+			extract_tool_detail("lsp", &json!({"action": "rename", "file": "src/lib.rs"})),
+			Some("action: rename, file: src/lib.rs".to_string())
+		);
+		assert_eq!(
+			extract_tool_detail("debug", &json!({"action": "launch", "program": "./app"})),
+			Some("action: launch, program: ./app".to_string())
+		);
+
+		// Tier decisions
+		let write_mode = approvals(ApprovalMode::Write, &[]);
+		assert_eq!(write_mode.decide_tier("read", ToolTier::Read), Decision::Auto);
+		assert_eq!(write_mode.decide_tier("write", ToolTier::Write), Decision::Ask);
+		assert_eq!(write_mode.decide_tier("bash", ToolTier::Exec), Decision::Ask);
+		assert_eq!(write_mode.decide_tier("read", ToolTier::Exec), Decision::Ask);
+
+		let allow_bash = approvals(ApprovalMode::AlwaysAsk, &["bash"]);
+		assert_eq!(allow_bash.decide_tier("bash", ToolTier::Exec), Decision::Auto);
+		assert_eq!(allow_bash.decide_tier("write", ToolTier::Write), Decision::Ask);
+	}
+
+	#[test]
+	fn test_allow_mcp_tool_origin_matches_exact_colon_syntax() {
+		let mut app = approvals(ApprovalMode::AlwaysAsk, &["mcp:my_server:my_tool"]);
+		// Server-level allow does NOT auto-authorize all tools
+		let mut server_level = approvals(ApprovalMode::AlwaysAsk, &["mcp:my_server"]);
+		server_level.allow_mcp_tool_origin("my_server", "my_tool", "mcp__my_server_my_tool");
+		assert_eq!(server_level.decide("mcp__my_server_my_tool", false), Decision::Ask);
+
+		// Other tool on same server is NOT authorized
+		app.allow_mcp_tool_origin("my_server", "other_tool", "mcp__my_server_other_tool");
+		assert_eq!(app.decide("mcp__my_server_other_tool", false), Decision::Ask);
+
+		// Same tool on other server is NOT authorized
+		app.allow_mcp_tool_origin("other_server", "my_tool", "mcp__other_server_my_tool");
+		assert_eq!(app.decide("mcp__other_server_my_tool", false), Decision::Ask);
+
+		// Exact origin match authorizes execution
+		app.allow_mcp_tool_origin("my_server", "my_tool", "mcp__my_server_my_tool");
+		assert_eq!(app.decide("mcp__my_server_my_tool", false), Decision::Auto);
+	}
+}

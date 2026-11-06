@@ -1,0 +1,1310 @@
+//! Internal URL router: `scheme://` resources resolved by protocol handlers.
+//!
+//! Mirrors `packages/coding-agent/src/internal-urls/router.ts`: the `read` and
+//! `write` tools consult one router before touching the filesystem, handlers
+//! register per scheme, reserved OMP namespaces cannot be replaced, and a
+//! scheme with no handler is an explicit protocol error instead of a path.
+//!
+//! No transport lives here: RPC host schemes register an adapter handler that
+//! speaks `host_uri_request`/`host_uri_result` frames, and any other embedder
+//! can register its own. That keeps `pi-agent` free of RPC dependencies.
+//!
+//! The `ssh://` handler is built in and lives in [`super::ssh`]: it shells out
+//! to the native OpenSSH client instead of routing frames through a host.
+//! The `mcp://` handler is built in and resolves live MCP sessions from
+//! [`crate::mcp::client`]'s process-wide registry.
+//! The `artifact://` handler is built in and lives in
+//! [`super::internal_urls_artifact`]: it reads a session's spilled tool output
+//! from roots bound in [`UrlScope::local_roots`], never a process-global
+//! registry.
+//! The `agent://` handler is built in and lives in
+//! [`super::internal_urls_agent`]: it reads saved subagent `<id>.md` outputs
+//! from the caller's own session roots, never a live transcript.
+
+use std::{
+	collections::BTreeMap,
+	path::{Path, PathBuf},
+	sync::{Arc, Mutex, MutexGuard},
+};
+
+use async_trait::async_trait;
+
+use super::hashline::snapshot::SNAPSHOT_MAX_BYTES;
+use crate::CancellationToken;
+
+/// Built-in scheme for directory roots a session binds in
+/// [`UrlScope::local_roots`].
+pub const LOCAL_SCHEME: &str = "local";
+
+/// OMP-owned namespaces a host may never replace: `security://` is reserved for
+/// the security review surface, `local://` for the built-in root handler,
+/// `artifact://` for the built-in spilled-output reader, `agent://` for saved
+/// subagent outputs, `ssh://` for the built-in native OpenSSH read handler,
+/// `mcp://` for the built-in MCP resource consumer, `issue://`/`pr://` for the
+/// built-in native GitHub handlers, and `history://` for the session transcript
+/// reader mounted by `hub_park::register_history`.
+///
+/// `history://` and `security://` are per-session mounts rather than
+/// constructor built-ins; they install only through their own reserved mount
+/// helpers ([`register_security`] and `hub_park::register_history`), never
+/// through [`InternalUrlRouter::register`].
+pub const RESERVED_SCHEMES: [&str; 9] = [
+	"agent", "artifact", "history", "issue", "local", "mcp", "pr", "security", "ssh",
+];
+
+/// Reserved scheme for the read-only security review surface.
+pub const SECURITY_SCHEME: &str = "security";
+
+/// The only reserved schemes OMP itself mounts after construction. Keeping the
+/// list closed is what stops a host bridge from installing a handler over any
+/// other built-in namespace.
+const RESERVED_MOUNT_SCHEMES: [&str; 2] = ["history", SECURITY_SCHEME];
+
+/// One parsed internal URL (`skill://plugin:name` style colons are preserved in
+/// the path because only the first `://` separates the scheme).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InternalUrl {
+	pub scheme: String,
+	/// Verbatim input, used as the resource identity.
+	pub href:   String,
+	pub host:   String,
+	pub path:   String,
+}
+
+impl InternalUrl {
+	#[must_use]
+	pub fn parse(input: &str) -> Option<Self> {
+		let scheme = scheme_of(input)?;
+		let rest = &input[scheme.len() + 3..];
+		let (host, path) = match rest.find('/') {
+			Some(index) => (&rest[..index], &rest[index..]),
+			None => (rest, ""),
+		};
+		Some(Self {
+			scheme,
+			href: input.to_string(),
+			host: host.to_string(),
+			path: path.to_string(),
+		})
+	}
+}
+
+/// Scheme of a `scheme://` string, lowercased; `None` for a plain path.
+#[must_use]
+pub fn scheme_of(raw: &str) -> Option<String> {
+	let (scheme, _) = raw.split_once("://")?;
+	let mut chars = scheme.chars();
+	let first = chars.next()?;
+	if !first.is_ascii_alphabetic() {
+		return None;
+	}
+	if !chars.all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.')) {
+		return None;
+	}
+	Some(scheme.to_ascii_lowercase())
+}
+
+/// A scheme a host may register: lowercase letter first, then `a-z0-9+-.`.
+#[must_use]
+pub fn is_valid_scheme(scheme: &str) -> bool {
+	let mut chars = scheme.chars();
+	let Some(first) = chars.next() else {
+		return false;
+	};
+	if !first.is_ascii_lowercase() {
+		return false;
+	}
+	chars.all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || matches!(c, '+' | '.' | '-'))
+}
+
+/// Whether `scheme` is an OMP namespace hosts may not replace.
+#[must_use]
+pub fn is_reserved_scheme(scheme: &str) -> bool {
+	RESERVED_SCHEMES.contains(&scheme)
+}
+
+/// One resolved internal resource (`InternalResource` upstream).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InternalResource {
+	pub url:           String,
+	pub content:       String,
+	/// `text/markdown`, `application/json` or `text/plain`.
+	pub content_type:  String,
+	pub size:          usize,
+	pub source_path:   Option<PathBuf>,
+	pub notes:         Option<Vec<String>>,
+	pub immutable:     bool,
+	pub is_directory:  bool,
+	/// Whether the scheme handler behind this resource accepts writes. Set by
+	/// the router from [`ProtocolHandler::writable`]; a handler never grants
+	/// this by returning a physical `source_path`.
+	pub writable:      bool,
+}
+
+impl InternalResource {
+	#[must_use]
+	pub fn text(url: &str, content: String) -> Self {
+		Self {
+			url: url.to_string(),
+			size: content.len(),
+			content,
+			content_type: "text/plain".to_string(),
+			source_path: None,
+			notes: None,
+			immutable: false,
+			is_directory: false,
+			writable: false,
+		}
+	}
+}
+
+/// Immutable session scope handed to handlers with every call. Callers build
+/// the context themselves, so concurrent turns and children never share or
+/// overwrite each other's scope.
+#[derive(Debug, Clone, Default)]
+pub struct UrlScope {
+	pub session_file: Option<PathBuf>,
+	/// Scheme to directory bindings (e.g. `local` to the session artifacts dir).
+	pub local_roots:  BTreeMap<String, PathBuf>,
+}
+
+impl UrlScope {
+	#[must_use]
+	pub fn resolve_context(&self, cwd: &Path, signal: &CancellationToken) -> ResolveContext {
+		ResolveContext {
+			cwd:          cwd.to_path_buf(),
+			session_file: self.session_file.clone(),
+			local_roots:  self.local_roots.clone(),
+			signal:       signal.clone(),
+		}
+	}
+
+	#[must_use]
+	pub fn write_context(&self, cwd: &Path, signal: &CancellationToken) -> WriteContext {
+		WriteContext {
+			cwd:         cwd.to_path_buf(),
+			local_roots: self.local_roots.clone(),
+			signal:      signal.clone(),
+		}
+	}
+}
+
+/// Read context for one `resolve` call.
+#[derive(Debug, Clone, Default)]
+pub struct ResolveContext {
+	pub cwd:          PathBuf,
+	pub session_file: Option<PathBuf>,
+	pub local_roots:  BTreeMap<String, PathBuf>,
+	pub signal:       CancellationToken,
+}
+
+/// Write context for one `write` call.
+#[derive(Debug, Clone, Default)]
+pub struct WriteContext {
+	pub cwd:         PathBuf,
+	pub local_roots: BTreeMap<String, PathBuf>,
+	pub signal:      CancellationToken,
+}
+
+/// One scheme handler. `resolve` is required; `write` is installed only when
+/// [`ProtocolHandler::writable`] is true, which is what makes a read-only
+/// scheme reject writes before any host round-trip.
+#[async_trait]
+pub trait ProtocolHandler: Send + Sync {
+	fn scheme(&self) -> &str;
+
+	fn immutable(&self) -> bool {
+		false
+	}
+
+	fn writable(&self) -> bool {
+		false
+	}
+
+	async fn resolve(
+		&self,
+		url: &InternalUrl,
+		context: &ResolveContext,
+	) -> Result<InternalResource, String>;
+
+	async fn write(
+		&self,
+		url: &InternalUrl,
+		_content: &str,
+		_context: &WriteContext,
+	) -> Result<(), String> {
+		Err(read_only_error(&url.scheme))
+	}
+}
+
+/// Error text for a write to a scheme without a write handler.
+#[must_use]
+pub fn read_only_error(scheme: &str) -> String {
+	format!("{scheme}:// URLs are read-only for write; use the protocol-specific tool for mutations.")
+}
+
+/// Error text for a scheme no handler registered.
+#[must_use]
+pub fn unknown_protocol_error(scheme: &str, supported: &[String]) -> String {
+	let list = if supported.is_empty() {
+		"none".to_string()
+	} else {
+		let mut schemes: Vec<String> = supported
+			.iter()
+			.map(|supported| format!("{supported}://"))
+			.collect();
+		schemes.sort();
+		schemes.join(", ")
+	};
+	format!("Unknown protocol: {scheme}://\nSupported: {list}")
+}
+
+/// Scheme registry consulted by `read`/`write` before the filesystem. Holds
+/// handlers only: every call carries its own context.
+pub struct InternalUrlRouter {
+	handlers: Mutex<BTreeMap<String, Arc<dyn ProtocolHandler>>>,
+}
+
+impl Default for InternalUrlRouter {
+	/// Every constructor starts with the built-in `local://`, `artifact://`,
+	/// `agent://`, `ssh://`, `mcp://`, `issue://`, and `pr://` handlers, so a
+	/// session scope root, a spilled artifact, a saved subagent output, a remote
+	/// read, an MCP resource, and a GitHub issue or PR resolve without an extra
+	/// mount step.
+	fn default() -> Self {
+		let mut handlers: BTreeMap<String, Arc<dyn ProtocolHandler>> = BTreeMap::new();
+		handlers.insert(LOCAL_SCHEME.to_string(), Arc::new(LocalRootHandler));
+		handlers.insert(
+			super::internal_urls_artifact::ARTIFACT_SCHEME.to_string(),
+			Arc::new(super::internal_urls_artifact::ArtifactUrlHandler),
+		);
+		handlers.insert(
+			super::internal_urls_agent::AGENT_SCHEME.to_string(),
+			Arc::new(super::internal_urls_agent::AgentUrlHandler),
+		);
+		handlers.insert(
+			super::ssh::SSH_SCHEME.to_string(),
+			Arc::new(super::ssh::SshProtocolHandler::new()),
+		);
+		handlers.insert(MCP_SCHEME.to_string(), Arc::new(McpUrlHandler));
+		handlers.insert(
+			"issue".to_string(),
+			Arc::new(super::internal_urls_github::IssueUrlHandler),
+		);
+		handlers.insert(
+			"pr".to_string(),
+			Arc::new(super::internal_urls_github::PrUrlHandler),
+		);
+		Self { handlers: Mutex::new(handlers) }
+	}
+}
+
+impl std::fmt::Debug for InternalUrlRouter {
+	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		f.debug_struct("InternalUrlRouter")
+			.field("schemes", &self.schemes())
+			.finish()
+	}
+}
+
+impl InternalUrlRouter {
+	#[must_use]
+	pub fn new() -> Self {
+		Self::default()
+	}
+
+	/// Reserved namespaces are built in and refuse replacement, so a host can
+	/// never displace `local://`, `artifact://`, `agent://`, `history://`,
+	/// `security://`, `ssh://`, `mcp://`, `issue://`, or `pr://`.
+	pub fn register(
+		&self,
+		handler: Arc<dyn ProtocolHandler>,
+	) -> Result<Option<Arc<dyn ProtocolHandler>>, String> {
+		let scheme = handler.scheme().to_ascii_lowercase();
+		if is_reserved_scheme(&scheme) {
+			return Err(format!("{scheme}:// is reserved for built-in handlers"));
+		}
+		Ok(self.lock_handlers().insert(scheme, handler))
+	}
+
+	/// Mount one of OMP's own reserved handlers.
+	///
+	/// Only `history://` (`hub_park::register_history`) and `security://`
+	/// ([`register_security`]) use this: both are reserved so a host bridge
+	/// cannot replace them, but they are installed per session or on opt-in.
+	/// Any other scheme — reserved or not — is refused here, so no host can
+	/// install itself over a built-in namespace.
+	pub(crate) fn register_core(
+		&self,
+		handler: Arc<dyn ProtocolHandler>,
+	) -> Result<Option<Arc<dyn ProtocolHandler>>, String> {
+		let scheme = handler.scheme().to_ascii_lowercase();
+		if !RESERVED_MOUNT_SCHEMES.contains(&scheme.as_str()) {
+			return Err(format!(
+				"{scheme}:// is not an OMP-reserved mount scheme"
+			));
+		}
+		Ok(self.lock_handlers().insert(scheme, handler))
+	}
+
+	/// Remove a handler; `false` when the scheme was not registered or is
+	/// reserved.
+	pub fn unregister(&self, scheme: &str) -> bool {
+		let scheme = scheme.to_ascii_lowercase();
+		if is_reserved_scheme(&scheme) {
+			return false;
+		}
+		self.lock_handlers().remove(&scheme).is_some()
+	}
+
+	#[must_use]
+	pub fn get_handler(&self, scheme: &str) -> Option<Arc<dyn ProtocolHandler>> {
+		self.lock_handlers().get(&scheme.to_ascii_lowercase()).cloned()
+	}
+
+	/// Registered schemes, sorted.
+	#[must_use]
+	pub fn schemes(&self) -> Vec<String> {
+		self.lock_handlers().keys().cloned().collect()
+	}
+
+	/// Whether this input is a `scheme://` URL with a registered handler.
+	#[must_use]
+	pub fn can_handle(&self, input: &str) -> bool {
+		scheme_of(input).is_some_and(|scheme| self.get_handler(&scheme).is_some())
+	}
+
+	/// Same predicate as [`Self::can_handle`]; kept for parity with upstream
+	/// where `canResolve` also accepts MCP resources (none exist natively).
+	#[must_use]
+	pub fn can_resolve(&self, input: &str) -> bool {
+		self.can_handle(input)
+	}
+
+	/// Resolve one internal URL through its handler.
+	pub async fn resolve(
+		&self,
+		input: &str,
+		context: &ResolveContext,
+	) -> Result<InternalResource, String> {
+		let url = InternalUrl::parse(input)
+			.ok_or_else(|| format!("Invalid internal URL: {input}"))?;
+		let handler = self
+			.get_handler(&url.scheme)
+			.ok_or_else(|| unknown_protocol_error(&url.scheme, &self.schemes()))?;
+		let mut resource = handler.resolve(&url, context).await?;
+		if resource.url.is_empty() {
+			resource.url = url.href;
+		}
+		resource.immutable = resource.immutable || handler.immutable();
+		// Capability comes from the mounted handler, never from a resource
+		// payload that happens to carry a physical path.
+		resource.writable = handler.writable();
+		if resource.size == 0 && !resource.content.is_empty() {
+			resource.size = resource.content.len();
+		}
+		Ok(resource)
+	}
+
+	/// Write one internal URL through its handler. A scheme without a write
+	/// handler rejects before any transport call.
+	pub async fn write(
+		&self,
+		input: &str,
+		content: &str,
+		context: &WriteContext,
+	) -> Result<(), String> {
+		let url = InternalUrl::parse(input)
+			.ok_or_else(|| format!("Invalid internal URL: {input}"))?;
+		let handler = self
+			.get_handler(&url.scheme)
+			.ok_or_else(|| unknown_protocol_error(&url.scheme, &self.schemes()))?;
+		if !handler.writable() {
+			return Err(read_only_error(&url.scheme));
+		}
+		handler.write(&url, content, context).await
+	}
+
+	fn lock_handlers(&self) -> MutexGuard<'_, BTreeMap<String, Arc<dyn ProtocolHandler>>> {
+		self.handlers.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+	}
+}
+
+/// Mount the read-only `security://` review namespace.
+///
+/// `security://` is reserved for the OMP-native security surface: a host bridge
+/// can never register or replace it through [`InternalUrlRouter::register`].
+/// The CLI security module owns the handler and calls this to install it, so
+/// the mount pins the exact scheme and refuses a writable handler — the
+/// namespace stays read-only no matter what the caller passes.
+pub fn register_security(
+	router: &InternalUrlRouter,
+	handler: Arc<dyn ProtocolHandler>,
+) -> Result<(), String> {
+	if handler.scheme().to_ascii_lowercase() != SECURITY_SCHEME {
+		return Err(format!(
+			"security:// mount requires a handler for exactly {SECURITY_SCHEME}://"
+		));
+	}
+	if handler.writable() {
+		return Err(format!(
+			"{SECURITY_SCHEME}:// is read-only and refuses a writable handler"
+		));
+	}
+	router.register_core(handler).map(|_| ())
+}
+
+/// Registered scheme for live MCP resource reads.
+pub const MCP_SCHEME: &str = "mcp";
+
+/// Built-in `mcp://` read handler.
+///
+/// URL forms (assignment contract, server-scoped listing):
+/// - `mcp://` — list active MCP server names
+/// - `mcp://<server>` — `resources/list` for that server
+/// - `mcp://<server>/<resource-uri>` — `resources/read` (path after the first
+///   `/` is the opaque resource URI, including nested schemes)
+///
+/// Sessions come from [`crate::mcp::client`]'s process-wide registry. The
+/// handler never connects; unknown/empty registries are explicit errors.
+pub struct McpUrlHandler;
+
+#[async_trait]
+impl ProtocolHandler for McpUrlHandler {
+	fn scheme(&self) -> &str {
+		MCP_SCHEME
+	}
+
+	fn immutable(&self) -> bool {
+		true
+	}
+
+	async fn resolve(
+		&self,
+		url: &InternalUrl,
+		context: &ResolveContext,
+	) -> Result<InternalResource, String> {
+		if context.signal.is_cancelled() {
+			return Err("aborted".to_string());
+		}
+		let servers = crate::mcp::list_active_sessions();
+		if servers.is_empty() {
+			return Err(
+				"No active MCP sessions. MCP servers may not be configured or connected."
+					.to_string(),
+			);
+		}
+
+		if url.host.is_empty() {
+			let mut lines = vec!["# Active MCP servers".to_string(), String::new()];
+			for name in &servers {
+				lines.push(format!("- {name}"));
+			}
+			let content = lines.join("\n");
+			let mut resource = InternalResource::text(&url.href, content);
+			resource.content_type = "text/markdown".to_string();
+			resource.immutable = true;
+			resource.is_directory = true;
+			return Ok(resource);
+		}
+
+		let Some(connection) = crate::mcp::get_active_session(&url.host) else {
+			return Err(format!(
+				"Unknown MCP server \"{}\".\nAvailable servers: {}",
+				url.host,
+				servers.join(", ")
+			));
+		};
+
+		if context.signal.is_cancelled() {
+			return Err("aborted".to_string());
+		}
+
+		let resource_uri = url.path.trim_start_matches('/');
+		if resource_uri.is_empty() {
+			let resources = connection.list_resources().await.map_err(|error| {
+				format!("mcp://{} resources/list failed: {error}", url.host)
+			})?;
+			let content = if resources.is_empty() {
+				format!("# MCP resources on {}\n\n(none)", url.host)
+			} else {
+				let mut lines =
+					vec![format!("# MCP resources on {}", url.host), String::new()];
+				for resource in &resources {
+					let mut line = format!("- {}", resource.uri);
+					if !resource.name.is_empty() && resource.name != resource.uri {
+						line.push_str(&format!(" ({})", resource.name));
+					}
+					if let Some(mime) = &resource.mime_type {
+						line.push_str(&format!(" [{mime}]"));
+					}
+					lines.push(line);
+				}
+				lines.join("\n")
+			};
+			let mut resource = InternalResource::text(&url.href, content);
+			resource.content_type = "text/markdown".to_string();
+			resource.immutable = true;
+			resource.is_directory = true;
+			resource.notes = Some(vec![format!("MCP server: {}", url.host)]);
+			return Ok(resource);
+		}
+
+		let result = connection
+			.read_resource(resource_uri)
+			.await
+			.map_err(|error| {
+				format!("MCP resource read error for \"{resource_uri}\" on \"{}\": {error}", url.host)
+			})?;
+		if result.contents.is_empty() {
+			return Err(format!(
+				"Server \"{}\" returned no content for \"{resource_uri}\".",
+				url.host
+			));
+		}
+
+		let mut text_parts = Vec::new();
+		for item in &result.contents {
+			if let Some(text) = &item.text {
+				text_parts.push(text.clone());
+			} else if let Some(blob) = &item.blob {
+				let mime = item.mime_type.as_deref().unwrap_or("unknown");
+				text_parts.push(format!(
+					"[Binary content: {mime}, base64 length {}]",
+					blob.len()
+				));
+			}
+		}
+		let content = if text_parts.is_empty() {
+			"(empty resource)".to_string()
+		} else {
+			text_parts.join("\n---\n")
+		};
+		let mut resource = InternalResource::text(&url.href, content);
+		resource.immutable = true;
+		resource.notes = Some(vec![format!("MCP server: {}", url.host)]);
+		Ok(resource)
+	}
+}
+
+/// Read-only handler for the `local://` root a session binds in
+/// [`UrlScope::local_roots`].
+///
+/// Stateless: the root comes from the immutable per-call [`ResolveContext`], so
+/// a child's narrowed scope resolves its own tree while every session shares one
+/// router. Traversal is descriptor-relative — `O_NOFOLLOW` on the root, on every
+/// intermediate directory and on the final file — and the bytes are read from
+/// that verified descriptor, never re-opened by path, so a symlink swapped in
+/// mid-walk cannot redirect the read outside the root.
+pub struct LocalRootHandler;
+
+#[async_trait]
+impl ProtocolHandler for LocalRootHandler {
+	fn scheme(&self) -> &str {
+		LOCAL_SCHEME
+	}
+
+	async fn resolve(
+		&self,
+		url: &InternalUrl,
+		context: &ResolveContext,
+	) -> Result<InternalResource, String> {
+		let Some(root) = context.local_roots.get(LOCAL_SCHEME) else {
+			return Err(format!(
+				"{}:// has no root in this session scope; bind it in UrlScope::local_roots",
+				LOCAL_SCHEME
+			));
+		};
+		let relative = format!("{}{}", url.host, url.path);
+		let relative = relative.trim_start_matches('/');
+		if relative.is_empty() {
+			return Err(format!("{}:// needs a path below the bound root", LOCAL_SCHEME));
+		}
+		if Path::new(relative)
+			.components()
+			.any(|component| !matches!(component, std::path::Component::Normal(_)))
+		{
+			return Err(format!(
+				"{} escapes the {}:// root: only relative paths below it resolve",
+				url.href, LOCAL_SCHEME
+			));
+		}
+		let root = root.clone();
+		let relative = relative.to_string();
+		let name = relative.clone();
+		let href = url.href.clone();
+		// Real path of the verified target: `read` records its snapshot under
+		// this key so `edit` can address the artifact by the same identity.
+		let source_path = root.join(&relative);
+		let (bytes, size) = tokio::task::spawn_blocking(move || read_contained(&root, &relative))
+			.await
+			.map_err(|error| format!("{href}: local read task failed: {error}"))??;
+		let truncated = u64::try_from(bytes.len()).unwrap_or(u64::MAX) > SNAPSHOT_MAX_BYTES as u64;
+		let content = decode_utf8(&bytes, truncated, &url.href)?;
+		let mut resource = InternalResource::text(&url.href, content);
+		resource.content_type = content_type_for(Path::new(&name)).to_string();
+		resource.source_path = Some(source_path);
+		// The reported size is the file's own length, never the truncated read.
+		resource.size = usize::try_from(size).unwrap_or(usize::MAX);
+		if truncated {
+			resource.notes = Some(vec![format!(
+				"read truncated at {} bytes; the file is {} bytes on disk and only the first {} \
+				 bytes were returned",
+				SNAPSHOT_MAX_BYTES,
+				size,
+				resource.content.len()
+			)]);
+		}
+		Ok(resource)
+	}
+}
+
+/// Decode resource bytes as UTF-8; a capped read is cut back to the last valid
+/// character boundary instead of failing the whole read.
+pub(super) fn decode_utf8(bytes: &[u8], truncated: bool, href: &str) -> Result<String, String> {
+	match std::str::from_utf8(bytes) {
+		Ok(text) => Ok(text.to_string()),
+		Err(error) if truncated => Ok(std::str::from_utf8(&bytes[..error.valid_up_to()])
+			.unwrap_or_default()
+			.to_string()),
+		Err(_) => Err(format!("{href} is not UTF-8 text; binary resources are not supported")),
+	}
+}
+
+/// Read `relative` below `root` through descriptors only, capped at
+/// [`SNAPSHOT_MAX_BYTES`] plus one byte so the caller can tell it was cut.
+#[cfg(unix)]
+pub(crate) fn read_contained(root: &Path, relative: &str) -> Result<(Vec<u8>, u64), String> {
+	crate::tools::validate_artifact_relative(relative)?;
+	use std::{
+		ffi::CString,
+		io::Read,
+		os::{
+			fd::{AsRawFd, FromRawFd, OwnedFd},
+			unix::ffi::OsStrExt,
+		},
+	};
+
+	fn cstring(part: &str) -> Result<CString, String> {
+		CString::new(part)
+			.map_err(|_| format!("local:// path component contains a NUL: {part:?}"))
+	}
+	fn last_error() -> std::io::Error {
+		std::io::Error::last_os_error()
+	}
+
+	let root_c = CString::new(root.as_os_str().as_bytes())
+		.map_err(|_| format!("local:// root contains a NUL: {}", root.display()))?;
+	// SAFETY: `root_c` is NUL-terminated; the fd returned is owned by this call.
+	let root_fd = unsafe {
+		libc::open(
+			root_c.as_ptr(),
+			libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+		)
+	};
+	if root_fd < 0 {
+		return Err(format!("local:// root {}: {}", root.display(), last_error()));
+	}
+	// SAFETY: `root_fd` is a fresh descriptor this call owns.
+	let mut dir = unsafe { OwnedFd::from_raw_fd(root_fd) };
+
+	let mut parts: Vec<&str> = relative.split('/').filter(|part| !part.is_empty()).collect();
+	let Some(name) = parts.pop() else {
+		return Err(format!("local://{relative} needs a file name"));
+	};
+	for part in parts {
+		let c_part = cstring(part)?;
+		// SAFETY: `dir` is open and `c_part` is NUL-terminated.
+		let fd = unsafe {
+			libc::openat(
+				dir.as_raw_fd(),
+				c_part.as_ptr(),
+				libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+			)
+		};
+		if fd < 0 {
+			return Err(format!("local://{relative}: {}", last_error()));
+		}
+		// SAFETY: fresh descriptor, ownership moves into the guard.
+		dir = unsafe { OwnedFd::from_raw_fd(fd) };
+	}
+
+	let c_name = cstring(name)?;
+	// SAFETY: `dir` is open and `c_name` is NUL-terminated.
+	let fd = unsafe {
+		libc::openat(
+			dir.as_raw_fd(),
+			c_name.as_ptr(),
+			// `O_NONBLOCK` keeps a FIFO from parking this blocking worker in
+			// `open`; the regular-file check below still rejects it.
+			libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK,
+		)
+	};
+	if fd < 0 {
+		return Err(format!("local://{relative}: {}", last_error()));
+	}
+	// SAFETY: fresh descriptor, ownership moves into the `File`.
+	let file = std::fs::File::from(unsafe { OwnedFd::from_raw_fd(fd) });
+	let metadata = file.metadata().map_err(|error| format!("local://{relative}: {error}"))?;
+	if !metadata.is_file() {
+		return Err(format!("local://{relative} is not a regular file"));
+	}
+	let size = metadata.len();
+	let cap = SNAPSHOT_MAX_BYTES as u64 + 1;
+	let mut bytes = Vec::with_capacity(usize::try_from(size.min(cap)).unwrap_or(0));
+	file.take(cap)
+		.read_to_end(&mut bytes)
+		.map_err(|error| format!("local://{relative}: {error}"))?;
+	Ok((bytes, size))
+}
+
+#[cfg(not(unix))]
+pub(crate) fn read_contained(_root: &Path, relative: &str) -> Result<(Vec<u8>, u64), String> {
+	crate::tools::validate_artifact_relative(relative)?;
+	Err(format!(
+		"local://{relative} needs descriptor-relative traversal; unsupported on this platform"
+	))
+}
+
+/// Content type for an extension the `read` tool can render; everything else is
+/// plain text.
+fn content_type_for(path: &Path) -> &'static str {
+	match path.extension().and_then(std::ffi::OsStr::to_str) {
+		Some("md" | "markdown") => "text/markdown",
+		Some("json") => "application/json",
+		_ => "text/plain",
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use std::sync::atomic::{AtomicUsize, Ordering};
+
+	#[cfg(unix)]
+	use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+	use super::*;
+
+	struct Echo {
+		scheme:    &'static str,
+		immutable: bool,
+		writable:  bool,
+		writes:    AtomicUsize,
+	}
+
+	impl Echo {
+		fn new(scheme: &'static str, immutable: bool, writable: bool) -> Arc<Self> {
+			Arc::new(Self { scheme, immutable, writable, writes: AtomicUsize::new(0) })
+		}
+	}
+
+	#[async_trait]
+	impl ProtocolHandler for Echo {
+		fn scheme(&self) -> &str {
+			self.scheme
+		}
+
+		fn immutable(&self) -> bool {
+			self.immutable
+		}
+
+		fn writable(&self) -> bool {
+			self.writable
+		}
+
+		async fn resolve(
+			&self,
+			url: &InternalUrl,
+			context: &ResolveContext,
+		) -> Result<InternalResource, String> {
+			let cwd = context.cwd.display();
+			Ok(InternalResource::text(&url.href, format!("{cwd}|{}", url.host)))
+		}
+
+		async fn write(
+			&self,
+			_url: &InternalUrl,
+			content: &str,
+			_context: &WriteContext,
+		) -> Result<(), String> {
+			self.writes.fetch_add(1, Ordering::SeqCst);
+			if content.is_empty() {
+				return Err("empty".to_string());
+			}
+			Ok(())
+		}
+	}
+
+	fn runtime() -> tokio::runtime::Runtime {
+		tokio::runtime::Builder::new_current_thread()
+			.enable_all()
+			.build()
+			.expect("runtime")
+	}
+
+	#[test]
+	fn scheme_parsing_and_validation() {
+		assert_eq!(scheme_of("notes://a/b").as_deref(), Some("notes"));
+		assert_eq!(scheme_of("Skill://x").as_deref(), Some("skill"));
+		assert_eq!(scheme_of("/tmp/a:b"), None);
+		assert_eq!(scheme_of("1bad://x"), None);
+		assert!(is_valid_scheme("a1+-."));
+		assert!(!is_valid_scheme("A"));
+		assert!(is_reserved_scheme("security"));
+		assert!(is_reserved_scheme("agent"));
+		assert!(is_reserved_scheme("local"));
+		assert!(is_reserved_scheme("ssh"));
+		assert!(is_reserved_scheme("mcp"));
+		let url = InternalUrl::parse("skill://plugin:name/x").expect("parse");
+		assert_eq!(url.scheme, "skill");
+		assert_eq!(url.host, "plugin:name");
+		assert_eq!(url.path, "/x");
+	}
+
+	#[test]
+	fn unknown_scheme_is_a_protocol_error_not_a_path() {
+		let router = InternalUrlRouter::new();
+		let cancel = CancellationToken::new();
+		let context = UrlScope::default().resolve_context(Path::new("/w"), &cancel);
+		let error = runtime()
+			.block_on(router.resolve("nope://x", &context))
+			.expect_err("unknown");
+		assert_eq!(
+			error,
+			"Unknown protocol: nope://\nSupported: agent://, artifact://, issue://, local://, mcp://, pr://, ssh://"
+		);
+		router.register(Echo::new("notes", false, false)).expect("register");
+		let error = runtime()
+			.block_on(router.resolve("nope://x", &context))
+			.expect_err("unknown");
+		assert_eq!(
+			error,
+			"Unknown protocol: nope://\nSupported: agent://, artifact://, issue://, local://, mcp://, notes://, pr://, ssh://"
+		);
+		assert!(!router.can_handle("nope://x"));
+		assert!(router.can_handle("notes://x"));
+	}
+
+	#[test]
+	fn read_only_scheme_rejects_write_before_the_handler() {
+		let router = InternalUrlRouter::new();
+		let read_only = Echo::new("notes", false, false);
+		router.register(read_only.clone()).expect("register");
+		let writable = Echo::new("docs", true, true);
+		router.register(writable.clone()).expect("register");
+		let cancel = CancellationToken::new();
+		let context = UrlScope::default().write_context(Path::new("/w"), &cancel);
+		let runtime = runtime();
+		assert_eq!(
+			runtime
+				.block_on(router.write("notes://a", "x", &context))
+				.expect_err("read-only"),
+			"notes:// URLs are read-only for write; use the protocol-specific tool for mutations."
+		);
+		assert_eq!(read_only.writes.load(Ordering::SeqCst), 0);
+		runtime
+			.block_on(router.write("docs://a", "x", &context))
+			.expect("writable");
+		assert_eq!(writable.writes.load(Ordering::SeqCst), 1);
+		assert!(router.unregister("docs"));
+		assert!(!router.unregister("docs"));
+		assert_eq!(
+			router.schemes(),
+			vec![
+				"agent".to_string(),
+				"artifact".to_string(),
+				"issue".to_string(),
+				"local".to_string(),
+				"mcp".to_string(),
+				"notes".to_string(),
+				"pr".to_string(),
+				"ssh".to_string()
+			]
+		);
+	}
+
+	#[test]
+	fn scope_travels_per_call_with_handler_immutability() {
+		let router = InternalUrlRouter::new();
+		router.register(Echo::new("notes", true, false)).expect("register");
+		let scope = UrlScope {
+			session_file: Some(PathBuf::from("/s/session.jsonl")),
+			local_roots:  BTreeMap::from([("local".to_string(), PathBuf::from("/s/session"))]),
+		};
+		let context = scope.resolve_context(Path::new("/w"), &CancellationToken::new());
+		assert_eq!(context.session_file, Some(PathBuf::from("/s/session.jsonl")));
+		assert_eq!(context.local_roots.get("local"), Some(&PathBuf::from("/s/session")));
+		let resource = runtime()
+			.block_on(router.resolve("notes://a", &context))
+			.expect("resolve");
+		assert_eq!(resource.url, "notes://a");
+		assert_eq!(resource.content, "/w|a");
+		assert_eq!(resource.content_type, "text/plain");
+		assert_eq!(resource.size, resource.content.len());
+		assert!(resource.immutable);
+	}
+
+	#[test]
+	fn builtin_local_and_artifact_are_reserved_and_cannot_be_replaced() {
+		let router = InternalUrlRouter::new();
+		assert_eq!(
+			router.schemes(),
+			vec![
+				"agent".to_string(),
+				"artifact".to_string(),
+				"issue".to_string(),
+				"local".to_string(),
+				"mcp".to_string(),
+				"pr".to_string(),
+				"ssh".to_string()
+			]
+		);
+		let error = router
+			.register(Echo::new("local", false, false))
+			.err()
+			.expect("reserved");
+		assert_eq!(error, "local:// is reserved for built-in handlers");
+		let error = router
+			.register(Echo::new("artifact", false, false))
+			.err()
+			.expect("reserved");
+		assert_eq!(error, "artifact:// is reserved for built-in handlers");
+		for scheme in ["local", "artifact"] {
+			assert!(!router.unregister(scheme));
+			assert!(router.get_handler(scheme).is_some());
+		}
+	}
+
+	#[test]
+	fn security_mount_is_exact_readonly_and_reserved() {
+		let router = InternalUrlRouter::new();
+		// The generic path keeps refusing the reserved namespace.
+		let error = router
+			.register(Echo::new(SECURITY_SCHEME, true, false))
+			.err()
+			.expect("reserved");
+		assert_eq!(error, "security:// is reserved for built-in handlers");
+		assert!(router.get_handler(SECURITY_SCHEME).is_none());
+
+		register_security(&router, Echo::new(SECURITY_SCHEME, true, false)).expect("mount security");
+		let mounted = router.get_handler(SECURITY_SCHEME).expect("mounted");
+		assert_eq!(mounted.scheme(), SECURITY_SCHEME);
+
+		let error = register_security(&router, Echo::new("notes", true, false))
+			.err()
+			.expect("wrong scheme");
+		assert_eq!(
+			error,
+			"security:// mount requires a handler for exactly security://"
+		);
+
+		let error = register_security(&router, Echo::new(SECURITY_SCHEME, false, true))
+			.err()
+			.expect("writable handler");
+		assert_eq!(
+			error,
+			"security:// is read-only and refuses a writable handler"
+		);
+
+		// Another reserved scheme cannot ride the security mount or the core.
+		let error = register_security(&router, Echo::new("local", true, false))
+			.err()
+			.expect("reserved scheme");
+		assert!(error.contains("exactly security://"));
+		let error = router
+			.register_core(Echo::new("mcp", true, false))
+			.err()
+			.expect("core refuses non-mount schemes");
+		assert_eq!(error, "mcp:// is not an OMP-reserved mount scheme");
+		assert!(router.get_handler("mcp").is_some());
+	}
+
+	#[test]
+	fn mcp_scheme_lists_servers_resources_and_reads() {
+		use crate::mcp::{
+			register_active_session, unregister_active_session, McpConnection, MCPResource,
+			MCPResourceContentItem, MCPResourceReadResult, MCPResourcesListResult,
+			MCPServerCapabilities, MCPServerConfig, MCPServerInfo, MCPStdioServerConfig,
+		};
+		use crate::mcp::client::clear_active_sessions;
+		use crate::mcp::transports::McpTransport;
+		use crate::mcp::error::McpError;
+		use serde_json::{json, Value};
+		use std::time::Duration;
+		use tokio::sync::RwLock;
+
+		struct FakeTransport;
+
+		#[async_trait]
+		impl McpTransport for FakeTransport {
+			async fn request(
+				&self,
+				method: &str,
+				params: Option<Value>,
+				_timeout: Option<Duration>,
+			) -> Result<Value, McpError> {
+				match method {
+					"resources/list" => Ok(serde_json::to_value(MCPResourcesListResult {
+						resources: vec![MCPResource {
+							uri: "test://notes".to_string(),
+							name: "notes".to_string(),
+							title: None,
+							description: None,
+							mime_type: Some("text/plain".to_string()),
+							size: None,
+							annotations: None,
+						}],
+						next_cursor: None,
+					})
+					.expect("serialize list")),
+					"resources/read" => {
+						let uri = params
+							.as_ref()
+							.and_then(|value| value.get("uri"))
+							.and_then(Value::as_str)
+							.unwrap_or_default();
+						assert_eq!(uri, "test://notes");
+						Ok(serde_json::to_value(MCPResourceReadResult {
+							contents: vec![MCPResourceContentItem {
+								uri: uri.to_string(),
+								mime_type: Some("text/plain".to_string()),
+								text: Some("hello from mcp".to_string()),
+								blob: None,
+							}],
+						})
+						.expect("serialize read"))
+					},
+					other => Err(McpError::Protocol(format!("unexpected method {other}"))),
+				}
+			}
+
+			async fn notify(&self, _method: &str, _params: Option<Value>) -> Result<(), McpError> {
+				Ok(())
+			}
+
+			async fn close(&self) -> Result<(), McpError> {
+				Ok(())
+			}
+		}
+
+		clear_active_sessions();
+		let router = InternalUrlRouter::new();
+		let cancel = CancellationToken::new();
+		let context = UrlScope::default().resolve_context(Path::new("/w"), &cancel);
+		let runtime = runtime();
+
+		let empty = runtime
+			.block_on(router.resolve("mcp://", &context))
+			.expect_err("no sessions");
+		assert!(
+			empty.contains("No active MCP sessions"),
+			"empty registry error: {empty}"
+		);
+
+		let connection = Arc::new(McpConnection {
+			name: "demo".to_string(),
+			config: MCPServerConfig::Stdio(MCPStdioServerConfig {
+				command: "true".to_string(),
+				args: Vec::new(),
+				env: Default::default(),
+				cwd: None,
+				timeout: None,
+				request_id_format: None,
+			}),
+			transport: Arc::new(RwLock::new(Arc::new(FakeTransport) as Arc<dyn McpTransport>)),
+			server_info: MCPServerInfo {
+				name: "demo".to_string(),
+				version: Some("1.0.0".to_string()),
+			},
+			capabilities: MCPServerCapabilities {
+				resources: Some(json!({})),
+				..Default::default()
+			},
+			instructions: None,
+		});
+		register_active_session(Arc::clone(&connection));
+
+		let listed = runtime
+			.block_on(router.resolve("mcp://", &context))
+			.expect("list servers");
+		assert!(listed.content.contains("- demo"), "{}", listed.content);
+		assert!(listed.immutable);
+		assert!(listed.is_directory);
+
+		let unknown = runtime
+			.block_on(router.resolve("mcp://missing", &context))
+			.expect_err("unknown server");
+		assert!(
+			unknown.contains("Unknown MCP server \"missing\""),
+			"{unknown}"
+		);
+		assert!(unknown.contains("demo"), "{unknown}");
+
+		let resources = runtime
+			.block_on(router.resolve("mcp://demo", &context))
+			.expect("list resources");
+		assert!(
+			resources.content.contains("test://notes"),
+			"{}",
+			resources.content
+		);
+		assert_eq!(
+			resources.notes.as_deref(),
+			Some(["MCP server: demo".to_string()].as_slice())
+		);
+
+		let body = runtime
+			.block_on(router.resolve("mcp://demo/test://notes", &context))
+			.expect("read resource");
+		assert_eq!(body.content, "hello from mcp");
+		assert!(body.immutable);
+
+		unregister_active_session("demo");
+		clear_active_sessions();
+	}
+
+	#[test]
+	fn decode_utf8_cuts_a_capped_read_back_to_a_boundary() {
+		let bytes = "abc\u{00e9}".as_bytes().to_vec();
+		let cut = &bytes[..4];
+		assert_eq!(decode_utf8(cut, true, "local://x").expect("cut"), "abc");
+		assert!(decode_utf8(cut, false, "local://x").is_err());
+	}
+
+	#[test]
+	fn local_root_handler_resolves_only_inside_its_root() {
+		let root = std::env::temp_dir().join(format!("omp-local-url-{}", std::process::id()));
+		let outside = std::env::temp_dir().join(format!("omp-local-out-{}", std::process::id()));
+		std::fs::create_dir_all(root.join("nested")).expect("root");
+		std::fs::create_dir_all(&outside).expect("outside");
+		std::fs::write(root.join("note.md"), "hello").expect("note");
+		std::fs::write(root.join("nested").join("deep.txt"), "deep").expect("deep");
+		std::fs::write(outside.join("secret.txt"), "secret").expect("secret");
+		let scope = UrlScope {
+			session_file: None,
+			local_roots:  BTreeMap::from([(LOCAL_SCHEME.to_string(), root.clone())]),
+		};
+		let context = scope.resolve_context(&root, &CancellationToken::new());
+		let router = InternalUrlRouter::new();
+		let resource = runtime()
+			.block_on(router.resolve("local://note.md", &context))
+			.expect("resolve inside the root");
+		assert_eq!(resource.content, "hello");
+		assert_eq!(resource.content_type, "text/markdown");
+		assert_eq!(resource.size, 5);
+		let deep = runtime()
+			.block_on(router.resolve("local://nested/deep.txt", &context))
+			.expect("resolve a nested file");
+		assert_eq!(deep.content, "deep");
+		assert!(runtime()
+			.block_on(router.resolve("local://../escape.md", &context))
+			.is_err());
+		assert!(runtime()
+			.block_on(router.resolve("local://missing.md", &context))
+			.is_err());
+		assert!(runtime()
+			.block_on(router.resolve("local://nested", &context))
+			.is_err());
+		assert!(runtime()
+			.block_on(router.write(
+				"local://note.md",
+				"x",
+				&scope.write_context(&root, &CancellationToken::new())
+			))
+			.is_err());
+		// No root bound for this call: the handler stays honest.
+		let bare = UrlScope::default().resolve_context(&root, &CancellationToken::new());
+		assert!(runtime()
+			.block_on(router.resolve("local://note.md", &bare))
+			.is_err());
+		#[cfg(unix)]
+		{
+			std::os::unix::fs::symlink(outside.join("secret.txt"), root.join("link.txt"))
+				.expect("symlink file");
+			std::os::unix::fs::symlink(&outside, root.join("linkdir")).expect("symlink dir");
+			assert!(runtime()
+				.block_on(router.resolve("local://link.txt", &context))
+				.is_err());
+			assert!(runtime()
+				.block_on(router.resolve("local://linkdir/secret.txt", &context))
+				.is_err());
+		}
+		std::fs::remove_dir_all(&root).ok();
+		std::fs::remove_dir_all(&outside).ok();
+	}
+
+	#[cfg(unix)]
+	fn unique_temp(label: &str) -> PathBuf {
+		let nanos = SystemTime::now()
+			.duration_since(UNIX_EPOCH)
+			.map(|duration| duration.as_nanos())
+			.unwrap_or_default();
+		let path = std::env::temp_dir().join(format!(
+			"omp-local-{label}-{}-{nanos}",
+			std::process::id()
+		));
+		std::fs::create_dir(&path).expect("temp dir");
+		path
+	}
+
+	/// Nonblocking writers pair with a reader a regression left in `open(2)`;
+	/// bounded so a fixed build cannot spin.
+	#[cfg(unix)]
+	fn release_blocked_reader(fifo: &Path) {
+		use std::os::unix::ffi::OsStrExt;
+		let Ok(c_fifo) = std::ffi::CString::new(fifo.as_os_str().as_bytes()) else {
+			return;
+		};
+		let deadline = Instant::now() + Duration::from_secs(2);
+		while Instant::now() < deadline {
+			// SAFETY: NUL-terminated path; a successful fd is closed right here.
+			let fd = unsafe { libc::open(c_fifo.as_ptr(), libc::O_WRONLY | libc::O_NONBLOCK) };
+			if fd >= 0 {
+				// SAFETY: fd was returned by `open` above and is owned here.
+				unsafe { libc::close(fd) };
+				return;
+			}
+			std::thread::sleep(Duration::from_millis(25));
+		}
+	}
+
+	#[cfg(unix)]
+	#[test]
+	fn local_root_fifo_fails_fast_instead_of_blocking() {
+		use std::os::unix::ffi::OsStrExt;
+
+		let root = unique_temp("fifo");
+		let fifo = root.join("pipe");
+		let c_fifo = std::ffi::CString::new(fifo.as_os_str().as_bytes()).expect("cstr");
+		// SAFETY: NUL-terminated path inside a directory this test created.
+		assert_eq!(unsafe { libc::mkfifo(c_fifo.as_ptr(), 0o600) }, 0, "mkfifo");
+
+		let scope = UrlScope {
+			session_file: None,
+			local_roots:  BTreeMap::from([(LOCAL_SCHEME.to_string(), root.clone())]),
+		};
+		let context = scope.resolve_context(&root, &CancellationToken::new());
+		let router = InternalUrlRouter::new();
+		let rt = runtime();
+		// The outcome is fixed before any writer exists, so the timeout — not a
+		// writer pairing — decides a regressed build.
+		let outcome = rt.block_on(async {
+			tokio::time::timeout(Duration::from_secs(2), router.resolve("local://pipe", &context))
+				.await
+		});
+		if outcome.is_err() {
+			release_blocked_reader(&fifo);
+		}
+		// The runtime must outlive the release, or dropping it waits on the
+		// parked blocking worker.
+		drop(rt);
+
+		let message = match outcome {
+			Ok(Err(message)) => message,
+			other => panic!("a FIFO must fail fast: {other:?}"),
+		};
+		assert!(message.contains("is not a regular file"), "{message}");
+		std::fs::remove_file(&fifo).expect("unlink fifo");
+		std::fs::remove_dir(&root).expect("rmdir");
+	}
+}
