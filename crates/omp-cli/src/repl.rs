@@ -1,7 +1,7 @@
 //! `omp repl` line grammar.
 //!
 //! A line is a turn unless it starts with `/`: `/exit`, `/quit`, `/model`,
-//! `/cwd`.
+//! `/cwd`, `/memory`.
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ReplCommand {
@@ -10,6 +10,8 @@ pub enum ReplCommand {
 	Model(Option<String>),
 	/// `/cwd <path>` or bare `/cwd` (show current).
 	Cwd(Option<String>),
+	/// `/memory <action> [...]`, same grammar as `omp memory`.
+	Memory(Vec<String>),
 	Prompt(String),
 }
 
@@ -31,6 +33,11 @@ pub fn parse(line: &str) -> Option<ReplCommand> {
 		"/exit" | "/quit" => Some(ReplCommand::Exit),
 		"/model" => Some(ReplCommand::Model(argument)),
 		"/cwd" => Some(ReplCommand::Cwd(argument)),
+		"/memory" => Some(ReplCommand::Memory(
+			argument
+				.map(|argument| argument.split_whitespace().map(str::to_string).collect())
+				.unwrap_or_default(),
+		)),
 		_ => Some(ReplCommand::Prompt(trimmed.to_string())),
 	}
 }
@@ -47,6 +54,17 @@ mod tests {
 		assert_eq!(parse("/model gpt-5"), Some(ReplCommand::Model(Some("gpt-5".into()))));
 		assert_eq!(parse("/model"), Some(ReplCommand::Model(None)));
 		assert_eq!(parse("/cwd /tmp"), Some(ReplCommand::Cwd(Some("/tmp".into()))));
+		assert_eq!(
+			parse("/memory create --global keep answers terse"),
+			Some(ReplCommand::Memory(vec![
+				"create".into(),
+				"--global".into(),
+				"keep".into(),
+				"answers".into(),
+				"terse".into(),
+			]))
+		);
+		assert_eq!(parse("/memory"), Some(ReplCommand::Memory(Vec::new())));
 		assert_eq!(parse("fix the tests"), Some(ReplCommand::Prompt("fix the tests".into())));
 		assert_eq!(
 			parse("/unknown stays a prompt"),

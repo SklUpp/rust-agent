@@ -194,9 +194,18 @@ fn clamp_line(line: Option<u64>) -> u32 {
 }
 
 /// Run `omp read` against `cwd`, writing the tool's exact text response.
-pub fn run_read(
+pub fn run_read(path: &str, cwd: &Path, out: &mut dyn Write) -> Result<(), String> {
+	run_read_with_memory(path, cwd, None, crate::autolearn::MemoryBackend::Off, out)
+}
+
+/// `omp read` with `memory://` mounted for the CLI when the path is a memory
+/// URI. The same handler and backend gate as the headless session router, so
+/// `omp read memory://list` and an in-session `read` agree.
+pub fn run_read_with_memory(
 	path: &str,
 	cwd: &Path,
+	memory_agent_dir: Option<&Path>,
+	backend: crate::autolearn::MemoryBackend,
 	out: &mut dyn Write,
 ) -> Result<(), String> {
 	if path.is_empty() {
@@ -207,7 +216,16 @@ pub fn run_read(
 		.build()
 		.map_err(|err| format!("Failed to start runtime: {err}"))?;
 	let ctx = pi_agent::AgentContext::new(cwd.to_path_buf());
-	let router = Arc::new(pi_agent::tools::InternalUrlRouter::default());
+	let router = pi_agent::tools::InternalUrlRouter::default();
+	if let Some(agent_dir) = memory_agent_dir {
+		router
+			.register(Arc::new(crate::memory_protocol::MemoryUrlHandler::new(
+				agent_dir.to_path_buf(),
+				backend,
+			)))
+			.map_err(|error| format!("Error: {error}"))?;
+	}
+	let router = Arc::new(router);
 	let scope = Arc::new(pi_agent::tools::UrlScope::default());
 	let tool = pi_agent::ReadTool::new().with_internal_urls(router, scope);
 	let result = runtime

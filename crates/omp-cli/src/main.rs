@@ -286,10 +286,48 @@ fn run() -> std::result::Result<(), CliError> {
 				Some(cwd) => dirs::absolute(&std::env::current_dir()?, cwd),
 				None => std::env::current_dir()?,
 			};
+			let path = path.as_deref().unwrap_or("");
+			// `memory://` needs the same handler and backend gate the session
+			// router uses; ordinary file reads stay config-free.
+			let (memory_agent_dir, memory_backend) = if path.starts_with("memory://") {
+				let config = Config::load_run(&cli.config, Some(&base))?;
+				(Some(dirs::agent_dir()), config.memory_backend())
+			} else {
+				(None, MemoryBackend::Off)
+			};
 			let stdout = io::stdout();
 			let mut out = io::BufWriter::new(stdout.lock());
-			tool_commands::run_read(path.as_deref().unwrap_or(""), &base, &mut out)
-				.map_err(CliError::fail)?;
+			tool_commands::run_read_with_memory(
+				path,
+				&base,
+				memory_agent_dir.as_deref(),
+				memory_backend,
+				&mut out,
+			)
+			.map_err(CliError::fail)?;
+			return Ok(());
+		},
+		Some(Command::Memory { action, args }) => {
+			let base = match &cli.cwd {
+				Some(cwd) => dirs::absolute(&std::env::current_dir()?, cwd),
+				None => std::env::current_dir()?,
+			};
+			let config = Config::load_run(&cli.config, Some(&base))?;
+			let mut argv = Vec::with_capacity(args.len() + 1);
+			if let Some(action) = action {
+				argv.push(action.clone());
+			}
+			argv.extend(args.iter().cloned());
+			let stdout = io::stdout();
+			let mut out = io::BufWriter::new(stdout.lock());
+			omp_cli::memory_cmd::execute(
+				&argv,
+				&dirs::agent_dir(),
+				&base,
+				config.memory_backend(),
+				&mut out,
+			)
+			.map_err(CliError::fail)?;
 			return Ok(());
 		},
 		Some(Command::Grep {
@@ -1502,6 +1540,23 @@ fn run_repl<W: Write, E: Write>(
 				eprintln!("cwd: {}", session.cwd.display());
 			},
 			repl::ReplCommand::Cwd(None) => eprintln!("cwd: {}", session.cwd.display()),
+			repl::ReplCommand::Memory(argv) => {
+				let agent_dir = session
+					.skill_options
+					.agent_dir
+					.clone()
+					.unwrap_or_else(dirs::agent_dir);
+				let mut err = io::stderr();
+				if let Err(error) = omp_cli::memory_cmd::execute(
+					&argv,
+					&agent_dir,
+					&session.cwd,
+					session.config.memory_backend(),
+					&mut err,
+				) {
+					eprintln!("{error}");
+				}
+			},
 			repl::ReplCommand::Prompt(text) => {
 				let text = match session.expand_skill_command(&text) {
 					Ok(text) => text,

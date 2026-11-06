@@ -39,6 +39,7 @@ pub mod local_cmd;
 pub mod local_memory;
 pub mod local_models;
 pub mod managed_skills;
+pub mod memory_cmd;
 pub mod memory_protocol;
 pub mod memory_store;
 pub mod output;

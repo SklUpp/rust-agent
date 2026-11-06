@@ -17,6 +17,10 @@
 //!   provenance. This namespace accepts writes: writing the body replaces the
 //!   stored text and refreshes the derived `learned.md` export.
 //!
+//! Creation and deletion stay user commands (`omp memory`, `/memory`): model
+//! tool writes can edit an existing record but can never mint an `asserted`
+//! record or delete one, so memory text cannot grant itself authority.
+//!
 //! `memory://root` stays read-only: deletion is an explicit store/CLI
 //! operation, never a side effect of writing a file. Mnemopi ids and Hindsight
 //! pointers are not implemented here.
@@ -73,14 +77,25 @@ impl MemoryUrlHandler {
 		let relative = url.path.trim_start_matches('/');
 		let mut resource = match namespace {
 			LIST_NAMESPACE if relative.is_empty() => {
-				let records = memory_store::list_visible(&self.agent_dir, &context.cwd)
-					.map_err(|error| error.to_string())?;
+				let records = match memory_store::list_visible(&self.agent_dir, &context.cwd) {
+					Ok(records) => records,
+					Err(memory_store::MemoryStoreError::NotFound(_)) => Vec::new(),
+					Err(error) => return Err(error.to_string()),
+				};
 				InternalResource::text(&url.href, render_record_list(&records))
 			},
 			SEARCH_NAMESPACE if !relative.is_empty() => {
 				let query = decode_percent(relative);
-				let records = memory_store::recall_visible(&self.agent_dir, &context.cwd, &query, None)
-					.map_err(|error| error.to_string())?;
+				let records = match memory_store::recall_visible(
+					&self.agent_dir,
+					&context.cwd,
+					&query,
+					None,
+				) {
+					Ok(records) => records,
+					Err(memory_store::MemoryStoreError::NotFound(_)) => Vec::new(),
+					Err(error) => return Err(error.to_string()),
+				};
 				InternalResource::text(&url.href, render_record_list(&records))
 			},
 			record if relative.is_empty() && memory_store::is_record_id(record) => {
@@ -258,19 +273,17 @@ pub fn memory_path(agent_dir: &Path, cwd: &Path, relative: &str) -> PathBuf {
 }
 
 /// One line per record, with its durable id so it can be opened directly.
-fn render_record_list(records: &[MemoryRecord]) -> String {
+#[must_use]
+pub fn render_record_list(records: &[MemoryRecord]) -> String {
 	if records.is_empty() {
 		return "No memory records.".to_string();
 	}
 	let mut out = String::new();
 	for record in records {
-		let scope = match &record.cwd {
-			Some(cwd) => format!("project:{cwd}"),
-			None => "global".to_string(),
-		};
 		out.push_str(&format!(
-			"- {} [{scope}] origin={} actor={} source={} updated={}\n  {}\n",
+			"- {} [{}] origin={} actor={} source={} updated={}\n  {}\n",
 			record.id,
+			scope_label(record),
 			record.origin.as_str(),
 			record.actor.as_deref().unwrap_or("-"),
 			record.source.as_deref().unwrap_or("-"),
@@ -281,8 +294,18 @@ fn render_record_list(records: &[MemoryRecord]) -> String {
 	out
 }
 
+/// `global` or `project:<cwd>`; the one scope spelling every surface uses.
+#[must_use]
+pub fn scope_label(record: &MemoryRecord) -> String {
+	match &record.cwd {
+		Some(cwd) => format!("project:{cwd}"),
+		None => "global".to_string(),
+	}
+}
+
 /// One record with the provenance D53 requires for viewing/editing.
-fn render_record(record: &MemoryRecord) -> String {
+#[must_use]
+pub fn render_record(record: &MemoryRecord) -> String {
 	let mut out = format!("# Memory {}\n\n- scope: {}\n", record.id, record.scope.as_str());
 	if let Some(cwd) = &record.cwd {
 		out.push_str(&format!("- cwd: {cwd}\n"));
@@ -471,8 +494,8 @@ mod tests {
 		let error = write_record(&handler, &cwd, root_href, "x").await.expect_err("root write");
 		assert!(error.contains("read-only"), "{error}");
 
-		let error = resolve(&handler, &cwd, "memory://list").await.expect_err("no store");
-		assert!(error.contains("no memory records"), "{error}");
+		let listing = resolve(&handler, &cwd, "memory://list").await.expect("empty list");
+		assert!(listing.content.contains("No memory records"), "{}", listing.content);
 
 		let legacy = local_memory::memory_root(&agent_dir, &cwd).join("learned.md");
 		std::fs::write(&legacy, "- legacy deploy lesson\n").expect("learned");

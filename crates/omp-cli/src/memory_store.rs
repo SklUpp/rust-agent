@@ -579,6 +579,26 @@ impl MemoryStore {
 		cwd: Option<&str>,
 		limit: Option<usize>,
 	) -> MemoryResult<Vec<MemoryRecord>> {
+		self.recall_with_scope(query, cwd, limit, ScopeFilter::All)
+	}
+
+	/// Global-only recall. The scope predicate is part of SQL before any
+	/// `LIMIT`, so other projects' rows can never occupy the candidate window.
+	pub fn recall_global(
+		&self,
+		query: &str,
+		limit: Option<usize>,
+	) -> MemoryResult<Vec<MemoryRecord>> {
+		self.recall_with_scope(query, None, limit, ScopeFilter::Global)
+	}
+
+	fn recall_with_scope(
+		&self,
+		query: &str,
+		cwd: Option<&str>,
+		limit: Option<usize>,
+		scope: ScopeFilter,
+	) -> MemoryResult<Vec<MemoryRecord>> {
 		let tokens = query_tokens(query);
 		if tokens.is_empty() {
 			return Err(MemoryStoreError::Validation(
@@ -588,7 +608,7 @@ impl MemoryStore {
 		let limit = limit
 			.unwrap_or(DEFAULT_RECALL_LIMIT)
 			.clamp(1, MAX_RECALL_LIMIT);
-		let mut filter = Filter::all(cwd);
+		let mut filter = Filter { scope, cwd: cwd.map(str::to_string), limit: None };
 		if filter
 			.cwd
 			.as_deref()
@@ -793,6 +813,49 @@ pub fn delete_record_and_export(agent_dir: &Path, cwd: &Path, id: &str) -> Memor
 	Ok(())
 }
 
+/// Create one explicit user assertion (`origin=asserted`, `actor=user`) and
+/// refresh the project's derived `learned.md`. Global rows have no file and are
+/// injected by [`crate::local_memory::build_memory_instructions`] instead.
+pub fn create_asserted_and_export(
+	agent_dir: &Path,
+	cwd: &Path,
+	scope: Scope,
+	body: &str,
+	context: Option<&str>,
+) -> MemoryResult<MemoryRecord> {
+	let store = MemoryStore::open(agent_dir)?;
+	let cwd_text = match scope {
+		Scope::Global => None,
+		Scope::Project => Some(project_cwd(cwd)?),
+	};
+	if scope == Scope::Project {
+		// One-time legacy migration before the first user write, so ids from a
+		// pre-store file stay addressable and the export below is complete.
+		store.import_learned_lessons(agent_dir, cwd)?;
+	}
+	let record = store.add(&AddInput {
+		scope,
+		cwd:     cwd_text.as_deref(),
+		body,
+		context,
+		origin:  Origin::Asserted,
+		actor:   Some("user"),
+		source:  Some("user"),
+		dedupe:  false,
+	})?;
+	if scope == Scope::Project {
+		store.export_learned_lessons(agent_dir, cwd)?;
+	}
+	Ok(record)
+}
+
+/// Read one visible record through the same migration path as a view.
+pub fn get_visible(agent_dir: &Path, cwd: &Path, id: &str) -> MemoryResult<MemoryRecord> {
+	let cwd_text = project_cwd(cwd)?;
+	let store = open_for_view(agent_dir, cwd)?;
+	store.get(id, Some(&cwd_text))
+}
+
 /// All records a session for `cwd` may see: global plus this project.
 ///
 /// A project whose only memory is a legacy `learned.md` is migrated first, so
@@ -802,6 +865,55 @@ pub fn list_visible(agent_dir: &Path, cwd: &Path) -> MemoryResult<Vec<MemoryReco
 	let cwd_text = project_cwd(cwd)?;
 	let store = open_for_view(agent_dir, cwd)?;
 	store.list(&Filter::all(Some(&cwd_text)))
+}
+
+/// Scope-selected list for the user command. `None` is the normal session view
+/// (global plus this project), `Global` ignores `cwd`, and `Project` is this
+/// project only. A global-only view of a missing store is empty, not an error.
+pub fn list_scope(
+	agent_dir: &Path,
+	cwd: &Path,
+	scope: Option<Scope>,
+) -> MemoryResult<Vec<MemoryRecord>> {
+	match scope {
+		None => list_visible(agent_dir, cwd),
+		Some(Scope::Global) => list_global(agent_dir),
+		Some(Scope::Project) => {
+			let store = open_for_view(agent_dir, cwd)?;
+			store.list(&Filter::project(&project_cwd(cwd)?))
+		},
+	}
+}
+
+/// Global-only rows; absence of a store is an empty list.
+pub fn list_global(agent_dir: &Path) -> MemoryResult<Vec<MemoryRecord>> {
+	if !MemoryStore::database_path(agent_dir).is_file() {
+		return Ok(Vec::new());
+	}
+	MemoryStore::open_existing(agent_dir)?.list(&Filter::global())
+}
+
+/// Scope-selected lexical recall, same rules as [`list_scope`].
+pub fn recall_scope(
+	agent_dir: &Path,
+	cwd: &Path,
+	query: &str,
+	scope: Option<Scope>,
+	limit: Option<usize>,
+) -> MemoryResult<Vec<MemoryRecord>> {
+	match scope {
+		None => recall_visible(agent_dir, cwd, query, limit),
+		Some(Scope::Global) => {
+			if !MemoryStore::database_path(agent_dir).is_file() {
+				return Ok(Vec::new());
+			}
+			MemoryStore::open_existing(agent_dir)?.recall_global(query, limit)
+		},
+		Some(Scope::Project) => {
+			let store = open_for_view(agent_dir, cwd)?;
+			store.recall(query, Some(&project_cwd(cwd)?), limit)
+		},
+	}
 }
 
 /// Bounded lexical recall for a session at `cwd`, with the same legacy import

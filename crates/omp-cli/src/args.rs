@@ -1075,6 +1075,18 @@ pub enum Command {
 		path: Option<String>,
 	},
 
+	/// View, create, edit, search, and delete global/project memory records.
+	///
+	/// Usage: `omp memory <list|search|get|create|update|delete> [--global|--project] [--context TEXT]`.
+	Memory {
+		/// Action (`list`, `search`, `get`, `create`, `update`, `delete`, `help`).
+		#[arg(value_name = "ACTION")]
+		action: Option<String>,
+		/// Operands and flags for the action.
+		#[arg(value_name = "ARG", trailing_var_arg = true, allow_hyphen_values = true)]
+		args:   Vec<String>,
+	},
+
 	/// Search files with the same engine and output modes as the grep tool.
 	Grep {
 		/// Regex pattern to search for.
@@ -1886,6 +1898,17 @@ mod tests {
 		// Missing operands reach the command bodies so they exit 1 with the
 		// TS CLI's message instead of clap's exit 2.
 		assert_eq!(parse(&["omp", "read"]).command, Some(Command::Read { path: None }));
+		assert_eq!(
+			parse(&["omp", "memory", "create", "--global", "keep answers terse"]).command,
+			Some(Command::Memory {
+				action: Some("create".to_string()),
+				args:   vec!["--global".to_string(), "keep answers terse".to_string()],
+			})
+		);
+		assert_eq!(
+			parse(&["omp", "memory"]).command,
+			Some(Command::Memory { action: None, args: Vec::new() })
+		);
 		assert_eq!(
 			parse(&["omp", "grep"]).command,
 			Some(Command::Grep {
