@@ -504,3 +504,103 @@ async fn owned_sandbox_is_cleaned_up_without_orphans() {
 	assert_eq!(leftover, vec![std::ffi::OsString::from("foreign-checkout")]);
 	assert_eq!(read(&parent.join("tracked.txt")), "base\n", "parent intact");
 }
+
+// ─── 7. non-git workspace ───────────────────────────────────────────────────
+
+fn plain_project(dir: &Path) {
+	fs::create_dir_all(dir.join("src")).expect("project dir");
+	fs::write(dir.join("src/main.txt"), "one\ntwo\nthree\n").expect("main");
+	fs::write(dir.join("keep.bin"), [0_u8, 1, 2, 3]).expect("bin");
+}
+
+/// A workspace with no `.git` is isolated by snapshotting the live files and
+/// integrated with a three-way file merge; no repository is created.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn plain_workspace_task_delta_is_applied_without_git() {
+	let temp = TempDir::new("plain-apply");
+	let parent = temp.join("project");
+	plain_project(&parent);
+
+	let policy = policy(IsolationMergeMode::Patch);
+	let (baseline, sandbox) =
+		start_sandbox(&parent, &temp.join("wt"), policy, "task-plain").await;
+	assert!(baseline.plain.is_some(), "non-git baseline is a plain snapshot");
+	fs::write(sandbox.merged_dir().join("src/main.txt"), "one\ntwo\nthree\nagent\n")
+		.expect("child edit");
+	fs::write(sandbox.merged_dir().join("agent.bin"), [0_u8, 9, 8, 7]).expect("child bin");
+
+	let out = finish(
+		&sandbox,
+		&baseline,
+		policy,
+		"task-plain",
+		&temp.join("artifacts"),
+		&CancellationToken::new(),
+	)
+	.await;
+	assert!(out.cleanup_error.is_none(), "{out:?}");
+	let report = out.report.clone().expect("report");
+	assert_eq!(report.changes_applied, Some(true), "{}", out.summary);
+	assert_eq!(read(&parent.join("src/main.txt")), "one\ntwo\nthree\nagent\n");
+	assert_eq!(
+		fs::read(parent.join("agent.bin")).expect("merged bin"),
+		[0_u8, 9, 8, 7]
+	);
+	assert!(!parent.join(".git").exists(), "no Git repo is created");
+	assert!(!sandbox.handle().base_dir.exists(), "sandbox cleaned");
+}
+
+/// An external edit to the same file must not be overwritten: the merge
+/// refuses, keeps the parent intact, and preserves base/current/result.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn plain_workspace_conflict_keeps_parent_and_preserves_versions() {
+	let temp = TempDir::new("plain-conflict");
+	let parent = temp.join("project");
+	plain_project(&parent);
+
+	let policy = policy(IsolationMergeMode::Patch);
+	let (baseline, sandbox) =
+		start_sandbox(&parent, &temp.join("wt"), policy, "task-plain-conflict").await;
+	fs::write(sandbox.merged_dir().join("src/main.txt"), "one\nchild\nthree\n")
+		.expect("child edit");
+	// The user keeps editing the same region while the task runs.
+	fs::write(parent.join("src/main.txt"), "one\nparent\nthree\n").expect("parent drift");
+
+	let artifacts = temp.join("artifacts");
+	let out = finish(
+		&sandbox,
+		&baseline,
+		policy,
+		"task-plain-conflict",
+		&artifacts,
+		&CancellationToken::new(),
+	)
+	.await;
+	assert!(out.cleanup_error.is_none(), "{out:?}");
+	let report = out.report.clone().expect("report");
+	assert_eq!(
+		report.changes_applied,
+		Some(false),
+		"conflicting merge must not apply: {}",
+		out.summary
+	);
+	assert_eq!(
+		read(&parent.join("src/main.txt")),
+		"one\nparent\nthree\n",
+		"the user's edit is untouched"
+	);
+	let bundle = artifacts
+		.join("task-plain-conflict.conflicts")
+		.join("src__main.txt");
+	assert_eq!(read(&bundle.join("base")), "one\ntwo\nthree\n");
+	assert_eq!(read(&bundle.join("current")), "one\nparent\nthree\n");
+	assert_eq!(read(&bundle.join("result")), "one\nchild\nthree\n");
+	assert!(
+		out.summary.contains("conflict"),
+		"the conflict is surfaced: {}",
+		out.summary
+	);
+	let patch_path = report.patch_path.expect("patch artifact");
+	assert!(Path::new(&patch_path).exists(), "patch artifact retained");
+	assert!(!sandbox.handle().base_dir.exists(), "sandbox cleaned");
+}

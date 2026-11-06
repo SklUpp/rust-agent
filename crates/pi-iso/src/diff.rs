@@ -252,6 +252,13 @@ fn parse_git_diff(blob: &[u8]) -> Vec<FileChange> {
 
 // ─── plain mode ─────────────────────────────────────────────────────────────
 
+/// Plain-mode (non-git) diff for callers that already run on a blocking
+/// thread. Same walk, mtime short-circuit, and unified rendering as
+/// [`default_diff`] uses for a tree without `.git`.
+pub fn plain_diff_blocking(lower: &Path, merged: &Path) -> IsoResult<Diff> {
+	walk_diff_blocking(lower, merged)
+}
+
 async fn walk_diff(lower: &Path, merged: &Path) -> IsoResult<Diff> {
 	let lower = lower.to_path_buf();
 	let merged = merged.to_path_buf();
@@ -325,15 +332,25 @@ fn walk(root: &Path, dir: &Path, out: &mut BTreeMap<PathBuf, Metadata>) -> IsoRe
 		let entry =
 			entry.map_err(|err| IsoError::other(format!("dir entry in {}: {err}", dir.display())))?;
 		let path = entry.path();
-		let meta = entry
-			.metadata()
-			.map_err(|err| IsoError::other(format!("metadata {}: {err}", path.display())))?;
-		if meta.is_symlink() {
+		// `file_type` never follows symlinks: a symlinked directory must not be
+		// recursed into (that can leave the tree or loop forever).
+		let file_type = entry
+			.file_type()
+			.map_err(|err| IsoError::other(format!("file_type {}: {err}", path.display())))?;
+		let meta = if file_type.is_symlink() {
+			std::fs::symlink_metadata(&path)
+				.map_err(|err| IsoError::other(format!("metadata {}: {err}", path.display())))?
+		} else {
+			entry
+				.metadata()
+				.map_err(|err| IsoError::other(format!("metadata {}: {err}", path.display())))?
+		};
+		if file_type.is_symlink() {
 			let rel = path.strip_prefix(root).unwrap_or(&path).to_path_buf();
 			out.insert(rel, meta);
 			continue;
 		}
-		if meta.is_dir() {
+		if file_type.is_dir() {
 			walk(root, &path, out)?;
 			continue;
 		}
@@ -354,6 +371,13 @@ fn plain_change(
 	peer_root: Option<&Path>,
 ) -> IsoResult<FileChange> {
 	let full = side.join(rel);
+	// Symlinks (including broken ones) are reported as changed without
+	// following the target: reading through a link can escape the tree.
+	if is_symlink(&full)
+		|| peer_root.is_some_and(|peer| is_symlink(&peer.join(rel)))
+	{
+		return Ok(FileChange { path: rel.to_path_buf(), op, diff: None });
+	}
 	let primary = std::fs::read(&full)
 		.map_err(|err| IsoError::other(format!("read {}: {err}", full.display())))?;
 	if looks_binary(&primary) {
@@ -418,4 +442,8 @@ fn render_unified(rel: &Path, op: ChangeKind, old: &str, new: &str) -> String {
 
 fn looks_binary(bytes: &[u8]) -> bool {
 	bytes.iter().take(8192).any(|&b| b == 0)
+}
+
+fn is_symlink(path: &Path) -> bool {
+	std::fs::symlink_metadata(path).is_ok_and(|meta| meta.file_type().is_symlink())
 }

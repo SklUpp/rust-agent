@@ -1,18 +1,30 @@
-//! Git-backed task isolation lifecycle for `task` subagents.
+//! Task-isolation lifecycle for `task` subagents.
 //!
-//! Mirrors the TypeScript `task/worktree.ts` + `task/isolation-runner.ts`
-//! contract while reusing the existing [`pi_iso`] PAL for the writable view
-//! and the `git` CLI for everything the PAL does not model:
+//! Two backends share one contract:
 //!
-//! - [`prepare_context`] snapshots the parent's HEAD + staged + unstaged +
-//!   untracked content (size-capped) and discovers nested repositories.
-//! - [`ensure`] resolves a backend, claims an owned base dir before the mount,
-//!   materialises `m/`, then severs the sandbox's git metadata from the parent
-//!   so a child's git operations can never mutate the parent checkout.
-//! - [`finalize`] captures the child delta against the *baseline snapshot*
-//!   (never `HEAD`, which would include inherited WIP and hide agent commits),
-//!   writes a binary-safe patch artifact, optionally merges it or fetches a
-//!   preserved task branch, then tears the sandbox down.
+//! - **Git checkout.** Mirrors the TypeScript `task/worktree.ts` +
+//!   `task/isolation-runner.ts` contract while reusing the existing [`pi_iso`]
+//!   PAL for the writable view and the `git` CLI for everything the PAL does
+//!   not model:
+//!
+//!   - [`prepare_context`] snapshots the parent's HEAD + staged + unstaged +
+//!     untracked content (size-capped) and discovers nested repositories.
+//!   - [`ensure`] resolves a backend, claims an owned base dir before the mount,
+//!     materialises `m/`, then severs the sandbox's git metadata from the parent
+//!     so a child's git operations can never mutate the parent checkout.
+//!   - [`finalize`] captures the child delta against the *baseline snapshot*
+//!     (never `HEAD`, which would include inherited WIP and hide agent commits),
+//!     writes a binary-safe patch artifact, optionally merges it or fetches a
+//!     preserved task branch, then tears the sandbox down.
+//!
+//! - **No Git checkout.** [`prepare_context`] copies the live filesystem
+//!   (including uncommitted/untracked files) as the three-way base, `ensure`
+//!   forces the `Rcopy` backend, and [`finalize`] integrates with a real
+//!   base/current/result file merge. Conflicts are never written into the
+//!   parent: the whole integration is refused and all three versions are
+//!   preserved under the artifacts dir. Path confinement refuses symlinked
+//!   parent directories and re-checks content before every publish, but it is
+//!   best-effort (not an atomic compare-and-swap and not a sandbox).
 //!
 //! Every mutation that touches the parent repo runs under one process-wide
 //! async mutex: pi-agent has no per-repo lock, and two concurrent tasks
@@ -20,8 +32,9 @@
 //! pop a sibling's stash entry.
 
 use std::{
-	collections::HashSet,
+	collections::{BTreeMap, BTreeSet, HashSet},
 	fs,
+	io::{Read as _, Write as _},
 	path::{Path, PathBuf},
 	process::{Command, Stdio},
 	sync::{
@@ -33,11 +46,15 @@ use std::{
 
 use pi_iso::{BackendKind, IsoError};
 use serde::{Deserialize, Serialize};
+use similar::TextMerge;
 use tokio_util::sync::CancellationToken;
 
 use crate::{
 	provider::{ModelProvider, ToolChoice},
 	state::Message,
+	workspace_writer::{
+		FileVersion, LockError, VersionError, WorkspaceWriter, replace_if_unchanged,
+	},
 };
 
 /// Ownership marker written into a task-isolation base dir; byte-compatible
@@ -53,6 +70,10 @@ pub const ISOLATION_MOUNT_DIR: &str = "m";
 pub const ISOLATION_BASELINE_MAX_CONTENT_BYTES: u64 = 1024 * 1024 * 1024;
 
 const WORKTREE_DIR_PREFIX: &str = "t";
+
+/// Largest regular file the plain (non-git) integration will merge as text.
+/// Larger files are preserved as conflicts instead of buffered in memory.
+const PLAIN_MERGE_MAX_TEXT_BYTES: u64 = 8 * 1024 * 1024;
 
 /// Serializes every parent-repo mutation: root patch apply, cherry-pick, and
 /// nested stash/apply/commit/pop sequences.
@@ -309,12 +330,85 @@ impl RepoBaseline {
 pub struct WorktreeBaseline {
 	pub root: RepoBaseline,
 	pub nested: Vec<NestedBaseline>,
+	/// Set when the workspace is not a Git checkout. Isolation then snapshots
+	/// the live filesystem (including uncommitted and untracked files) and
+	/// integrates with a three-way file merge instead of Git.
+	pub plain: Option<PlainBaseline>,
 }
 
 #[derive(Debug, Clone)]
 pub struct NestedBaseline {
 	pub relative_path: String,
 	pub baseline: RepoBaseline,
+}
+
+/// One path observed in a plain (non-git) workspace snapshot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PlainEntry {
+	pub kind: PlainKind,
+	pub mode: u32,
+	pub len: u64,
+	/// `xxh64` of the file bytes, or of the link target for symlinks.
+	pub hash: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PlainKind {
+	File,
+	Symlink,
+}
+
+impl PlainEntry {
+	fn same(self, other: Self) -> bool {
+		self.kind == other.kind
+			&& self.hash == other.hash
+			&& self.len == other.len
+			&& (self.kind != PlainKind::File || self.mode == other.mode)
+	}
+}
+
+/// Byte-exact copy of a non-Git workspace taken before the child starts.
+///
+/// The copy is the merge base. It is intentionally a real copy (not a hardlink
+/// farm): a hardlinked base would silently change when an external editor
+/// writes the parent file in place, which would turn a conflicting edit into a
+/// silent overwrite.
+#[derive(Debug, Clone)]
+pub struct PlainBaseline {
+	pub root: PathBuf,
+	entries: Arc<BTreeMap<String, PlainEntry>>,
+	snapshot: Arc<PlainSnapshotDir>,
+}
+
+impl PlainBaseline {
+	/// Directory holding the frozen baseline tree.
+	pub fn snapshot_dir(&self) -> &Path {
+		&self.snapshot.dir
+	}
+}
+
+#[derive(Debug)]
+struct PlainSnapshotDir {
+	dir: PathBuf,
+}
+
+impl Drop for PlainSnapshotDir {
+	fn drop(&mut self) {
+		let _ = fs::remove_dir_all(&self.dir);
+	}
+}
+
+/// Isolated child output for a plain workspace, independent of the sandbox
+/// lifetime so integration can run from the artifact copy alone.
+#[derive(Debug, Clone)]
+pub struct PlainCapture {
+	pub base_dir: PathBuf,
+	pub result_dir: PathBuf,
+	pub artifacts_dir: PathBuf,
+	pub base: BTreeMap<String, PlainEntry>,
+	pub result: BTreeMap<String, PlainEntry>,
+	/// Number of paths added, modified, or removed by the child.
+	pub changed: usize,
 }
 
 /// Materialised sandbox. Cleanup is owned by [`IsolationSandbox`], never by the
@@ -343,6 +437,9 @@ pub struct CapturedChanges {
 	pub branch: Option<String>,
 	pub base_sha: Option<String>,
 	pub nested: Vec<NestedPatchArtifact>,
+	/// Set for a non-Git workspace: the frozen base tree plus the child
+	/// output copied into the artifacts dir.
+	pub plain: Option<PlainCapture>,
 	/// Why branch mode fell back to the patch artifact (dirty parent baseline).
 	pub branch_fallback_reason: Option<String>,
 	/// Capture failure that still left a recoverable patch artifact behind.
@@ -351,6 +448,9 @@ pub struct CapturedChanges {
 
 impl CapturedChanges {
 	pub fn is_empty(&self) -> bool {
+		if let Some(plain) = &self.plain {
+			return plain.changed == 0;
+		}
 		self.root_patch.iter().all(u8::is_ascii_whitespace)
 			&& self.nested.iter().all(|nested| nested.patch.iter().all(u8::is_ascii_whitespace))
 	}
@@ -708,13 +808,25 @@ fn base_segment(repo_root: &Path, id: &str) -> String {
 	format!("{}{digest:09x}", WORKTREE_DIR_PREFIX)
 }
 
-fn check_disjoint(base: &Path, repo_root: &Path, common_dir: &Path) -> Result<(), String> {
+fn check_disjoint(
+	base: &Path,
+	repo_root: &Path,
+	common_dir: Option<&Path>,
+) -> Result<(), String> {
 	let overlaps = |a: &Path, b: &Path| a.starts_with(b) || b.starts_with(a);
-	if overlaps(base, repo_root) || overlaps(base, common_dir) {
+	if overlaps(base, repo_root) {
 		return Err(format!(
-			"refusing isolation sandbox {}: it overlaps the source checkout {} or its git dir {}",
+			"refusing isolation sandbox {}: it overlaps the source checkout {}",
 			base.display(),
-			repo_root.display(),
+			repo_root.display()
+		));
+	}
+	if let Some(common_dir) = common_dir
+		&& overlaps(base, common_dir)
+	{
+		return Err(format!(
+			"refusing isolation sandbox {}: it overlaps the Git dir {}",
+			base.display(),
 			common_dir.display()
 		));
 	}
@@ -741,10 +853,38 @@ fn prepare_context_blocking(cwd: &Path) -> Result<WorktreeBaseline, String> {
 						.to_string(),
 				);
 			}
-			return Err(format!(
-				"Isolated task execution requires a Git repository, but {} is not inside one: {error}. Set `task.isolation.mode: none` to run tasks without isolation.",
-				cwd.display()
-			));
+			if has_git_marker(&cwd) {
+				// Git metadata exists, so the probe failed for a real reason
+				// (corrupt repo, dubious ownership, missing `git`). Never
+				// downgrade a real checkout to the filesystem merge.
+				if error.starts_with("cannot run git") {
+					return Err(format!(
+						"Isolated task execution found Git metadata at {} but cannot run the `git` binary: {error}. Install Git, or set `task.isolation.mode: none` to run tasks without isolation.",
+						cwd.display()
+					));
+				}
+				return Err(format!(
+					"Isolated task execution could not read the Git checkout at {}: {error}. Fix the repository, or set `task.isolation.mode: none` to run tasks without isolation; the workspace is not downgraded to the non-Git merge automatically.",
+					cwd.display()
+				));
+			}
+			// No `.git` marker anywhere up the tree: a filesystem workspace.
+			// The snapshot is the three-way merge base and includes every
+			// uncommitted/untracked file as it exists right now.
+			let plain = capture_plain_baseline(&cwd)?;
+			return Ok(WorktreeBaseline {
+				root: RepoBaseline {
+					repo_root: cwd.clone(),
+					head_commit: String::new(),
+					staged: Vec::new(),
+					unstaged: Vec::new(),
+					untracked: Vec::new(),
+					untracked_patch: Vec::new(),
+					submodules: Vec::new(),
+				},
+				nested: Vec::new(),
+				plain: Some(plain),
+			});
 		},
 	};
 	let submodules = submodule_paths(&root)?;
@@ -764,6 +904,7 @@ fn prepare_context_blocking(cwd: &Path) -> Result<WorktreeBaseline, String> {
 	Ok(WorktreeBaseline {
 		root: root_baseline,
 		nested,
+		plain: None,
 	})
 }
 
@@ -771,6 +912,20 @@ fn has_jj_marker(start: &Path) -> bool {
 	let mut current = Some(start);
 	while let Some(dir) = current {
 		if dir.join(".jj").is_dir() {
+			return true;
+		}
+		current = dir.parent();
+	}
+	false
+}
+
+/// `.git` (directory or linked-worktree pointer) at `start` or any ancestor.
+/// Used to distinguish "not a repository" from a broken repository when the
+/// `git` probe fails.
+fn has_git_marker(start: &Path) -> bool {
+	let mut current = Some(start);
+	while let Some(dir) = current {
+		if fs::symlink_metadata(dir.join(".git")).is_ok() {
 			return true;
 		}
 		current = dir.parent();
@@ -1025,6 +1180,1131 @@ fn capture_repo_delta(worktree: &Path, baseline: &RepoBaseline) -> Result<Vec<u8
 	)
 }
 
+// ─── plain (non-git) workspace ─────────────────────────────────────────────
+
+/// Snapshot a workspace that is not a Git checkout.
+///
+/// The baseline keeps a byte-exact copy of every regular file and symlink
+/// (excluding `.git` metadata). Integration later compares three real trees —
+/// frozen base, live parent, isolated result — so an external writer is
+/// detected by content, never by mtime.
+fn capture_plain_baseline(root: &Path) -> Result<PlainBaseline, String> {
+	let entries = plain_manifest(root)?;
+	let total = entries
+		.values()
+		.filter(|entry| entry.kind == PlainKind::File)
+		.fold(0_u64, |sum, entry| sum.saturating_add(entry.len));
+	if total > ISOLATION_BASELINE_MAX_CONTENT_BYTES {
+		return Err(format!(
+			"Workspace at {} carries {} of files, over the {} isolation-snapshot budget. Reduce the tree (generated output and caches are the usual culprit), or set `task.isolation.mode: none` to run tasks without isolation.",
+			root.display(),
+			format_bytes(total),
+			format_bytes(ISOLATION_BASELINE_MAX_CONTENT_BYTES)
+		));
+	}
+	let dir = temp_path("baseline");
+	if let Err(error) = copy_plain_tree(root, &dir, &entries) {
+		let _ = fs::remove_dir_all(&dir);
+		return Err(error);
+	}
+	Ok(PlainBaseline {
+		root: root.to_path_buf(),
+		entries: Arc::new(entries),
+		snapshot: Arc::new(PlainSnapshotDir { dir }),
+	})
+}
+
+/// Content manifest of a plain tree. `.git` metadata is excluded from every
+/// snapshot, capture, and merge: nested repositories keep their own metadata,
+/// and merging its internals would corrupt them.
+fn plain_manifest(root: &Path) -> Result<BTreeMap<String, PlainEntry>, String> {
+	fn walk(
+		root: &Path,
+		dir: &Path,
+		out: &mut BTreeMap<String, PlainEntry>,
+	) -> Result<(), String> {
+		let entries = fs::read_dir(dir)
+			.map_err(|error| format!("read_dir {}: {error}", dir.display()))?;
+		let mut entries = entries.filter_map(Result::ok).collect::<Vec<_>>();
+		entries.sort_by_key(|entry| entry.file_name());
+		for entry in entries {
+			let name = entry.file_name();
+			if name.to_string_lossy() == ".git" {
+				let meta = fs::symlink_metadata(entry.path()).map_err(|error| {
+					format!("stat {}: {error}", entry.path().display())
+				})?;
+				if !meta.is_dir() {
+					return Err(format!(
+						"Nested Git metadata at {} is a linked worktree/submodule pointer, so an isolated copy would still mutate the source repository. Replace it with a full checkout, or set `task.isolation.mode: none` to run tasks without isolation.",
+						entry.path().display()
+					));
+				}
+				continue;
+			}
+			let path = entry.path();
+			let meta = fs::symlink_metadata(&path)
+				.map_err(|error| format!("stat {}: {error}", path.display()))?;
+			let relative = plain_relative(root, &path)?;
+			if meta.file_type().is_symlink() {
+				let target = fs::read_link(&path)
+					.map_err(|error| format!("read_link {}: {error}", path.display()))?;
+				let target = target.to_string_lossy();
+				out.insert(
+					relative,
+					PlainEntry {
+						kind:  PlainKind::Symlink,
+						mode:  plain_mode(&meta),
+						len:   target.len() as u64,
+						hash:  xxhash_rust::xxh64::xxh64(target.as_bytes(), 0),
+					},
+				);
+			} else if meta.is_dir() {
+				walk(root, &path, out)?;
+			} else if meta.is_file() {
+				out.insert(
+					relative,
+					PlainEntry {
+						kind: PlainKind::File,
+						mode: plain_mode(&meta),
+						len:  meta.len(),
+						hash: hash_file(&path)?,
+					},
+				);
+			}
+			// FIFOs, sockets, and devices have no mergeable content.
+		}
+		Ok(())
+	}
+	let mut out = BTreeMap::new();
+	if !root.exists() {
+		return Ok(out);
+	}
+	walk(root, root, &mut out)?;
+	Ok(out)
+}
+
+fn plain_relative(root: &Path, path: &Path) -> Result<String, String> {
+	let relative = path
+		.strip_prefix(root)
+		.map_err(|_| format!("{} is outside {}", path.display(), root.display()))?;
+	relative
+		.to_str()
+		.map(|text| text.replace('\\', "/"))
+		.ok_or_else(|| format!("workspace path {} is not valid UTF-8", path.display()))
+}
+
+fn plain_mode(meta: &fs::Metadata) -> u32 {
+	#[cfg(unix)]
+	{
+		use std::os::unix::fs::PermissionsExt;
+		meta.permissions().mode() & 0o7777
+	}
+	#[cfg(not(unix))]
+	{
+		let _ = meta;
+		0
+	}
+}
+
+fn hash_file(path: &Path) -> Result<u64, String> {
+	let mut file =
+		fs::File::open(path).map_err(|error| format!("open {}: {error}", path.display()))?;
+	let mut hasher = xxhash_rust::xxh64::Xxh64::new(0);
+	let mut buffer = vec![0_u8; 64 * 1024];
+	loop {
+		let read = file
+			.read(&mut buffer)
+			.map_err(|error| format!("read {}: {error}", path.display()))?;
+		if read == 0 {
+			return Ok(hasher.digest());
+		}
+		hasher.update(&buffer[..read]);
+	}
+}
+
+fn copy_plain_tree(
+	root: &Path,
+	dir: &Path,
+	entries: &BTreeMap<String, PlainEntry>,
+) -> Result<(), String> {
+	fs::create_dir_all(dir).map_err(|error| format!("create {}: {error}", dir.display()))?;
+	for (relative, entry) in entries {
+		let source = root.join(relative);
+		let destination = dir.join(relative);
+		if let Some(parent) = destination.parent() {
+			fs::create_dir_all(parent)
+				.map_err(|error| format!("create {}: {error}", parent.display()))?;
+		}
+		copy_plain_node(&source, &destination, *entry)?;
+	}
+	Ok(())
+}
+
+fn copy_plain_node(source: &Path, destination: &Path, entry: PlainEntry) -> Result<(), String> {
+	remove_plain_node(destination)?;
+	match entry.kind {
+		PlainKind::File => {
+			fs::copy(source, destination).map_err(|error| {
+				format!("copy {} -> {}: {error}", source.display(), destination.display())
+			})?;
+			copy_plain_mtime(source, destination);
+			set_plain_mode(destination, entry.mode)?;
+			Ok(())
+		},
+		PlainKind::Symlink => {
+			let target = fs::read_link(source)
+				.map_err(|error| format!("read_link {}: {error}", source.display()))?;
+			create_plain_symlink(&target, destination).map_err(|error| {
+				format!("symlink {} -> {}: {error}", destination.display(), target.display())
+			})
+		},
+	}
+}
+
+/// Mirror the source mtime onto a snapshot copy. pi-iso's plain diff uses
+/// `(size, mtime)` as its fast path, so keeping it makes the patch artifact
+/// name only files the child actually touched. Best effort: mtime is a diff
+/// hint, never a correctness input (the manifest hashes bytes).
+fn copy_plain_mtime(source: &Path, destination: &Path) {
+	let Ok(modified) = fs::metadata(source).and_then(|meta| meta.modified()) else {
+		return;
+	};
+	if let Ok(file) = fs::OpenOptions::new().write(true).open(destination) {
+		let _ = file.set_modified(modified);
+	}
+}
+
+fn remove_plain_node(path: &Path) -> Result<(), String> {
+	match fs::symlink_metadata(path) {
+		Ok(meta) if meta.is_dir() => fs::remove_dir_all(path)
+			.map_err(|error| format!("remove {}: {error}", path.display())),
+		Ok(_) => fs::remove_file(path).map_err(|error| format!("remove {}: {error}", path.display())),
+		Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+		Err(error) => Err(format!("stat {}: {error}", path.display())),
+	}
+}
+
+fn set_plain_mode(path: &Path, mode: u32) -> Result<(), String> {
+	#[cfg(unix)]
+	{
+		use std::os::unix::fs::PermissionsExt;
+		fs::set_permissions(path, fs::Permissions::from_mode(mode & 0o7777))
+			.map_err(|error| format!("chmod {}: {error}", path.display()))
+	}
+	#[cfg(not(unix))]
+	{
+		let _ = (path, mode);
+		Ok(())
+	}
+}
+
+fn create_plain_symlink(target: &Path, link: &Path) -> std::io::Result<()> {
+	#[cfg(unix)]
+	{
+		std::os::unix::fs::symlink(target, link)
+	}
+	#[cfg(windows)]
+	{
+		std::os::windows::fs::symlink_file(target, link)
+	}
+	#[cfg(not(any(unix, windows)))]
+	{
+		let _ = (target, link);
+		Err(std::io::Error::new(
+			std::io::ErrorKind::Unsupported,
+			"symlink integration is unsupported on this platform",
+		))
+	}
+}
+
+fn plain_entry_at(path: &Path) -> Result<Option<PlainEntry>, String> {
+	match fs::symlink_metadata(path) {
+		Ok(meta) if meta.file_type().is_symlink() => {
+			let target = fs::read_link(path)
+				.map_err(|error| format!("read_link {}: {error}", path.display()))?;
+			let target = target.to_string_lossy();
+			Ok(Some(PlainEntry {
+				kind:  PlainKind::Symlink,
+				mode:  plain_mode(&meta),
+				len:   target.len() as u64,
+				hash:  xxhash_rust::xxh64::xxh64(target.as_bytes(), 0),
+			}))
+		},
+		Ok(meta) if meta.is_file() => Ok(Some(PlainEntry {
+			kind: PlainKind::File,
+			mode: plain_mode(&meta),
+			len:  meta.len(),
+			hash: hash_file(path)?,
+		})),
+		Ok(_) => Err(format!(
+			"{} is not a regular file or symlink; refusing to integrate over it",
+			path.display()
+		)),
+		Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+		Err(error) => Err(format!("stat {}: {error}", path.display())),
+	}
+}
+
+fn capture_plain(
+	merged: &Path,
+	baseline: &PlainBaseline,
+	id: &str,
+	artifacts_dir: &Path,
+) -> Result<CapturedChanges, String> {
+	let result = plain_manifest(merged)?;
+	fs::create_dir_all(artifacts_dir)
+		.map_err(|error| format!("create artifacts dir {}: {error}", artifacts_dir.display()))?;
+	let result_dir = artifacts_dir.join(format!("{id}.isolated"));
+	fs::create_dir_all(&result_dir)
+		.map_err(|error| format!("create {}: {error}", result_dir.display()))?;
+	let mut changed = 0_usize;
+	for (relative, entry) in &result {
+		if baseline
+			.entries
+			.get(relative)
+			.is_some_and(|base| base.same(*entry))
+		{
+			continue;
+		}
+		let destination = result_dir.join(relative);
+		if let Some(parent) = destination.parent() {
+			fs::create_dir_all(parent)
+				.map_err(|error| format!("create {}: {error}", parent.display()))?;
+		}
+		copy_plain_node(&merged.join(relative), &destination, *entry)?;
+		changed += 1;
+	}
+	for relative in baseline.entries.keys() {
+		if !result.contains_key(relative) {
+			changed += 1;
+		}
+	}
+
+	let mut root_patch = Vec::new();
+	if changed > 0 {
+		let diff = pi_iso::plain_diff_blocking(baseline.snapshot_dir(), merged)
+			.map_err(|error| format!("diff {}: {error}", baseline.root.display()))?;
+		for change in diff.files {
+			if change
+				.path
+				.components()
+				.any(|component| component.as_os_str() == ".git")
+			{
+				continue;
+			}
+			match change.diff {
+				Some(text) => root_patch.extend_from_slice(text.as_bytes()),
+				None => root_patch.extend_from_slice(
+					format!(
+						"Binary files a/{0} and b/{0} differ\n",
+						change.path.display()
+					)
+					.as_bytes(),
+				),
+			}
+		}
+	}
+	let patch_path = artifacts_dir.join(format!("{id}.patch"));
+	fs::write(&patch_path, &root_patch)
+		.map_err(|error| format!("write patch {}: {error}", patch_path.display()))?;
+
+	Ok(CapturedChanges {
+		root_patch,
+		patch_path: Some(patch_path),
+		plain: Some(PlainCapture {
+			base_dir: baseline.snapshot_dir().to_path_buf(),
+			result_dir,
+			artifacts_dir: artifacts_dir.to_path_buf(),
+			base: (*baseline.entries).clone(),
+			result,
+			changed,
+		}),
+		..CapturedChanges::default()
+	})
+}
+
+fn plain_same(a: Option<PlainEntry>, b: Option<PlainEntry>) -> bool {
+	match (a, b) {
+		(None, None) => true,
+		(Some(a), Some(b)) => a.same(b),
+		_ => false,
+	}
+}
+
+/// Line-oriented three-way merge from the installed `similar` crate.
+/// `None` means unresolved conflict; the caller then preserves all versions
+/// instead of writing conflict markers into the user's workspace.
+fn merge_plain_text(base: &[u8], current: &[u8], result: &[u8]) -> Option<Vec<u8>> {
+	if base.contains(&0) || current.contains(&0) || result.contains(&0) {
+		return None;
+	}
+	let base = std::str::from_utf8(base).ok()?;
+	let current = std::str::from_utf8(current).ok()?;
+	let result = std::str::from_utf8(result).ok()?;
+	let merge = TextMerge::from_lines(base, current, result);
+	(!merge.is_conflicted()).then(|| merge.to_string().into_bytes())
+}
+
+enum PlainAction {
+	Write {
+		relative: String,
+		bytes:    Vec<u8>,
+		mode:     u32,
+		expected: Option<PlainEntry>,
+	},
+	Symlink {
+		relative: String,
+		target:   PathBuf,
+		expected: Option<PlainEntry>,
+	},
+	Delete {
+		relative: String,
+		expected: Option<PlainEntry>,
+	},
+}
+
+impl PlainAction {
+	fn relative(&self) -> &str {
+		match self {
+			Self::Write { relative, .. }
+			| Self::Symlink { relative, .. }
+			| Self::Delete { relative, .. } => relative,
+		}
+	}
+}
+
+enum PlainPlan {
+	Action(PlainAction),
+	Skip,
+	Conflict(String),
+}
+
+enum PlainApplyError {
+	/// Another omp writer holds the parent lease, or the path appeared after
+	/// preflight. Nothing was written.
+	External(String),
+	/// The target no longer matches the content preflight observed.
+	Stale(String),
+	Io(String),
+}
+
+impl PlainApplyError {
+	fn message(&self) -> &str {
+		match self {
+			Self::External(message) | Self::Stale(message) | Self::Io(message) => message,
+		}
+	}
+}
+
+fn merge_plain(
+	repo_root: &Path,
+	id: &str,
+	captured: &CapturedChanges,
+	mode: IsolationMergeMode,
+) -> MergeOutcome {
+	let Some(plain) = &captured.plain else {
+		return MergeOutcome {
+			applied:                 false,
+			had_changes:             false,
+			summary:                 "\n\n<system-notification>Plain integration was requested without a plain capture.</system-notification>".to_string(),
+			merged_branch_for_nested: false,
+		};
+	};
+	let current = match plain_manifest(repo_root) {
+		Ok(manifest) => manifest,
+		Err(error) => {
+			return MergeOutcome {
+				applied:                 false,
+				had_changes:             false,
+				summary:                 format!(
+					"\n\n<system-notification>Could not read the parent workspace for three-way merge: {error}\nThe isolated output was retained at {}.</system-notification>",
+					plain.result_dir.display()
+				),
+				merged_branch_for_nested: false,
+			};
+		},
+	};
+
+	let mut actions = Vec::new();
+	let mut conflicts = Vec::new();
+	let mut paths = BTreeSet::new();
+	paths.extend(plain.base.keys().cloned());
+	paths.extend(plain.result.keys().cloned());
+	paths.extend(current.keys().cloned());
+	for relative in paths {
+		let base = plain.base.get(&relative).copied();
+		let result = plain.result.get(&relative).copied();
+		let now = current.get(&relative).copied();
+		if plain_same(base, result) {
+			continue;
+		}
+		if plain_same(base, now) {
+			match plain_result_action(plain, &relative, result, now) {
+				Ok(action) => actions.push(action),
+				Err(reason) => conflicts.push((relative, reason)),
+			}
+			continue;
+		}
+		if plain_same(now, result) {
+			continue;
+		}
+		match plan_plain_merge(repo_root, plain, &relative, base, result, now) {
+			Ok(PlainPlan::Action(action)) => actions.push(action),
+			Ok(PlainPlan::Skip) => {},
+			Ok(PlainPlan::Conflict(reason)) => conflicts.push((relative, reason)),
+			Err(error) => conflicts.push((relative, error)),
+		}
+	}
+
+	let writer = WorkspaceWriter::new();
+	let mut warnings = Vec::new();
+	// The root session owns the workspace-scope lease, so taking it here would
+	// deadlock every merge. Integration takes the narrower per-file lease and
+	// re-checks content before publishing.
+	if let Err(error) = &writer {
+		warnings.push(format!(
+			"Parent workspace writer lease is unavailable ({error}); integration ran without the omp writer lease. External changes detected before each write are reported, but this is not an atomic compare-and-swap."
+		));
+	}
+
+	if !conflicts.is_empty() {
+		// Refuse the whole integration: a partial write would mix task output
+		// into a workspace the user is actively editing.
+		let mut summary = format!(
+			"\n\n<system-notification>Three-way merge refused: {} path(s) conflict; the parent workspace was left unchanged.</system-notification>",
+			conflicts.len()
+		);
+		for (relative, reason) in &conflicts {
+			match preserve_plain_conflict(repo_root, plain, id, relative) {
+				Ok(Some(dir)) => summary.push_str(&format!(
+					"\n- {relative}: {reason}\n  base/current/result: {}",
+					dir.display()
+				)),
+				Ok(None) => summary.push_str(&format!("\n- {relative}: {reason}")),
+				Err(error) => summary.push_str(&format!(
+					"\n- {relative}: {reason}\n  could not preserve the three versions: {error}"
+				)),
+			}
+		}
+		summary.push_str(&format!(
+			"\nIsolated artifact: {}",
+			plain.result_dir.display()
+		));
+		if let Some(path) = &captured.patch_path {
+			summary.push_str(&format!("\nPatch artifact:\n- {}", path.display()));
+		}
+		for warning in warnings {
+			summary.push_str(&format!("\n\n<system-notification>{warning}</system-notification>"));
+		}
+		return MergeOutcome {
+			applied: false,
+			had_changes: false,
+			summary,
+			merged_branch_for_nested: false,
+		};
+	}
+
+	let writer = writer.as_ref().ok();
+	let mut applied = 0_usize;
+	let mut failures = Vec::new();
+	for action in &actions {
+		match apply_plain_action(writer, repo_root, action) {
+			Ok(()) => applied += 1,
+			Err(error) => failures.push(format!("{}: {}", action.relative(), error.message())),
+		}
+	}
+
+	let mut summary = format!(
+		"\n\nNon-Git workspace: filesystem three-way merge applied {applied} path(s)."
+	);
+	if mode == IsolationMergeMode::Branch {
+		summary.push_str(" A non-Git workspace has no branch history to merge.");
+	}
+	if let Some(path) = &captured.patch_path {
+		summary.push_str(&format!("\nPatch artifact:\n- {}", path.display()));
+	}
+	summary.push_str(&format!("\nIsolated artifact: {}", plain.result_dir.display()));
+	if !failures.is_empty() {
+		summary.push_str(&format!(
+			"\n\n<system-notification>{} path(s) could not be integrated; the parent workspace was left unchanged for them.</system-notification>",
+			failures.len()
+		));
+		for failure in &failures {
+			summary.push_str(&format!("\n- {failure}"));
+		}
+	}
+	for warning in warnings {
+		summary.push_str(&format!("\n\n<system-notification>{warning}</system-notification>"));
+	}
+	MergeOutcome {
+		applied: failures.is_empty(),
+		had_changes: applied > 0,
+		summary,
+		merged_branch_for_nested: false,
+	}
+}
+
+fn plain_result_action(
+	plain: &PlainCapture,
+	relative: &str,
+	result: Option<PlainEntry>,
+	expected: Option<PlainEntry>,
+) -> Result<PlainAction, String> {
+	let Some(entry) = result else {
+		return Ok(PlainAction::Delete {
+			relative: relative.to_string(),
+			expected,
+		});
+	};
+	match entry.kind {
+		PlainKind::File => Ok(PlainAction::Write {
+			relative: relative.to_string(),
+			bytes: fs::read(plain.result_dir.join(relative))
+				.map_err(|error| format!("read isolated artifact {relative}: {error}"))?,
+			mode: entry.mode,
+			expected,
+		}),
+		PlainKind::Symlink => Ok(PlainAction::Symlink {
+			relative: relative.to_string(),
+			target: fs::read_link(plain.result_dir.join(relative))
+				.map_err(|error| format!("read isolated symlink {relative}: {error}"))?,
+			expected,
+		}),
+	}
+}
+
+fn plan_plain_merge(
+	repo_root: &Path,
+	plain: &PlainCapture,
+	relative: &str,
+	base: Option<PlainEntry>,
+	result: Option<PlainEntry>,
+	now: Option<PlainEntry>,
+) -> Result<PlainPlan, String> {
+	let (Some(base), Some(result), Some(now)) = (base, result, now) else {
+		return Ok(PlainPlan::Conflict(
+			"the path was added or removed on both sides".to_string(),
+		));
+	};
+	if base.kind != PlainKind::File || result.kind != PlainKind::File || now.kind != PlainKind::File {
+		return Ok(PlainPlan::Conflict(
+			"node kind changed on both sides; no text base to merge".to_string(),
+		));
+	}
+	if base.len > PLAIN_MERGE_MAX_TEXT_BYTES
+		|| result.len > PLAIN_MERGE_MAX_TEXT_BYTES
+		|| now.len > PLAIN_MERGE_MAX_TEXT_BYTES
+	{
+		return Ok(PlainPlan::Conflict(format!(
+			"file is larger than the {PLAIN_MERGE_MAX_TEXT_BYTES}-byte text-merge limit"
+		)));
+	}
+	let base_bytes = fs::read(plain.base_dir.join(relative))
+		.map_err(|error| format!("read baseline {relative}: {error}"))?;
+	let current_bytes = fs::read(repo_root.join(relative))
+		.map_err(|error| format!("read parent {relative}: {error}"))?;
+	let result_bytes = fs::read(plain.result_dir.join(relative))
+		.map_err(|error| format!("read isolated artifact {relative}: {error}"))?;
+	let Some(merged) = merge_plain_text(&base_bytes, &current_bytes, &result_bytes) else {
+		return Ok(PlainPlan::Conflict(
+			"overlapping edits; preserved base/current/result".to_string(),
+		));
+	};
+	let merged_hash = xxhash_rust::xxh64::xxh64(&merged, 0);
+	let mode = if result.mode == base.mode {
+		now.mode
+	} else if now.mode == base.mode || now.mode == result.mode {
+		result.mode
+	} else {
+		return Ok(PlainPlan::Conflict(
+			"file mode changed on both sides".to_string(),
+		));
+	};
+	if merged_hash == now.hash && merged.len() as u64 == now.len && mode == now.mode {
+		return Ok(PlainPlan::Skip);
+	}
+	Ok(PlainPlan::Action(PlainAction::Write {
+		relative: relative.to_string(),
+		bytes: merged,
+		mode,
+		expected: Some(now),
+	}))
+}
+
+fn preserve_plain_conflict(
+	repo_root: &Path,
+	plain: &PlainCapture,
+	id: &str,
+	relative: &str,
+) -> Result<Option<PathBuf>, String> {
+	let sanitized = relative.replace(['/', '\\'], "__");
+	let dir = plain
+		.artifacts_dir
+		.join(format!("{id}.conflicts"))
+		.join(&sanitized);
+	fs::create_dir_all(&dir).map_err(|error| format!("create {}: {error}", dir.display()))?;
+	let mut copied = false;
+	for (label, root) in [
+		("base", plain.base_dir.as_path()),
+		("current", repo_root),
+		("result", plain.result_dir.as_path()),
+	] {
+		let source = root.join(relative);
+		let Some(entry) = plain_entry_at(&source).map_err(|error| format!("{label}: {error}"))
+		else {
+			continue;
+		};
+		let destination = dir.join(label);
+		remove_plain_node(&destination)?;
+		copy_plain_node(&source, &destination, entry)?;
+		copied = true;
+	}
+	Ok(copied.then_some(dir))
+}
+
+fn plain_target(root: &Path, relative: &str) -> Result<PathBuf, PlainApplyError> {
+	let path = Path::new(relative);
+	let safe = !path.is_absolute()
+		&& path
+			.components()
+			.all(|component| matches!(component, std::path::Component::Normal(_)));
+	if !safe {
+		return Err(PlainApplyError::Io(format!(
+			"refusing unsafe isolation path {relative}"
+		)));
+	}
+	let target = root.join(path);
+	validate_plain_ancestors(root, &target)?;
+	Ok(target)
+}
+
+/// Reject a parent component that is a symlink.
+///
+/// This is best-effort confinement, not a sandbox: the check is not atomic
+/// with the later write, so an external process can still swap a directory
+/// between the check and the publish. That residual race is reported as a
+/// stale/external change by the publish path, never claimed as CAS.
+fn validate_plain_ancestors(root: &Path, target: &Path) -> Result<(), PlainApplyError> {
+	let Ok(relative) = target.strip_prefix(root) else {
+		return Err(PlainApplyError::Io(format!(
+			"{} is outside {}",
+			target.display(),
+			root.display()
+		)));
+	};
+	let mut probe = root.to_path_buf();
+	let mut components = relative.components().peekable();
+	while let Some(component) = components.next() {
+		if components.peek().is_none() {
+			// The final component is the node itself; the publish path handles
+			// (and replaces) it without following it.
+			break;
+		}
+		let std::path::Component::Normal(name) = component else {
+			return Err(PlainApplyError::Io(format!(
+				"refusing unsafe isolation path {}",
+				target.display()
+			)));
+		};
+		probe.push(name);
+		match fs::symlink_metadata(&probe) {
+			Err(error) if error.kind() == std::io::ErrorKind::NotFound => break,
+			Err(error) => {
+				return Err(PlainApplyError::Io(format!(
+					"stat {}: {error}",
+					probe.display()
+				)));
+			},
+			Ok(meta) if meta.file_type().is_symlink() => {
+				return Err(PlainApplyError::External(format!(
+					"refusing to write {} through the symlinked directory {}; the parent must not redirect task output",
+					target.display(),
+					probe.display()
+				)));
+			},
+			Ok(_) => {},
+		}
+	}
+	Ok(())
+}
+
+/// Create missing parent directories one component at a time with `create_dir`
+/// (never `create_dir_all`, which would silently accept an existing symlink).
+fn ensure_plain_parents(root: &Path, target: &Path) -> Result<(), PlainApplyError> {
+	let parent = target.parent().unwrap_or(root);
+	let Ok(relative) = parent.strip_prefix(root) else {
+		return Err(PlainApplyError::Io(format!(
+			"{} is outside {}",
+			target.display(),
+			root.display()
+		)));
+	};
+	let mut current = root.to_path_buf();
+	for component in relative.components() {
+		let std::path::Component::Normal(name) = component else {
+			return Err(PlainApplyError::Io(format!(
+				"refusing unsafe isolation path {}",
+				target.display()
+			)));
+		};
+		current.push(name);
+		match fs::symlink_metadata(&current) {
+			Ok(meta) if meta.file_type().is_symlink() => {
+				return Err(PlainApplyError::External(format!(
+					"refusing to write {} through the symlinked directory {}; the parent must not redirect task output",
+					target.display(),
+					current.display()
+				)));
+			},
+			Ok(meta) if meta.is_dir() => {},
+			Ok(_) => {
+				return Err(PlainApplyError::External(format!(
+					"refusing to write {}: {} is not a directory",
+					target.display(),
+					current.display()
+				)));
+			},
+			Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+				match fs::create_dir(&current) {
+					Ok(()) => {},
+					Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+						let meta = fs::symlink_metadata(&current).map_err(|error| {
+							PlainApplyError::Io(format!("stat {}: {error}", current.display()))
+						})?;
+						if meta.file_type().is_symlink() || !meta.is_dir() {
+							return Err(PlainApplyError::External(format!(
+								"refusing to write {}: {} appeared and is not a directory",
+								target.display(),
+								current.display()
+							)));
+						}
+					},
+					Err(error) => {
+						return Err(PlainApplyError::Io(format!(
+							"create {}: {error}",
+							current.display()
+						)));
+					},
+				}
+			},
+			Err(error) => {
+				return Err(PlainApplyError::Io(format!(
+					"stat {}: {error}",
+					current.display()
+				)));
+			},
+		}
+	}
+	Ok(())
+}
+
+fn apply_plain_action(
+	writer: Option<&WorkspaceWriter>,
+	root: &Path,
+	action: &PlainAction,
+) -> Result<(), PlainApplyError> {
+	let relative = action.relative();
+	let target = plain_target(root, relative)?;
+	let _lease = match writer {
+		Some(writer) => Some(writer.acquire(&target).map_err(|error| match error {
+			LockError::Occupied { .. } => PlainApplyError::External(format!(
+				"another omp writer holds the lease for {}",
+				target.display()
+			)),
+			LockError::Io(error) => PlainApplyError::Io(format!(
+				"workspace writer lease failed for {}: {error}",
+				target.display()
+			)),
+		})?),
+		None => None,
+	};
+	ensure_plain_parents(root, &target)?;
+	let observed = plain_entry_at(&target)
+		.map_err(|error| PlainApplyError::Io(format!("{error}")))?;
+	let expected = match action {
+		PlainAction::Write { expected, .. }
+		| PlainAction::Symlink { expected, .. }
+		| PlainAction::Delete { expected, .. } => *expected,
+	};
+	if !plain_same(observed, expected) {
+		return Err(PlainApplyError::Stale(format!(
+			"{} changed while the task ran; refusing to overwrite it",
+			target.display()
+		)));
+	}
+	match action {
+		PlainAction::Delete { .. } => fs::remove_file(&target)
+			.map_err(|error| PlainApplyError::Io(format!("remove {}: {error}", target.display()))),
+		PlainAction::Symlink { target: link, .. } => {
+			plain_publish_symlink(&target, link, expected)
+		},
+		PlainAction::Write { bytes, mode, .. } => plain_publish_file(&target, bytes, *mode, expected),
+	}
+}
+
+/// Publish file bytes over the parent path.
+///
+/// - A symlink currently at the path is replaced atomically with `rename(2)`
+///   on a same-directory temporary; `rename` replaces the link itself and
+///   never follows it.
+/// - An existing regular file goes through [`replace_if_unchanged`] when small
+///   enough for a [`FileVersion`]; larger files use the same temporary publish.
+/// - A new path is created with exclusive create, chmodded through the open
+///   descriptor, and removed on failure only when the inode is still the one
+///   this call created.
+///
+/// None of these is an atomic compare-and-swap: an external process can still
+/// race the final rename. Every failure is reported, and nothing that is not
+/// provably this call's own output is deleted.
+fn plain_publish_file(
+	target: &Path,
+	bytes: &[u8],
+	mode: u32,
+	expected: Option<PlainEntry>,
+) -> Result<(), PlainApplyError> {
+	if matches!(expected, Some(entry) if entry.kind == PlainKind::Symlink) {
+		return plain_publish_temp(target, bytes, mode, expected);
+	}
+	match expected {
+		Some(entry) => {
+			// Never follow a link that appeared after the preflight.
+			match fs::symlink_metadata(target) {
+				Ok(meta) if meta.file_type().is_symlink() => {
+					return Err(PlainApplyError::Stale(format!(
+						"{} became a symlink during integration; refusing to write through it",
+						target.display()
+					)));
+				},
+				Ok(meta) if meta.is_file() => {},
+				Ok(_) => {
+					return Err(PlainApplyError::Stale(format!(
+						"{} is no longer a regular file; refusing to overwrite it",
+						target.display()
+					)));
+				},
+				Err(error) => {
+					return Err(PlainApplyError::Io(format!(
+						"stat {}: {error}",
+						target.display()
+					)));
+				},
+			}
+			match FileVersion::read(target) {
+				Ok(version) => {
+					if xxhash_rust::xxh64::xxh64(version.raw(), 0) != entry.hash
+						|| version.raw().len() as u64 != entry.len
+					{
+						return Err(PlainApplyError::Stale(format!(
+							"{} changed while the task ran; refusing to overwrite it",
+							target.display()
+						)));
+					}
+					replace_if_unchanged(target, &version, bytes, Some(mode)).map_err(|error| {
+						if error.is_stale() {
+							PlainApplyError::Stale(format!(
+								"{} changed during the write; refusing to overwrite it",
+								target.display()
+							))
+						} else {
+							PlainApplyError::Io(format!("write {}: {error}", target.display()))
+						}
+					})
+				},
+				Err(VersionError::TooLarge { .. }) => {
+					plain_publish_temp(target, bytes, mode, expected)
+				},
+				Err(VersionError::Stale { .. }) => Err(PlainApplyError::Stale(format!(
+					"{} changed while the task ran; refusing to overwrite it",
+					target.display()
+				))),
+				Err(error) => Err(PlainApplyError::Io(format!(
+					"read {}: {error}",
+					target.display()
+				))),
+			}
+		},
+		None => {
+			// New file: exclusive create reports a concurrently appearing path
+			// instead of overwriting it.
+			let mut options = fs::OpenOptions::new();
+			options.write(true).create_new(true);
+			#[cfg(unix)]
+			{
+				use std::os::unix::fs::OpenOptionsExt;
+				options.mode(mode & 0o7777);
+			}
+			let mut file = options.open(target).map_err(|error| {
+				if error.kind() == std::io::ErrorKind::AlreadyExists {
+					PlainApplyError::External(format!(
+						"{} appeared while the task ran; refusing to overwrite it",
+						target.display()
+					))
+				} else {
+					PlainApplyError::Io(format!("create {}: {error}", target.display()))
+				}
+			})?;
+			let identity = file.metadata().ok().as_ref().and_then(file_identity);
+			let written = file
+				.write_all(bytes)
+				.and_then(|()| file.flush())
+				.and_then(|()| set_file_mode(&file, mode));
+			if let Err(error) = written {
+				drop(file);
+				remove_if_same_inode(target, identity);
+				return Err(PlainApplyError::Io(format!(
+					"write {}: {error}",
+					target.display()
+				)));
+			}
+			Ok(())
+		},
+	}
+}
+
+/// Publish through a same-directory temporary and `rename(2)`.
+///
+/// Used for files that cannot go through [`FileVersion`] and for replacing a
+/// symlink: `rename` replaces the directory entry itself, never the link
+/// target. The expected entry is re-checked immediately before the rename;
+/// this narrows, but does not close, the external-writer race.
+fn plain_publish_temp(
+	target: &Path,
+	bytes: &[u8],
+	mode: u32,
+	expected: Option<PlainEntry>,
+) -> Result<(), PlainApplyError> {
+	let parent = target.parent().unwrap_or_else(|| Path::new("."));
+	let name = target
+		.file_name()
+		.map(|name| name.to_string_lossy().into_owned())
+		.unwrap_or_else(|| "file".to_string());
+	let temp = parent.join(format!(
+		".{name}.omp-iso-{}-{}",
+		std::process::id(),
+		TEMP_SEQ.fetch_add(1, Ordering::SeqCst)
+	));
+	let result = (|| {
+		let mut options = fs::OpenOptions::new();
+		options.write(true).create_new(true);
+		#[cfg(unix)]
+		{
+			use std::os::unix::fs::OpenOptionsExt;
+			options.mode(mode & 0o7777);
+		}
+		let mut file = options
+			.open(&temp)
+			.map_err(|error| PlainApplyError::Io(format!("create {}: {error}", temp.display())))?;
+		file.write_all(bytes)
+			.map_err(|error| PlainApplyError::Io(format!("write {}: {error}", temp.display())))?;
+		file.flush()
+			.map_err(|error| PlainApplyError::Io(format!("flush {}: {error}", temp.display())))?;
+		set_file_mode(&file, mode)
+			.map_err(|error| PlainApplyError::Io(format!("chmod {}: {error}", temp.display())))?;
+		let observed = plain_entry_at(target)
+			.map_err(|error| PlainApplyError::Io(format!("{error}")))?;
+		if !plain_same(observed, expected) {
+			return Err(PlainApplyError::Stale(format!(
+				"{} changed during the write; refusing to overwrite it",
+				target.display()
+			)));
+		}
+		fs::rename(&temp, target)
+			.map_err(|error| PlainApplyError::Io(format!("rename {}: {error}", target.display())))
+	})();
+	if result.is_err() {
+		let _ = fs::remove_file(&temp);
+	}
+	result
+}
+
+/// Atomically replace the directory entry with a symlink. `rename` removes the
+/// old file/link without following it; a concurrently appearing directory makes
+/// the rename fail without deleting anything.
+fn plain_publish_symlink(
+	target: &Path,
+	link: &Path,
+	expected: Option<PlainEntry>,
+) -> Result<(), PlainApplyError> {
+	let parent = target.parent().unwrap_or_else(|| Path::new("."));
+	let name = target
+		.file_name()
+		.map(|name| name.to_string_lossy().into_owned())
+		.unwrap_or_else(|| "link".to_string());
+	let temp = parent.join(format!(
+		".{name}.omp-iso-link-{}-{}",
+		std::process::id(),
+		TEMP_SEQ.fetch_add(1, Ordering::SeqCst)
+	));
+	let result = (|| {
+		create_plain_symlink(link, &temp).map_err(|error| {
+			PlainApplyError::Io(format!(
+				"symlink {} -> {}: {error}",
+				temp.display(),
+				link.display()
+			))
+		})?;
+		let observed = plain_entry_at(target)
+			.map_err(|error| PlainApplyError::Io(format!("{error}")))?;
+		if !plain_same(observed, expected) {
+			return Err(PlainApplyError::Stale(format!(
+				"{} changed during the write; refusing to overwrite it",
+				target.display()
+			)));
+		}
+		fs::rename(&temp, target)
+			.map_err(|error| PlainApplyError::Io(format!("rename {}: {error}", target.display())))
+	})();
+	if result.is_err() {
+		let _ = fs::remove_file(&temp);
+	}
+	result
+}
+
+fn set_file_mode(file: &fs::File, mode: u32) -> std::io::Result<()> {
+	#[cfg(unix)]
+	{
+		use std::os::unix::fs::PermissionsExt;
+		file.set_permissions(fs::Permissions::from_mode(mode & 0o7777))
+	}
+	#[cfg(not(unix))]
+	{
+		let _ = (file, mode);
+		Ok(())
+	}
+}
+
+fn file_identity(meta: &fs::Metadata) -> Option<(u64, u64)> {
+	#[cfg(unix)]
+	{
+		use std::os::unix::fs::MetadataExt;
+		Some((meta.dev(), meta.ino()))
+	}
+	#[cfg(not(unix))]
+	{
+		let _ = meta;
+		None
+	}
+}
+
+/// Best-effort removal of this call's own failed output. An external writer
+/// that replaced the inode keeps its file.
+fn remove_if_same_inode(path: &Path, identity: Option<(u64, u64)>) {
+	#[cfg(unix)]
+	{
+		use std::os::unix::fs::MetadataExt;
+		let Some(expected) = identity else { return };
+		if let Ok(meta) = fs::symlink_metadata(path)
+			&& (meta.dev(), meta.ino()) == expected
+		{
+			let _ = fs::remove_file(path);
+		}
+	}
+	#[cfg(not(unix))]
+	{
+		let _ = (path, identity);
+	}
+}
+
 // ─── sandbox creation ───────────────────────────────────────────────────────
 
 /// Materialise a sandbox. The returned value owns cleanup: if the awaiting
@@ -1054,15 +2334,17 @@ fn ensure_blocking(
 	worktree_base: &Path,
 ) -> Result<IsolationHandle, String> {
 	let repo_root = canonical_dir(repo_root)?;
-	let common = resolve_relative(
-		&repo_root,
-		&git_text(&repo_root, &["rev-parse", "--git-common-dir"])?,
-	);
-	let common = canonical_dir(&common)?;
+	let is_git = has_git_marker(&repo_root);
+	let common = if is_git {
+		let raw = git_text(&repo_root, &["rev-parse", "--git-common-dir"])?;
+		Some(canonical_dir(&resolve_relative(&repo_root, &raw))?)
+	} else {
+		None
+	};
 	let base_root = ensure_absolute_dir(worktree_base)?;
-	check_disjoint(&base_root, &repo_root, &common)?;
+	check_disjoint(&base_root, &repo_root, common.as_deref())?;
 	let base_dir = base_root.join(base_segment(&repo_root, id));
-	check_disjoint(&base_dir, &repo_root, &common)?;
+	check_disjoint(&base_dir, &repo_root, common.as_deref())?;
 	if base_dir.exists() {
 		return Err(format!(
 			"isolation sandbox {} already exists; run `omp worktree clear` and retry",
@@ -1076,6 +2358,16 @@ fn ensure_blocking(
 	let mut candidates = resolution.candidates;
 	if candidates.is_empty() {
 		candidates.push(BackendKind::Rcopy);
+	}
+	if common.is_none() {
+		// Non-Git source: Rcopy is the only correct backend. Its recursive copy
+		// freezes the live tree, whereas a live-lower view would fold external
+		// parent edits into the child result. pi-iso's git path also requires
+		// `.git`.
+		fallback_reason.get_or_insert_with(|| {
+			"workspace is not a Git checkout; using rcopy so the child sees a frozen copy of the live files".to_string()
+		});
+		candidates = vec![BackendKind::Rcopy];
 	}
 
 	for candidate in candidates {
@@ -1099,7 +2391,11 @@ fn ensure_blocking(
 		}
 		match pi_iso::backend(candidate).start(&repo_root, &merged_dir) {
 			Ok(()) => {
-				if let Err(error) = detach_git_metadata(&merged_dir, &common) {
+				let detached = match common.as_deref() {
+					Some(common) => detach_git_metadata(&merged_dir, common),
+					None => Ok(()),
+				};
+				if let Err(error) = detached {
 					if pi_iso::backend(candidate).stop(&merged_dir).is_ok() {
 						let _ = fs::remove_dir_all(&base_dir);
 					}
@@ -1179,6 +2475,11 @@ fn prepare_sandbox_blocking(
 		.lock()
 		.unwrap_or_else(|poison| poison.into_inner());
 	let merged = &inner.handle.merged_dir;
+	if baseline.plain.is_some() {
+		// Plain workspace: rcopy already froze the live tree and there is no
+		// git metadata to sever or synthetic tree to write.
+		return Ok(());
+	}
 
 	for submodule in &baseline.root.submodules {
 		let source = baseline.root.repo_root.join(submodule);
@@ -1479,6 +2780,9 @@ fn capture_blocking(
 		.lock()
 		.unwrap_or_else(|poison| poison.into_inner());
 	let merged = &sandbox.handle.merged_dir;
+	if let Some(plain) = &baseline.plain {
+		return capture_plain(merged, plain, id, artifacts_dir);
+	}
 
 	let root_patch = capture_repo_delta(merged, &baseline.root)?;
 	fs::create_dir_all(artifacts_dir)
@@ -1682,7 +2986,7 @@ fn merge_blocking(
 	repo_root: &Path,
 	captured: &CapturedChanges,
 	mode: IsolationMergeMode,
-	_id: &str,
+	id: &str,
 	commits: IsolationCommitStyle,
 	messages: &CommitMessages,
 	cancel: &CancellationToken,
@@ -1698,6 +3002,9 @@ fn merge_blocking(
 			},
 			true,
 		);
+	}
+	if captured.plain.is_some() {
+		return (merge_plain(repo_root, id, captured, mode), false);
 	}
 	let outcome = match mode {
 		IsolationMergeMode::Patch => merge_patch(repo_root, captured, messages, commits),
@@ -2159,6 +3466,7 @@ pub async fn finalize(
 
 	let mut commit_messages = CommitMessages::default();
 	if policy.commits == IsolationCommitStyle::Ai
+		&& baseline.plain.is_none()
 		&& (policy.apply || policy.merge == IsolationMergeMode::Branch)
 	{
 		let Some(provider) = commit_provider.clone() else {
@@ -2291,7 +3599,7 @@ pub async fn finalize(
 		}
 	}
 
-	if policy.merge == IsolationMergeMode::Branch {
+	if policy.merge == IsolationMergeMode::Branch && baseline.plain.is_none() {
 		let merged = sandbox.handle().merged_dir.clone();
 		let baseline_root = baseline.root.clone();
 		let id_owned = id.to_string();
@@ -2381,6 +3689,12 @@ pub async fn finalize(
 					path.display()
 				));
 			}
+		}
+		if let Some(plain) = &captured.plain {
+			summary.push_str(&format!(
+				"\nIsolated artifact: {}",
+				plain.result_dir.display()
+			));
 		}
 		finalize.summary = summary;
 	} else if let Some(error) = &captured.error
@@ -2966,5 +4280,472 @@ mod tests {
 		assert_eq!(IsolationMode::parse("worktree").expect("legacy"), IsolationMode::Rcopy);
 		assert!(IsolationMergeMode::parse("squash").is_err());
 		assert!(IsolationCommitStyle::parse("ai").is_ok());
+	}
+
+	// ─── non-git workspace ──────────────────────────────────────────────
+
+	fn plain_policy(merge: IsolationMergeMode) -> IsolationPolicy {
+		IsolationPolicy {
+			merge,
+			apply: true,
+			commits: IsolationCommitStyle::Generic,
+			preferred: Some(BackendKind::Rcopy),
+		}
+	}
+
+	fn plain_project(dir: &Path) {
+		fs::create_dir_all(dir.join("src")).expect("src dir");
+		fs::write(dir.join("src/main.txt"), "one\ntwo\nthree\n").expect("main");
+		fs::write(dir.join("keep.bin"), [0_u8, 1, 2, 3]).expect("bin");
+	}
+
+	fn plain_sandbox(
+		temp: &TempDir,
+		parent: &Path,
+		id: &str,
+		merge: IsolationMergeMode,
+	) -> (WorktreeBaseline, IsolationSandbox) {
+		let baseline = prepare_context_blocking(parent).expect("baseline");
+		assert!(baseline.plain.is_some(), "non-git baseline is plain");
+		assert!(baseline.root.head_commit.is_empty());
+		let base = temp.0.join("wt");
+		fs::create_dir_all(&base).expect("wt");
+		let sandbox = IsolationSandbox::new(
+			ensure_blocking(&baseline.root.repo_root, id, plain_policy(merge), &base)
+				.expect("sandbox"),
+		);
+		prepare_sandbox_blocking(&sandbox.inner, &baseline).expect("prepare");
+		(baseline, sandbox)
+	}
+
+	#[test]
+	fn plain_workspace_task_delta_applies_without_git() {
+		let temp = TempDir::new("plain");
+		let parent = temp.0.join("project");
+		plain_project(&parent);
+		// Nested git metadata is copied for the child but must never be
+		// captured or merged.
+		fs::create_dir_all(parent.join("vendor/.git")).expect("nested git");
+		fs::write(parent.join("vendor/.git/config"), "base\n").expect("git metadata");
+
+		let (baseline, sandbox) =
+			plain_sandbox(&temp, &parent, "task-plain", IsolationMergeMode::Patch);
+		let merged = sandbox.merged_dir().to_path_buf();
+		fs::write(merged.join("src/main.txt"), "one\ntwo\nthree\nagent\n").expect("edit");
+		fs::write(merged.join("src/new.sh"), "#!/bin/sh\n").expect("new file");
+		set_plain_mode(&merged.join("src/new.sh"), 0o755).expect("mode");
+		fs::write(merged.join("vendor/.git/config"), "child\n").expect("git edit");
+
+		let artifacts = temp.0.join("artifacts");
+		let captured = capture_blocking(
+			&sandbox.inner,
+			&baseline,
+			"task-plain",
+			&artifacts,
+			IsolationMergeMode::Patch,
+		)
+		.expect("capture");
+		assert_eq!(
+			captured.plain.as_ref().expect("plain capture").changed,
+			2,
+			"only the agent's own edits count"
+		);
+		let patch = String::from_utf8_lossy(&captured.root_patch).into_owned();
+		assert!(patch.contains("+agent"), "{patch}");
+		assert!(!patch.contains("vendor/.git"), "git metadata excluded: {patch}");
+
+		let (outcome, cancelled) = merge_blocking(
+			&baseline.root.repo_root,
+			&captured,
+			IsolationMergeMode::Patch,
+			"task-plain",
+			IsolationCommitStyle::Generic,
+			&CommitMessages::default(),
+			&CancellationToken::new(),
+		);
+		assert!(!cancelled);
+		assert!(outcome.applied, "{}", outcome.summary);
+		assert_eq!(
+			fs::read_to_string(parent.join("src/main.txt")).expect("main"),
+			"one\ntwo\nthree\nagent\n"
+		);
+		assert_eq!(
+			fs::read_to_string(parent.join("src/new.sh")).expect("new"),
+			"#!/bin/sh\n"
+		);
+		#[cfg(unix)]
+		{
+			use std::os::unix::fs::PermissionsExt;
+			assert_eq!(
+				fs::metadata(parent.join("src/new.sh"))
+					.expect("mode")
+					.permissions()
+					.mode()
+					& 0o777,
+				0o755,
+				"executable bit is preserved"
+			);
+		}
+		assert_eq!(
+			fs::read_to_string(parent.join("vendor/.git/config")).expect("git metadata"),
+			"base\n",
+			"nested .git metadata is never merged"
+		);
+		assert!(
+			captured
+				.patch_path
+				.as_ref()
+				.is_some_and(|path| path.exists()),
+			"patch artifact retained"
+		);
+		assert!(
+			captured.plain.as_ref().expect("plain").result_dir.is_dir(),
+			"isolated artifact retained"
+		);
+		assert!(sandbox.cleanup().is_none());
+	}
+
+	#[test]
+	fn plain_three_way_merges_disjoint_parent_and_child_edits() {
+		let temp = TempDir::new("threeway");
+		let parent = temp.0.join("project");
+		plain_project(&parent);
+		let (baseline, sandbox) =
+			plain_sandbox(&temp, &parent, "task-3way", IsolationMergeMode::Patch);
+		fs::write(
+			sandbox.merged_dir().join("src/main.txt"),
+			"one\ntwo\nthree\nchild\n",
+		)
+		.expect("child");
+		let captured = capture_blocking(
+			&sandbox.inner,
+			&baseline,
+			"task-3way",
+			&temp.0.join("artifacts"),
+			IsolationMergeMode::Patch,
+		)
+		.expect("capture");
+		// The user edits a different region after the baseline was taken.
+		fs::write(parent.join("src/main.txt"), "parent\ntwo\nthree\n").expect("parent drift");
+
+		let (outcome, _) = merge_blocking(
+			&parent,
+			&captured,
+			IsolationMergeMode::Patch,
+			"task-3way",
+			IsolationCommitStyle::Generic,
+			&CommitMessages::default(),
+			&CancellationToken::new(),
+		);
+		assert!(outcome.applied, "{}", outcome.summary);
+		assert_eq!(
+			fs::read_to_string(parent.join("src/main.txt")).expect("merged"),
+			"parent\ntwo\nthree\nchild\n",
+			"non-overlapping parent and child edits are both kept"
+		);
+		assert!(sandbox.cleanup().is_none());
+	}
+
+	#[test]
+	fn plain_conflict_preserves_versions_and_leaves_parent_unchanged() {
+		let temp = TempDir::new("plainconflict");
+		let parent = temp.0.join("project");
+		plain_project(&parent);
+		let (baseline, sandbox) =
+			plain_sandbox(&temp, &parent, "task-conflict", IsolationMergeMode::Patch);
+		fs::write(
+			sandbox.merged_dir().join("src/main.txt"),
+			"one\nchild\nthree\n",
+		)
+		.expect("child");
+		let artifacts = temp.0.join("artifacts");
+		let captured = capture_blocking(
+			&sandbox.inner,
+			&baseline,
+			"task-conflict",
+			&artifacts,
+			IsolationMergeMode::Patch,
+		)
+		.expect("capture");
+		fs::write(parent.join("src/main.txt"), "one\nparent\nthree\n").expect("parent drift");
+
+		let (outcome, _) = merge_blocking(
+			&parent,
+			&captured,
+			IsolationMergeMode::Patch,
+			"task-conflict",
+			IsolationCommitStyle::Generic,
+			&CommitMessages::default(),
+			&CancellationToken::new(),
+		);
+		assert!(!outcome.applied);
+		assert!(
+			!fs::read_to_string(parent.join("src/main.txt"))
+				.expect("parent")
+				.contains("<<<<<<<"),
+			"conflict markers are never written into the workspace"
+		);
+		assert_eq!(
+			fs::read_to_string(parent.join("src/main.txt")).expect("parent"),
+			"one\nparent\nthree\n",
+			"the user's edit is untouched"
+		);
+		let bundle = artifacts
+			.join("task-conflict.conflicts")
+			.join("src__main.txt");
+		assert_eq!(
+			fs::read_to_string(bundle.join("base")).expect("base"),
+			"one\ntwo\nthree\n"
+		);
+		assert_eq!(
+			fs::read_to_string(bundle.join("current")).expect("current"),
+			"one\nparent\nthree\n"
+		);
+		assert_eq!(
+			fs::read_to_string(bundle.join("result")).expect("result"),
+			"one\nchild\nthree\n"
+		);
+		assert!(outcome.summary.contains("conflict"), "{}", outcome.summary);
+		assert!(sandbox.cleanup().is_none());
+	}
+
+	#[test]
+	fn plain_merge_defers_to_a_held_parent_lease() {
+		let temp = TempDir::new("plainlease");
+		let parent = temp.0.join("project");
+		plain_project(&parent);
+		let (baseline, sandbox) =
+			plain_sandbox(&temp, &parent, "task-lease", IsolationMergeMode::Patch);
+		fs::write(
+			sandbox.merged_dir().join("src/main.txt"),
+			"one\ntwo\nthree\nchild\n",
+		)
+		.expect("child");
+		let captured = capture_blocking(
+			&sandbox.inner,
+			&baseline,
+			"task-lease",
+			&temp.0.join("artifacts"),
+			IsolationMergeMode::Patch,
+		)
+		.expect("capture");
+
+		// Another writer (the parent session) holds the workspace lease for the
+		// target; integration must report it instead of clobbering.
+		let writer = WorkspaceWriter::new().expect("writer lease root");
+		let _held = writer
+			.acquire(&parent.join("src/main.txt"))
+			.expect("hold parent lease");
+		let (outcome, _) = merge_blocking(
+			&parent,
+			&captured,
+			IsolationMergeMode::Patch,
+			"task-lease",
+			IsolationCommitStyle::Generic,
+			&CommitMessages::default(),
+			&CancellationToken::new(),
+		);
+		assert!(!outcome.applied, "{}", outcome.summary);
+		assert!(
+			outcome.summary.contains("lease"),
+			"the held lease is reported: {}",
+			outcome.summary
+		);
+		assert_eq!(
+			fs::read_to_string(parent.join("src/main.txt")).expect("parent"),
+			"one\ntwo\nthree\n"
+		);
+		assert!(sandbox.cleanup().is_none());
+	}
+
+	#[cfg(unix)]
+	#[test]
+	fn plain_symlinked_parent_directory_cannot_redirect_task_output() {
+		let temp = TempDir::new("plainlinkdir");
+		let parent = temp.0.join("project");
+		fs::create_dir_all(&parent).expect("project");
+		fs::write(parent.join("keep.txt"), "keep\n").expect("keep");
+		let (baseline, sandbox) =
+			plain_sandbox(&temp, &parent, "task-linkdir", IsolationMergeMode::Patch);
+		fs::create_dir_all(sandbox.merged_dir().join("out")).expect("out");
+		fs::write(sandbox.merged_dir().join("out/report.txt"), "report\n").expect("report");
+		let captured = capture_blocking(
+			&sandbox.inner,
+			&baseline,
+			"task-linkdir",
+			&temp.0.join("artifacts"),
+			IsolationMergeMode::Patch,
+		)
+		.expect("capture");
+		// The parent redirects `out` outside the workspace after the baseline.
+		let outside = temp.0.join("outside");
+		fs::create_dir_all(&outside).expect("outside");
+		std::os::unix::fs::symlink(&outside, parent.join("out")).expect("symlink");
+
+		let (outcome, _) = merge_blocking(
+			&parent,
+			&captured,
+			IsolationMergeMode::Patch,
+			"task-linkdir",
+			IsolationCommitStyle::Generic,
+			&CommitMessages::default(),
+			&CancellationToken::new(),
+		);
+		assert!(!outcome.applied, "{}", outcome.summary);
+		assert!(
+			!outside.join("report.txt").exists(),
+			"nothing may be written through a symlinked parent directory"
+		);
+		assert!(
+			fs::symlink_metadata(parent.join("out"))
+				.expect("symlink")
+				.file_type()
+				.is_symlink(),
+			"the parent's symlink is not replaced"
+		);
+		assert!(sandbox.cleanup().is_none());
+	}
+
+	#[cfg(unix)]
+	#[test]
+	fn plain_symlink_replaced_by_file_is_applied() {
+		let temp = TempDir::new("plainlinkfile");
+		let parent = temp.0.join("project");
+		fs::create_dir_all(&parent).expect("project");
+		fs::write(parent.join("target.txt"), "target\n").expect("target");
+		std::os::unix::fs::symlink("target.txt", parent.join("link.txt")).expect("link");
+		let (baseline, sandbox) =
+			plain_sandbox(&temp, &parent, "task-linkfile", IsolationMergeMode::Patch);
+		fs::remove_file(sandbox.merged_dir().join("link.txt")).expect("remove link");
+		fs::write(sandbox.merged_dir().join("link.txt"), "now a file\n").expect("file");
+		let captured = capture_blocking(
+			&sandbox.inner,
+			&baseline,
+			"task-linkfile",
+			&temp.0.join("artifacts"),
+			IsolationMergeMode::Patch,
+		)
+		.expect("capture");
+		assert!(
+			fs::symlink_metadata(parent.join("link.txt"))
+				.expect("parent link")
+				.file_type()
+				.is_symlink(),
+			"parent still has the link before merge"
+		);
+
+		let (outcome, _) = merge_blocking(
+			&parent,
+			&captured,
+			IsolationMergeMode::Patch,
+			"task-linkfile",
+			IsolationCommitStyle::Generic,
+			&CommitMessages::default(),
+			&CancellationToken::new(),
+		);
+		assert!(outcome.applied, "{}", outcome.summary);
+		let meta = fs::symlink_metadata(parent.join("link.txt")).expect("link");
+		assert!(!meta.file_type().is_symlink(), "link became a regular file");
+		assert_eq!(
+			fs::read_to_string(parent.join("link.txt")).expect("link file"),
+			"now a file\n"
+		);
+		assert_eq!(
+			fs::read_to_string(parent.join("target.txt")).expect("target"),
+			"target\n",
+			"the link target is never written through"
+		);
+		assert!(sandbox.cleanup().is_none());
+	}
+
+	#[test]
+	fn plain_new_paths_are_never_overwritten_when_they_appear() {
+		let temp = TempDir::new("plainappear");
+		let parent = temp.0.join("project");
+		fs::create_dir_all(&parent).expect("project");
+		fs::write(parent.join("keep.txt"), "keep\n").expect("keep");
+		let (baseline, sandbox) =
+			plain_sandbox(&temp, &parent, "task-appear", IsolationMergeMode::Patch);
+		fs::write(sandbox.merged_dir().join("new.txt"), "task\n").expect("new");
+		fs::write(sandbox.merged_dir().join("blocked.txt"), "task\n").expect("blocked");
+		let captured = capture_blocking(
+			&sandbox.inner,
+			&baseline,
+			"task-appear",
+			&temp.0.join("artifacts"),
+			IsolationMergeMode::Patch,
+		)
+		.expect("capture");
+		// An external writer creates the same new file and a directory where the
+		// task wanted a file, both after capture.
+		fs::write(parent.join("new.txt"), "user\n").expect("user file");
+		fs::create_dir_all(parent.join("blocked.txt")).expect("user dir");
+
+		let (outcome, _) = merge_blocking(
+			&parent,
+			&captured,
+			IsolationMergeMode::Patch,
+			"task-appear",
+			IsolationCommitStyle::Generic,
+			&CommitMessages::default(),
+			&CancellationToken::new(),
+		);
+		assert!(!outcome.applied, "{}", outcome.summary);
+		assert_eq!(
+			fs::read_to_string(parent.join("new.txt")).expect("user file"),
+			"user\n",
+			"an externally created file is not overwritten"
+		);
+		assert!(
+			parent.join("blocked.txt").is_dir(),
+			"an externally created directory is not replaced"
+		);
+		assert!(sandbox.cleanup().is_none());
+	}
+
+	#[test]
+	fn broken_git_checkout_is_not_downgraded_to_plain() {
+		let temp = TempDir::new("brokengit");
+		let parent = temp.0.join("repo");
+		fs::create_dir_all(parent.join(".git")).expect(".git dir");
+		let result = prepare_context_blocking(&parent);
+		let message = result.expect_err("broken checkout must not become a plain workspace");
+		assert!(
+			message.contains("not downgraded") || message.contains("could not read the Git checkout"),
+			"{message}"
+		);
+	}
+
+	#[test]
+	fn plain_empty_workspace_creates_the_task_files() {
+		let temp = TempDir::new("plainempty");
+		let parent = temp.0.join("project");
+		fs::create_dir_all(&parent).expect("project");
+		let (baseline, sandbox) =
+			plain_sandbox(&temp, &parent, "task-empty", IsolationMergeMode::Branch);
+		fs::write(sandbox.merged_dir().join("new.txt"), "created\n").expect("new");
+		let captured = capture_blocking(
+			&sandbox.inner,
+			&baseline,
+			"task-empty",
+			&temp.0.join("artifacts"),
+			IsolationMergeMode::Branch,
+		)
+		.expect("capture");
+		let (outcome, _) = merge_blocking(
+			&parent,
+			&captured,
+			IsolationMergeMode::Branch,
+			"task-empty",
+			IsolationCommitStyle::Generic,
+			&CommitMessages::default(),
+			&CancellationToken::new(),
+		);
+		assert!(outcome.applied, "{}", outcome.summary);
+		assert_eq!(
+			fs::read_to_string(parent.join("new.txt")).expect("new"),
+			"created\n"
+		);
+		assert!(sandbox.cleanup().is_none());
 	}
 }
