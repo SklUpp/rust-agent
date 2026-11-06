@@ -16,9 +16,10 @@ use async_trait::async_trait;
 use futures::{StreamExt, stream};
 use pi_agent::{
 	AgentConfig, AgentEvent, AgentLoop, AgentState, ChunkStream, Message, ModelProvider,
-	OpenAiCompatibleProvider, OpenAiUsage, ProviderError, StreamAssembler, StreamChunk, TokenUsage,
+	OpenAiUsage, ProviderError, StreamAssembler, StreamChunk, TokenUsage,
 	ToolChoice, ToolRegistry, TurnStatus, normalize_usage, parse_sse_line,
 };
+use pi_agent::provider::http::OpenAiCompatibleProvider;
 use serde_json::{Value, json};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};

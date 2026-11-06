@@ -13,9 +13,10 @@ use std::time::Duration;
 
 use futures::StreamExt;
 use pi_agent::{
-	ContentPart, Message, ModelProvider, OpenAiCompatibleProvider, ProviderError, StopReason,
+	ContentPart, Message, ModelProvider, ProviderError, StopReason,
 	StreamAssembler, StreamChunk, ToolCall, ToolCallDelta, ToolChoice, parse_sse_line, sse_stream,
 };
+use pi_agent::provider::http::OpenAiCompatibleProvider;
 use serde_json::{Value, json};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};

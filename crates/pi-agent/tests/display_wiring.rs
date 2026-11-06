@@ -138,8 +138,12 @@ async fn children_resolve_their_own_model_and_drop_anchors_without_edit() {
 	let supervisor = Supervisor::with_selection(
 		registry_with_builtins(),
 		Arc::new(
-			pi_agent::OpenAiCompatibleProvider::new("http://127.0.0.1:9", "test-key", "test-model")
-				.expect("provider"),
+			pi_agent::provider::http::OpenAiCompatibleProvider::new(
+				"http://127.0.0.1:9",
+				"test-key",
+				"test-model",
+			)
+			.expect("provider"),
 		),
 		None,
 		DelegationLimits::default(),

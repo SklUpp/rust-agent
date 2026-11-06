@@ -7,9 +7,10 @@ use std::time::Duration;
 
 use pi_agent::tools::process::{ProcessBackend, ProcessManager};
 use pi_agent::{
-	AgentContext, DelegationLimits, HubTool, ModelProvider, OpenAiCompatibleProvider, Supervisor,
+	AgentContext, DelegationLimits, HubTool, ModelProvider, Supervisor,
 	Tool, ToolRegistry,
 };
+use pi_agent::provider::http::OpenAiCompatibleProvider;
 use serde_json::{Value, json};
 
 fn temp_root(prefix: &str) -> std::path::PathBuf {

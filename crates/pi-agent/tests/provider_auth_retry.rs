@@ -14,9 +14,8 @@ use std::thread;
 use std::time::Duration;
 
 use pi_agent::Message;
-use pi_agent::provider::{
-	CredentialCallback, ModelProvider, OpenAiCompatibleProvider, ProviderError, ToolChoice,
-};
+use pi_agent::provider::http::OpenAiCompatibleProvider;
+use pi_agent::provider::{CredentialCallback, ModelProvider, ProviderError, ToolChoice};
 
 const OK_BODY: &str = "{\"choices\":[{\"message\":{\"role\":\"assistant\",\"content\":\"ok\"},\"finish_reason\":\"stop\"}]}";
 

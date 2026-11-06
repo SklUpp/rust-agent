@@ -6,10 +6,11 @@ use std::{
 
 use pi_agent::{
 	AgentConfig, AgentContext, AgentLoop, AgentState,
-	ChildStatus, DelegationLimits, HubTool, OpenAiCompatibleProvider,
+	ChildStatus, DelegationLimits, HubTool,
 	Role, Supervisor, TaskTool, Tool, ToolRegistry,
 	tools::{InternalUrlRouter, UrlScope, task_catalog::{AgentCatalog, AgentDefinition, AgentSource, Spawns}},
 };
+use pi_agent::provider::http::OpenAiCompatibleProvider;
 use pi_agent::tools::hub::HubToolDetails;
 use pi_agent::tools::task::TaskToolDetails;
 use serde_json::{Value, json};

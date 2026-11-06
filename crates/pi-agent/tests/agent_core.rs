@@ -9,10 +9,11 @@ use std::{
 use async_trait::async_trait;
 use futures::StreamExt;
 use pi_agent::provider::OpenAiChatRequest;
+use pi_agent::provider::http::OpenAiCompatibleProvider;
 use pi_agent::{
 	AgentConfig, AgentError, AgentError::Interrupted, AgentEvent, AgentLoop, AgentState,
 	CancellationToken, ChunkStream, ContentPart, DelegationLimits, EditTool, GlobTool, GrepTool,
-	ImagePart, Message, ModelProvider, OpenAiCompatibleProvider, ProviderError, ReadTool, Role,
+	ImagePart, Message, ModelProvider, ProviderError, ReadTool, Role,
 	SteeringEvent, StopReason, StreamAssembler, StreamChunk, Supervisor, Tool, ToolCall,
 	ToolCallDelta, ToolChoice, ToolRegistry, TurnStatus, WriteTool, parse_sse_line, sse_stream,
 };
