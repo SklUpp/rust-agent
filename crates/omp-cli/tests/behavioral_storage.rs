@@ -1,5 +1,5 @@
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
 use omp_cli::output;
@@ -21,6 +21,22 @@ fn temp_dir(prefix: &str) -> PathBuf {
 	dir
 }
 
+/// Byte snapshot of the SQLite authority (`sessions.db` plus its WAL). `-shm`
+/// is shared lock state, not durable content, and is deliberately excluded.
+fn durable_snapshot(dir: &Path) -> Vec<(PathBuf, Vec<u8>)> {
+	let mut snapshots = Vec::new();
+	for entry in fs::read_dir(dir).expect("read session dir") {
+		let path = entry.expect("read session dir entry").path();
+		let name = path.file_name().and_then(|name| name.to_str()).unwrap_or("");
+		if name == "sessions.db" || name == "sessions.db-wal" {
+			let bytes = fs::read(&path).expect("read durable authority");
+			snapshots.push((path, bytes));
+		}
+	}
+	snapshots.sort();
+	snapshots
+}
+
 #[test]
 fn read_real_ts_v3_session_and_preserve_typed_content() {
 	let fixture_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -30,6 +46,7 @@ fn read_real_ts_v3_session_and_preserve_typed_content() {
 	let temp = temp_dir("v3");
 	let test_file = temp.join("session.jsonl");
 	fs::copy(&fixture_path, &test_file).expect("copy fixture");
+	let source_bytes = fs::read(&test_file).expect("read imported source");
 	let imported_path = omp_cli::session::import_v3_session(&test_file, &temp)
 		.expect("import TS fixture");
 	let imported_id = imported_path
@@ -90,7 +107,20 @@ fn read_real_ts_v3_session_and_preserve_typed_content() {
 	assert_eq!(assistant.stop_reason.as_deref(), Some("aborted"));
 	assert_eq!(assistant.error_message.as_deref(), Some("Interrupted by user"));
 	assert!(assistant.timestamp_ms.is_some_and(|ts| ts > 0), "must have a numeric timestamp");
-	assert!(!test_file.exists(), "appends go to SQLite, not the JSONL fixture");
+	// SQLite is the single authority: the imported JSONL is a source artifact,
+	// never a second journal, so appends must leave it byte-exact and must not
+	// create the per-session identity file.
+	assert_eq!(
+		fs::read(&test_file).expect("read source after append"),
+		source_bytes,
+		"appends go to SQLite; the imported JSONL source must stay byte-exact"
+	);
+	let identity = store.file().expect("identity path").to_path_buf();
+	assert!(
+		!identity.exists(),
+		"appends go to SQLite; the identity JSONL must never be created as a journal"
+	);
+	assert!(temp.join("sessions.db").is_file(), "append must persist into the SQLite authority");
 
 	fs::remove_dir_all(temp).ok();
 }
@@ -875,10 +905,11 @@ fn direct_append_message_with_malformed_text_and_image_fails_preflight_and_prese
 		parts: vec![],
 	};
 	store.append_turn(&initial_turn).expect("append initial turn");
-	let file = store.file().expect("file").to_path_buf();
+	let identity = store.file().expect("identity path").to_path_buf();
+	assert!(!identity.exists(), "identity JSONL must never be created as a journal");
+	let durable_before = durable_snapshot(&temp);
+	assert!(!durable_before.is_empty(), "baseline turn must persist into SQLite");
 
-	let file_content_before = fs::read_to_string(&file).expect("read before");
-	let file_size_before = fs::metadata(&file).expect("metadata before").len();
 	let messages_len_before = store.messages().len();
 	let entries_len_before = store.entries().len();
 	let history_len_before = store.history().len();
@@ -908,14 +939,48 @@ fn direct_append_message_with_malformed_text_and_image_fails_preflight_and_prese
 	let err = res.unwrap_err();
 	assert!(err.contains("missing text"), "error must mention missing text: {err}");
 
-	// Verify exact equality of file and in-memory state
-	let file_content_after = fs::read_to_string(&file).expect("read after");
-	assert_eq!(file_content_before, file_content_after, "session file must remain 100% identical");
-	let file_size_after = fs::metadata(&file).expect("metadata after").len();
-	assert_eq!(file_size_before, file_size_after, "session file size must not change");
+	// Verify the SQLite authority and in-memory state are untouched: the
+	// malformed part is rejected in preflight, before any durable write.
+	assert_eq!(
+		durable_snapshot(&temp),
+		durable_before,
+		"durable store must remain byte-exact after a failed preflight"
+	);
+	assert!(!identity.exists(), "failed preflight must not create a JSONL journal");
 	assert_eq!(store.messages().len(), messages_len_before, "messages must not mutate");
 	assert_eq!(store.entries().len(), entries_len_before, "entries must not mutate");
 	assert_eq!(store.history().len(), history_len_before, "history must not mutate");
+	assert!(
+		store
+			.messages()
+			.iter()
+			.all(|entry| entry.id != "msg-bad-text"),
+		"rejected entry must never enter the in-memory view"
+	);
+
+	// A fresh read of the same authority must also miss the rejected entry.
+	let reopened = SessionStore::open(&SessionOptions {
+		enabled: true,
+		cwd: PathBuf::from("/work"),
+		model: None,
+		provider: None,
+		dir: Some(temp.clone()),
+		id: Some("s-direct-malformed-text".to_string()),
+		continue_latest: false,
+		parent_session: None,
+		no_title: false,
+	});
+	assert!(reopened.enabled(), "reopened store must load the durable session");
+	assert_eq!(reopened.messages().len(), messages_len_before, "durable messages must not change");
+	assert_eq!(reopened.entries().len(), entries_len_before, "durable entries must not change");
+	assert_eq!(reopened.history().len(), history_len_before, "durable history must not change");
+	assert!(
+		reopened
+			.messages()
+			.iter()
+			.all(|entry| entry.id != "msg-bad-text"),
+		"rejected entry must never reach the durable authority"
+	);
 
 	fs::remove_dir_all(temp).ok();
 }
