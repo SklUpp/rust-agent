@@ -12,18 +12,20 @@ use crate::mcp::transports::sse::LegacySseTransport;
 use crate::mcp::transports::stdio::StdioTransport;
 use crate::mcp::transports::McpTransport;
 use crate::mcp::types::{
-    MCPClientCapabilities, MCPContent, MCPInitializeParams, MCPInitializeResult, MCPResource,
+    MCPClientCapabilities, MCPContent, MCPGetPromptParams, MCPGetPromptResult,
+    MCPInitializeParams, MCPInitializeResult, MCPPrompt, MCPPromptsListResult, MCPResource,
     MCPResourceReadParams, MCPResourceReadResult, MCPResourceTemplate,
     MCPResourceTemplatesListResult, MCPResourcesListResult, MCPRootsCapability,
     MCPServerCapabilities, MCPServerConfig, MCPServerInfo, MCPToolCallResult, MCPToolDefinition,
     MCPToolsListResult, MCP_PROTOCOL_VERSION,
 };
 
-// Conservative pagination bounds for untrusted servers; shared by resources
-// and resource templates. 64 pages x 10k entries keeps a broken cursor from
-// becoming unbounded memory/time while never limiting a real server.
-const MAX_RESOURCE_PAGES: usize = 64;
-const MAX_RESOURCE_ENTRIES: usize = 10_000;
+// Conservative pagination bounds for untrusted servers; shared by every
+// cursor-paginated `*/list` method (resources, resource templates, prompts).
+// 64 pages x 10k entries keeps a broken cursor from becoming unbounded
+// memory/time while never limiting a real server.
+const MAX_LIST_PAGES: usize = 64;
+const MAX_LIST_ENTRIES: usize = 10_000;
 
 pub fn is_retriable_connection_error(error: &McpError) -> bool {
     match error {
@@ -270,7 +272,7 @@ impl McpConnection {
 
         loop {
             pages += 1;
-            if pages > MAX_RESOURCE_PAGES {
+            if pages > MAX_LIST_PAGES {
                 return Err(McpError::Protocol(
                     "resources/list exceeded pagination bounds".to_string(),
                 ));
@@ -302,7 +304,7 @@ impl McpConnection {
                 McpError::Protocol(format!("Invalid resources/list response: {}", e))
             })?;
 
-            if page.resources.len() > MAX_RESOURCE_ENTRIES.saturating_sub(all_resources.len()) {
+            if page.resources.len() > MAX_LIST_ENTRIES.saturating_sub(all_resources.len()) {
                 return Err(McpError::Protocol(
                     "resources/list exceeded pagination bounds".to_string(),
                 ));
@@ -344,7 +346,7 @@ impl McpConnection {
 
         loop {
             pages += 1;
-            if pages > MAX_RESOURCE_PAGES {
+            if pages > MAX_LIST_PAGES {
                 return Err(McpError::Protocol(
                     "resources/templates/list exceeded pagination bounds".to_string(),
                 ));
@@ -386,7 +388,7 @@ impl McpConnection {
                 })?;
 
             if page.resource_templates.len()
-                > MAX_RESOURCE_ENTRIES.saturating_sub(all_templates.len())
+                > MAX_LIST_ENTRIES.saturating_sub(all_templates.len())
             {
                 return Err(McpError::Protocol(
                     "resources/templates/list exceeded pagination bounds".to_string(),
@@ -428,6 +430,123 @@ impl McpConnection {
 
         serde_json::from_value(res_val)
             .map_err(|e| McpError::Protocol(format!("Invalid resources/read response: {}", e)))
+    }
+
+    /// Whether the server negotiated the `prompts` capability.
+    #[must_use]
+    pub fn supports_prompts(&self) -> bool {
+        self.capabilities.prompts.is_some()
+    }
+
+    /// List prompt templates, following `nextCursor` until exhausted.
+    ///
+    /// Unlike `list_resources`, an unnegotiated `prompts` capability is an
+    /// explicit [`McpError::UnsupportedCapability`]: a caller that asked for
+    /// prompts is told the server cannot serve them rather than being handed a
+    /// misleading empty catalog. A server that advertised `prompts` but fails
+    /// the method surfaces its own JSON-RPC error unchanged. Nothing is cached
+    /// or retried, and the capability check sends no request.
+    pub async fn list_prompts(&self) -> Result<Vec<MCPPrompt>, McpError> {
+        if !self.supports_prompts() {
+            return Err(McpError::UnsupportedCapability(
+                "prompts (server did not advertise prompts/list)".to_string(),
+            ));
+        }
+        let timeout_dur = self.request_timeout();
+        let deadline = timeout_dur.map(|timeout| Instant::now() + timeout);
+        let mut all_prompts = Vec::new();
+        let mut cursor: Option<String> = None;
+        let mut seen = HashSet::new();
+        let mut pages = 0usize;
+
+        loop {
+            pages += 1;
+            if pages > MAX_LIST_PAGES {
+                return Err(McpError::Protocol(
+                    "prompts/list exceeded pagination bounds".to_string(),
+                ));
+            }
+            let mut params = json!({});
+            if let Some(c) = &cursor {
+                params["cursor"] = json!(c);
+            }
+            let remaining = match deadline {
+                Some(deadline) => {
+                    let remaining = deadline.saturating_duration_since(Instant::now());
+                    if remaining.is_zero() {
+                        return Err(McpError::Timeout(
+                            "prompts/list pagination deadline exceeded".to_string(),
+                        ));
+                    }
+                    Some(remaining)
+                }
+                None => None,
+            };
+            let transport = {
+                let guard = self.transport.read().await;
+                guard.clone()
+            };
+            let res_val = transport
+                .request("prompts/list", Some(params), remaining)
+                .await?;
+            let page: MCPPromptsListResult = serde_json::from_value(res_val)
+                .map_err(|e| McpError::Protocol(format!("Invalid prompts/list response: {}", e)))?;
+
+            if page.prompts.len() > MAX_LIST_ENTRIES.saturating_sub(all_prompts.len()) {
+                return Err(McpError::Protocol(
+                    "prompts/list exceeded pagination bounds".to_string(),
+                ));
+            }
+            all_prompts.extend(page.prompts);
+
+            match page.next_cursor {
+                Some(next) if !next.is_empty() => {
+                    if !seen.insert(next.clone()) {
+                        return Err(McpError::Protocol(
+                            "prompts/list returned a repeated cursor".to_string(),
+                        ));
+                    }
+                    cursor = Some(next);
+                }
+                _ => break,
+            }
+        }
+
+        Ok(all_prompts)
+    }
+
+    /// Render one prompt template by name.
+    ///
+    /// `arguments` are sent only when non-empty; a missing required argument is
+    /// left to the server, whose JSON-RPC error propagates unchanged. The call
+    /// is single-shot: rendering is server-side work, so a lost response is
+    /// never replayed.
+    pub async fn get_prompt(
+        &self,
+        name: &str,
+        arguments: BTreeMap<String, String>,
+    ) -> Result<MCPGetPromptResult, McpError> {
+        if !self.supports_prompts() {
+            return Err(McpError::UnsupportedCapability(
+                "prompts (server did not advertise prompts/get)".to_string(),
+            ));
+        }
+        let timeout_dur = self.request_timeout();
+        let params = serde_json::to_value(MCPGetPromptParams {
+            name: name.to_string(),
+            arguments: (!arguments.is_empty()).then_some(arguments),
+        })?;
+
+        let transport = {
+            let guard = self.transport.read().await;
+            guard.clone()
+        };
+        let res_val = transport
+            .request("prompts/get", Some(params), timeout_dur)
+            .await?;
+
+        serde_json::from_value(res_val)
+            .map_err(|e| McpError::Protocol(format!("Invalid prompts/get response: {}", e)))
     }
 
     pub async fn call_tool(

@@ -12,7 +12,8 @@
 //! The `ssh://` handler is built in and lives in [`super::ssh`]: it shells out
 //! to the native OpenSSH client instead of routing frames through a host.
 //! The `mcp://` handler is built in and resolves live MCP sessions from
-//! [`crate::mcp::client`]'s process-wide registry.
+//! [`crate::mcp::client`]'s process-wide registry. The `mcp-prompt://` handler
+//! is built in next to it and lists/renders prompts over the same sessions.
 //! The `artifact://` handler is built in and lives in
 //! [`super::internal_urls_artifact`]: it reads a session's spilled tool output
 //! from roots bound in [`UrlScope::local_roots`], never a process-global
@@ -40,17 +41,17 @@ pub const LOCAL_SCHEME: &str = "local";
 /// the security review surface, `local://` for the built-in root handler,
 /// `artifact://` for the built-in spilled-output reader, `agent://` for saved
 /// subagent outputs, `ssh://` for the built-in native OpenSSH read handler,
-/// `mcp://` for the built-in MCP resource consumer, `issue://`/`pr://` for the
-/// built-in native GitHub handlers, and `history://` for the session transcript
-/// reader mounted by `hub_park::register_history`.
+/// `mcp://` for the built-in MCP resource consumer, `mcp-prompt://` for the
+/// built-in MCP prompt catalog/renderer, `issue://`/`pr://` for the built-in
+/// native GitHub handlers, and `history://` for the session transcript reader
+/// mounted by `hub_park::register_history`.
 ///
 /// `history://` and `security://` are per-session mounts rather than
 /// constructor built-ins; they install only through their own reserved mount
 /// helpers ([`register_security`] and `hub_park::register_history`), never
 /// through [`InternalUrlRouter::register`].
-pub const RESERVED_SCHEMES: [&str; 9] = [
-	"agent", "artifact", "history", "issue", "local", "mcp", "pr", "security", "ssh",
-];
+pub const RESERVED_SCHEMES: [&str; 10] =
+	["agent", "artifact", "history", "issue", "local", "mcp", "mcp-prompt", "pr", "security", "ssh"];
 
 /// Reserved scheme for the read-only security review surface.
 pub const SECURITY_SCHEME: &str = "security";
@@ -267,10 +268,10 @@ pub struct InternalUrlRouter {
 
 impl Default for InternalUrlRouter {
 	/// Every constructor starts with the built-in `local://`, `artifact://`,
-	/// `agent://`, `ssh://`, `mcp://`, `issue://`, and `pr://` handlers, so a
-	/// session scope root, a spilled artifact, a saved subagent output, a remote
-	/// read, an MCP resource, and a GitHub issue or PR resolve without an extra
-	/// mount step.
+	/// `agent://`, `ssh://`, `mcp://`, `mcp-prompt://`, `issue://`, and `pr://`
+	/// handlers, so a session scope root, a spilled artifact, a saved subagent
+	/// output, a remote read, an MCP resource or prompt, and a GitHub issue or
+	/// PR resolve without an extra mount step.
 	fn default() -> Self {
 		let mut handlers: BTreeMap<String, Arc<dyn ProtocolHandler>> = BTreeMap::new();
 		handlers.insert(LOCAL_SCHEME.to_string(), Arc::new(LocalRootHandler));
@@ -287,6 +288,10 @@ impl Default for InternalUrlRouter {
 			Arc::new(super::ssh::SshProtocolHandler::new()),
 		);
 		handlers.insert(MCP_SCHEME.to_string(), Arc::new(McpUrlHandler));
+		handlers.insert(
+			super::internal_urls_mcp_prompt::MCP_PROMPT_SCHEME.to_string(),
+			Arc::new(super::internal_urls_mcp_prompt::McpPromptUrlHandler),
+		);
 		handlers.insert(
 			"issue".to_string(),
 			Arc::new(super::internal_urls_github::IssueUrlHandler),
@@ -525,7 +530,7 @@ impl ProtocolHandler for McpUrlHandler {
 			let resources = connection.list_resources().await.map_err(|error| {
 				format!("mcp://{} resources/list failed: {error}", url.host)
 			})?;
-			let content = if resources.is_empty() {
+			let mut content = if resources.is_empty() {
 				format!("# MCP resources on {}\n\n(none)", url.host)
 			} else {
 				let mut lines =
@@ -542,6 +547,9 @@ impl ProtocolHandler for McpUrlHandler {
 				}
 				lines.join("\n")
 			};
+			if connection.supports_prompts() {
+				content.push_str(&format!("\n\nPrompts: mcp-prompt://{}", url.host));
+			}
 			let mut resource = InternalResource::text(&url.href, content);
 			resource.content_type = "text/markdown".to_string();
 			resource.immutable = true;
@@ -855,6 +863,7 @@ mod tests {
 		assert!(is_reserved_scheme("local"));
 		assert!(is_reserved_scheme("ssh"));
 		assert!(is_reserved_scheme("mcp"));
+		assert!(is_reserved_scheme("mcp-prompt"));
 		let url = InternalUrl::parse("skill://plugin:name/x").expect("parse");
 		assert_eq!(url.scheme, "skill");
 		assert_eq!(url.host, "plugin:name");
@@ -871,7 +880,7 @@ mod tests {
 			.expect_err("unknown");
 		assert_eq!(
 			error,
-			"Unknown protocol: nope://\nSupported: agent://, artifact://, issue://, local://, mcp://, pr://, ssh://"
+			"Unknown protocol: nope://\nSupported: agent://, artifact://, issue://, local://, mcp://, mcp-prompt://, pr://, ssh://"
 		);
 		router.register(Echo::new("notes", false, false)).expect("register");
 		let error = runtime()
@@ -879,7 +888,7 @@ mod tests {
 			.expect_err("unknown");
 		assert_eq!(
 			error,
-			"Unknown protocol: nope://\nSupported: agent://, artifact://, issue://, local://, mcp://, notes://, pr://, ssh://"
+			"Unknown protocol: nope://\nSupported: agent://, artifact://, issue://, local://, mcp://, mcp-prompt://, notes://, pr://, ssh://"
 		);
 		assert!(!router.can_handle("nope://x"));
 		assert!(router.can_handle("notes://x"));
@@ -916,6 +925,7 @@ mod tests {
 				"issue".to_string(),
 				"local".to_string(),
 				"mcp".to_string(),
+				"mcp-prompt".to_string(),
 				"notes".to_string(),
 				"pr".to_string(),
 				"ssh".to_string()
@@ -955,6 +965,7 @@ mod tests {
 				"issue".to_string(),
 				"local".to_string(),
 				"mcp".to_string(),
+				"mcp-prompt".to_string(),
 				"pr".to_string(),
 				"ssh".to_string()
 			]

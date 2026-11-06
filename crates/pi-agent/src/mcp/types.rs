@@ -248,12 +248,26 @@ pub struct MCPServerInfo {
 	pub version: Option<String>,
 }
 
+/// Server `prompts` capability. The object is optional on the wire, so the
+/// negotiated capability is the *presence* of the `prompts` key: `None` means
+/// the server did not advertise it and `prompts/list`/`prompts/get` must not be
+/// requested.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct MCPPromptsCapability {
+	#[serde(rename = "listChanged", default)]
+	pub list_changed: bool,
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct MCPServerCapabilities {
 	#[serde(default)]
 	pub tools: Option<Value>,
 	#[serde(default)]
 	pub resources: Option<Value>,
+	/// Advertised only by servers that implement `prompts/list` and
+	/// `prompts/get`; skipped from serialization until negotiated.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub prompts: Option<MCPPromptsCapability>,
 	#[serde(default)]
 	pub logging: Option<Value>,
 }
@@ -293,6 +307,12 @@ pub enum MCPContent {
 	Text { text: String },
 	#[serde(rename = "image")]
 	Image {
+		data: String,
+		#[serde(rename = "mimeType")]
+		mime_type: String,
+	},
+	#[serde(rename = "audio")]
+	Audio {
 		data: String,
 		#[serde(rename = "mimeType")]
 		mime_type: String,
@@ -401,8 +421,84 @@ pub struct MCPResourceReadParams {
 	pub uri: String,
 }
 
+/// One declared argument of a prompt template.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct MCPPromptArgument {
+	pub name: String,
+	#[serde(default)]
+	pub description: Option<String>,
+	#[serde(default)]
+	pub required: bool,
+}
+
+/// A prompt template advertised by `prompts/list`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MCPPrompt {
+	pub name: String,
+	#[serde(default)]
+	pub title: Option<String>,
+	#[serde(default)]
+	pub description: Option<String>,
+	#[serde(default)]
+	pub arguments: Vec<MCPPromptArgument>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct MCPPromptsListResult {
+	#[serde(default)]
+	pub prompts: Vec<MCPPrompt>,
+	#[serde(rename = "nextCursor", default)]
+	pub next_cursor: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MCPGetPromptParams {
+	pub name: String,
+	/// Omitted entirely when no arguments are supplied, never `null`.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub arguments: Option<BTreeMap<String, String>>,
+}
+
+/// `prompts/get` message content: the wire allows one content block or an
+/// array of them, so both forms decode without wrapping or loss.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum MCPPromptContent {
+	Single(MCPContent),
+	Many(Vec<MCPContent>),
+}
+
+impl MCPPromptContent {
+	#[must_use]
+	pub fn into_vec(self) -> Vec<MCPContent> {
+		match self {
+			Self::Single(content) => vec![content],
+			Self::Many(contents) => contents,
+		}
+	}
+}
+
+/// One rendered prompt message. `role` stays verbatim: the spec defines
+/// `user`/`assistant`, and an unexpected value must survive to the caller
+/// instead of failing or being rewritten.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MCPPromptMessage {
+	pub role: String,
+	pub content: MCPPromptContent,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct MCPGetPromptResult {
+	#[serde(default)]
+	pub description: Option<String>,
+	#[serde(default)]
+	pub messages: Vec<MCPPromptMessage>,
+}
+
 #[cfg(test)]
 mod tests {
+	use std::collections::BTreeMap;
+
 	use super::*;
 
 	#[test]
@@ -513,6 +609,92 @@ mod tests {
 		assert_eq!(
 			serde_json::to_value(MCPClientCapabilities::default()).unwrap(),
 			serde_json::json!({})
+		);
+	}
+
+	#[test]
+	fn prompts_capability_negotiates_by_presence() {
+		let absent: MCPServerCapabilities =
+			serde_json::from_value(serde_json::json!({"tools": {}})).unwrap();
+		assert!(absent.prompts.is_none());
+
+		let empty: MCPServerCapabilities =
+			serde_json::from_value(serde_json::json!({"prompts": {}})).unwrap();
+		let capability = empty
+			.prompts
+			.expect("an empty object still advertises prompts");
+		assert!(!capability.list_changed);
+
+		let declared: MCPServerCapabilities =
+			serde_json::from_value(serde_json::json!({"prompts": {"listChanged": true}})).unwrap();
+		assert!(declared.prompts.unwrap().list_changed);
+		let value = serde_json::to_value(MCPServerCapabilities::default()).unwrap();
+		assert!(value.get("prompts").is_none(), "unnegotiated prompts must not serialize");
+	}
+
+	#[test]
+	fn prompt_get_result_keeps_single_and_array_content() {
+		let single: MCPGetPromptResult = serde_json::from_value(serde_json::json!({
+			"description": "one",
+			"messages": [{"role": "user", "content": {"type": "text", "text": "hi"}}]
+		}))
+		.expect("single content object");
+		assert_eq!(single.description.as_deref(), Some("one"));
+		assert_eq!(single.messages.len(), 1);
+		assert_eq!(single.messages[0].role, "user");
+		match &single.messages[0].content {
+			MCPPromptContent::Single(MCPContent::Text { text }) => assert_eq!(text, "hi"),
+			other => panic!("expected single text content, got {other:?}"),
+		}
+
+		let many: MCPGetPromptResult = serde_json::from_value(serde_json::json!({
+			"messages": [{
+				"role": "assistant",
+				"content": [
+					{"type": "text", "text": "look"},
+					{"type": "image", "data": "AAECAwQ=", "mimeType": "image/png"},
+					{"type": "audio", "data": "BAUGBw==", "mimeType": "audio/wav"},
+					{
+						"type": "resource",
+						"resource": {"uri": "mem://a", "mimeType": "text/plain", "text": "body"}
+					}
+				]
+			}]
+		}))
+		.expect("array content");
+		let blocks = many.messages[0].content.clone().into_vec();
+		assert_eq!(blocks.len(), 4);
+		match &blocks[1] {
+			MCPContent::Image { data, mime_type } => {
+				assert_eq!(data, "AAECAwQ=");
+				assert_eq!(mime_type, "image/png");
+			},
+			other => panic!("expected image content, got {other:?}"),
+		}
+		match &blocks[2] {
+			MCPContent::Audio { data, mime_type } => {
+				assert_eq!(data, "BAUGBw==");
+				assert_eq!(mime_type, "audio/wav");
+			},
+			other => panic!("expected audio content, got {other:?}"),
+		}
+		match &blocks[3] {
+			MCPContent::Resource { resource } => {
+				assert_eq!(resource.uri, "mem://a");
+				assert_eq!(resource.text.as_deref(), Some("body"));
+			},
+			other => panic!("expected embedded resource, got {other:?}"),
+		}
+
+		let params = MCPGetPromptParams { name: "review".to_string(), arguments: None };
+		assert_eq!(serde_json::to_value(&params).unwrap(), serde_json::json!({"name": "review"}));
+		let params = MCPGetPromptParams {
+			name: "review".to_string(),
+			arguments: Some(BTreeMap::from([("path".to_string(), "a/b".to_string())])),
+		};
+		assert_eq!(
+			serde_json::to_value(&params).unwrap(),
+			serde_json::json!({"name": "review", "arguments": {"path": "a/b"}})
 		);
 	}
 }

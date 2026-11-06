@@ -1,7 +1,7 @@
 use pi_agent::mcp::*;
 use pi_agent::tools::naming::*;
 use serde_json::{json, Value};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::io::Write;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -2353,4 +2353,310 @@ async fn test_stdio_resources_requires_capability() {
 
     conn.close().await.expect("close");
     let _ = std::fs::remove_file(script_path);
+}
+
+
+/// Deterministic stdio MCP server exposing prompts. `mode` selects:
+/// `full` (two pages + rendered content), `no-prompts-cap` (capability absent),
+/// `repeat-prompts` (repeated cursor), `prompts-list-error`, and
+/// `prompts-get-error`.
+fn write_prompt_fixture(script_path: &std::path::Path) {
+    std::fs::write(
+        script_path,
+        r#"
+import sys, json
+
+mode = sys.argv[1] if len(sys.argv) > 1 else "full"
+capabilities = {"tools": {}} if mode == "no-prompts-cap" else {"prompts": {"listChanged": False}}
+
+def send(obj):
+    sys.stdout.write(json.dumps(obj) + "\n")
+    sys.stdout.flush()
+
+for line in sys.stdin:
+    line = line.strip()
+    if not line:
+        continue
+    msg = json.loads(line)
+    mid = msg.get("id")
+    method = msg.get("method")
+    params = msg.get("params") or {}
+
+    if method == "initialize":
+        send({"jsonrpc": "2.0", "id": mid, "result": {
+            "protocolVersion": "2025-11-25",
+            "capabilities": capabilities,
+            "serverInfo": {"name": "mock-prompts", "version": "1.0.0"}
+        }})
+    elif method == "notifications/initialized":
+        pass
+    elif method == "prompts/list":
+        if mode == "no-prompts-cap":
+            send({"jsonrpc": "2.0", "id": mid, "error": {"code": -32601, "message": "Method not found"}})
+        elif mode == "repeat-prompts":
+            send({"jsonrpc": "2.0", "id": mid, "result": {
+                "prompts": [{"name": "loop"}],
+                "nextCursor": "same-cursor"
+            }})
+        elif mode == "prompts-list-error":
+            send({"jsonrpc": "2.0", "id": mid, "error": {"code": -32603, "message": "prompt backend unavailable"}})
+        elif params.get("cursor") == "prompts-page-2":
+            send({"jsonrpc": "2.0", "id": mid, "result": {
+                "prompts": [{"name": "second", "description": "Second prompt"}]
+            }})
+        else:
+            send({"jsonrpc": "2.0", "id": mid, "result": {
+                "prompts": [{
+                    "name": "review",
+                    "title": "Review",
+                    "description": "Review a change",
+                    "arguments": [
+                        {"name": "path", "description": "File to review", "required": True},
+                        {"name": "mode"}
+                    ]
+                }],
+                "nextCursor": "prompts-page-2"
+            }})
+    elif method == "prompts/get":
+        name = params.get("name")
+        args = params.get("arguments")
+        if mode == "prompts-get-error":
+            send({"jsonrpc": "2.0", "id": mid, "error": {"code": -32603, "message": "render failed"}})
+        elif name == "noargs":
+            if args is not None:
+                send({"jsonrpc": "2.0", "id": mid, "error": {"code": -32602, "message": "arguments must be omitted"}})
+            else:
+                send({"jsonrpc": "2.0", "id": mid, "result": {
+                    "messages": [{"role": "user", "content": {"type": "text", "text": "no arguments"}}]
+                }})
+        elif name == "review":
+            if not isinstance(args, dict) or "path" not in args:
+                send({"jsonrpc": "2.0", "id": mid, "error": {"code": -32602, "message": "missing required argument: path"}})
+            else:
+                send({"jsonrpc": "2.0", "id": mid, "result": {
+                    "description": "Review a change",
+                    "messages": [
+                        {"role": "user", "content": [
+                            {"type": "text", "text": "Review " + args["path"]}
+                        ]},
+                        {"role": "assistant", "content": [
+                            {"type": "text", "text": "mode=" + args.get("mode", "none")},
+                            {"type": "image", "data": "AAECAwQ=", "mimeType": "image/png"},
+                            {"type": "audio", "data": "BAUGBw==", "mimeType": "audio/wav"},
+                            {"type": "resource", "resource": {
+                                "uri": "mem://prompt/notes",
+                                "mimeType": "text/plain",
+                                "text": "embedded prompt note"
+                            }}
+                        ]}
+                    ]
+                }})
+        else:
+            send({"jsonrpc": "2.0", "id": mid, "error": {"code": -32602, "message": "Unknown prompt: " + str(name)}})
+    else:
+        send({"jsonrpc": "2.0", "id": mid, "error": {"code": -32601, "message": "Method not found: " + str(method)}})
+"#,
+    )
+    .unwrap();
+}
+
+async fn prompt_fixture_conn(mode: &str) -> (McpConnection, std::path::PathBuf) {
+    let script_path = std::env::temp_dir().join(format!(
+        "mock_mcp_prompts_{}_{}.py",
+        mode,
+        std::process::id()
+    ));
+    write_prompt_fixture(&script_path);
+
+    let config = MCPServerConfig::Stdio(MCPStdioServerConfig {
+        command: "python3".to_string(),
+        args: vec![script_path.to_str().unwrap().to_string(), mode.to_string()],
+        env: HashMap::new(),
+        cwd: None,
+        timeout: Some(10000),
+        request_id_format: Some(RequestIdFormat::Number),
+    });
+
+    let conn = connect_to_server("test_prompts", config)
+        .await
+        .expect("Failed to connect prompts fixture");
+    (conn, script_path)
+}
+
+#[tokio::test]
+async fn test_stdio_prompts_list_paginated_and_get_typed_content() {
+    let (conn, script_path) = prompt_fixture_conn("full").await;
+
+    let capability = conn
+        .capabilities
+        .prompts
+        .as_ref()
+        .expect("prompts capability negotiated");
+    assert!(!capability.list_changed);
+    assert!(conn.supports_prompts());
+
+    let prompts = conn.list_prompts().await.expect("list_prompts");
+    assert_eq!(prompts.len(), 2, "both pages must be fetched");
+    assert_eq!(prompts[0].name, "review");
+    assert_eq!(prompts[0].title.as_deref(), Some("Review"));
+    assert_eq!(prompts[0].description.as_deref(), Some("Review a change"));
+    assert_eq!(prompts[0].arguments.len(), 2);
+    assert_eq!(prompts[0].arguments[0].name, "path");
+    assert_eq!(
+        prompts[0].arguments[0].description.as_deref(),
+        Some("File to review")
+    );
+    assert!(prompts[0].arguments[0].required);
+    assert_eq!(prompts[0].arguments[1].name, "mode");
+    assert!(!prompts[0].arguments[1].required);
+    assert_eq!(prompts[1].name, "second");
+    assert!(prompts[1].arguments.is_empty());
+
+    // Arguments are forwarded typed; the fixture renders them into the message.
+    let result = conn
+        .get_prompt(
+            "review",
+            BTreeMap::from([
+                ("path".to_string(), "src/lib.rs".to_string()),
+                ("mode".to_string(), "a b".to_string()),
+            ]),
+        )
+        .await
+        .expect("get_prompt");
+    assert_eq!(result.description.as_deref(), Some("Review a change"));
+    assert_eq!(result.messages.len(), 2);
+    assert_eq!(result.messages[0].role, "user");
+    let user_blocks = result.messages[0].content.clone().into_vec();
+    match &user_blocks[0] {
+        MCPContent::Text { text } => assert_eq!(text, "Review src/lib.rs"),
+        other => panic!("expected rendered text, got {other:?}"),
+    }
+    assert_eq!(result.messages[1].role, "assistant");
+    let blocks = result.messages[1].content.clone().into_vec();
+    assert_eq!(blocks.len(), 4, "no content block may be dropped");
+    match &blocks[0] {
+        MCPContent::Text { text } => assert_eq!(text, "mode=a b"),
+        other => panic!("expected text, got {other:?}"),
+    }
+    match &blocks[1] {
+        MCPContent::Image { data, mime_type } => {
+            assert_eq!(mime_type, "image/png");
+            assert_eq!(data, "AAECAwQ=");
+        }
+        other => panic!("expected image, got {other:?}"),
+    }
+    match &blocks[2] {
+        MCPContent::Audio { data, mime_type } => {
+            assert_eq!(mime_type, "audio/wav");
+            assert_eq!(data, "BAUGBw==");
+        }
+        other => panic!("expected audio, got {other:?}"),
+    }
+    match &blocks[3] {
+        MCPContent::Resource { resource } => {
+            assert_eq!(resource.uri, "mem://prompt/notes");
+            assert_eq!(resource.mime_type.as_deref(), Some("text/plain"));
+            assert_eq!(resource.text.as_deref(), Some("embedded prompt note"));
+            assert!(resource.blob.is_none());
+        }
+        other => panic!("expected embedded resource, got {other:?}"),
+    }
+
+    // Empty arguments are omitted from the wire; the fixture rejects a present
+    // `arguments` key, so this also proves the omission.
+    let empty = conn
+        .get_prompt("noargs", BTreeMap::new())
+        .await
+        .expect("get_prompt without arguments");
+    assert_eq!(empty.messages.len(), 1);
+    match &empty.messages[0].content {
+        MCPPromptContent::Single(MCPContent::Text { text }) => assert_eq!(text, "no arguments"),
+        other => panic!("expected single text content, got {other:?}"),
+    }
+
+    // A missing required argument is the server's decision: its error is
+    // surfaced unchanged instead of being guessed at.
+    match conn.get_prompt("review", BTreeMap::new()).await {
+        Err(McpError::JsonRpc { code, message, .. }) => {
+            assert_eq!(code, -32602);
+            assert_eq!(message, "missing required argument: path");
+        }
+        other => panic!("expected JsonRpc error, got {other:?}"),
+    }
+
+    conn.close().await.expect("close");
+    let _ = std::fs::remove_file(script_path);
+}
+
+#[tokio::test]
+async fn test_stdio_prompts_requires_capability() {
+    let (conn, script_path) = prompt_fixture_conn("no-prompts-cap").await;
+
+    // The fixture answers prompts/list with -32601; the capability error proves
+    // no request was sent.
+    assert!(conn.capabilities.prompts.is_none());
+    assert!(!conn.supports_prompts());
+    match conn.list_prompts().await {
+        Err(McpError::UnsupportedCapability(message)) => {
+            assert!(message.contains("prompts"), "{message}");
+        }
+        other => panic!("expected UnsupportedCapability, got {other:?}"),
+    }
+    match conn.get_prompt("review", BTreeMap::new()).await {
+        Err(McpError::UnsupportedCapability(message)) => {
+            assert!(message.contains("prompts"), "{message}");
+        }
+        other => panic!("expected UnsupportedCapability, got {other:?}"),
+    }
+
+    conn.close().await.expect("close");
+    let _ = std::fs::remove_file(script_path);
+}
+
+#[tokio::test]
+async fn test_stdio_prompts_repeated_cursor_is_bounded() {
+    let (conn, script_path) = prompt_fixture_conn("repeat-prompts").await;
+
+    let error = conn
+        .list_prompts()
+        .await
+        .expect_err("a repeated cursor must not loop forever");
+    assert!(
+        format!("{error:?}").contains("repeated cursor"),
+        "unexpected error: {error:?}"
+    );
+
+    conn.close().await.expect("close");
+    let _ = std::fs::remove_file(script_path);
+}
+
+#[tokio::test]
+async fn test_stdio_prompt_server_errors_surface() {
+    let (list_conn, list_script) = prompt_fixture_conn("prompts-list-error").await;
+    match list_conn.list_prompts().await {
+        Err(McpError::JsonRpc { code, message, .. }) => {
+            assert_eq!(code, -32603);
+            assert_eq!(message, "prompt backend unavailable");
+        }
+        other => panic!("expected JsonRpc error, got {other:?}"),
+    }
+    list_conn.close().await.expect("close");
+    let _ = std::fs::remove_file(list_script);
+
+    let (get_conn, get_script) = prompt_fixture_conn("prompts-get-error").await;
+    match get_conn
+        .get_prompt(
+            "review",
+            BTreeMap::from([("path".to_string(), "a.rs".to_string())]),
+        )
+        .await
+    {
+        Err(McpError::JsonRpc { code, message, .. }) => {
+            assert_eq!(code, -32603);
+            assert_eq!(message, "render failed");
+        }
+        other => panic!("expected JsonRpc error, got {other:?}"),
+    }
+    get_conn.close().await.expect("close");
+    let _ = std::fs::remove_file(get_script);
 }

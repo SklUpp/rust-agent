@@ -5502,6 +5502,12 @@ impl Tool for McpTool {
 									}
 									content.push_str(&format!("[Image: {mime_type}; base64={data}]"));
 								},
+								MCPContent::Audio { data, mime_type } => {
+									if !content.is_empty() {
+										content.push_str("\n\n");
+									}
+									content.push_str(&format!("[Audio: {mime_type}; base64={data}]"));
+								},
 								MCPContent::Resource { resource } => {
 									if !content.is_empty() {
 										content.push_str("\n\n");

@@ -15,6 +15,12 @@ pub enum McpError {
     #[error("Protocol error: {0}")]
     Protocol(String),
 
+    /// The server did not negotiate a capability the caller needs. Never
+    /// produced for an advertised-but-failing method: those surface as the
+    /// server's own JSON-RPC error.
+    #[error("Unsupported MCP capability: {0}")]
+    UnsupportedCapability(String),
+
     #[error("JSON-RPC error {code}: {message}")]
     JsonRpc {
         code: i64,

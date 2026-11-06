@@ -3817,7 +3817,7 @@ mod display_tests {
 		let result = read_with(&tool, &dir, "nope://x").await;
 		assert_eq!(
 			result.content,
-			"Unknown protocol: nope://\nSupported: agent://, artifact://, issue://, local://, mcp://, notes://, pr://, ssh://"
+			"Unknown protocol: nope://\nSupported: agent://, artifact://, issue://, local://, mcp://, mcp-prompt://, notes://, pr://, ssh://"
 		);
 	}
 
