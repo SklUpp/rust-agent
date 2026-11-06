@@ -5683,6 +5683,7 @@ mod tests {
 				tool.child_context(),
 				None,
 				Arc::new(Mutex::new(ChildSalvage::default())),
+				None,
 			),
 		)
 		.await
@@ -5768,6 +5769,7 @@ mod tests {
 			tool.child_context(),
 			None,
 			Arc::new(Mutex::new(ChildSalvage::default())),
+			None,
 		));
 		tokio::select! {
 			() = started.notified() => {}
@@ -5838,6 +5840,7 @@ mod tests {
 			tool.child_context(),
 			None,
 			Arc::new(Mutex::new(ChildSalvage::default())),
+			None,
 		)
 		.await;
 
@@ -5914,6 +5917,7 @@ mod tests {
 			tool.child_context(),
 			None,
 			Arc::new(Mutex::new(ChildSalvage::default())),
+			None,
 		)
 		.await;
 		match result {
