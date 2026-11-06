@@ -1324,9 +1324,30 @@ pub trait ToolApprover: Send + Sync {
 /// This is an allowlist, not a blocklist: provider credentials and every other
 /// ambient variable stay out unless a caller sets them explicitly on
 /// [`AgentContext::env`] (for example a per-call tool override). `PREFIX` and
-/// the `TMP*` names cover Termux; `LC_*` is matched by prefix below.
+/// the `TMP*` names cover Termux; `LC_*` is matched by prefix below; every
+/// other entry is an exact key — never an `XDG_*`/`PI_*` wildcard.
+///
+/// Loader and runtime startup keys (`LD_PRELOAD`, `LD_LIBRARY_PATH`,
+/// `NODE_OPTIONS`) are executable configuration, not a safe sandbox: they are
+/// inherited because Termux toolchains need them to start, and a caller that
+/// trusts a different environment can still set `ctx.env` explicitly.
+///
+/// `SSH_AUTH_SOCK` is deliberately absent: it is a credential capability, not
+/// platform or toolchain state. A host that wants agent access must pass it
+/// explicitly on the context.
 const AGENT_ENV_ALLOWLIST: &[&str] = &[
-	"PATH", "HOME", "PREFIX", "TMPDIR", "TMP", "TEMP", "LANG", "TERM", "SHELL", "TZ",
+	// Platform and terminal basics.
+	"PATH", "HOME", "PREFIX", "TMPDIR", "TMP", "TEMP", "LANG", "TERM", "SHELL", "TZ", "USER",
+	"LOGNAME",
+	// Language/toolchain roots and package-manager state.
+	"VIRTUAL_ENV", "CONDA_PREFIX", "CONDA_DEFAULT_ENV", "PYTHONPATH", "JAVA_HOME", "CARGO_HOME",
+	"RUSTUP_HOME", "GOPATH", "GEM_HOME", "GEM_PATH", "BUNDLE_PATH", "BUN_INSTALL",
+	// Named XDG directories only; no XDG_* prefix matching.
+	"XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_CACHE_HOME", "XDG_STATE_HOME", "XDG_RUNTIME_DIR",
+	// Explicit agent/tool configuration.
+	"PI_MAX_AST_FILES",
+	// Executable startup configuration (see the safety note above).
+	"LD_PRELOAD", "LD_LIBRARY_PATH", "NODE_OPTIONS",
 ];
 
 /// Whether a host environment variable is safe for an agent subprocess.
@@ -1386,7 +1407,9 @@ impl std::fmt::Debug for AgentContext {
 	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
 		f.debug_struct("AgentContext")
 			.field("cwd", &self.cwd)
-			.field("env", &self.env)
+			// Values may be explicit credentials; keys are enough to diagnose
+			// inheritance without copying a secret into a log line.
+			.field("env", &self.env.keys().collect::<Vec<_>>())
 			.field("cancellation_token", &self.cancellation_token)
 			.field("has_approver", &self.approver.is_some())
 			.field("has_ask", &self.ask.is_some())
@@ -1660,21 +1683,64 @@ mod env_allowlist_tests {
 			("TERM", "xterm-256color"),
 			("SHELL", "/bin/bash"),
 			("TZ", "UTC"),
+			("USER", "user"),
+			("LOGNAME", "user"),
+			("VIRTUAL_ENV", "/venv"),
+			("CONDA_PREFIX", "/conda"),
+			("CONDA_DEFAULT_ENV", "base"),
+			("PYTHONPATH", "/py"),
+			("JAVA_HOME", "/jdk"),
+			("CARGO_HOME", "/cargo"),
+			("RUSTUP_HOME", "/rustup"),
+			("GOPATH", "/go"),
+			("GEM_HOME", "/gem"),
+			("GEM_PATH", "/gem"),
+			("BUNDLE_PATH", "/bundle"),
+			("BUN_INSTALL", "/bun"),
+			("XDG_CONFIG_HOME", "/xdg/config"),
+			("XDG_DATA_HOME", "/xdg/data"),
+			("XDG_CACHE_HOME", "/xdg/cache"),
+			("XDG_STATE_HOME", "/xdg/state"),
+			("XDG_RUNTIME_DIR", "/xdg/run"),
+			("PI_MAX_AST_FILES", "25"),
+			("LD_PRELOAD", "/lib/preload.so"),
+			("LD_LIBRARY_PATH", "/lib"),
+			("NODE_OPTIONS", "--max-old-space-size=512"),
+			("ARBITRARY_CREDENTIAL_TOKEN", "credential-secret"),
 			("OPENAI_API_KEY", "sk-secret"),
 			("PI_PROVIDER_KEY", "provider-secret"),
+			("PI_UNRELATED", "not-a-prefix-match"),
+			("XDG_UNRELATED", "not-a-prefix-match"),
+			("SSH_AUTH_SOCK", "/tmp/agent.sock"),
 			("UNRELATED_HOST_STATE", "leak"),
 		]);
 
 		for name in [
 			"PATH", "HOME", "PREFIX", "TMPDIR", "TMP", "TEMP", "LANG", "LC_ALL", "LC_CTYPE", "TERM",
-			"SHELL", "TZ",
+			"SHELL", "TZ", "USER", "LOGNAME", "VIRTUAL_ENV", "CONDA_PREFIX", "CONDA_DEFAULT_ENV",
+			"PYTHONPATH", "JAVA_HOME", "CARGO_HOME", "RUSTUP_HOME", "GOPATH", "GEM_HOME", "GEM_PATH",
+			"BUNDLE_PATH", "BUN_INSTALL", "XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_CACHE_HOME",
+			"XDG_STATE_HOME", "XDG_RUNTIME_DIR", "PI_MAX_AST_FILES", "LD_PRELOAD",
+			"LD_LIBRARY_PATH", "NODE_OPTIONS",
 		] {
 			assert!(env.contains_key(name), "{name} must be inherited");
 		}
-		assert_eq!(env.len(), 12);
-		assert!(!env.contains_key("OPENAI_API_KEY"));
-		assert!(!env.contains_key("PI_PROVIDER_KEY"));
-		assert!(!env.contains_key("UNRELATED_HOST_STATE"));
+		assert_eq!(env.len(), 35);
+		for name in [
+			"ARBITRARY_CREDENTIAL_TOKEN", "OPENAI_API_KEY", "PI_PROVIDER_KEY", "PI_UNRELATED",
+			"XDG_UNRELATED", "SSH_AUTH_SOCK", "UNRELATED_HOST_STATE",
+		] {
+			assert!(!env.contains_key(name), "{name} must stay out");
+		}
+	}
+
+	#[test]
+	fn agent_context_debug_redacts_env_values() {
+		let mut ctx = AgentContext::new(PathBuf::from("/work"));
+		ctx.env.insert("ARBITRARY_CREDENTIAL_TOKEN".to_string(), "super-secret".to_string());
+		let debug = format!("{ctx:?}");
+		assert!(debug.contains("ARBITRARY_CREDENTIAL_TOKEN"));
+		assert!(!debug.contains("super-secret"), "{debug}");
 	}
 
 	#[test]

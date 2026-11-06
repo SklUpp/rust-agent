@@ -1183,6 +1183,14 @@ mod tests {
 	use super::*;
 	use crate::tool::Tool as _;
 
+	#[test]
+	fn max_ast_files_reads_only_the_context_env() {
+		let mut env = std::collections::HashMap::new();
+		assert_eq!(max_ast_files(&env), DEFAULT_MAX_AST_FILES);
+		env.insert("PI_MAX_AST_FILES".to_string(), "7".to_string());
+		assert_eq!(max_ast_files(&env), 7);
+	}
+
 	struct TempDir(PathBuf);
 
 	impl TempDir {

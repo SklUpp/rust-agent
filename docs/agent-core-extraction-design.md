@@ -32,7 +32,7 @@ Loop уже отделён от CLI на уровне зависимости: `o
 - `BackgroundResultSink`/`BackgroundDelivery` — в `crates/pi-agent/src/delivery.rs`; `loop.rs` импортирует delivery, не `supervisor`.
 - `mcp/naming.rs` → `tools/naming.rs`: чистая std-логика имён больше не тянет MCP implementation; registry использует её рядом с lookup.
 - `ToolRegistry::with_builtins` — только `#[cfg(test)]`; production-сборка набора остаётся у product host (`omp-cli/src/runtime.rs`), integration-тесты строят registry явно.
-- `state::platform_env` — явный allowlist (`PATH`, `HOME`, `PREFIX`, `TMP*`, `LANG`, `LC_*`, `TERM`, `SHELL`, `TZ`); `AgentContext`-конструкторы и overlay-ветка process broker больше не копируют ambient env. `ctx.env` остаётся явным caller override.
+- `state::platform_env` — явный allowlist (platform basics, toolchain roots, именованные `XDG_*`, `PI_MAX_AST_FILES`, а также `LD_PRELOAD`/`LD_LIBRARY_PATH`/`NODE_OPTIONS` как executable-конфигурация Termux, не sandbox); `AgentContext`-конструкторы и overlay-ветка process broker больше не копируют ambient env. `SSH_AUTH_SOCK` намеренно исключён (credential capability, только явный `ctx.env`); `AgentContext: Debug` печатает env-ключи без значений; `ctx.env` остаётся явным caller override.
 - HTTP-адаптер `OpenAiCompatibleProvider` пока не выделен: provider связан с `reqwest` и общими stream-типами; follow-up — вынести `provider.rs:257–630` в внутренний `provider_http`-модуль и пересчитать фактические зависимости после compilation proof.
 
 ## 3. Точный состав сохраняемого loop-среза
