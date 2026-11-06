@@ -231,7 +231,7 @@ fn test_continue_fresh_boundary() {
 		.iter()
 		.find(|entry| entry.message.role == "user")
 		.expect("user message");
-	assert!(user.message.timestamp_ms > 0);
+	assert!(user.message.timestamp_ms.is_some_and(|ts| ts > 0));
 	let assistant = messages
 		.iter()
 		.find(|entry| entry.message.role == "assistant")
@@ -240,7 +240,7 @@ fn test_continue_fresh_boundary() {
 	assert_eq!(assistant.message.provider.as_deref(), Some("mock"));
 	assert_eq!(assistant.message.model.as_deref(), Some("mock-model"));
 	assert_eq!(assistant.message.stop_reason.as_deref(), Some("stop"));
-	assert!(assistant.message.timestamp_ms > 0);
+	assert!(assistant.message.timestamp_ms.is_some_and(|ts| ts > 0));
 
 	let _ = fs::remove_dir_all(temp);
 }

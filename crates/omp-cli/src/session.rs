@@ -6255,7 +6255,7 @@ mod tests {
 		);
 		let duplicate = MessageEntry::new(
 			existing,
-			fresh.id.clone(),
+			Some(fresh.id.clone()),
 			output::iso8601(SystemTime::now()),
 			SessionMessage::user(MessageContent::Text("duplicate".to_string()), 2),
 		);
