@@ -1986,6 +1986,9 @@ impl AgentRunner for PiAgentRunner {
 				supervisor.set_url_scope(Arc::clone(scope));
 			}
 			supervisor.set_child_session_root(request.child_session_root.clone());
+			supervisor.set_child_durability_factory(
+				request.durable.as_ref().and_then(|boundary| boundary.child_durability_factory()),
+			);
 			// Park/revive is per scope: attach once, before the first spawn, so
 			// every contract written by task.rs is owned by this manager and a
 			// restart scan happens exactly once per supervisor generation.
