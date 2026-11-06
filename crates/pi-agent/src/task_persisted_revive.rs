@@ -59,6 +59,10 @@ fn default_depth() -> i32 {
 	1
 }
 
+fn is_false(value: &bool) -> bool {
+	!*value
+}
+
 /// One child transcript path in `root`.
 #[must_use]
 pub fn transcript_path(root: &Path, id: &str) -> PathBuf {
@@ -95,6 +99,14 @@ fn valid_id(id: &str) -> bool {
 #[serde(rename_all = "camelCase")]
 pub struct PersistedChildSession {
 	pub id: String,
+	/// Immutable spawn-time worker identity. Durable child sessions use it as
+	/// the worker/session key; legacy contracts omit it.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub result_key: Option<String>,
+	/// True when this child's conversation lives in the durable session store.
+	/// `load` then accepts a contract without a legacy JSONL transcript.
+	#[serde(default, skip_serializing_if = "is_false")]
+	pub durable: bool,
 	/// Agent definition name (for example `scout` or `reviewer`).
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub agent: Option<String>,
@@ -210,7 +222,7 @@ impl PersistedChildSession {
 		if parsed.id != id || !parsed.cwd.is_dir() {
 			return None;
 		}
-		if !transcript_path(root, id).is_file() {
+		if !parsed.durable && !transcript_path(root, id).is_file() {
 			return None;
 		}
 		Some(parsed)
@@ -399,6 +411,9 @@ pub struct RevivedChild {
 	pub agent:     Option<AgentDefinition>,
 	/// Contract is needed for the saved-output id and follow-up schema policy.
 	pub contract:  PersistedChildSession,
+	/// True when this loop already owns a durable child boundary; the actor must
+	/// not add a second JSONL journal in that case.
+	pub durable:   bool,
 }
 
 /// Host-owned cold-revive factory (upstream
@@ -567,11 +582,34 @@ fn resolve_revived_provider(
 	(Arc::clone(fallback), contract.resolved_model.clone())
 }
 
+/// Put the configured system prompt at the head of a revived history. A
+/// compacted replay can begin with a synthetic System notice, which would make
+/// the loop skip the real prompt; keep that notice's content as user context in
+/// its original order. Non-compacted durable histories carry no System message,
+/// so this only adds the one prompt the loop would otherwise inject.
+fn normalize_revived_system_prompt(replayed: Vec<Message>, system_prompt: &str) -> Vec<Message> {
+	if system_prompt.is_empty() {
+		return replayed;
+	}
+	let mut normalized = Vec::with_capacity(replayed.len().saturating_add(1));
+	normalized.push(Message::system(system_prompt.to_string()));
+	for message in replayed {
+		if message.role == Role::System {
+			if message.content != system_prompt {
+				normalized.push(Message::user(message.content));
+			}
+		} else {
+			normalized.push(message);
+		}
+	}
+	normalized
+}
+
 impl PersistedChildReviverFactory for DefaultPersistedReviverFactory {
 	fn revive(
 		&self,
 		contract: &PersistedChildSession,
-		replayed: Vec<Message>,
+		mut replayed: Vec<Message>,
 		supervisor: Option<&Arc<Supervisor>>,
 	) -> Result<RevivedChild, String> {
 		if !contract.cwd.is_dir() {
@@ -605,6 +643,7 @@ impl PersistedChildReviverFactory for DefaultPersistedReviverFactory {
 				registry
 			},
 		};
+		replayed = normalize_revived_system_prompt(replayed, &contract.system_prompt);
 		let replayed_turns = replayed.iter().filter(|m| m.role == Role::Assistant).count();
 		let config = AgentConfig {
 			max_turns:     contract.max_turns.saturating_add(replayed_turns),
@@ -631,10 +670,46 @@ impl PersistedChildReviverFactory for DefaultPersistedReviverFactory {
 		if let Some(plan) = &self.plan {
 			agent_loop = agent_loop.with_plan(Some(Arc::clone(plan)));
 		}
+		let mut durable = false;
+		let mut effective_contract = contract.clone();
 		if let Some(supervisor) = supervisor {
 			agent_loop = agent_loop
 				.with_background_results(supervisor.owner_results_sink(Some(&contract.id)))
 				.with_peer_inbox(supervisor.mailbox(), contract.id.clone());
+			if contract.durable {
+				let worker_id = contract.result_key.as_deref().ok_or_else(|| {
+					format!(
+						"durable child \"{}\" has no spawn-time result key; refusing an \
+						 ambiguous revive",
+						contract.id
+					)
+				})?;
+				let child = supervisor
+					.open_child_durable(&contract.id, Some(worker_id))
+					.map_err(|error| {
+						format!("cannot reopen durable child \"{}\": {error}", contract.id)
+					})?;
+				if let Some(child) = child {
+					agent_loop = agent_loop.with_durable(Some(child.boundary()));
+					durable = true;
+				}
+			} else if let Some(factory) = supervisor.child_durability_factory() {
+				// Legacy JSONL child: import once explicitly, then continue only
+				// on the durable store. Never keep writing both stores.
+				let worker_id = format!("legacy-{}", contract.id);
+				let child = factory
+					.import_legacy_child(&worker_id, &replayed)
+					.map_err(|error| {
+						format!(
+							"cannot import legacy child \"{}\" into the session store: {error}",
+							contract.id
+						)
+					})?;
+				agent_loop = agent_loop.with_durable(Some(child.boundary()));
+				durable = true;
+				effective_contract.durable = true;
+				effective_contract.result_key = Some(worker_id);
+			}
 		}
 		let agent = supervisor
 			.and_then(|supervisor| supervisor.agent_catalog())
@@ -648,11 +723,62 @@ impl PersistedChildReviverFactory for DefaultPersistedReviverFactory {
 		Ok(RevivedChild {
 			agent_loop,
 			agent,
-			contract: contract.clone(),
+			contract: effective_contract,
+			durable,
 			state: AgentState {
 				messages:    replayed,
 				total_turns: replayed_turns,
 			},
 		})
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	#[test]
+	fn compacted_synthetic_system_is_kept_after_real_prompt() {
+		let replayed = vec![
+			Message::system("[compacted context] earlier turns omitted"),
+			Message::user("first retained turn"),
+			Message::assistant("answer"),
+		];
+		let normalized = normalize_revived_system_prompt(replayed, "actual child prompt");
+		assert_eq!(normalized[0].role, Role::System);
+		assert_eq!(normalized[0].content, "actual child prompt");
+		assert_eq!(normalized[1].role, Role::User);
+		assert_eq!(
+			normalized[1].content,
+			"[compacted context] earlier turns omitted"
+		);
+		assert_eq!(normalized[2].content, "first retained turn");
+		assert_eq!(normalized[3].content, "answer");
+	}
+
+	#[test]
+	fn normal_history_gets_one_prompt_and_no_duplicate() {
+		let replayed = vec![Message::user("first turn"), Message::assistant("answer")];
+		let normalized = normalize_revived_system_prompt(replayed, "actual child prompt");
+		assert_eq!(normalized[0].role, Role::System);
+		assert_eq!(
+			normalized
+				.iter()
+				.filter(|message| message.role == Role::System)
+				.count(),
+			1
+		);
+		let already = vec![
+			Message::system("actual child prompt"),
+			Message::user("first turn"),
+		];
+		let normalized = normalize_revived_system_prompt(already, "actual child prompt");
+		assert_eq!(
+			normalized
+				.iter()
+				.filter(|message| message.role == Role::System)
+				.count(),
+			1
+		);
 	}
 }

@@ -47,6 +47,10 @@ pub struct IrcMessage {
 	#[serde(skip_serializing_if = "Option::is_none")]
 	pub reply_to: Option<String>,
 	pub ts:      u64,
+	/// Durable delivery identity for this message, when the host persists peer
+	/// mail. Transport metadata only: never authority or an instruction.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub delivery_id: Option<String>,
 }
 
 impl IrcMessage {
@@ -58,11 +62,17 @@ impl IrcMessage {
 			body: body.into(),
 			reply_to: None,
 			ts: now_ms(),
+			delivery_id: None,
 		}
 	}
 
 	pub fn with_reply_to(mut self, reply_to: Option<&str>) -> Self {
 		self.reply_to = reply_to.map(str::to_string);
+		self
+	}
+
+	pub fn with_delivery_id(mut self, delivery_id: Option<String>) -> Self {
+		self.delivery_id = delivery_id;
 		self
 	}
 }
@@ -287,11 +297,15 @@ impl Mailbox {
 				.map(|mailbox| mailbox.iter().map(|queued| queued.message.clone()).collect())
 				.unwrap_or_default();
 		}
-		state
+		let drained: Vec<IrcMessage> = state
 			.mailboxes
 			.remove(agent)
 			.map(|mailbox| mailbox.into_iter().map(|queued| queued.message).collect())
-			.unwrap_or_default()
+			.unwrap_or_default();
+		drop(state);
+		// The loop marks these delivered only after the target conversation is
+		// persisted, so taking them out of the mailbox is not a delivery.
+		drained
 	}
 
 	pub fn unread_count(&self, agent: &str) -> usize {

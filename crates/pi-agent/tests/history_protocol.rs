@@ -339,6 +339,8 @@ fn append(supervisor: &Arc<Supervisor>, id: &str, messages: &[Message]) {
 fn contract(id: &str, root: &Path) -> PersistedChildSession {
 	PersistedChildSession {
 		id: id.to_string(),
+		result_key: None,
+		durable: false,
 		agent: Some("scout".to_string()),
 		task: "investigate".to_string(),
 		system_prompt: "child system prompt".to_string(),

@@ -23,7 +23,10 @@ pub mod tools;
 pub mod workspace_writer;
 
 pub use compaction::{CompactionReport, Compactor};
-pub use durable::{DURABILITY_FAILURE_CODE, DurableBoundary, DurableError};
+pub use durable::{
+	ChildDurability, ChildDurabilityFactory, DURABILITY_FAILURE_CODE, DurableBoundary, DurableError,
+	WorkerCompletionSink, WorkerIdentity,
+};
 pub use loop_module::{
 	AgentError, AgentEvent, AgentLoop, AssistantGuard, InMemoryRewind, SteeringEvent, TurnAck,
 	TurnAckDecision, TurnAckRequest, TurnRewrite, TurnToolSelection, INTERRUPTED_TOOL_RESULT,

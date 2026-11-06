@@ -574,6 +574,18 @@ impl ProtocolHandler for HistoryProtocolHandler {
 		if context.signal.is_cancelled() {
 			return Err("aborted".to_string());
 		}
+		if let Some(messages) = self.manager.durable_messages(&candidate.id) {
+			let title = format!("{} ({})", candidate.id, candidate.status);
+			let content = format_history_markdown(&title, &messages);
+			let mut resource = InternalResource::text(&url.href, content);
+			resource.content_type = "text/markdown".to_string();
+			resource.source_path = Some(candidate.display.clone());
+			resource.notes = Some(vec![format!(
+				"Source: durable session (read-only, {})",
+				candidate.status
+			)]);
+			return Ok(resource);
+		}
 		#[cfg(test)]
 		if let Some(hook) = &self.open_hook {
 			hook(&candidate.display);

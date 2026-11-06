@@ -23,8 +23,10 @@ use std::{
 use async_trait::async_trait;
 use pi_agent::CompactionReport;
 use rusqlite::{OpenFlags, OptionalExtension as _};
+use tokio::runtime::{Handle, RuntimeFlavor};
 use pi_agent::{
-	DurableBoundary, DurableError,
+	ChildDurability, ChildDurabilityFactory, DurableBoundary, DurableError,
+	WorkerCompletionSink, WorkerIdentity,
 	state::{Message, Role, StopReason, ToolCall, ToolResult},
 };
 use serde_json::Value;
@@ -37,8 +39,8 @@ use crate::{
 		SessionMessage, Usage, derive_turn_history,
 	},
 	session_store::{
-		NewBranch, NewIntent, NewMessage, NewSession, SessionRecord, SqliteStore, StoreError,
-		StoreResult, UnresolvedIntent,
+		NewBranch, NewDelivery, NewIntent, NewMessage, NewSession, SessionRecord, SqliteStore,
+		StoreError, StoreResult, UnresolvedIntent, WorkerCompletion,
 	},
 };
 
@@ -235,8 +237,17 @@ impl DurableSession {
 		session_id: &str,
 		header: SessionHeader,
 	) -> StoreResult<(Self, Option<LoadedSession>)> {
-		let path = db_path.into();
-		let writer = Arc::new(DurableWriter::open(path)?);
+		let writer = Arc::new(DurableWriter::open(db_path)?);
+		Self::open_with_writer(writer, session_id, header)
+	}
+
+	/// Open on an existing writer thread. Used by the child factory so every
+	/// child session shares the root's single SQLite writer.
+	fn open_with_writer(
+		writer: Arc<DurableWriter>,
+		session_id: &str,
+		header: SessionHeader,
+	) -> StoreResult<(Self, Option<LoadedSession>)> {
 		let id = session_id.to_string();
 		let existing = {
 			let id = id.clone();
@@ -539,7 +550,7 @@ impl DurableSession {
 		let cursor = Arc::clone(&self.cursor);
 		let session_id = self.session_id.clone();
 		let entries = entries.to_vec();
-		self.writer.call(move |store| {
+		writer_call(&self.writer, move |store| {
 			let mut cursor = lock(&cursor);
 			let mut batch = Vec::with_capacity(entries.len());
 			let mut parent = cursor.leaf.clone();
@@ -558,6 +569,30 @@ impl DurableSession {
 			cursor.leaf = parent;
 			Ok(())
 		})
+	}
+
+	/// Import a legacy child conversation once into this (new) child session.
+	/// The imported tail becomes the resume seed, so the live loop's first
+	/// persist appends only genuinely new messages instead of duplicating it.
+	pub fn import_messages(&self, messages: &[Message]) -> StoreResult<()> {
+		let mut entries = Vec::new();
+		let mut ids = Vec::with_capacity(messages.len());
+		for message in messages {
+			if let Some(entry) = self.to_message_entry(message, None) {
+				ids.push(Some(entry.id.clone()));
+				entries.push(entry);
+			} else {
+				ids.push(None);
+			}
+		}
+		self.append_message_entries(&entries)?;
+		*lock(&self.tracked) = messages
+			.iter()
+			.map(|message| self.incoming_digest(message))
+			.collect();
+		*lock(&self.tracked_ids) = ids;
+		*lock(&self.resume_seed) = None;
+		Ok(())
 	}
 
 	fn incoming_digest(&self, message: &Message) -> u64 {
@@ -1003,8 +1038,318 @@ impl DurableBoundary for DurableSession {
 					.push_back(tool_entry.id);
 				Ok(())
 			})
+		.await
+		.map_err(|error| DurableError::new(error.to_string()))
+	}
+
+	fn child_durability_factory(&self) -> Option<Arc<dyn ChildDurabilityFactory>> {
+		Some(self.durable_child_factory())
+	}
+
+	async fn mark_deliveries_delivered(
+		&self,
+		delivery_ids: &[String],
+	) -> Result<(), DurableError> {
+		if delivery_ids.is_empty() {
+			return Ok(());
+		}
+		let ids = delivery_ids.to_vec();
+		let now = unix_ms();
+		self
+			.writer
+			.call_async(move |store| {
+				for id in &ids {
+					store.mark_delivery_delivered(id, now)?;
+				}
+				Ok(())
+			})
 			.await
 			.map_err(|error| DurableError::new(error.to_string()))
+	}
+
+	async fn mark_deliveries_processed(
+		&self,
+		delivery_ids: &[String],
+	) -> Result<(), DurableError> {
+		if delivery_ids.is_empty() {
+			return Ok(());
+		}
+		let ids = delivery_ids.to_vec();
+		let now = unix_ms();
+		self
+			.writer
+			.call_async(move |store| {
+				for id in &ids {
+					store.mark_delivery_processed(id, now)?;
+				}
+				Ok(())
+			})
+			.await
+			.map_err(|error| DurableError::new(error.to_string()))
+	}
+}
+
+/// Host child-scope factory backed by the root session's writer thread.
+///
+/// `worker_id` is the spawn-time result key. The origin session and branch are
+/// frozen here, at spawn, so a later branch cut cannot redirect the parent
+/// notification.
+struct StoreChildDurabilityFactory {
+	writer:     Arc<DurableWriter>,
+	session_id: String,
+	cursor:     Arc<Mutex<Cursor>>,
+}
+
+impl std::fmt::Debug for StoreChildDurabilityFactory {
+	fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		formatter
+			.debug_struct("StoreChildDurabilityFactory")
+			.field("session_id", &self.session_id)
+			.finish_non_exhaustive()
+	}
+}
+
+impl StoreChildDurabilityFactory {
+	fn open_session(
+		&self,
+		worker_id: &str,
+	) -> Result<(DurableSession, WorkerIdentity), DurableError> {
+		if worker_id.is_empty() {
+			return Err(DurableError::new("worker id must not be empty"));
+		}
+		let origin_branch_id = lock(&self.cursor).branch.clone();
+		let parent = self.session_id.clone();
+		let header = SessionHeader {
+			kind: "session".to_string(),
+			version: 3,
+			id: worker_id.to_string(),
+			timestamp: output::iso8601(SystemTime::now()),
+			cwd: std::env::current_dir()
+				.map(|path| path.display().to_string())
+				.unwrap_or_default(),
+			model: None,
+			provider: None,
+			title: None,
+			title_source: None,
+			additional_directories: Vec::new(),
+			parent_session: Some(parent),
+			previous_session_files: Vec::new(),
+			provider_prompt_cache_key: None,
+		};
+		let writer = Arc::clone(&self.writer);
+		let child_id = worker_id.to_string();
+		let (child, _) = run_blocking(move || {
+			DurableSession::open_with_writer(writer, &child_id, header)
+		})
+		.map_err(|error| DurableError::new(error.to_string()))?;
+		let identity = WorkerIdentity {
+			worker_id: worker_id.to_string(),
+			session_id: self.session_id.clone(),
+			origin_branch_id,
+		};
+		Ok((child, identity))
+	}
+
+	fn handle(child: DurableSession, identity: WorkerIdentity) -> ChildDurability {
+		let completion = Arc::new(StoreWorkerCompletion {
+			writer: Arc::clone(&child.writer),
+			identity: identity.clone(),
+		});
+		ChildDurability::new(
+			identity,
+			Arc::new(child) as Arc<dyn DurableBoundary>,
+			completion,
+		)
+	}
+}
+
+impl ChildDurabilityFactory for StoreChildDurabilityFactory {
+	fn open_child(&self, worker_id: &str) -> Result<ChildDurability, DurableError> {
+		let (child, identity) = self.open_session(worker_id)?;
+		Ok(Self::handle(child, identity))
+	}
+
+	fn import_legacy_child(
+		&self,
+		worker_id: &str,
+		messages: &[Message],
+	) -> Result<ChildDurability, DurableError> {
+		let (child, identity) = self.open_session(worker_id)?;
+		let id = worker_id.to_string();
+		let existing = writer_call(&self.writer, move |store| {
+			let Some(session) = store.session(&id)? else {
+				return Ok(false);
+			};
+			let Some(branch) = session.active_branch_id else {
+				return Ok(false);
+			};
+			Ok(!store.branch_messages(&branch)?.is_empty())
+		});
+		match existing {
+			Ok(true) => {},
+			Ok(false) => child
+				.import_messages(messages)
+				.map_err(|error| DurableError::new(error.to_string()))?,
+			Err(error) => return Err(DurableError::new(error.to_string())),
+		}
+		Ok(Self::handle(child, identity))
+	}
+
+	fn load_child_messages(&self, worker_id: &str) -> Result<Option<Vec<Message>>, DurableError> {
+		let id = worker_id.to_string();
+		let messages = writer_call(&self.writer, move |store| {
+			if store.session(&id)?.is_none() {
+				return Ok(None);
+			}
+			let (_, _, _, all, branch, _, projection) = load_parts(store, &id)?;
+			let Some(projection) = projection else {
+				return crate::runtime::history_messages_from_entries(&branch)
+					.map(Some)
+					.map_err(|error| StoreError::Corrupt(error.to_string()));
+			};
+			// A compacted child must revive from the same synthetic prefix plus
+			// retained-entry order the root build uses, not from the raw branch.
+			let by_id: HashMap<&str, &MessageEntry> =
+				all.iter().map(|entry| (entry.id.as_str(), entry)).collect();
+			let mut restored = Vec::with_capacity(projection.kept.len() + projection.synthetic.len());
+			for value in &projection.synthetic {
+				restored.push(serde_json::from_value::<Message>(value.clone()).map_err(
+					|error| StoreError::Corrupt(format!("child synthetic message: {error}")),
+				)?);
+			}
+			let mut kept = Vec::with_capacity(projection.kept.len());
+			for kept_id in &projection.kept {
+				let Some(entry) = by_id.get(kept_id.as_str()) else {
+					return Err(StoreError::Corrupt(format!(
+						"child compaction projection references missing message {kept_id}"
+					)));
+				};
+				kept.push((*entry).clone());
+			}
+			restored.extend(
+				crate::runtime::history_messages_from_entries(&kept)
+					.map_err(|error| StoreError::Corrupt(error.to_string()))?,
+			);
+			Ok(Some(restored))
+		})
+		.map_err(|error| DurableError::new(error.to_string()))?;
+		Ok(messages)
+	}
+
+	fn enqueue_peer_delivery(
+		&self,
+		target_session: Option<&str>,
+		sender: &str,
+		text: &str,
+	) -> Result<String, DurableError> {
+		let session_id = target_session
+			.map(str::to_string)
+			.unwrap_or_else(|| self.session_id.clone());
+		let branch_session = session_id.clone();
+		let origin_branch_id = writer_call(&self.writer, move |store| {
+			let session = store.session(&branch_session)?.ok_or_else(|| {
+				StoreError::NotFound(format!("target session {branch_session} does not exist"))
+			})?;
+			session.active_branch_id.ok_or_else(|| {
+				StoreError::Corrupt(format!("target session {branch_session} has no active branch"))
+			})
+		})
+			.map_err(|error| DurableError::new(error.to_string()))?;
+		let delivery_id = format!("peer-{}", output::session_id());
+		let payload = serde_json::json!({
+			"kind": "peer-message",
+			"from": sender,
+			"text": text,
+			"deliveryId": delivery_id,
+		});
+		let record = NewDelivery {
+			delivery_id: delivery_id.clone(),
+			worker_id: format!("peer:{sender}"),
+			session_id,
+			origin_branch_id,
+			payload,
+		};
+		writer_call(&self.writer, move |store| store.enqueue_delivery(record))
+			.map_err(|error| DurableError::new(error.to_string()))?;
+		Ok(delivery_id)
+	}
+
+}
+
+#[derive(Debug)]
+struct StoreWorkerCompletion {
+	writer:   Arc<DurableWriter>,
+	identity: WorkerIdentity,
+}
+
+impl WorkerCompletionSink for StoreWorkerCompletion {
+	fn complete_worker(
+		&self,
+		identity: &WorkerIdentity,
+		completion: Value,
+		delivery: Value,
+	) -> Result<(), DurableError> {
+		if identity != &self.identity {
+			return Err(DurableError::new(
+				"worker identity does not match the opened child scope",
+			));
+		}
+		let writer = Arc::clone(&self.writer);
+		let record = WorkerCompletion {
+			// The spawn-time result key is both durable identities. The delivery
+			// id stays stable across retries and restarts.
+			worker_id: identity.worker_id.clone(),
+			delivery_id: identity.worker_id.clone(),
+			session_id: identity.session_id.clone(),
+			origin_branch_id: identity.origin_branch_id.clone(),
+			completion,
+			delivery,
+		};
+		writer_call(&writer, move |store| store.complete_worker(record))
+			.map_err(|error| DurableError::new(error.to_string()))
+	}
+}
+
+/// Run a synchronous writer job without blocking the async runtime. On a
+/// multi-thread runtime the job runs on the blocking pool; elsewhere (tests,
+/// pre-runtime callers) it runs inline.
+fn run_blocking<T: Send + 'static>(job: impl FnOnce() -> T + Send + 'static) -> T {
+	match Handle::try_current() {
+		Ok(handle) if handle.runtime_flavor() == RuntimeFlavor::MultiThread => {
+			match tokio::task::block_in_place(|| handle.block_on(tokio::task::spawn_blocking(job))) {
+				Ok(value) => value,
+				Err(error) => panic!("session store blocking job failed: {error}"),
+			}
+		},
+		_ => job(),
+	}
+}
+
+fn writer_call<T: Send + 'static>(
+	writer: &Arc<DurableWriter>,
+	operation: impl FnOnce(&mut SqliteStore) -> StoreResult<T> + Send + 'static,
+) -> StoreResult<T> {
+	let writer = Arc::clone(writer);
+	run_blocking(move || writer.call(operation))
+}
+
+fn unix_ms() -> i64 {
+	SystemTime::now()
+		.duration_since(UNIX_EPOCH)
+		.map_or(0, |duration| i64::try_from(duration.as_millis()).unwrap_or(i64::MAX))
+}
+
+impl DurableSession {
+	/// Child-scope factory rooted at this session. The root writer thread is
+	/// shared, so child messages/intents and root completions serialize on one
+	/// SQLite connection.
+	#[must_use]
+	pub fn durable_child_factory(&self) -> Arc<dyn ChildDurabilityFactory> {
+		Arc::new(StoreChildDurabilityFactory {
+			writer: Arc::clone(&self.writer),
+			session_id: self.session_id.clone(),
+			cursor: Arc::clone(&self.cursor),
+		})
 	}
 }
 
@@ -1193,4 +1538,115 @@ pub fn latest_session_id(db_path: &Path) -> StoreResult<Option<String>> {
 #[must_use]
 pub fn database_path(session_dir: &Path) -> PathBuf {
 	session_dir.join("sessions.db")
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	fn header(id: &str, parent: Option<&str>) -> SessionHeader {
+		SessionHeader {
+			kind: "session".to_string(),
+			version: 3,
+			id: id.to_string(),
+			timestamp: output::iso8601(SystemTime::now()),
+			cwd: std::env::temp_dir().display().to_string(),
+			model: None,
+			provider: None,
+			title: None,
+			title_source: None,
+			additional_directories: Vec::new(),
+			parent_session: parent.map(str::to_string),
+			previous_session_files: Vec::new(),
+			provider_prompt_cache_key: None,
+		}
+	}
+
+	fn temp_db(tag: &str) -> (PathBuf, PathBuf) {
+		let dir = std::env::temp_dir().join(format!(
+			"omp-durable-child-{}-{}-{tag}",
+			std::process::id(),
+			output::session_id()
+		));
+		std::fs::create_dir_all(&dir).expect("temp dir");
+		let path = dir.join("sessions.db");
+		(dir, path)
+	}
+
+	#[tokio::test]
+	async fn child_intent_precedes_effect_and_completion_keeps_spawn_origin() {
+		let (dir, path) = temp_db("factory");
+		let root = Arc::new(
+			DurableSession::create(&path, header("root", None)).expect("create root session"),
+		);
+		let origin = root.active_branch();
+		let factory = root.durable_child_factory();
+		let child = factory.open_child("ns:task-1").expect("open child scope");
+		assert_eq!(child.identity().session_id, "root");
+		assert_eq!(child.identity().origin_branch_id, origin);
+
+		let execution_id = child
+			.boundary()
+			.begin_execution(&ToolCall {
+				id: "call-1".to_string(),
+				name: "bash".to_string(),
+				arguments: serde_json::json!({ "command": "true" }),
+			})
+			.await
+			.expect("child intent before effect");
+		let store = SqliteStore::open(&path).expect("reopen store");
+		let unresolved = store
+			.unresolved_intents("ns:task-1")
+			.expect("child intents");
+		assert_eq!(unresolved.len(), 1);
+		assert_eq!(unresolved[0].execution_id, execution_id);
+		assert_eq!(store.outcome(&execution_id).expect("outcome"), None);
+		drop(store);
+
+		child
+			.complete(
+				serde_json::json!({ "status": "completed" }),
+				serde_json::json!({ "text": "done" }),
+			)
+			.expect("complete child");
+		let store = SqliteStore::open(&path).expect("reopen store");
+		let pending = store.pending_deliveries("root").expect("pending");
+		assert_eq!(pending.len(), 1);
+		assert_eq!(pending[0].worker_id, "ns:task-1");
+		assert_eq!(
+			pending[0].origin_branch_id, origin,
+			"completion must use the branch captured at spawn"
+		);
+		drop(store);
+		let _ = std::fs::remove_dir_all(dir);
+	}
+
+	#[tokio::test]
+	async fn imported_legacy_child_second_load_sees_appended_turns() {
+		let (dir, path) = temp_db("legacy-second");
+		let root = Arc::new(
+			DurableSession::create(&path, header("root", None)).expect("create root session"),
+		);
+		let factory = root.durable_child_factory();
+		let child = factory
+			.import_legacy_child("legacy-task-1", &[Message::user("old turn")])
+			.expect("import legacy child");
+		child
+			.boundary()
+			.persist_messages(&[Message::user("old turn"), Message::assistant("new answer")])
+			.await
+			.expect("append after import");
+		let messages = factory
+			.load_child_messages("legacy-task-1")
+			.expect("reload durable child")
+			.expect("durable child exists");
+		assert_eq!(messages.len(), 2);
+		assert_eq!(messages[0].content, "old turn");
+		assert_eq!(messages[1].content, "new answer");
+		assert!(
+			messages.iter().all(|message| message.role != Role::System),
+			"revive inserts the real contract prompt, not a stale System from the transcript"
+		);
+		let _ = std::fs::remove_dir_all(dir);
+	}
 }

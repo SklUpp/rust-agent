@@ -307,7 +307,9 @@ pub struct UnresolvedIntent {
 /// `worker_id` is the durable worker identity, not a reusable display index.
 /// `delivery_id` is caller-owned and must stay stable across retries and
 /// process restarts (for example the spawn-time result key); it is the
-/// deduplication identity.
+/// deduplication identity. The two ids may be the same string: they name two
+/// distinct rows (completion + delivery), not two effects. A side effect is
+/// still never replayed just because a row is re-read.
 #[derive(Debug, Clone)]
 pub struct WorkerCompletion {
 	pub worker_id: String,
@@ -316,6 +318,17 @@ pub struct WorkerCompletion {
 	pub origin_branch_id: String,
 	pub completion: Value,
 	pub delivery: Value,
+}
+
+/// A standalone pending delivery (peer mail) with no worker completion. Stable
+/// `delivery_id` is caller-owned and is the deduplication identity.
+#[derive(Debug, Clone)]
+pub struct NewDelivery {
+	pub delivery_id: String,
+	pub worker_id: String,
+	pub session_id: String,
+	pub origin_branch_id: String,
+	pub payload: Value,
 }
 
 /// One durable delivery. `delivered_at_ms` means the message was durably offered
@@ -1131,6 +1144,125 @@ impl SqliteStore {
 		Ok(())
 	}
 
+	/// Insert a pending delivery that has no worker completion (peer mail).
+	/// Repeating the same id/payload is idempotent; conflicting reuse is
+	/// rejected. Enqueue never marks the delivery delivered or processed.
+	pub fn enqueue_delivery(&mut self, delivery: NewDelivery) -> StoreResult<()> {
+		validate_id("delivery id", &delivery.delivery_id)?;
+		validate_id("worker id", &delivery.worker_id)?;
+		validate_id("delivery session id", &delivery.session_id)?;
+		validate_id("delivery origin branch id", &delivery.origin_branch_id)?;
+		let payload_json = encode_json(&delivery.payload)?;
+		let transaction = self.connection.transaction()?;
+		let origin_session: Option<String> = transaction
+			.query_row(
+				"SELECT session_id FROM branches WHERE id = ?1",
+				params![delivery.origin_branch_id],
+				|row| row.get(0),
+			)
+			.optional()?;
+		match origin_session {
+			None => {
+				return Err(StoreError::NotFound(format!(
+					"delivery branch {} does not exist",
+					delivery.origin_branch_id
+				)));
+			},
+			Some(origin_session) if origin_session != delivery.session_id => {
+				return Err(StoreError::Validation(
+					"delivery branch belongs to a different session".to_string(),
+				));
+			},
+			Some(_) => {},
+		}
+		let existing: Option<(String, String, String, String)> = transaction
+			.query_row(
+				"SELECT worker_id, session_id, origin_branch_id, payload_json \
+				 FROM deliveries WHERE delivery_id = ?1",
+				params![delivery.delivery_id],
+				|row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+			)
+			.optional()?;
+		if let Some((worker_id, session_id, origin_branch_id, stored)) = existing {
+			if worker_id != delivery.worker_id
+				|| session_id != delivery.session_id
+				|| origin_branch_id != delivery.origin_branch_id
+				|| decode_json(&stored)? != delivery.payload
+			{
+				return Err(StoreError::Conflict(format!(
+					"delivery {} already exists with different data",
+					delivery.delivery_id
+				)));
+			}
+			transaction.commit()?;
+			return Ok(());
+		}
+		let now = now_ms();
+		transaction.execute(
+			"INSERT INTO deliveries \
+			 (delivery_id, worker_id, session_id, origin_branch_id, payload_json, created_at_ms, delivered_at_ms, processed_at_ms) \
+			 VALUES (?1, ?2, ?3, ?4, ?5, ?6, NULL, NULL)",
+			params![
+				delivery.delivery_id,
+				delivery.worker_id,
+				delivery.session_id,
+				delivery.origin_branch_id,
+				payload_json,
+				now
+			],
+		)?;
+		transaction.commit()?;
+		Ok(())
+	}
+
+	/// Append a delivery message to the target branch and mark the delivery
+	/// delivered in one transaction. The message must belong to the delivery's
+	/// session; its branch is the target context's current branch. A delivery can
+	/// be consumed once; processing stays a separate explicit checkpoint.
+	pub fn consume_delivery(
+		&mut self,
+		delivery_id: &str,
+		message: NewMessage,
+		at_ms: i64,
+	) -> StoreResult<()> {
+		validate_id("delivery id", delivery_id)?;
+		let transaction = self.connection.transaction()?;
+		let delivery: Option<(String, Option<i64>)> = transaction
+			.query_row(
+				"SELECT session_id, delivered_at_ms FROM deliveries WHERE delivery_id = ?1",
+				params![delivery_id],
+				|row| Ok((row.get(0)?, row.get(1)?)),
+			)
+			.optional()?;
+		let Some((session_id, delivered_at)) = delivery else {
+			return Err(StoreError::NotFound(format!(
+				"delivery {delivery_id} does not exist"
+			)));
+		};
+		if session_id != message.session_id {
+			return Err(StoreError::Validation(
+				"delivery message belongs to a different session".to_string(),
+			));
+		}
+		if delivered_at.is_some() {
+			return Err(StoreError::Conflict(format!(
+				"delivery {delivery_id} was already appended to the target context"
+			)));
+		}
+		let changes = transaction.execute(
+			"UPDATE deliveries SET delivered_at_ms = ?1 WHERE delivery_id = ?2 AND delivered_at_ms IS NULL",
+			params![at_ms, delivery_id],
+		)?;
+		if changes == 0 {
+			return Err(StoreError::Conflict(format!(
+				"delivery {delivery_id} was already appended to the target context"
+			)));
+		}
+		append_message_tx(&transaction, &message, at_ms)?;
+		transaction.commit()?;
+		Ok(())
+	}
+
 	/// Deliveries not yet durably offered to the target context.
 	pub fn pending_deliveries(&self, session_id: &str) -> StoreResult<Vec<DeliveryRecord>> {
 		self.query_deliveries(
@@ -1940,6 +2072,112 @@ mod tests {
 				.unprocessed_deliveries("s1")
 				.expect("unprocessed deliveries")
 				.is_empty()
+		);
+	}
+
+	#[test]
+	fn pending_delivery_survives_reopen_and_keeps_offbranch_origin() {
+		let (dir, path) = temp_db("pending-reopen");
+		{
+			let mut store = SqliteStore::open(&path).expect("open file store");
+			store
+				.create_session(NewSession {
+					id: "s1".to_string(),
+					parent_session_id: None,
+					payload: json!({ "cwd": "/tmp/project" }),
+					initial_branch_id: "b1".to_string(),
+					initial_branch_payload: json!({ "kind": "root" }),
+				})
+				.expect("create session");
+			store.append_message(message("m1", None)).expect("append m1");
+			store
+				.create_branch(NewBranch {
+					id: "b2".to_string(),
+					session_id: "s1".to_string(),
+					parent_branch_id: Some("b1".to_string()),
+					parent_message_id: Some("m1".to_string()),
+					payload: json!({ "kind": "cut" }),
+				})
+				.expect("create branch");
+			store.set_active_branch("s1", "b2").expect("cut to b2");
+			store
+				.complete_worker(WorkerCompletion {
+					worker_id: "ns:task-1".to_string(),
+					delivery_id: "ns:task-1".to_string(),
+					session_id: "s1".to_string(),
+					origin_branch_id: "b1".to_string(),
+					completion: json!({ "status": "completed" }),
+					delivery: json!({ "text": "result" }),
+				})
+				.expect("complete worker on b1");
+		}
+		let mut store = SqliteStore::open(&path).expect("reopen file store");
+		let session = store.session("s1").expect("session").expect("row");
+		assert_eq!(session.active_branch_id.as_deref(), Some("b2"));
+		let pending = store.pending_deliveries("s1").expect("pending");
+		assert_eq!(pending.len(), 1);
+		assert_eq!(pending[0].delivery_id, "ns:task-1");
+		assert_eq!(
+			pending[0].origin_branch_id, "b1",
+			"a later branch cut must not move the parent notification"
+		);
+		// Consume into the target context and keep processing a separate mark.
+		store
+			.consume_delivery(
+				"ns:task-1",
+				NewMessage {
+					id: "m2".to_string(),
+					session_id: "s1".to_string(),
+					branch_id: "b2".to_string(),
+					parent_message_id: Some("m1".to_string()),
+					payload: json!({ "id": "m2", "role": "user", "text": "result" }),
+				},
+				10,
+			)
+			.expect("consume delivery into b2");
+		assert!(store.pending_deliveries("s1").expect("pending").is_empty());
+		let unprocessed = store.unprocessed_deliveries("s1").expect("unprocessed");
+		assert_eq!(unprocessed.len(), 1);
+		assert_eq!(unprocessed[0].delivered_at_ms, Some(10));
+		assert_eq!(unprocessed[0].processed_at_ms, None);
+		store
+			.mark_delivery_processed("ns:task-1", 11)
+			.expect("explicit processed checkpoint");
+		assert!(store.unprocessed_deliveries("s1").expect("done").is_empty());
+		let _ = std::fs::remove_dir_all(dir);
+	}
+
+	#[test]
+	fn child_intent_is_durable_before_any_tool_effect() {
+		let mut store = seeded_store();
+		store
+			.create_session(NewSession {
+				id: "child-1".to_string(),
+				parent_session_id: Some("s1".to_string()),
+				payload: json!({ "cwd": "/tmp/project", "parentSession": "s1" }),
+				initial_branch_id: "child-1.main".to_string(),
+				initial_branch_payload: json!({ "kind": "root" }),
+			})
+			.expect("create child session");
+		let execution_id = store
+			.record_intent(NewIntent {
+				session_id: "child-1".to_string(),
+				branch_id: "child-1.main".to_string(),
+				provider_call_id: "child-call-1".to_string(),
+				tool_name: "bash".to_string(),
+				payload: json!({ "command": "rm -rf build" }),
+			})
+			.expect("child intent before effect");
+		let unresolved = store
+			.unresolved_intents("child-1")
+			.expect("read child unresolved");
+		assert_eq!(unresolved.len(), 1);
+		assert_eq!(unresolved[0].execution_id, execution_id);
+		assert_eq!(unresolved[0].tool_name, "bash");
+		assert_eq!(
+			store.outcome(&execution_id).expect("outcome"),
+			None,
+			"the intent must not claim the effect ran"
 		);
 	}
 

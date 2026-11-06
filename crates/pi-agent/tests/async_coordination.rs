@@ -747,6 +747,7 @@ impl BackgroundResultSink for UsageSink {
 		vec![pi_agent::BackgroundDelivery {
 			id: "task-usage".to_string(),
 			result_key: Some("ns:task-usage".to_string()),
+			delivery_id: None,
 			text: "<task-result id=\"task-usage\" status=\"completed\">\n<usage input=\"5\" output=\"2\" />\n\
 			       <output>\nbody\n</output>\n</task-result>"
 				.to_string(),

@@ -26,6 +26,7 @@ use super::{
 };
 use crate::{
 	compaction::CompactionReport,
+	durable::ChildDurability,
 	loop_module::{AgentError, AgentEvent, AgentLoop, SteeringEvent},
 	state::{
 		AgentConfig, AgentContext, AgentShell, AgentState, Message, TokenUsage, ToolResult, TurnResult,
@@ -505,6 +506,31 @@ impl TaskTool {
 		// carries its own accounting key from here on, so no consumer has to look
 		// the record up later (a settled record may already be pruned).
 		let spawn_result_key = self.supervisor.capture_result_key(&child_id);
+		let child_durability = match self
+			.supervisor
+			.open_child_durable(&child_id, spawn_result_key.as_deref())
+		{
+			Ok(durable) => durable,
+			Err(message) => {
+				reservation.disarm();
+				self.supervisor
+					.mark_failed(&child_id, start.elapsed().as_millis() as u64, &message);
+				self.supervisor.unregister_active_child(&child_id);
+				self.supervisor.release_outstanding(&child_id);
+				return single_failure(
+					index,
+					child_id,
+					child_name,
+					agent_name,
+					agent_source,
+					item.task,
+					message,
+					start.elapsed().as_millis() as u64,
+					None,
+					None,
+				);
+			},
+		};
 
 		let _permit = match tokio::select! {
 			biased;
@@ -514,6 +540,7 @@ impl TaskTool {
 		} {
 			Ok(permit) => permit,
 			Err(reason) => {
+				record_early_abort(&self.supervisor, &child_id, &agent_name, reason);
 				self.supervisor.mark_aborted(&child_id, reason);
 				self.supervisor.unregister_active_child(&child_id);
 				return SingleResult {
@@ -549,6 +576,12 @@ impl TaskTool {
 
 		// A permit can be granted at the same moment the reservation is cancelled.
 		if child_cancel.is_cancelled() {
+			record_early_abort(
+				&self.supervisor,
+				&child_id,
+				&agent_name,
+				"cancelled by hub",
+			);
 			self.supervisor.mark_aborted(&child_id, "cancelled by hub");
 			self.supervisor.unregister_active_child(&child_id);
 			return SingleResult {
@@ -770,6 +803,8 @@ impl TaskTool {
 				resolved_model.as_deref(),
 				model_role.as_deref(),
 				prompt_schema.as_ref(),
+				spawn_result_key.as_deref(),
+				child_durability.is_some(),
 			);
 		}
 
@@ -784,8 +819,9 @@ impl TaskTool {
 		let full_prompt = format!("Complete assignment thoroughly:\n\n{assignment}");
 		let initial_message = Message::user(full_prompt.clone());
 		// Persist the autoload messages once, before the assignment; TS stores
-		// them as hidden custom messages rather than user turns.
-		{
+		// them as hidden custom messages rather than user turns. A durable child
+		// scope stores the same messages in SQLite, so no JSONL copy is written.
+		if child_durability.is_none() {
 			let mut transcript_messages: Vec<&Message> = autoload_msgs.iter().collect();
 			transcript_messages.push(&initial_message);
 			self
@@ -833,21 +869,25 @@ impl TaskTool {
 		let live_supervisor = Arc::clone(&self.supervisor);
 		let live_child_id = child_id.clone();
 		let live_agent = item.agent.clone();
+		let durable_for_loop = child_durability.clone();
 		let mut task_handle = tokio::spawn(async move {
 			let autoload_len = autoload_msgs.len();
 			let had_system = autoload_msgs
 				.first()
 				.is_some_and(|message| message.role == crate::state::Role::System);
-			// The journal must already hold every accepted message when
-			// compaction prunes, so the loop reports each turn boundary and the
-			// owner appends there; the final flush below covers the last step.
-			let journal = Arc::new(TranscriptJournal::new(
-				Arc::clone(&live_supervisor),
-				live_child_id.clone(),
-				autoload_len.saturating_add(1),
-				had_system,
-			));
-			let child_loop = match child_approver {
+			let durable = durable_for_loop;
+			// Without a durable child scope (explicit ephemeral mode) the journal
+			// must already hold every accepted message when compaction prunes.
+			// With one, the loop boundary owns the same ordering in SQLite.
+			let journal = durable.is_none().then(|| {
+				Arc::new(TranscriptJournal::new(
+					Arc::clone(&live_supervisor),
+					live_child_id.clone(),
+					autoload_len.saturating_add(1),
+					had_system,
+				))
+			});
+			let mut child_loop = match child_approver {
 				Some(approver) => AgentLoop::with_approver(
 					child_config,
 					child_provider,
@@ -862,15 +902,18 @@ impl TaskTool {
 			// Mail that could not be handed to the closing run is buffered by the
 			// hub; the adopted actor drains it here at its next turn boundary, so
 			// a send that raced the hand-off is not stranded.
-			.with_peer_inbox(live_supervisor.mailbox(), live_child_id.clone())
-			.with_turn_observer(Some({
-				let journal = Arc::clone(&journal);
-				Arc::new(
+			.with_peer_inbox(live_supervisor.mailbox(), live_child_id.clone());
+			if let Some(durable) = &durable {
+				child_loop = child_loop.with_durable(Some(durable.boundary()));
+			}
+			if let Some(journal) = &journal {
+				let journal = Arc::clone(journal);
+				child_loop = child_loop.with_turn_observer(Some(Arc::new(
 					move |messages: &[Message], prune: Option<CompactionReport>| {
 						journal.flush(messages, prune)
 					},
-				) as crate::loop_module::TurnObserver
-			}));
+				) as crate::loop_module::TurnObserver));
+			}
 			let mut child_state = AgentState { messages: autoload_msgs, total_turns: 0 };
 			let child_cancelled = child_cancel_for_loop.clone();
 			let outcome = child_loop
@@ -891,8 +934,11 @@ impl TaskTool {
 			// must already be on disk or the next append would land out of order.
 			// A failed or interrupted run is flushed too: the loop keeps the
 			// request and every steering message the hub already receipted as
-			// `injected`, and a later revive replays them.
-			journal.flush(&child_state.messages, None);
+			// `injected`, and a later revive replays them. A durable child scope
+			// already persisted the same tail through the loop boundary.
+			if let Some(journal) = &journal {
+				journal.flush(&child_state.messages, None);
+			}
 			// Hand the final authoritative state back for the post-drain
 			// reconcile (successful or rolled back).
 			*final_messages_task
@@ -914,6 +960,7 @@ impl TaskTool {
 						&live_agent,
 						child_loop,
 						child_state,
+						durable.is_some(),
 					)
 				},
 				_ => None,
@@ -1308,19 +1355,52 @@ impl TaskTool {
 		if let Some(mark) = terminal_mark {
 			match mark {
 				TerminalMark::Completed(output) => {
-					self
-						.supervisor
-						.mark_completed(&outstanding_id, duration_ms, &output);
-					if invocation_task && metadata_confirmed {
-						adopt_keep_alive_child(
-							&self.supervisor,
-							&outstanding_id,
-							result.isolation.is_some(),
-							&mut live_child,
-						);
+					if let Err(error) = record_durable_completion(
+						&self.supervisor,
+						&outstanding_id,
+						"completed",
+						&output,
+						duration_ms,
+						result.usage,
+						result.output_id.as_deref(),
+						&agent_name,
+					) {
+						let message = format!("failed (durable completion): {error}");
+						result.exit_code = 1;
+						result.error = Some(message.clone());
+						result.stderr = message.clone();
+						self
+							.supervisor
+							.mark_failed(&outstanding_id, duration_ms, &message);
+					} else {
+						self
+							.supervisor
+							.mark_completed(&outstanding_id, duration_ms, &output);
+						if invocation_task && metadata_confirmed {
+							adopt_keep_alive_child(
+								&self.supervisor,
+								&outstanding_id,
+								result.isolation.is_some(),
+								&mut live_child,
+							);
+						}
 					}
 				},
 				TerminalMark::Failed(message) => {
+					if let Err(error) = record_durable_completion(
+						&self.supervisor,
+						&outstanding_id,
+						"failed",
+						&message,
+						duration_ms,
+						result.usage,
+						result.output_id.as_deref(),
+						&agent_name,
+					) {
+						eprintln!(
+							"warning: child {outstanding_id} durable completion failed: {error}"
+						);
+					}
 					self
 						.supervisor
 						.mark_failed(&outstanding_id, duration_ms, &message);
@@ -1334,6 +1414,20 @@ impl TaskTool {
 					}
 				},
 				TerminalMark::Aborted(reason) => {
+					if let Err(error) = record_durable_completion(
+						&self.supervisor,
+						&outstanding_id,
+						"aborted",
+						&reason,
+						duration_ms,
+						result.usage,
+						result.output_id.as_deref(),
+						&agent_name,
+					) {
+						eprintln!(
+							"warning: child {outstanding_id} durable abort failed: {error}"
+						);
+					}
 					// An abort can follow real completed turns (yield-abort, a
 					// cancelled isolation finalize): carry their usage instead of
 					// settling an unknown abort.
@@ -1400,6 +1494,18 @@ impl TaskTool {
 		// Captured while the record is unreserved-but-immutable: a late usage
 		// fill must prove it addresses this exact record, never a later one.
 		let spawn_result_key = self.supervisor.capture_result_key(&child_id);
+		let child_durable = match self
+			.supervisor
+			.open_child_durable(&child_id, spawn_result_key.as_deref())
+		{
+			Ok(durable) => durable,
+			Err(error) => {
+				self.supervisor.mark_aborted(&child_id, "durable child scope unavailable");
+				self.supervisor.unregister_active_child(&child_id);
+				self.supervisor.release_outstanding(&child_id);
+				return Err(format!("{child_name}: {error}"));
+			},
+		};
 		let supervisor = self.supervisor.clone();
 		// Capture the resolver with the spawn, like the foreground path: a later
 		// root turn must not change a background child's autoload view.
@@ -1420,10 +1526,17 @@ impl TaskTool {
 		let background_salvage = Arc::new(Mutex::new(ChildSalvage::default()));
 
 		let steering_for_child = steering_tx.clone();
+		let early_agent = agent_name.clone();
 		let handle = tokio::spawn(async move {
 			// Wait until the reservation is registered as active, so an early
 			// cancel can abort this task before it ever reaches the model.
 			if start_rx.await.is_err() {
+				record_early_abort(
+					&supervisor,
+					&task_id,
+					&early_agent,
+					"cancelled before start",
+				);
 				supervisor.mark_aborted(&task_id, "cancelled before start");
 				supervisor.unregister_active_child(&task_id);
 				return;
@@ -1435,11 +1548,13 @@ impl TaskTool {
 				permit = semaphore.clone().acquire_owned() => permit.ok(),
 			};
 			let Some(_permit) = permit else {
+				record_early_abort(&supervisor, &task_id, &early_agent, "cancelled by hub");
 				supervisor.mark_aborted(&task_id, "cancelled by hub");
 				supervisor.unregister_active_child(&task_id);
 				return;
 			};
 			if cancel.is_cancelled() {
+				record_early_abort(&supervisor, &task_id, &early_agent, "cancelled by hub");
 				supervisor.mark_aborted(&task_id, "cancelled by hub");
 				supervisor.unregister_active_child(&task_id);
 				return;
@@ -1456,6 +1571,7 @@ impl TaskTool {
 				child_ctx,
 				plan,
 				Arc::clone(&background_salvage),
+				child_durable,
 			)
 			.await;
 			supervisor.unregister_active_child(&task_id);
@@ -1481,6 +1597,12 @@ impl TaskTool {
 		) {
 			child_cancel.cancel();
 			handle.abort();
+			record_early_abort(
+				&self.supervisor,
+				&child_id,
+				&agent_name,
+				"cancelled before start",
+			);
 			self.supervisor.mark_aborted(&child_id, "cancelled by hub");
 			self.supervisor.unregister_active_child(&child_id);
 			return Err(format!("{child_name}: cancelled before start"));
@@ -1817,6 +1939,83 @@ enum TerminalMark {
 	Aborted(String),
 }
 
+/// Durable worker completion shape. The delivery is the parent notification
+/// committed in the same transaction; it is not a model-processed promise.
+fn worker_completion_value(
+	status: &str,
+	output: &str,
+	duration_ms: u64,
+	usage: Option<TokenUsage>,
+	output_id: Option<&str>,
+) -> Value {
+	json!({
+		"status": status,
+		"output": output,
+		"durationMs": duration_ms,
+		"usage": usage,
+		"outputId": output_id,
+	})
+}
+
+fn worker_delivery_value(agent: &str, status: &str, text: &str) -> Value {
+	json!({ "kind": "task-result", "agent": agent, "status": status, "text": text })
+}
+
+/// Commit the completion and parent notification together. A configured
+/// durable factory fails closed: the caller must surface the error instead of
+/// enqueueing a notification the durable parent does not own.
+fn record_durable_completion(
+	supervisor: &Arc<Supervisor>,
+	id: &str,
+	status: &str,
+	text: &str,
+	duration_ms: u64,
+	usage: Option<TokenUsage>,
+	output_id: Option<&str>,
+	agent: &str,
+) -> Result<(), String> {
+	let completion = worker_completion_value(status, text, duration_ms, usage, output_id);
+	let delivery = worker_delivery_value(agent, status, text);
+	supervisor.complete_child_durable(id, completion, delivery)
+}
+
+/// Record an early cancellation as an aborted worker completion. The delivery
+/// row is the persisted parent notification; no success status is invented.
+fn record_early_abort(supervisor: &Arc<Supervisor>, id: &str, agent: &str, reason: &str) {
+	if let Err(error) =
+		record_durable_completion(supervisor, id, "aborted", reason, 0, None, None, agent)
+	{
+		eprintln!("warning: child {id} early-abort completion failed: {error}");
+	}
+}
+
+/// A configured durable child that cannot commit its completion must not
+/// report success. Replace the live notification with the storage failure and
+/// settle the record as failed.
+fn settle_durable_failure(
+	supervisor: &Arc<Supervisor>,
+	id: &str,
+	agent: &str,
+	duration_ms: u64,
+	usage: Option<TokenUsage>,
+	error: String,
+) {
+	let message = format!("failed (durable completion): {error}");
+	let (output, _) = cap_result_text(&message);
+	let envelope = task_result_envelope(
+		id,
+		agent,
+		None,
+		"failed (durable completion)",
+		duration_ms,
+		&output,
+		None,
+		usage.as_ref(),
+	);
+	supervisor.mark_failed_with_usage(id, duration_ms, &envelope, usage);
+	supervisor.enqueue_delivery(id, envelope);
+}
+
 /// Build a child loop with fresh read/edit state, its own result sink, and its
 /// own peer inbox. Runs detached from the parent turn so REPL turns do not kill
 /// a background job.
@@ -1832,6 +2031,7 @@ async fn run_background_child(
 	child_ctx: ChildContext,
 	plan: Option<Arc<dyn crate::state::PlanModeGuard>>,
 	salvage: Arc<Mutex<ChildSalvage>>,
+	child_durable: Option<ChildDurability>,
 ) -> Result<BackgroundOutcome, AgentError> {
 	let child_model = child_ctx
 		.resolve_model(&item.agent, item.effort.as_deref())
@@ -1905,6 +2105,10 @@ async fn run_background_child(
 			child_active_model.as_deref(),
 			child_model_role.as_deref(),
 			prompt_schema.as_ref(),
+			child_durable
+				.as_ref()
+				.map(|durable| durable.identity().worker_id.as_str()),
+			child_durable.is_some(),
 		);
 	}
 	let child_approver = supervisor.child_approver();
@@ -1915,7 +2119,7 @@ async fn run_background_child(
 	};
 	let full_prompt = format!("Complete assignment thoroughly:\n\n{assignment}");
 	let initial_message = Message::user(full_prompt.clone());
-	{
+	if child_durable.is_none() {
 		let mut transcript_messages: Vec<&Message> = autoload_msgs.iter().collect();
 		transcript_messages.push(&initial_message);
 		supervisor.append_child_transcript(&child_id, &transcript_messages);
@@ -1924,7 +2128,7 @@ async fn run_background_child(
 		supervisor: Arc::clone(&supervisor),
 		id:         child_id.clone(),
 	};
-	let child_loop = match child_approver {
+	let mut child_loop = match child_approver {
 		Some(approver) => {
 			AgentLoop::with_approver(child_config, child_provider, child_registry, approver)
 		},
@@ -1933,29 +2137,35 @@ async fn run_background_child(
 	.with_plan(plan)
 	// Each child owns a fresh shell; never inherit the parent's handle.
 	.with_shell(Some(Arc::new(AgentShell::new())));
-	let child_loop = child_loop
+	child_loop = child_loop
 		.with_background_results(supervisor.owner_results_sink(Some(&child_id)))
 		.with_peer_inbox(supervisor.mailbox(), child_id.clone());
+	if let Some(durable) = &child_durable {
+		child_loop = child_loop.with_durable(Some(durable.boundary()));
+	}
 	let autoload_len = autoload_msgs.len();
 	let had_system = autoload_msgs
 		.first()
 		.is_some_and(|message| message.role == crate::state::Role::System);
 	// Journal every turn boundary before compaction may prune, so an accepted
-	// message is never only in memory when the head is rewritten.
-	let journal = Arc::new(TranscriptJournal::new(
-		Arc::clone(&supervisor),
-		child_id.clone(),
-		autoload_len.saturating_add(1),
-		had_system,
-	));
-	let child_loop = child_loop.with_turn_observer(Some({
-		let journal = Arc::clone(&journal);
-		Arc::new(
+	// message is never only in memory when the head is rewritten. A durable
+	// child scope already owns that ordering in SQLite.
+	let journal = child_durable.is_none().then(|| {
+		Arc::new(TranscriptJournal::new(
+			Arc::clone(&supervisor),
+			child_id.clone(),
+			autoload_len.saturating_add(1),
+			had_system,
+		))
+	});
+	if let Some(journal) = &journal {
+		let journal = Arc::clone(journal);
+		child_loop = child_loop.with_turn_observer(Some(Arc::new(
 			move |messages: &[Message], prune: Option<CompactionReport>| {
 				journal.flush(messages, prune)
 			},
-		) as crate::loop_module::TurnObserver
-	}));
+		) as crate::loop_module::TurnObserver));
+	}
 	let (event_tx, event_rx) = tokio::sync::mpsc::channel(256);
 	if let Some(hook) = supervisor.child_advisor_hook() {
 		let session_file = supervisor.child_session_file(&child_id);
@@ -2016,8 +2226,10 @@ async fn run_background_child(
 	let turns = outcome?;
 	// Final flush before any live handover: the adopted actor appends its next
 	// turn to the same file, and a replay that omits tool results emits dangling
-	// `tool_calls`.
-	journal.flush(&child_state.messages, None);
+	// `tool_calls`. A durable child scope already persisted the same tail.
+	if let Some(journal) = &journal {
+		journal.flush(&child_state.messages, None);
+	}
 	let (base, aborted, _) = summarize_turns(&turns);
 	let succeeded = !aborted && !finalize_output(&item, &turns, &base, false).failed;
 	let adoptable = isolation.is_none();
@@ -2048,7 +2260,14 @@ async fn run_background_child(
 	// caller, so it never gets a wakeable actor; everything else keeps its real
 	// loop/state, which the caller publishes only after the terminal decision.
 	let live = if adoptable && !cancelled && !aborted {
-		live_child_bundle(&supervisor, &child_id, &item.agent, child_loop, child_state)
+		live_child_bundle(
+			&supervisor,
+			&child_id,
+			&item.agent,
+			child_loop,
+			child_state,
+			child_durable.is_some(),
+		)
 	} else {
 		None
 	};
@@ -2258,23 +2477,89 @@ fn settle_background_result(
 					None,
 					usage.as_ref(),
 				);
+				if let Err(error) = record_durable_completion(
+					&supervisor,
+					&id,
+					"failed",
+					&message,
+					duration_ms,
+					usage,
+					output_id.as_deref(),
+					&agent,
+				) {
+					settle_durable_failure(&supervisor, &id, &agent, duration_ms, usage, error);
+					return;
+				}
 				supervisor.mark_failed_with_usage(&id, duration_ms, &envelope, usage);
 				supervisor.enqueue_delivery(&id, envelope);
 				return;
 			}
 			if cancelled {
-				supervisor.mark_aborted(&id, "cancelled during isolation finalize");
-				tombstone_aborted_child(&supervisor, &id, "cancelled during isolation finalize");
+				let reason = "cancelled during isolation finalize";
+				let usage = child_usage(&turns);
+				let (output, _) = cap_result_text(reason);
+				let envelope = task_result_envelope(
+					&id,
+					&agent,
+					output_id.as_deref(),
+					"cancelled",
+					duration_ms,
+					&output,
+					None,
+					usage.as_ref(),
+				);
+				if let Err(error) = record_durable_completion(
+					&supervisor,
+					&id,
+					"cancelled",
+					reason,
+					duration_ms,
+					usage,
+					output_id.as_deref(),
+					&agent,
+				) {
+					settle_durable_failure(&supervisor, &id, &agent, duration_ms, usage, error);
+					return;
+				}
+				supervisor.mark_aborted(&id, reason);
+				supervisor.enqueue_delivery(&id, envelope);
+				tombstone_aborted_child(&supervisor, &id, reason);
 				// The turns ran and their provider requests were charged: keep
 				// that usage (write-once) instead of reporting an unknown abort.
-				fill(child_usage(&turns));
+				fill(usage);
 				return;
 			}
 			if aborted {
 				let reason = reason.as_deref().unwrap_or("aborted by yield");
+				let usage = child_usage(&turns);
+				let (output, _) = cap_result_text(reason);
+				let envelope = task_result_envelope(
+					&id,
+					&agent,
+					output_id.as_deref(),
+					"aborted",
+					duration_ms,
+					&output,
+					None,
+					usage.as_ref(),
+				);
+				if let Err(error) = record_durable_completion(
+					&supervisor,
+					&id,
+					"aborted",
+					reason,
+					duration_ms,
+					usage,
+					output_id.as_deref(),
+					&agent,
+				) {
+					settle_durable_failure(&supervisor, &id, &agent, duration_ms, usage, error);
+					return;
+				}
 				supervisor.mark_aborted(&id, reason);
+				supervisor.enqueue_delivery(&id, envelope);
 				tombstone_aborted_child(&supervisor, &id, reason);
-				fill(child_usage(&turns));
+				fill(usage);
 				return;
 			}
 			// Reported turns count even when the child later fails validation;
@@ -2303,6 +2588,19 @@ fn settle_background_result(
 					None,
 					usage.as_ref(),
 				);
+				if let Err(error) = record_durable_completion(
+					&supervisor,
+					&id,
+					"failed",
+					&output,
+					duration_ms,
+					usage,
+					output_id.as_deref(),
+					&agent,
+				) {
+					settle_durable_failure(&supervisor, &id, &agent, duration_ms, usage, error);
+					return;
+				}
 				supervisor.mark_failed_with_usage(&id, duration_ms, &envelope, usage);
 				supervisor.enqueue_delivery(&id, envelope);
 				adopt_keep_alive_child(&supervisor, &id, isolation.is_some(), &mut live);
@@ -2327,6 +2625,19 @@ fn settle_background_result(
 				merge_summary.as_deref(),
 				usage.as_ref(),
 			);
+			if let Err(error) = record_durable_completion(
+				&supervisor,
+				&id,
+				"completed",
+				&output,
+				duration_ms,
+				usage,
+				output_id.as_deref(),
+				&agent,
+			) {
+				settle_durable_failure(&supervisor, &id, &agent, duration_ms, usage, error);
+				return;
+			}
 			supervisor.mark_completed_with_usage(&id, duration_ms, &envelope, usage);
 			supervisor.enqueue_delivery(&id, envelope);
 			adopt_keep_alive_child(&supervisor, &id, isolation.is_some(), &mut live);
@@ -2357,13 +2668,52 @@ fn settle_background_result(
 					None,
 					observed.as_ref(),
 				);
+				if let Err(error) = record_durable_completion(
+					&supervisor,
+					&id,
+					"failed",
+					&message,
+					duration_ms,
+					observed,
+					output_id.as_deref(),
+					&agent,
+				) {
+					settle_durable_failure(&supervisor, &id, &agent, duration_ms, observed, error);
+					return;
+				}
 				supervisor.mark_failed_with_usage(&id, duration_ms, &envelope, observed);
 				supervisor.enqueue_delivery(&id, envelope);
 				tombstone_aborted_child(&supervisor, &id, &message);
 				return;
 			}
-			supervisor.mark_aborted(&id, "aborted");
-			tombstone_aborted_child(&supervisor, &id, "aborted");
+			let reason = "aborted";
+			let (output, _) = cap_result_text(reason);
+			let envelope = task_result_envelope(
+				&id,
+				&agent,
+				output_id.as_deref(),
+				"aborted",
+				duration_ms,
+				&output,
+				None,
+				observed.as_ref(),
+			);
+			if let Err(error) = record_durable_completion(
+				&supervisor,
+				&id,
+				"aborted",
+				reason,
+				duration_ms,
+				observed,
+				output_id.as_deref(),
+				&agent,
+			) {
+				settle_durable_failure(&supervisor, &id, &agent, duration_ms, observed, error);
+				return;
+			}
+			supervisor.mark_aborted(&id, reason);
+			supervisor.enqueue_delivery(&id, envelope);
+			tombstone_aborted_child(&supervisor, &id, reason);
 			fill(observed);
 		},
 		Err(error) => {
@@ -2392,6 +2742,19 @@ fn settle_background_result(
 					None,
 					observed.as_ref(),
 				);
+				if let Err(error) = record_durable_completion(
+					&supervisor,
+					&id,
+					"failed",
+					&message,
+					duration_ms,
+					observed,
+					output_id.as_deref(),
+					&agent,
+				) {
+					settle_durable_failure(&supervisor, &id, &agent, duration_ms, observed, error);
+					return;
+				}
 				supervisor.mark_failed_with_usage(&id, duration_ms, &envelope, observed);
 				supervisor.enqueue_delivery(&id, envelope);
 				tombstone_aborted_child(&supervisor, &id, &message);
@@ -2407,6 +2770,19 @@ fn settle_background_result(
 				None,
 				observed.as_ref(),
 			);
+			if let Err(error) = record_durable_completion(
+				&supervisor,
+				&id,
+				"failed",
+				&message,
+				duration_ms,
+				observed,
+				output_id.as_deref(),
+				&agent,
+			) {
+				settle_durable_failure(&supervisor, &id, &agent, duration_ms, observed, error);
+				return;
+			}
 			supervisor.mark_failed_with_usage(&id, duration_ms, &envelope, observed);
 			supervisor.enqueue_delivery(&id, envelope);
 			tombstone_aborted_child(&supervisor, &id, &message);
@@ -2829,6 +3205,8 @@ fn persist_child_contract(
 	resolved_model: Option<&str>,
 	model_role: Option<&str>,
 	output_schema: Option<&Value>,
+	result_key: Option<&str>,
+	durable: bool,
 ) {
 	if crate::subagent_lifecycle::lookup(supervisor).is_none() {
 		return;
@@ -2850,6 +3228,8 @@ fn persist_child_contract(
 	let read_only = Some(!tools.iter().any(|name| name.as_str() == "write"));
 	let contract = PersistedChildSession {
 		id:               child_id.to_string(),
+		result_key:       result_key.map(str::to_string),
+		durable,
 		agent:            Some(item.agent.name.clone()),
 		task:             item.task.clone(),
 		system_prompt:    config.system_prompt.clone().unwrap_or_default(),
@@ -2905,12 +3285,13 @@ fn live_child_bundle(
 	agent: &AgentDefinition,
 	agent_loop: AgentLoop,
 	state: AgentState,
+	durable: bool,
 ) -> Option<RevivedChild> {
 	let root = supervisor
 		.child_session_file(child_id)
 		.and_then(|path| path.parent().map(std::path::Path::to_path_buf))?;
 	let contract = PersistedChildSession::load(&root, child_id)?;
-	Some(RevivedChild { agent_loop, state, agent: Some(agent.clone()), contract })
+	Some(RevivedChild { agent_loop, state, agent: Some(agent.clone()), contract, durable })
 }
 
 /// Append the messages the child loop actually accepted to its transcript.
@@ -4009,6 +4390,8 @@ mod tests {
 	fn follow_up_output_requires_a_terminal_yield() {
 		let contract = PersistedChildSession {
 			id: "task-1".to_string(),
+			result_key: None,
+			durable: false,
 			agent: Some("task".to_string()),
 			task: "work".to_string(),
 			system_prompt: "system".to_string(),
@@ -4134,6 +4517,8 @@ mod tests {
 		supervisor.append_child_transcript(&id, &[&Message::user("work")]);
 		let mut contract = PersistedChildSession {
 			id: id.clone(),
+			result_key: None,
+			durable: false,
 			agent: Some("task".to_string()),
 			task: "work".to_string(),
 			system_prompt: "system".to_string(),

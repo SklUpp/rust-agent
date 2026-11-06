@@ -490,6 +490,23 @@ impl SubagentLifecycleManager {
 		path.is_file().then_some(path)
 	}
 
+	/// Durable child conversation for `history://`. Returns `None` when this
+	/// agent has no durable scope (legacy transcript or no session store).
+	pub fn durable_messages(&self, id: &str) -> Option<Vec<Message>> {
+		let supervisor = self.supervisor.upgrade()?;
+		let worker_id = {
+			let state = lock(&self.state);
+			state
+				.entries
+				.get(id)
+				.and_then(|entry| entry.contract.as_ref())
+				.filter(|contract| contract.durable)
+				.and_then(|contract| contract.result_key.clone())
+		}
+		.or_else(|| supervisor.capture_result_key(id))?;
+		supervisor.load_child_messages(&worker_id).ok().flatten()
+	}
+
 	/// Rows the `history://` index and lookup may expose.
 	///
 	/// Includes rows `roster` filters out (tombstoned ids keep a readable
@@ -854,7 +871,7 @@ impl SubagentLifecycleManager {
 		if tokio::runtime::Handle::try_current().is_err() {
 			return Err("adopting a live agent requires a tokio runtime".to_string());
 		}
-		let RevivedChild { agent_loop, state: child_state, agent, contract } = child;
+		let RevivedChild { agent_loop, state: child_state, agent, contract, durable } = child;
 		if contract.id != id {
 			return Err(format!(
 				"contract id {:?} does not match child \"{id}\"",
@@ -995,6 +1012,7 @@ impl SubagentLifecycleManager {
 				state: child_state,
 				agent,
 				contract: persisted_contract,
+				durable,
 			},
 			receiver,
 			steering_rx,
@@ -1298,9 +1316,32 @@ impl SubagentLifecycleManager {
 			));
 		}
 
-		let replayed = load_transcript(&session_file).map_err(|error| {
-			format!("cannot reopen agent \"{id}\" transcript: {error}")
-		})?;
+		let durable_messages = if contract.durable {
+			let worker_id = contract.result_key.as_deref().ok_or_else(|| {
+				format!(
+					"cannot revive agent \"{id}\": durable child has no spawn-time result key"
+				)
+			})?;
+			supervisor
+				.load_child_messages(worker_id)
+				.map_err(|error| format!("cannot reopen agent \"{id}\" durable session: {error}"))?
+		} else {
+			// A prior revive may have imported this legacy child and appended
+			// turns there. Prefer that SQLite history over the stale JSONL tail.
+			let worker_id = contract
+				.result_key
+				.clone()
+				.unwrap_or_else(|| format!("legacy-{id}"));
+			supervisor
+				.load_child_messages(&worker_id)
+				.map_err(|error| format!("cannot reopen agent \"{id}\" durable session: {error}"))?
+		};
+		let replayed = match durable_messages {
+			Some(messages) => messages,
+			None => load_transcript(&session_file).map_err(|error| {
+				format!("cannot reopen agent \"{id}\" transcript: {error}")
+			})?,
+		};
 		let revived = self.reviver.revive(&contract, replayed, Some(supervisor))?;
 		let (inbound, receiver) = mpsc::channel(64);
 		inbound
@@ -1627,21 +1668,26 @@ async fn run_actor(
 		mut state,
 		agent,
 		contract,
+		durable,
 	} = revived;
 	// One journal for the whole actor: the loop reports every turn boundary, so
 	// accepted messages reach the file before compaction can prune them, and the
 	// cursor carries across wake turns.
-	let journal = manager
-		.upgrade()
-		.and_then(|manager| manager.supervisor.upgrade())
-		.map(|supervisor| {
-			Arc::new(TranscriptJournal::new(
-				supervisor,
-				id.clone(),
-				state.messages.len(),
-				state.messages.first().is_some_and(|m| m.role == Role::System),
-			))
-		});
+	let journal = (!durable)
+		.then(|| {
+			manager
+				.upgrade()
+				.and_then(|manager| manager.supervisor.upgrade())
+				.map(|supervisor| {
+					Arc::new(TranscriptJournal::new(
+						supervisor,
+						id.clone(),
+						state.messages.len(),
+						state.messages.first().is_some_and(|m| m.role == Role::System),
+					))
+				})
+		})
+		.flatten();
 	if let Some(journal) = journal.clone() {
 		agent_loop = agent_loop.with_turn_observer(Some({
 			let journal = Arc::clone(&journal);

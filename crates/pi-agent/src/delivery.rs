@@ -25,8 +25,12 @@ pub trait BackgroundResultSink: Send + Sync {
 		self
 			.take_background_results()
 			.into_iter()
-			.map(|text| {
-				BackgroundDelivery { id: String::new(), result_key: None, text, usage: None }
+			.map(|text| BackgroundDelivery {
+				id: String::new(),
+				result_key: None,
+				delivery_id: None,
+				text,
+				usage: None,
 			})
 			.collect()
 	}
@@ -45,6 +49,9 @@ pub struct BackgroundDelivery {
 	/// Canonical accounting key. `None` only for a sink that has no supervisor
 	/// behind it (the trait default); consumers then fall back to `id`.
 	pub result_key: Option<String>,
+	/// Durable delivery identity when the host persisted this notification.
+	/// `None` for ephemeral/eval results with no delivery row.
+	pub delivery_id: Option<String>,
 	pub text: String,
 	pub usage: Option<TokenUsage>,
 }

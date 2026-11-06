@@ -399,6 +399,8 @@ fn reserved_child_with_parent(
 	);
 	let contract = PersistedChildSession {
 		id: id.clone(),
+		result_key: None,
+		durable: false,
 		agent: Some("scout".to_string()),
 		task: "investigate the repo".to_string(),
 		system_prompt: "child system prompt".to_string(),
@@ -447,6 +449,7 @@ fn live_child(
 		state: AgentState { messages, total_turns: 0 },
 		agent: None,
 		contract,
+		durable: false,
 	}
 }
 
@@ -2292,6 +2295,8 @@ fn contract_for(
 ) -> PersistedChildSession {
 	PersistedChildSession {
 		id: id.to_string(),
+		result_key: None,
+		durable: false,
 		agent: Some(agent.to_string()),
 		task: task.to_string(),
 		system_prompt: "child system prompt".to_string(),

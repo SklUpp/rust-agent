@@ -17,6 +17,7 @@ use tokio_util::sync::CancellationToken;
 use crate::{
 	dap::DapTool,
 	delivery::{BackgroundDelivery, BackgroundResultSink},
+	durable::{ChildDurability, ChildDurabilityFactory},
 	eval::EvalToolBinder,
 	loop_module::{AgentEvent, SteeringEvent},
 	lsp::LspTool,
@@ -126,6 +127,9 @@ struct PendingDelivery {
 	result_key: Option<String>,
 	owner: Option<String>,
 	text: String,
+	/// Durable delivery row identity, present only when the worker completion
+	/// committed one. Eval jobs have no such row.
+	delivery_id: Option<String>,
 	/// Summed reported usage retained from the settled job record at enqueue
 	/// time. `None` when the child (or the host-owned eval job) reported none.
 	usage: Option<TokenUsage>,
@@ -442,6 +446,11 @@ struct SupervisorState {
 	/// delivery and stops on a newer value: the target's terminal `agent_end`, not
 	/// an idle transition.
 	agent_end_seq: HashMap<String, u64>,
+	/// Per-child durable scope, keyed by the supervisor's immutable child id.
+	durable_children: HashMap<String, ChildDurability>,
+	/// Child ids whose durable completion already committed; an abort must not
+	/// write a conflicting second completion for them.
+	completed_children: HashSet<String>,
 	/// Background results not yet handed to their owner or a hub snapshot.
 	pending: VecDeque<PendingDelivery>,
 	/// Jobs whose result was already delivered or recovered by a snapshot.
@@ -526,6 +535,10 @@ pub struct Supervisor {
 	root_permits: Arc<Semaphore>,
 	/// Peer mailboxes; supervisor-owned so they survive REPL turns.
 	mailbox: Arc<Mailbox>,
+	/// Host-injected child durability factory. `None` means no session owner is
+	/// configured (tests/ephemeral); a configured factory must open every child
+	/// scope or the spawn fails.
+	child_durability: Mutex<Option<Arc<dyn ChildDurabilityFactory>>>,
 	/// Options copied into each child's fresh `EditTool` (same knobs as the
 	/// parent run, but a fresh store/registers/guard).
 	edit_options: Mutex<hashline::edit::EditToolOptions>,
@@ -706,6 +719,7 @@ impl Supervisor {
 			autoload: Mutex::new(None),
 			root_permits: Arc::new(Semaphore::new(permits)),
 			mailbox: Arc::new(Mailbox::default()),
+			child_durability: Mutex::new(None),
 			edit_options: Mutex::new(hashline::edit::EditToolOptions::default()),
 			display_resolver: Mutex::new(None),
 			active_model: Mutex::new(None),
@@ -732,6 +746,8 @@ impl Supervisor {
 				cancel_generation: HashMap::new(),
 				revive_reservations: HashMap::new(),
 				agent_end_seq: HashMap::new(),
+				durable_children: HashMap::new(),
+				completed_children: HashSet::new(),
 				pending: VecDeque::new(),
 				consumed: HashSet::new(),
 				settled_at: HashMap::new(),
@@ -1278,6 +1294,119 @@ impl Supervisor {
 			.filter(|key| !key.is_empty())
 	}
 
+	/// Install the host child-durability factory and its peer checkpoint sink.
+	/// Passing `None` is explicit ephemeral mode (tests / `--no-session`); a
+	/// configured factory must open every child scope or the spawn fails.
+	pub fn set_child_durability_factory(
+		&self,
+		factory: Option<Arc<dyn ChildDurabilityFactory>>,
+	) {
+		*self.child_durability.lock().unwrap() = factory;
+	}
+
+	#[must_use]
+	pub fn child_durability_factory(&self) -> Option<Arc<dyn ChildDurabilityFactory>> {
+		self.child_durability.lock().unwrap().clone()
+	}
+
+	/// Open the durable scope for one worker before its first turn. `worker_id`
+	/// is the spawn-time result key; a configured factory never falls back to an
+	/// ephemeral child if that key is missing.
+	pub fn open_child_durable(
+		&self,
+		id: &str,
+		worker_id: Option<&str>,
+	) -> Result<Option<ChildDurability>, String> {
+		let Some(factory) = self.child_durability_factory() else {
+			return Ok(None);
+		};
+		let worker_id = worker_id
+			.filter(|key| !key.is_empty())
+			.ok_or_else(|| format!("child {id} has no spawn-time result key"))?;
+		let child = factory
+			.open_child(worker_id)
+			.map_err(|error| format!("child {id} durable scope: {error}"))?;
+		if child.identity().worker_id != worker_id {
+			return Err(format!(
+				"child {id} durable scope returned worker id {:?}, expected {worker_id:?}",
+				child.identity().worker_id
+			));
+		}
+		self
+			.state
+			.lock()
+			.unwrap()
+			.durable_children
+			.insert(id.to_string(), child.clone());
+		Ok(Some(child))
+	}
+
+	/// Commit a worker completion and its parent notification. No-op when this
+	/// scope has no durable child (explicit ephemeral), never a silent fallback
+	/// for a configured one.
+	pub fn complete_child_durable(
+		&self,
+		id: &str,
+		completion: serde_json::Value,
+		delivery: serde_json::Value,
+	) -> Result<(), String> {
+		let child = self
+			.state
+			.lock()
+			.unwrap()
+			.durable_children
+			.get(id)
+			.cloned();
+		match child {
+			Some(child) => {
+				child
+					.complete(completion, delivery)
+					.map_err(|error| format!("child {id} durable completion: {error}"))?;
+				self
+					.state
+					.lock()
+					.unwrap()
+					.completed_children
+					.insert(id.to_string());
+				Ok(())
+			},
+			None => Ok(()),
+		}
+	}
+
+	/// Durable child conversation for a cold revive. `None` means no SQLite child
+	/// scope exists, so the caller may read a legacy transcript explicitly.
+	pub fn load_child_messages(&self, worker_id: &str) -> Result<Option<Vec<Message>>, String> {
+		let Some(factory) = self.child_durability_factory() else {
+			return Ok(None);
+		};
+		factory
+			.load_child_messages(worker_id)
+			.map_err(|error| error.to_string())
+	}
+
+	/// Persist one peer message into the target scope as a pending delivery.
+	/// Returns `None` when this supervisor has no durable factory.
+	pub fn offer_peer_delivery(
+		&self,
+		target: &str,
+		sender: &str,
+		text: &str,
+	) -> Result<Option<String>, String> {
+		let Some(factory) = self.child_durability_factory() else {
+			return Ok(None);
+		};
+		let target_session = if target == crate::mailbox::MAIN_AGENT_ID {
+			None
+		} else {
+			self.capture_result_key(target).or_else(|| Some(target.to_string()))
+		};
+		factory
+			.enqueue_peer_delivery(target_session.as_deref(), sender, text)
+			.map(Some)
+			.map_err(|error| format!("peer delivery for {target}: {error}"))
+	}
+
 	/// Usage this child's completed provider requests already reported, summed.
 	/// `None` means the provider reported nothing — never zero.
 	pub fn observed_usage(&self, id: &str) -> Option<TokenUsage> {
@@ -1356,6 +1485,7 @@ impl Supervisor {
 					taken.push(BackgroundDelivery {
 						id: delivery.id,
 						result_key: delivery.result_key,
+						delivery_id: delivery.delivery_id,
 						text: delivery.text,
 						usage: delivery.usage,
 					});
@@ -1398,10 +1528,23 @@ impl Supervisor {
 		}
 		let usage = state.records.get(id).and_then(|record| record.usage);
 		let result_key = state.records.get(id).map(|record| record.result_key.clone());
+		// Only a committed completion has a durable delivery row. A failed
+		// completion stays in `durable_children` for retry but must not attach an
+		// id the loop would later fail to mark.
+		let delivery_id = state
+			.completed_children
+			.contains(id)
+			.then(|| result_key.clone())
+			.flatten();
 		state.pending_bytes += text.len();
-		state
-			.pending
-			.push_back(PendingDelivery { id: id.to_string(), result_key, owner, text, usage });
+		state.pending.push_back(PendingDelivery {
+			id: id.to_string(),
+			result_key,
+			owner,
+			text,
+			delivery_id,
+			usage,
+		});
 	}
 
 	/// Enqueue a non-task background result (eval auto-background) scoped to an
@@ -1447,6 +1590,7 @@ impl Supervisor {
 			id: id.to_string(),
 			owner,
 			text,
+			delivery_id: None,
 			usage: None,
 		});
 		true
@@ -2693,6 +2837,39 @@ impl Supervisor {
 			(changed, record)
 		};
 		if changed {
+			let durable = {
+				let state = self.state.lock().unwrap();
+				if state.completed_children.contains(id) {
+					None
+				} else {
+					state.durable_children.get(id).cloned()
+				}
+			};
+			if let Some(child) = durable {
+				let completion = serde_json::json!({
+					"status": "aborted",
+					"reason": reason,
+					"usage": usage,
+				});
+				let delivery = serde_json::json!({
+					"kind": "task-result",
+					"status": "aborted",
+					"text": reason,
+				});
+				match child.complete(completion, delivery) {
+					Ok(()) => {
+						self
+							.state
+							.lock()
+							.unwrap()
+							.completed_children
+							.insert(id.to_string());
+					},
+					Err(error) => {
+						eprintln!("warning: child {id} durable abort failed: {error}");
+					},
+				}
+			}
 			if let Some(record) = record {
 				self.emit(SubagentEvent::Lifecycle(lifecycle_of(
 					&record,

@@ -1711,8 +1711,23 @@ impl HubTool {
 		let await_ends = self.supervisor.agent_end_seq(to);
 		let mut receipts = Vec::with_capacity(targets.len());
 		for target in &targets {
+			let delivery_id = match self
+				.supervisor
+				.offer_peer_delivery(target, &sender, message)
+			{
+				Ok(delivery_id) => delivery_id,
+				Err(error) => {
+					receipts.push(IrcDeliveryReceipt {
+						to: target.clone(),
+						outcome: "failed".to_string(),
+						error: Some(error),
+					});
+					continue;
+				},
+			};
 			let msg = IrcMessage::new(sender.clone(), target.clone(), message)
-				.with_reply_to(reply_to);
+				.with_reply_to(reply_to)
+				.with_delivery_id(delivery_id);
 			let known = self.supervisor.is_known_agent(target);
 			let receipt = if mailbox.deliver_to_waiter(&msg) {
 				IrcDeliveryReceipt {

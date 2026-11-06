@@ -887,10 +887,14 @@ impl AgentLoop {
 		&self,
 		state: &mut AgentState,
 		events: Option<&mpsc::Sender<AgentEvent>>,
-	) {
+	) -> Vec<String> {
+		let mut delivery_ids = Vec::new();
 		if let Some(sink) = &self.background_results {
 			for delivery in sink.take_background_deliveries() {
 				state.messages.push(Message::user(delivery.text.clone()));
+				if let Some(delivery_id) = delivery.delivery_id {
+					delivery_ids.push(delivery_id);
+				}
 				if let Some(events) = events {
 					let _ = events
 						.send(AgentEvent::BackgroundResult {
@@ -905,9 +909,13 @@ impl AgentLoop {
 		}
 		if let Some((mailbox, agent_id)) = &self.peer_inbox {
 			for message in mailbox.inbox(agent_id, false) {
+				if let Some(delivery_id) = &message.delivery_id {
+					delivery_ids.push(delivery_id.clone());
+				}
 				state.messages.push(Message::user(format_incoming(&message)));
 			}
 		}
+		delivery_ids
 	}
 	/// Await host durability for the conversation. A failed write is terminal:
 	/// the caller must not issue the next model request or start another tool
@@ -918,6 +926,41 @@ impl AgentLoop {
 		};
 		durable
 			.persist_messages(messages)
+			.await
+			.map_err(|error| AgentError::Durable(error.to_string()))
+	}
+
+	/// Mark delivery rows as present in the persisted conversation.
+	async fn mark_deliveries_delivered(
+		&self,
+		delivery_ids: &[String],
+	) -> Result<(), AgentError> {
+		if delivery_ids.is_empty() {
+			return Ok(());
+		}
+		let Some(durable) = &self.durable else {
+			return Ok(());
+		};
+		durable
+			.mark_deliveries_delivered(delivery_ids)
+			.await
+			.map_err(|error| AgentError::Durable(error.to_string()))
+	}
+
+	/// Mark deliveries the provider request actually consumed. Only called after
+	/// a response, never on inbox take.
+	async fn mark_deliveries_processed(
+		&self,
+		delivery_ids: &[String],
+	) -> Result<(), AgentError> {
+		if delivery_ids.is_empty() {
+			return Ok(());
+		}
+		let Some(durable) = &self.durable else {
+			return Ok(());
+		};
+		durable
+			.mark_deliveries_processed(delivery_ids)
 			.await
 			.map_err(|error| AgentError::Durable(error.to_string()))
 	}
@@ -1081,7 +1124,7 @@ impl AgentLoop {
 			state.messages.push(user_message);
 		}
 		let _presence = PresenceGuard::install(&self.peer_inbox);
-		self.inject_boundary_messages(state, events.as_ref()).await;
+		let mut pending_delivery_ids = self.inject_boundary_messages(state, events.as_ref()).await;
 		let ctx = AgentContext::with_approver(
 			self.config.cwd.clone(),
 			cancellation_token.clone(),
@@ -1122,7 +1165,9 @@ impl AgentLoop {
 			}
 			// Results that settled while the previous assistant turn ran land
 			// before this one, exactly once.
-			self.inject_boundary_messages(state, events.as_ref()).await;
+			pending_delivery_ids.extend(
+				self.inject_boundary_messages(state, events.as_ref()).await,
+			);
 
 			// Peek the session queue before compaction so the reminder is part
 			// of this request and stays in the newest history. A requirement
@@ -1149,6 +1194,10 @@ impl AgentLoop {
 			// A failure stops the run; there is no ack handshake and no silent
 			// "persistence disabled" downgrade.
 			self.persist_conversation(&state.messages).await?;
+			// Delivered means the target conversation persisted the message, not
+			// that a mailbox or queue handed it out.
+			self.mark_deliveries_delivered(&pending_delivery_ids).await?;
+			let request_delivery_ids = std::mem::take(&mut pending_delivery_ids);
 
 			// Durable before destructive: the owner journals everything accepted
 			// so far. If that write failed, the prune below is skipped — dropping
@@ -1229,6 +1278,9 @@ impl AgentLoop {
 					return Err(error);
 				},
 			};
+			// The provider accepted this request and returned a response; only now
+			// are its delivery rows consumed by the model.
+			self.mark_deliveries_processed(&request_delivery_ids).await?;
 			if let Some(guard) = &self.assistant_guard {
 				guard.guard(&mut assistant, &state.messages);
 			}
