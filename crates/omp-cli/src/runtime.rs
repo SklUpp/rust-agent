@@ -9050,14 +9050,29 @@ mod tests {
 			"a\nc\nd\ne\nf\ng\nh\ni\nj\nb\n"
 		);
 
-		// Turn 3: the tag minted before an external prepend still recovers.
+		// Turn 3: a tag minted before an external prepend is stale (D44), so the
+		// edit is refused instead of silently rebased onto the drifted file.
 		let turn3 = build(&session, plain);
 		let read = execute(&turn3, "read", serde_json::json!({ "path": "note.txt" }), &ctx).await;
 		let drift_header = read.content.lines().next().expect("header").to_string();
 		let before_drift = std::fs::read_to_string(dir.join("note.txt")).expect("read");
 		std::fs::write(dir.join("note.txt"), format!("zero\n{before_drift}")).expect("drift");
-		let recovered = execute(&turn3, "edit", serde_json::json!({
+		let drifted = std::fs::read_to_string(dir.join("note.txt")).expect("read");
+		let refused = execute(&turn3, "edit", serde_json::json!({
 			"input": format!("{drift_header}\nPUT 2.=2:\n+A\n"),
+		}), &ctx)
+		.await;
+		assert!(refused.is_error, "{}", refused.content);
+		assert_eq!(
+			std::fs::read_to_string(dir.join("note.txt")).expect("read"),
+			drifted,
+			"a refused stale edit must not touch the file"
+		);
+		// Re-reading refreshes the tag; the retry lands on the current line.
+		let read = execute(&turn3, "read", serde_json::json!({ "path": "note.txt" }), &ctx).await;
+		let header = read.content.lines().next().expect("header").to_string();
+		let recovered = execute(&turn3, "edit", serde_json::json!({
+			"input": format!("{header}\nPUT 3.=3:\n+A\n"),
 		}), &ctx)
 		.await;
 		assert!(!recovered.is_error, "{}", recovered.content);

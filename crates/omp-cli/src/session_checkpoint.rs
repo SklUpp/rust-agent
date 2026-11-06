@@ -667,6 +667,18 @@ mod tests {
 		dir
 	}
 
+	/// Fork re-keys storage identity (ids, parent links, timestamps) inside the
+	/// durable store; everything else must carry over verbatim.
+	fn stable_entry(entry: &SessionEntry) -> serde_json::Value {
+		let mut value = serde_json::to_value(entry).expect("serialize entry");
+		if let Some(object) = value.as_object_mut() {
+			for key in ["id", "parentId", "timestamp", "fromId"] {
+				object.remove(key);
+			}
+		}
+		value
+	}
+
 	fn options(dir: PathBuf, id: &str) -> SessionOptions {
 		SessionOptions {
 			enabled: true,
@@ -884,6 +896,8 @@ mod tests {
 		assert!(!joined.contains("contents"), "abandoned exploration leaked into context");
 
 		// Completed guard survives resume.
+		let branch_before: Vec<SessionEntry> =
+			store.branch_entries().into_iter().cloned().collect();
 		drop(store);
 		let reopened = SessionStore::open(&session_options);
 		assert!(reopened.enabled());
@@ -979,22 +993,91 @@ mod tests {
 			"abandoned exploration leaked into forked context"
 		);
 
-		let forked_entries: Vec<String> = forked
-			.entries()
+		// The durable fork re-keys storage identity: entry content must carry
+		// over verbatim, while `parentId` and a summary's `fromId` must point at
+		// the re-keyed copies, not at the source ids.
+		let forked_entries = forked.entries();
+		assert_eq!(
+			forked_entries.len(),
+			branch_before.len(),
+			"fork changed or dropped an active-branch entry"
+		);
+		let content = |entries: &[SessionEntry]| -> Vec<serde_json::Value> {
+			entries.iter().map(stable_entry).collect()
+		};
+		assert_eq!(
+			content(forked_entries),
+			content(&branch_before),
+			"fork changed active-branch entry content"
+		);
+		let source_index: std::collections::HashMap<&str, usize> = branch_before
 			.iter()
-			.map(|entry| serde_json::to_string(entry).expect("serialize forked entry"))
+			.enumerate()
+			.map(|(index, entry)| (entry.id.as_str(), index))
 			.collect();
-		for line in &before {
-			assert!(
-				forked_entries.contains(line),
-				"fork changed or dropped entry: {line}"
+		for (index, (source, forked_entry)) in branch_before.iter().zip(forked_entries).enumerate()
+		{
+			let expected_parent = source.parent_id.as_deref().map(|parent| {
+				let parent_index = source_index.get(parent).copied().unwrap_or_else(|| {
+					panic!("entry {index} names a parent outside the source branch: {parent}")
+				});
+				forked_entries[parent_index].id.as_str()
+			});
+			assert_eq!(
+				forked_entry.parent_id.as_deref(),
+				expected_parent,
+				"fork must re-map parentId of entry {index}"
 			);
+			if source.kind == "branch_summary" {
+				let source_from = source
+					.extra
+					.get("fromId")
+					.and_then(Value::as_str)
+					.unwrap_or("root");
+				let expected_from = if source_from == "root" {
+					"root"
+				} else {
+					let from_index = source_index.get(source_from).copied().unwrap_or_else(|| {
+						panic!("summary {index} names a fromId outside the source branch")
+					});
+					forked_entries[from_index].id.as_str()
+				};
+				assert_eq!(
+					forked_entry.extra.get("fromId").and_then(Value::as_str),
+					Some(expected_from),
+					"fork must re-map the summary fromId of entry {index}"
+				);
+			}
 		}
 		assert!(
-			forked.entries().iter().any(|entry| entry.id == "ex-result"),
-			"abandoned exploration must stay persisted in the fork"
+			forked.branch_chain_warning().is_none(),
+			"forked branch chain must resolve"
 		);
-		assert!(forked.branch_messages().iter().all(|entry| entry.id != "ex-result"));
+		assert_eq!(
+			forked.branch_entries().len(),
+			forked_entries.len(),
+			"every forked entry must sit on the active branch"
+		);
+		assert!(
+			forked_entries.iter().any(|entry| entry.kind == "branch_summary"),
+			"fork must keep the retained branch summary"
+		);
+		// The abandoned exploration is excluded by its stable tool-call identity,
+		// never by regenerated entry ids.
+		assert!(
+			forked
+				.messages()
+				.iter()
+				.all(|message| message.message.tool_call_id.as_deref() != Some("ex-call")),
+			"abandoned exploration tool call must not be copied"
+		);
+		assert!(
+			forked
+				.messages()
+				.iter()
+				.all(|message| !message.message.content.text().contains("contents")),
+			"fork is branch-scoped: abandoned exploration must not be copied"
+		);
 
 		fs::remove_dir_all(dir).ok();
 	}

@@ -4653,10 +4653,6 @@ pub fn fork_session(
 			.map_err(|error| format!("cannot persist forked session header: {error}"))?;
 	}
 	for entry in branch_entries {
-		if entry.kind == "branch_summary" {
-			// The fork is linear: keep only the active branch's content.
-			continue;
-		}
 		let parent = target.leaf_id().map(str::to_string);
 		if entry.kind == "message" {
 			let message: MessageEntry =
@@ -4672,8 +4668,21 @@ pub fn fork_session(
 		} else {
 			let mut value = serde_json::to_value(&entry).map_err(|e| e.to_string())?;
 			value["id"] = serde_json::json!(format!("entry-{}", output::session_id()));
-			value["parentId"] = serde_json::json!(parent);
 			value["timestamp"] = serde_json::json!(now);
+			if entry.kind == "branch_summary" {
+				// The branch point is re-keyed with the fork: a summary cut keeps
+				// its origin (a root cut stays root), and `fromId` follows it.
+				let from = if entry.parent_id.is_some() {
+					parent.clone()
+				} else {
+					None
+				};
+				value["fromId"] =
+					serde_json::json!(from.clone().unwrap_or_else(|| "root".to_string()));
+				value["parentId"] = serde_json::json!(from);
+			} else {
+				value["parentId"] = serde_json::json!(parent);
+			}
 			let forked: SessionEntry =
 				serde_json::from_value(value).map_err(|e| e.to_string())?;
 			target.append_entry(forked)?;
@@ -6043,33 +6052,23 @@ mod tests {
 	}
 
 	#[test]
-	fn continue_picks_the_newest_log_by_mtime() {
+	fn continue_picks_the_most_recently_saved_session() {
 		let dir = temp_dir();
 		let mut older = SessionStore::open(&options(dir.clone(), Some("older")));
 		older
 			.append_turn(&turn("old", "old answer"))
 			.expect("append");
-		let older_file = older.file().expect("older file").to_path_buf();
+		assert!(older.enabled(), "older store: {:?}", older.corrupt_reason());
 		drop(older);
+		// A later write must leave the other session older by a real margin, so
+		// the durable `updated_at_ms` ordering is unambiguous.
+		std::thread::sleep(Duration::from_millis(5));
 		let mut newer = SessionStore::open(&options(dir.clone(), Some("newer")));
 		newer
 			.append_turn(&turn("new", "new answer"))
 			.expect("append");
-		let newer_file = newer.file().expect("newer file").to_path_buf();
+		assert!(newer.enabled(), "newer store: {:?}", newer.corrupt_reason());
 		drop(newer);
-		let base = UNIX_EPOCH + Duration::from_secs(1_000);
-		fs::File::options()
-			.write(true)
-			.open(&older_file)
-			.expect("open older")
-			.set_modified(base)
-			.expect("mtime older");
-		fs::File::options()
-			.write(true)
-			.open(&newer_file)
-			.expect("open newer")
-			.set_modified(base + Duration::from_secs(10))
-			.expect("mtime newer");
 
 		let mut resumed = SessionStore::open(&SessionOptions {
 			continue_latest: true,
