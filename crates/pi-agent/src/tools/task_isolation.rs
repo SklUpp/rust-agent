@@ -1850,7 +1850,7 @@ fn preserve_plain_conflict(
 		("result", plain.result_dir.as_path()),
 	] {
 		let source = root.join(relative);
-		let Some(entry) = plain_entry_at(&source).map_err(|error| format!("{label}: {error}"))
+		let Some(entry) = plain_entry_at(&source).map_err(|error| format!("{label}: {error}"))?
 		else {
 			continue;
 		};
