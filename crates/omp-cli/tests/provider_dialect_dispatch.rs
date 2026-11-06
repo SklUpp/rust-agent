@@ -45,6 +45,21 @@ fn catalog_with_model(
 	Catalog { providers, connections, source: PathBuf::from("models.json") }
 }
 
+/// Request cwd isolated per fixture: the runner claims its project's
+/// workspace-owner lease, so parallel tests must not share one directory.
+fn unique_cwd() -> PathBuf {
+	let path = std::env::temp_dir().join(format!(
+		"omp-dialect-{}-{}",
+		std::process::id(),
+		std::time::SystemTime::now()
+			.duration_since(std::time::UNIX_EPOCH)
+			.map(|elapsed| elapsed.as_nanos())
+			.unwrap_or(0)
+	));
+	let _ = std::fs::create_dir_all(&path);
+	path
+}
+
 /// Root request whose `config.yml` entry carries only the credential: the
 /// catalog holds the (dead) provider fallback, so only the per-model `baseUrl`
 /// can make the turn succeed.
@@ -57,7 +72,7 @@ fn wire_request(catalog: Catalog, provider: &str, model: &str, api_key: Option<&
 	RunRequest {
 		prompt: "fix the build".to_string(),
 		parts: Vec::new(),
-		cwd: std::env::temp_dir(),
+		cwd: unique_cwd(),
 		output_mode: OutputMode::Json,
 		model: Some(format!("{provider}/{model}")),
 		provider: None,

@@ -651,6 +651,9 @@ async fn write_aborted_during_actual_write_cleans_temp_and_preserves_target() {
 
 	let token = CancellationToken::new();
 	let ctx = pi_agent::AgentContext::with_cancellation(dir.path.clone(), token.clone());
+	let store = Arc::new(pi_agent::tools::hashline::SnapshotStore::new());
+	record_edit_snapshot(&store, &target);
+	let tool = WriteTool::default().with_snapshots(Some(store));
 
 	let payload = "A".repeat(1024 * 1024);
 	let args = json!({
@@ -659,7 +662,7 @@ async fn write_aborted_during_actual_write_cleans_temp_and_preserves_target() {
 	});
 
 	let task = tokio::spawn(async move {
-		WriteTool::default().execute(&args, &ctx).await
+		tool.execute(&args, &ctx).await
 	});
 
 	for _ in 0..1000 {
@@ -700,6 +703,9 @@ async fn write_aborted_by_task_abort_cleans_temp_and_prevents_rename() {
 
 	let token = CancellationToken::new();
 	let ctx = pi_agent::AgentContext::with_cancellation(dir.path.clone(), token);
+	let store = Arc::new(pi_agent::tools::hashline::SnapshotStore::new());
+	record_edit_snapshot(&store, &target);
+	let tool = WriteTool::default().with_snapshots(Some(store));
 
 	let payload = "A".repeat(1024 * 1024);
 	let args = json!({
@@ -708,7 +714,7 @@ async fn write_aborted_by_task_abort_cleans_temp_and_prevents_rename() {
 	});
 
 	let task = tokio::spawn(async move {
-		WriteTool::default().execute(&args, &ctx).await
+		tool.execute(&args, &ctx).await
 	});
 
 	for _ in 0..1000 {
@@ -880,7 +886,10 @@ async fn write_preserves_restrictive_mode_on_existing_file() {
 	std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o600)).expect("chmod");
 
 	let ctx = pi_agent::AgentContext::new(dir.path.clone());
+	let store = Arc::new(pi_agent::tools::hashline::SnapshotStore::new());
+	record_edit_snapshot(&store, &target);
 	let result = WriteTool::default()
+		.with_snapshots(Some(store))
 		.execute(
 			&json!({
 				"path": "secret.key",

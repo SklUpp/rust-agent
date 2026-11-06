@@ -630,6 +630,21 @@ fn effort_catalog() -> Catalog {
 	catalog
 }
 
+/// Isolated request cwd: live-session tests share one test binary, and the
+/// runner claims each project's workspace-owner lease exclusively.
+fn unique_cwd(label: &str) -> PathBuf {
+	let path = std::env::temp_dir().join(format!(
+		"omp-rpc-{label}-{}-{}",
+		std::process::id(),
+		std::time::SystemTime::now()
+			.duration_since(std::time::UNIX_EPOCH)
+			.map(|elapsed| elapsed.as_nanos())
+			.unwrap_or(0)
+	));
+	let _ = std::fs::create_dir_all(&path);
+	path
+}
+
 fn launch(port: u16, model: &str, provider: &str) -> RpcLaunch {
 	let mut config = Config::default();
 	config.providers.insert(
@@ -640,7 +655,7 @@ fn launch(port: u16, model: &str, provider: &str) -> RpcLaunch {
 			..Default::default()
 		},
 	);
-	let cwd = std::env::temp_dir();
+	let cwd = unique_cwd(model);
 	RpcLaunch {
 		runner: Arc::new(PiAgentRunner::new().expect("runner")),
 		config,

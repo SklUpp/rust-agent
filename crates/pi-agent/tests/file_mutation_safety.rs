@@ -18,7 +18,7 @@ use std::{
 use pi_agent::{
 	AgentContext, Tool, ToolError,
 	tools::{
-		AstEditTool, PendingStore,
+		AstEditTool, PendingStore, WriteTool,
 		edit_variants::{EditMode, execute},
 		hashline::SnapshotStore,
 	},
@@ -554,4 +554,99 @@ async fn replace_preserves_bom_crlf_and_multibyte_text() {
 		"\u{feff}α\r\nδ\r\nγ\r\n",
 		"BOM and CRLF endings survive the edit"
 	);
+}
+
+#[tokio::test]
+async fn write_refuses_to_overwrite_a_file_without_a_retained_read() {
+	let dir = TempDir::new("write-no-read");
+	dir.write("notes.txt", "original\n");
+	let result = WriteTool::new()
+		.execute(
+			&json!({ "path": "notes.txt", "content": "replacement\n" }),
+			&ctx(&dir),
+		)
+		.await
+		.expect("write executes");
+	assert!(result.is_error, "{}", result.content);
+	assert!(
+		result.content.contains("without a retained read snapshot"),
+		"{}",
+		result.content
+	);
+	assert_eq!(dir.read("notes.txt"), "original\n");
+	let leftovers: Vec<String> = fs::read_dir(&dir.path)
+		.expect("read dir")
+		.map(|entry| entry.expect("entry").file_name().to_string_lossy().into_owned())
+		.filter(|name| name.contains(".tmp-"))
+		.collect();
+	assert!(leftovers.is_empty(), "no staged write may remain: {leftovers:?}");
+}
+
+#[tokio::test]
+async fn write_refuses_a_stale_snapshot_and_accepts_the_current_raw_version() {
+	let dir = TempDir::new("write-stale");
+	let file = dir.write("notes.txt", "v1\n");
+	let store = Arc::new(SnapshotStore::new());
+	let key = pi_agent::tools::hashline::canonical_key(&file);
+	store
+		.record_with_raw(&key, b"v1\n", "v1\n", None)
+		.expect("record raw");
+	let tool = WriteTool::new().with_snapshots(Some(Arc::clone(&store)));
+
+	fs::write(&file, "v2\n").expect("external edit");
+	let stale = tool
+		.execute(
+			&json!({ "path": "notes.txt", "content": "v3\n" }),
+			&ctx(&dir),
+		)
+		.await
+		.expect("write executes");
+	assert!(stale.is_error, "{}", stale.content);
+	assert!(
+		stale.content.contains("changed since the retained read"),
+		"{}",
+		stale.content
+	);
+	assert_eq!(dir.read("notes.txt"), "v2\n");
+
+	store
+		.record_with_raw(&key, b"v2\n", "v2\n", None)
+		.expect("record current raw");
+	let fresh = tool
+		.execute(
+			&json!({ "path": "notes.txt", "content": "v3\n" }),
+			&ctx(&dir),
+		)
+		.await
+		.expect("write executes");
+	assert!(!fresh.is_error, "{}", fresh.content);
+	assert_eq!(dir.read("notes.txt"), "v3\n");
+}
+
+#[tokio::test]
+async fn concurrent_new_file_writes_publish_exactly_one_winner() {
+	let dir = TempDir::new("write-new-race");
+	let left_tool = WriteTool::new();
+	let right_tool = WriteTool::new();
+	let left_ctx = ctx(&dir);
+	let right_ctx = ctx(&dir);
+	let left = left_tool.execute(
+		&json!({ "path": "race.txt", "content": "left\n" }),
+		&left_ctx,
+	);
+	let right = right_tool.execute(
+		&json!({ "path": "race.txt", "content": "right\n" }),
+		&right_ctx,
+	);
+	let (left, right) = tokio::join!(left, right);
+	let left = left.expect("write executes");
+	let right = right.expect("write executes");
+	let winners = [&left, &right].iter().filter(|result| !result.is_error).count();
+	assert_eq!(
+		winners, 1,
+		"exactly one creator may publish: left={} right={}",
+		left.content, right.content
+	);
+	let content = dir.read("race.txt");
+	assert!(content == "left\n" || content == "right\n", "{content:?}");
 }

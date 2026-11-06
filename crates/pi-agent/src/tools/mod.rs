@@ -76,6 +76,7 @@ use crate::state::{
 use crate::tool::{Tool, ToolError, tool_result};
 use crate::tools::conflict::{ConflictEntry, ConflictId};
 use crate::tools::process::{ProcessBackend, ProcessError, ProcessSpec, RestartPolicy};
+use crate::workspace_writer::{FileVersion, WorkspaceWriter};
 
 /// Captured stdout+stderr budget for one bash call.
 const MAX_BASH_OUTPUT_BYTES: usize = 64 * 1024;
@@ -832,6 +833,36 @@ impl Drop for AbortGuard {
 	}
 }
 
+#[cfg(test)]
+static WRITE_COMMIT_GATE: Mutex<
+	Option<(std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>)>,
+> = Mutex::new(None);
+
+/// Arm a one-shot barrier between staging and the final rename. Tests hold the
+/// blocking writer there, then cancel or drop the turn before releasing it.
+#[cfg(test)]
+fn arm_write_commit_gate() -> (std::sync::mpsc::Receiver<()>, std::sync::mpsc::Sender<()>) {
+	let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+	let (release_tx, release_rx) = std::sync::mpsc::channel();
+	let mut gate = WRITE_COMMIT_GATE
+		.lock()
+		.unwrap_or_else(|poison| poison.into_inner());
+	*gate = Some((entered_tx, release_rx));
+	(entered_rx, release_tx)
+}
+
+#[cfg(test)]
+fn run_write_commit_gate() {
+	let gate = WRITE_COMMIT_GATE
+		.lock()
+		.unwrap_or_else(|poison| poison.into_inner())
+		.take();
+	if let Some((entered, release)) = gate {
+		let _ = entered.send(());
+		let _ = release.recv();
+	}
+}
+
 async fn resolve_symlink_target(mut path: PathBuf) -> std::io::Result<PathBuf> {
 	for _ in 0..32 {
 		match tokio::fs::symlink_metadata(&path).await {
@@ -1026,6 +1057,197 @@ pub(crate) async fn write_atomic_with_mode(
 
 	abort_guard.disarm();
 	Ok(())
+}
+
+/// Failure of one local workspace commit; the message is user-facing.
+enum WorkspaceWriteError {
+	Cancelled,
+	Message(String),
+}
+
+/// Write one workspace file under the `write` tool contract.
+///
+/// An existing target is only replaced when the session's snapshot store still
+/// retains the exact raw bytes a read observed for it, and only while this
+/// process holds the cross-process file lease. A missing target is published
+/// with a no-clobber atomic link, so a concurrent creator is never overwritten.
+/// Neither path is an atomic compare-and-swap against an external editor: the
+/// full raw version is re-read immediately before the rename. An external
+/// process that bypasses this API is therefore not excluded.
+async fn write_workspace_file(
+	target: &Path,
+	bytes: &[u8],
+	snapshots: Option<Arc<hashline::SnapshotStore>>,
+	token: &CancellationToken,
+) -> Result<(), WorkspaceWriteError> {
+	if token.is_cancelled() {
+		return Err(WorkspaceWriteError::Cancelled);
+	}
+	let target = resolve_symlink_target(target.to_path_buf())
+		.await
+		.map_err(|error| {
+			WorkspaceWriteError::Message(format!("resolve symlink: {error}"))
+		})?;
+	if let Some(parent) = target.parent() {
+		tokio::fs::create_dir_all(parent).await.map_err(|error| {
+			WorkspaceWriteError::Message(format!("{}: {error}", parent.display()))
+		})?;
+	}
+	let write_token = token.child_token();
+	let commit_state = Arc::new(Mutex::new(CommitState::default()));
+	let mut abort_guard = AbortGuard::new(write_token.clone(), Arc::clone(&commit_state));
+	let bytes = bytes.to_vec();
+	let outcome = tokio::task::spawn_blocking(move || {
+		commit_workspace_file(
+			&target,
+			&bytes,
+			snapshots.as_deref(),
+			&write_token,
+			&commit_state,
+		)
+	})
+	.await
+	.map_err(|error| WorkspaceWriteError::Message(format!("write task failed: {error}")))?;
+	outcome?;
+	abort_guard.disarm();
+	Ok(())
+}
+
+fn commit_workspace_file(
+	target: &Path,
+	bytes: &[u8],
+	snapshots: Option<&hashline::SnapshotStore>,
+	token: &CancellationToken,
+	commit_state: &Arc<Mutex<CommitState>>,
+) -> Result<(), WorkspaceWriteError> {
+	if token.is_cancelled() {
+		return Err(WorkspaceWriteError::Cancelled);
+	}
+	let metadata = match std::fs::symlink_metadata(target) {
+		Ok(metadata) => metadata,
+		Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+			return create_workspace_file(target, bytes, token);
+		},
+		Err(error) => {
+			return Err(WorkspaceWriteError::Message(format!(
+				"stat {}: {error}",
+				target.display()
+			)));
+		},
+	};
+	if metadata.file_type().is_dir() {
+		return Err(WorkspaceWriteError::Message(format!(
+			"{} is a directory",
+			target.display()
+		)));
+	}
+	if !metadata.file_type().is_file() {
+		return Err(WorkspaceWriteError::Message(format!(
+			"{} is not a regular file",
+			target.display()
+		)));
+	}
+
+	let canonical = crate::workspace_writer::canonical_identity(target);
+	let writer = WorkspaceWriter::new().map_err(|error| {
+		WorkspaceWriteError::Message(format!("workspace writer unavailable: {error}"))
+	})?;
+	let _lease = writer.acquire(&canonical).map_err(|error| {
+		WorkspaceWriteError::Message(format!("cannot replace {}: {error}", target.display()))
+	})?;
+	let version = FileVersion::read(&canonical)
+		.map_err(|error| WorkspaceWriteError::Message(error.to_string()))?;
+	let Some(retained) =
+		snapshots.and_then(|store| store.latest_raw(&hashline::canonical_key(&canonical)))
+	else {
+		return Err(WorkspaceWriteError::Message(format!(
+			"refusing to overwrite {} without a retained read snapshot; read the file first",
+			target.display()
+		)));
+	};
+	if retained.as_ref() != version.raw() {
+		return Err(WorkspaceWriteError::Message(format!(
+			"refusing to overwrite {}: it changed since the retained read (raw bytes differ); \
+			 re-read it first",
+			target.display()
+		)));
+	}
+
+	// Stage the bytes beside the target, keep the file's exact mode, and only
+	// then re-verify the read version and publish with one rename. Cancellation
+	// is re-checked between chunks and once more under the same commit lock the
+	// `AbortGuard` uses, so a dropped/aborted turn cannot rename after the
+	// target was validated.
+	let (temp_path, mut temp_file) = create_exclusive_temp(&canonical, &None).map_err(|error| {
+		WorkspaceWriteError::Message(format!("stage {}: {error}", target.display()))
+	})?;
+	let mut guard = TempFileGuard::new(temp_path.clone());
+	for chunk in bytes.chunks(64 * 1024) {
+		if token.is_cancelled() {
+			return Err(WorkspaceWriteError::Cancelled);
+		}
+		temp_file.write_all(chunk).map_err(|error| {
+			WorkspaceWriteError::Message(format!("stage {}: {error}", temp_path.display()))
+		})?;
+	}
+	temp_file.flush().map_err(|error| {
+		WorkspaceWriteError::Message(format!("stage {}: {error}", temp_path.display()))
+	})?;
+	std::fs::set_permissions(&temp_path, metadata.permissions()).map_err(|error| {
+		WorkspaceWriteError::Message(format!("stage {}: {error}", temp_path.display()))
+	})?;
+	version
+		.verify()
+		.map_err(|error| WorkspaceWriteError::Message(error.to_string()))?;
+	#[cfg(test)]
+	run_write_commit_gate();
+	{
+		let mut lock = commit_state.lock().unwrap_or_else(|poison| poison.into_inner());
+		if lock.cancelled || token.is_cancelled() {
+			return Err(WorkspaceWriteError::Cancelled);
+		}
+		std::fs::rename(&temp_path, &canonical).map_err(|error| {
+			WorkspaceWriteError::Message(format!("publish {}: {error}", target.display()))
+		})?;
+		guard.disarm();
+		lock.committed = true;
+	}
+	Ok(())
+}
+
+fn create_workspace_file(
+	target: &Path,
+	bytes: &[u8],
+	token: &CancellationToken,
+) -> Result<(), WorkspaceWriteError> {
+	let (staged, mut file) = create_exclusive_temp(target, &None).map_err(|error| {
+		WorkspaceWriteError::Message(format!("stage {}: {error}", target.display()))
+	})?;
+	// The guard removes the staged sibling on drop: `hard_link` publishes a
+	// second name and leaves this one, and the rename fallback consumes it.
+	let _guard = TempFileGuard::new(staged.clone());
+	file.write_all(bytes).map_err(|error| {
+		WorkspaceWriteError::Message(format!("stage {}: {error}", staged.display()))
+	})?;
+	file.flush().map_err(|error| {
+		WorkspaceWriteError::Message(format!("stage {}: {error}", staged.display()))
+	})?;
+	drop(file);
+	if token.is_cancelled() {
+		return Err(WorkspaceWriteError::Cancelled);
+	}
+	match atomic_publish::publish_staged_file(&staged, target) {
+		Ok(true) => Ok(()),
+		Ok(false) => Err(WorkspaceWriteError::Message(format!(
+			"refusing to overwrite {}: it was created concurrently by another writer; \
+			 re-read it first",
+			target.display()
+		))),
+		Err(error) => Err(WorkspaceWriteError::Message(format!(
+			"publish {}: {error}",
+			target.display()
+		))),
+	}
 }
 
 /// Failure from [`write_conflict_atomic`].
@@ -1987,8 +2209,11 @@ impl WriteTool {
 	) -> Option<String> {
 		let store = self.snapshots.as_ref()?;
 		let normalized = hashline::hash::normalize_to_lf(new_content);
-		let tag = store.record(
+		// The written bytes are the raw version: a normalized-only record would
+		// mint a tag that no strict raw check could ever authorize.
+		let tag = store.record_with_raw(
 			&hashline::canonical_key(absolute_path),
+			new_content.as_bytes(),
 			&normalized,
 			Some(&[]),
 		)?;
@@ -2499,23 +2724,25 @@ impl Tool for WriteTool {
 		if ctx.cancellation_token.is_cancelled() {
 			return Ok(tool_result(format!("Write to {} cancelled", target.display()), true));
 		}
-		if let Some(parent) = target.parent() {
-			tokio::fs::create_dir_all(parent)
-				.await
-				.map_err(|err| ToolError::ExecutionFailed(format!("{}: {err}", parent.display())))?;
-		}
-		match write_atomic(&target, content.as_bytes(), &ctx.cancellation_token).await {
+		match write_workspace_file(
+			&target,
+			content.as_bytes(),
+			self.snapshots.clone(),
+			&ctx.cancellation_token,
+		)
+		.await
+		{
 			Ok(()) => Ok(tool_result(
 				format!("Successfully wrote {} bytes to {}", content.len(), target.display()),
 				false,
 			)),
-			Err(err)
-				if err.kind() == std::io::ErrorKind::Interrupted
-					|| ctx.cancellation_token.is_cancelled() =>
-			{
+			Err(WorkspaceWriteError::Cancelled) => {
 				Ok(tool_result(format!("Write to {} cancelled", target.display()), true))
 			},
-			Err(err) => Ok(tool_result(format!("Failed to write {}: {err}", target.display()), true)),
+			Err(WorkspaceWriteError::Message(message)) => Ok(tool_result(
+				format!("Failed to write {}: {message}", target.display()),
+				true,
+			)),
 		}
 	}
 }
@@ -3680,8 +3907,8 @@ impl Tool for GrepTool {
 
 /// The hashline sink seam: one concrete store satisfies the read-side trait.
 impl ReadSnapshotSink for hashline::NativeSnapshotSink {
-	fn record_file(&self, absolute_path: &Path, full_text: &str) -> Option<String> {
-		hashline::NativeSnapshotSink::record_file(self, absolute_path, full_text)
+	fn record_file(&self, absolute_path: &Path, full_text: &str, raw: Arc<[u8]>) -> Option<String> {
+		hashline::NativeSnapshotSink::record_file(self, absolute_path, full_text, raw)
 	}
 
 	fn record_seen_lines(&self, absolute_path: &Path, tag: &str, lines: &[u32]) {
@@ -4773,5 +5000,133 @@ mod plan_mode_tool_tests {
 			"{header} does not carry {}",
 			head.hash
 		);
+	}
+}
+
+#[cfg(test)]
+mod workspace_write_commit_tests {
+	use super::*;
+
+	/// The commit gate is process-global; these two tests must not arm it at
+	/// the same time.
+	static GATE_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+	fn unique_dir(label: &str) -> PathBuf {
+		let dir = std::env::temp_dir().join(format!(
+			"omp-write-commit-{label}-{}-{}",
+			std::process::id(),
+			std::time::SystemTime::now()
+				.duration_since(std::time::UNIX_EPOCH)
+				.map(|elapsed| elapsed.as_nanos())
+				.unwrap_or(0)
+		));
+		std::fs::create_dir_all(&dir).expect("temp dir");
+		dir
+	}
+
+	fn read_backed_tool(dir: &Path, name: &str) -> (WriteTool, PathBuf) {
+		let target = dir.join(name);
+		std::fs::write(&target, "original\n").expect("seed");
+		let raw = std::fs::read(&target).expect("read seed");
+		let store = Arc::new(hashline::SnapshotStore::new());
+		store
+			.record_with_raw(
+				&hashline::canonical_key(&target),
+				&raw,
+				"original\n",
+				None,
+			)
+			.expect("record raw");
+		(WriteTool::new().with_snapshots(Some(store)), target)
+	}
+
+	fn no_staged_files(dir: &Path) -> bool {
+		std::fs::read_dir(dir)
+			.expect("read dir")
+			.filter_map(Result::ok)
+			.all(|entry| !entry.file_name().to_string_lossy().contains(".tmp-"))
+	}
+
+	fn wait_for_commit_gate(entered: std::sync::mpsc::Receiver<()>) {
+		entered
+			.recv_timeout(std::time::Duration::from_secs(10))
+			.expect("writer must reach the commit gate");
+	}
+
+	#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+	async fn cancelled_read_backed_write_never_renames_after_staging() {
+		let _serial = GATE_LOCK.lock().await;
+		let dir = unique_dir("cancel");
+		let (tool, target) = read_backed_tool(&dir, "cancel.txt");
+		let token = CancellationToken::new();
+		let ctx = AgentContext::with_cancellation(dir.clone(), token.clone());
+		let payload = "A".repeat(1024 * 1024);
+		let (entered, release) = arm_write_commit_gate();
+		let task = tokio::spawn(async move {
+			tool
+				.execute(
+					&serde_json::json!({ "path": "cancel.txt", "content": payload }),
+					&ctx,
+				)
+				.await
+		});
+		tokio::task::spawn_blocking(move || wait_for_commit_gate(entered))
+			.await
+			.expect("gate join");
+
+		token.cancel();
+		release.send(()).expect("release writer");
+
+		let result = task.await.expect("join").expect("execute");
+		assert!(result.is_error, "{}", result.content);
+		assert!(result.content.contains("cancelled"), "{}", result.content);
+		assert_eq!(
+			std::fs::read_to_string(&target).expect("read target"),
+			"original\n",
+			"a cancelled commit must never rename"
+		);
+		assert!(no_staged_files(&dir), "staged temp must be removed");
+		let _ = std::fs::remove_dir_all(&dir);
+	}
+
+	#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+	async fn dropped_read_backed_write_never_renames_after_staging() {
+		let _serial = GATE_LOCK.lock().await;
+		let dir = unique_dir("drop");
+		let (tool, target) = read_backed_tool(&dir, "drop.txt");
+		let ctx = AgentContext::new(dir.clone());
+		let payload = "A".repeat(1024 * 1024);
+		let (entered, release) = arm_write_commit_gate();
+		let task = tokio::spawn(async move {
+			tool
+				.execute(
+					&serde_json::json!({ "path": "drop.txt", "content": payload }),
+					&ctx,
+				)
+				.await
+		});
+		tokio::task::spawn_blocking(move || wait_for_commit_gate(entered))
+			.await
+			.expect("gate join");
+
+		// Dropping the future drops `AbortGuard`, which cancels the blocking
+		// writer's token before it can publish.
+		task.abort();
+		assert!(task.await.expect_err("aborted").is_cancelled());
+		release.send(()).expect("release writer");
+
+		for _ in 0..200 {
+			if no_staged_files(&dir) {
+				break;
+			}
+			tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+		}
+		assert_eq!(
+			std::fs::read_to_string(&target).expect("read target"),
+			"original\n",
+			"a dropped commit must never rename"
+		);
+		assert!(no_staged_files(&dir), "staged temp must be removed");
+		let _ = std::fs::remove_dir_all(&dir);
 	}
 }

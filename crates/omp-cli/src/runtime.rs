@@ -267,6 +267,12 @@ struct RunnerSession {
 	/// only while it still owns the registry entry, so a same-name session
 	/// started by another scope is left running.
 	mcp:             Mutex<Vec<Arc<McpConnection>>>,
+	/// D23 workspace-owner lease for the project this session last ran in.
+	/// Acquired on the first run, re-acquired only when the session switches
+	/// projects, and released when the scope drops. Children share the root
+	/// `RunnerSession`, so none of them re-acquires it (that `flock` would
+	/// deadlock against its own process).
+	workspace_lease: Mutex<Option<Arc<pi_agent::workspace_writer::WorkspaceScopeLease>>>,
 }
 
 /// Shared LSP ownership scope plus the transport preference it was built with.
@@ -302,7 +308,38 @@ impl RunnerSession {
 			url_scope: Mutex::new(Arc::new(pi_agent::tools::internal_urls::UrlScope::default())),
 			acp_bridge: Mutex::new(None),
 			mcp: Mutex::new(Vec::new()),
+			workspace_lease: Mutex::new(None),
 		}
+	}
+
+	/// Take this session's workspace-owner lease for `cwd`, the first time it
+	/// runs there. Switching projects releases the previous lease only after
+	/// the new one is held. A second owner (another session or process) gets an
+	/// explicit occupied error instead of sharing the workspace.
+	fn ensure_workspace_lease(&self, cwd: &Path) -> std::result::Result<(), String> {
+		let canonical = pi_agent::workspace_writer::canonical_identity(cwd);
+		let mut held = self.workspace_lease.lock().unwrap_or_else(|poison| poison.into_inner());
+		if held.as_ref().is_some_and(|lease| lease.canonical() == canonical) {
+			return Ok(());
+		}
+		let writer = pi_agent::workspace_writer::WorkspaceWriter::new()
+			.map_err(|error| format!("workspace writer lock root unavailable: {error}"))?;
+		let lease = writer.acquire_workspace(&canonical).map_err(|error| {
+			format!(
+				"workspace {} is already owned by another writer session: {error}",
+				canonical.display()
+			)
+		})?;
+		*held = Some(Arc::new(lease));
+		Ok(())
+	}
+
+	/// Drop this session's workspace lease (scope close/shutdown). A running
+	/// writer that still holds the `RunnerSession` keeps only the per-file
+	/// guard; no later run in this scope exists to reuse the workspace lease.
+	fn release_workspace_lease(&self) {
+		let mut held = self.workspace_lease.lock().unwrap_or_else(|poison| poison.into_inner());
+		*held = None;
 	}
 
 	/// Install this run's ACP reverse-call bridge; `None` keeps every tool
@@ -935,6 +972,9 @@ async fn shutdown_session(session: Arc<RunnerSession>) {
 	};
 	let close_mcp = close_mcp_sessions(mcp);
 	tokio::join!(dispose_eval, release_lsp, terminate_dap, close_mcp);
+	// Scope teardown makes the workspace available to the next owner before the
+	// last `Arc<RunnerSession>` clone is dropped.
+	session.release_workspace_lease();
 }
 
 /// Close discovered MCP sessions. [`McpConnection::close`] unregisters only the
@@ -1620,11 +1660,25 @@ impl AgentRunner for PiAgentRunner {
 				.unwrap_or_else(|poison| poison.into_inner()) = Some(Arc::clone(goal));
 		}
 		let session = Arc::clone(&resources.tools);
-		session.own_mcp_sessions(&mcp_spawn.connections);
 		session.set_session_identity(
 			request.session_id.as_deref(),
 			request.session_file.as_deref(),
 		);
+		// D23: every root session owns its workspace, including `--no-session`
+		// runs — an ephemeral journal choice is not a write permission. Only a
+		// request with no tools at all is provably unable to write. A tool-name
+		// allowlist is not proof: `bash`, `task`, custom, and MCP tools can all
+		// mutate files, so even the restricted security worker claims the
+		// workspace. A child agent runs inside this root session and never
+		// re-acquires the `flock`.
+		if request.tools_enabled
+			&& let Err(message) = session.ensure_workspace_lease(&request.cwd)
+		{
+			self.runtime
+				.block_on(close_mcp_sessions(mcp_spawn.connections.iter().cloned()));
+			return Err(Error::new(message));
+		}
+		session.own_mcp_sessions(&mcp_spawn.connections);
 		// Router and scope are installed before the registry is built: the root
 		// `read`/`write` instances below copy the scope at construction, and the
 		// supervisor shares the same router with every child registry.
@@ -6935,6 +6989,19 @@ mod tests {
 		catalog
 	}
 
+	fn unique_cwd(label: &str) -> PathBuf {
+		let path = std::env::temp_dir().join(format!(
+			"omp-runtime-{label}-{}-{}",
+			std::process::id(),
+			std::time::SystemTime::now()
+				.duration_since(std::time::UNIX_EPOCH)
+				.map(|elapsed| elapsed.as_nanos())
+				.unwrap_or(0)
+		));
+		let _ = std::fs::create_dir_all(&path);
+		path
+	}
+
 	fn request(approvals: Approvals) -> RunRequest {
 		let mut config = Config::default();
 		config
@@ -6947,7 +7014,7 @@ mod tests {
 		RunRequest {
 			prompt: "fix the build".to_string(),
 			parts: Vec::new(),
-			cwd: PathBuf::from("/work"),
+			cwd: unique_cwd("request"),
 			output_mode: OutputMode::Text,
 			model: Some("local/llama3".to_string()),
 			provider: None,
@@ -8131,7 +8198,7 @@ mod tests {
 
 		let addr = addr_rx.recv().unwrap();
 		let mut req = request(yolo());
-		req.cwd = std::env::temp_dir();
+		req.cwd = unique_cwd("bash-cancel");
 		req.config
 			.providers
 			.insert("local".to_string(), ProviderConfig {
@@ -10474,6 +10541,57 @@ mod process_scope_tests {
 				.is_some(),
 			"the owning ticket releases the tombstone"
 		);
+	}
+
+	/// D23: one identified writer session owns a workspace. A second owner is
+	/// refused explicitly, and switching projects moves the lease.
+	#[test]
+	fn workspace_lease_is_exclusive_and_follows_a_project_switch() {
+		let unique = std::time::SystemTime::now()
+			.duration_since(std::time::UNIX_EPOCH)
+			.expect("clock")
+			.as_nanos();
+		let base = std::env::temp_dir().join(format!(
+			"omp-workspace-lease-{}-{unique}",
+			std::process::id()
+		));
+		let first = base.join("first");
+		let second = base.join("second");
+		std::fs::create_dir_all(&first).expect("first workspace");
+		std::fs::create_dir_all(&second).expect("second workspace");
+
+		let owner = RunnerSession::new(EditToolOptions::default());
+		owner.ensure_workspace_lease(&first).expect("owner takes the workspace");
+		// A repeated run in the same project must reuse the held lease instead
+		// of colliding with its own `flock`.
+		owner.ensure_workspace_lease(&first).expect("same owner reuses its lease");
+
+		let contender = RunnerSession::new(EditToolOptions::default());
+		let error = contender
+			.ensure_workspace_lease(&first)
+			.expect_err("a second owner must be refused");
+		assert!(error.contains("already owned by another writer session"), "{error}");
+
+		owner
+			.ensure_workspace_lease(&second)
+			.expect("switching projects acquires the new workspace");
+		assert_eq!(
+			owner
+				.workspace_lease
+				.lock()
+				.unwrap_or_else(|poison| poison.into_inner())
+				.as_ref()
+				.map(|lease| lease.canonical().to_path_buf()),
+			Some(pi_agent::workspace_writer::canonical_identity(&second)),
+			"the lease follows the active project"
+		);
+		contender
+			.ensure_workspace_lease(&first)
+			.expect("the released workspace is free for the next owner");
+
+		drop(owner);
+		drop(contender);
+		let _ = std::fs::remove_dir_all(&base);
 	}
 
 	#[test]
