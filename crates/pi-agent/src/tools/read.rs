@@ -6,13 +6,23 @@
 //! trailing-selector grammar, literal-colon filenames, context expansion,
 //! line numbering, and 3000-line / 50 KiB / 768-column caps.
 //!
-//! Remaining read slices (planned, not yet ported): markit documents,
-//! images/`:img`, and the internal-URL router. SQLite databases are handled by
-//! `read_sqlite.rs`; ZIP/tar/compressed streams and their members by
-//! `read_archive.rs` (Python 3 stdlib backend). Merge conflicts are ported in
-//! `conflict.rs`: a plain window registers the marker blocks it surfaced,
-//! `<path>:conflicts` indexes the whole file, and `conflict://<N>[/scope]`
-//! renders one registered block under the same display rules.
+//! Selector grammar: `:N`, `:N-M`, `:N+K`, `:N-`, comma-separated range lists,
+//! `:raw`, `:raw:<range>`, `:conflicts`, `:img`, and `:map`. `:map` is a
+//! directory-only, syntax-only declaration map (`repo_map.rs` + `pi_ast::map`):
+//! it honors ignore files, never follows symlinks, omits declaration bodies,
+//! and explicitly marks truncation. A `:map` selector on a file is an error.
+//!
+//! Directory reads list the root and one nested level, keep at most 12 newest
+//! children per inner directory, and apply the same 50 KiB head cap; `:N-M`
+//! slices that listing. Internal URLs resolve through the mounted router;
+//! SQLite databases are handled by `read_sqlite.rs`; ZIP/tar/compressed streams
+//! and their members by `read_archive.rs` (Python 3 stdlib backend). Merge
+//! conflicts are ported in `conflict.rs`: a plain window registers the marker
+//! blocks it surfaced, `<path>:conflicts` indexes the whole file, and
+//! `conflict://<N>[/scope]` renders one registered block under the same display
+//! rules.
+//!
+//! Remaining read slices: markit documents and image/`:img` rendering.
 //!
 //! Display mode is resolved per call from [`FileDisplayInputs`] plus the
 //! per-read `raw` / `immutable` flags (`resolve_file_display_mode`), exactly as
@@ -395,7 +405,7 @@ impl Tool for ReadTool {
 	}
 
 	fn description(&self) -> &str {
-		"Read a file, directory listing, or a line range with an optional :selector suffix"
+		"Read a file, directory listing, or a line range with an optional :selector suffix. A directory with :map returns a deterministic, syntax-only declaration map."
 	}
 
 	fn schema(&self) -> Value {
@@ -404,7 +414,7 @@ impl Tool for ReadTool {
 			"properties": {
 				"path": {
 					"type": "string",
-					"description": "Path to read, optionally ending in a selector such as :50-100, :raw, or :raw:50-100"
+					"description": "Path to read, optionally ending in a selector such as :50-100, :raw, :raw:50-100, or :map (directories only)"
 				}
 			},
 			"required": ["path"]
@@ -583,7 +593,7 @@ impl Tool for ReadTool {
 		// Literal filesystem names win over selector interpretation when the
 		// whole path exists (or the probe is inconclusive), per
 		// `splitPathAndSelPreferringLiteral`.
-		let (path_part, sel_part, literal_whole_path) = match split_path_and_sel(&raw_path) {
+		let (path_part, sel_part, literal_whole_path) = match split_path_and_sel_with_map(&raw_path) {
 			Some(strict) => {
 				let literal = resolve_path(ctx, &raw_path);
 				match probe_literal(&literal).await {
@@ -595,7 +605,12 @@ impl Tool for ReadTool {
 		};
 
 		let mut target = resolve_path(ctx, &path_part);
-
+		// `:map` is handled before generic selector parsing so the `Sel` enum
+		// (and archive/sqlite readers that match on it exhaustively) stays
+		// unchanged. Literal `dir:map` names win above, as for every selector.
+		let is_map = sel_part
+			.as_deref()
+			.is_some_and(|sel| sel.eq_ignore_ascii_case("map"));
 		// Archives run before SQLite (upstream order). A literal whole path keeps
 		// precedence; otherwise the longest existing archive prefix resolves the
 		// container and the remainder is the member path plus selector.
@@ -637,6 +652,34 @@ impl Tool for ReadTool {
 			}
 		}
 
+		// `:map` is handled after archive/sqlite so those readers keep their
+		// existing colon syntax (`db.sqlite:map` stays a table name). A plain
+		// file with `:map` is an explicit directory-only error; an existing
+		// directory maps. Missing paths keep the normal suffix-resolution flow.
+		if is_map {
+			match tokio::fs::metadata(&target).await {
+				Ok(meta) if meta.is_dir() => {
+					return Ok(super::repo_map::read_directory_map(&target, ctx).await);
+				},
+				Ok(meta) if meta.is_file() => {
+					return Ok(tool_result(map_file_error(&target), true));
+				},
+				Ok(_) => {
+					return Ok(tool_result(
+						format!("{} is not a regular file or directory", target.display()),
+						true,
+					));
+				},
+				Err(err) if is_not_found(&err) => {},
+				Err(err) => {
+					return Ok(tool_result(
+						format!("Failed to read {}: {err}", target.display()),
+						true,
+					));
+				},
+			}
+		}
+
 		let parsed = match parse_sel(sel_part.as_deref()) {
 			Ok(parsed) => parsed,
 			Err(message) => return Ok(tool_result(message, true)),
@@ -650,6 +693,7 @@ impl Tool for ReadTool {
 		if let Some(bridge) = &self.acp
 			&& bridge.supports_fs_read()
 			&& !matches!(&parsed, Sel::Image | Sel::Conflicts)
+			&& !is_map
 		{
 			let path = target.display().to_string();
 			let remote = match bridge
@@ -730,9 +774,16 @@ impl Tool for ReadTool {
 		};
 
 		if meta.is_dir() {
-			let mut result = read_directory(&target, &parsed, ctx).await;
+			let mut result = if is_map {
+				super::repo_map::read_directory_map(&target, ctx).await
+			} else {
+				read_directory(&target, &parsed, ctx).await
+			};
 			attach_suffix_details(&mut result.details, suffix_resolution.as_ref());
 			return Ok(result);
+		}
+		if is_map {
+			return Ok(tool_result(map_file_error(&target), true));
 		}
 		if !meta.is_file() {
 			return Ok(tool_result(format!("{} is not a regular file", target.display()), true));
@@ -916,7 +967,14 @@ pub(super) fn is_raw(sel: &Sel) -> bool {
 
 fn invalid_selector(sel: &str) -> String {
 	format!(
-		"Invalid selector ':{sel}'. Use :N, :N-M, :N+K, :N- (open-ended), a comma-separated list of ranges, :raw, :img for SVG rendering, or a range combined with raw (e.g. :raw:50-100)."
+		"Invalid selector ':{sel}'. Use :N, :N-M, :N+K, :N- (open-ended), a comma-separated list of ranges, :raw, :img for SVG rendering, :map for a directory declaration map, or a range combined with raw (e.g. :raw:50-100)."
+	)
+}
+
+fn map_file_error(target: &Path) -> String {
+	format!(
+		"The :map selector is only supported for directories; '{}' is a file. Read the file with :N-M or :raw, or map its parent directory.",
+		target.display()
 	)
 }
 
@@ -1155,6 +1213,20 @@ pub(super) fn split_path_and_sel(raw_path: &str) -> Option<StrictSplit> {
 		}
 	}
 	Some(StrictSplit { path: base.to_string(), sel })
+}
+
+/// [`split_path_and_sel`] plus the directory-only `:map` selector. Keeping this
+/// separate leaves the shared splitter (archive members, internal URLs) on the
+/// exact previous grammar; only the top-level `read` path opts into `:map`.
+fn split_path_and_sel_with_map(raw_path: &str) -> Option<StrictSplit> {
+	if let Some(split) = split_path_and_sel(raw_path) {
+		return Some(split);
+	}
+	let colon = raw_path.rfind(':')?;
+	if colon == 0 || !raw_path[colon + 1..].eq_ignore_ascii_case("map") {
+		return None;
+	}
+	Some(StrictSplit { path: raw_path[..colon].to_string(), sel: "map".to_string() })
 }
 
 // ---------------------------------------------------------------------------

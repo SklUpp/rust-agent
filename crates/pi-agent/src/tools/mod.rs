@@ -22,6 +22,7 @@ pub mod process;
 pub mod read;
 mod read_archive;
 mod read_sqlite;
+mod repo_map;
 pub mod registry;
 pub mod scheduler;
 pub mod search_query;
