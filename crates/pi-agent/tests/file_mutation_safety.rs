@@ -630,14 +630,10 @@ async fn concurrent_new_file_writes_publish_exactly_one_winner() {
 	let right_tool = WriteTool::new();
 	let left_ctx = ctx(&dir);
 	let right_ctx = ctx(&dir);
-	let left = left_tool.execute(
-		&json!({ "path": "race.txt", "content": "left\n" }),
-		&left_ctx,
-	);
-	let right = right_tool.execute(
-		&json!({ "path": "race.txt", "content": "right\n" }),
-		&right_ctx,
-	);
+	let left_args = json!({ "path": "race.txt", "content": "left\n" });
+	let right_args = json!({ "path": "race.txt", "content": "right\n" });
+	let left = left_tool.execute(&left_args, &left_ctx);
+	let right = right_tool.execute(&right_args, &right_ctx);
 	let (left, right) = tokio::join!(left, right);
 	let left = left.expect("write executes");
 	let right = right.expect("write executes");
