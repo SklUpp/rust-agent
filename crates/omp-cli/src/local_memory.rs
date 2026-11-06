@@ -1,7 +1,14 @@
 //! Local (`memory.backend=local`) lesson capture.
 //!
-//! The `learn` tool with the file-based backend appends one lesson to
-//! `<agent dir>/memories/<encoded cwd>/learned.md`. Anchors:
+//! `learn` records the lesson in the SQLite memory store
+//! ([`crate::memory_store`]) and then exports the project's bullet block to
+//! `<agent dir>/memories/<encoded cwd>/learned.md`. The store is the single
+//! live writer (D32); `learned.md` is a bounded, derived export artifact that
+//! existing readers (`memory://root`, prompt guidance) keep consuming. Legacy
+//! bullets are migrated once per project scope (marker row committed with the
+//! import), so the cutover neither loses lessons nor resurrects deleted ones.
+//!
+//! Anchors:
 //! `packages/coding-agent/src/memories/index.ts:1275-1403`
 //! (`getMemoryRoot`, `encodeProjectPath`, `neutralizeInjection`,
 //! `redactSecrets`, `normalizeLearnedText`, `saveLearnedLesson`,
@@ -33,7 +40,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, LazyLock, Mutex, MutexGuard};
 
-use crate::{Error, Result, dirs};
+use crate::{Error, Result, dirs, memory_store::{AddInput, MemoryStore, Origin, Scope}};
 
 /// Filename of the captured-lessons file under a project's memory root.
 pub const LEARNED_LESSONS_FILE: &str = "learned.md";
@@ -249,7 +256,7 @@ fn bound_chars(text: &str, max_chars: usize) -> String {
 }
 
 /// Neutralize delimiters FIRST, then redact, then bound length.
-fn normalize_learned_text(text: &str, max_chars: usize) -> String {
+pub(crate) fn normalize_learned_text(text: &str, max_chars: usize) -> String {
 	bound_chars(redact_secrets(&neutralize_injection(text)).trim(), max_chars)
 }
 
@@ -277,25 +284,31 @@ pub struct Status {
 	pub message: &'static str,
 }
 
-/// `localBackend.status()`: writable (learned.md) but not searchable.
+/// `localBackend.status()`: the SQLite store is writable and lexically
+/// searchable (bounded LIKE recall; no FTS/embeddings yet).
 #[must_use]
 pub fn status() -> Status {
 	Status {
 		backend: "local",
 		active: true,
 		writable: true,
-		searchable: false,
-		message: "Local rollout-summary memory is active; lessons from the `learn` tool are saved to learned.md. Structured search is not available.",
+		searchable: true,
+		message: "Local SQLite memory is active; `learn` lessons are stored with provenance and `memory://` records support bounded lexical recall.",
 	}
 }
 
 /// Cooperative cancellation probe, e.g. `|| ctx.cancellation_token.is_cancelled()`.
 pub type CancelProbe<'a> = dyn Fn() -> bool + Sync + 'a;
 
-/// Append one lesson to the project's `learned.md`.
+/// Store one lesson and export it to the project's `learned.md`.
 ///
-/// `cancel` is checked after the read and once more before the atomic rename,
-/// so a cancelled call leaves the file byte-identical and no temp file behind.
+/// The SQLite store is the single live writer. The first call migrates the
+/// pre-store `learned.md` exactly once (marker row in the store); after that
+/// the file is rebuilt from rows, never merged with stale bullets, so an edit
+/// or delete cannot be undone by the artifact.
+///
+/// `cancel` is checked before touching the store, so a cancelled call leaves
+/// the file and the store byte-identical and no temp file behind.
 pub fn save_learned_lesson(
 	agent_dir: &Path,
 	cwd: &Path,
@@ -309,28 +322,27 @@ pub fn save_learned_lesson(
 	let context = input
 		.context
 		.map(|context| normalize_learned_text(context, MAX_LEARNED_CONTEXT_CHARS))
-		.unwrap_or_default();
-	let line = if context.is_empty() {
-		format!("- {content}")
-	} else {
-		format!("- {content} _(context: {context})_")
-	};
-	let file_path = memory_root(agent_dir, cwd).join(LEARNED_LESSONS_FILE);
-
-	with_path_lock(&file_path, || {
-		let existing = match fs::read_to_string(&file_path) {
-			Ok(existing) => existing,
-			Err(err) if err.kind() == std::io::ErrorKind::NotFound => String::new(),
-			Err(err) => {
-				return Err(Error::with_source(format!("cannot read {}", file_path.display()), err));
-			},
-		};
-		if is_cancelled(cancel) {
-			return Err(Error::new("learned.md write canceled"));
-		}
-		let merged = merge_lesson_lines(&existing, &line);
-		write_atomic(&file_path, &merged, cancel)
+		.filter(|context| !context.is_empty());
+	if is_cancelled(cancel) {
+		return Err(Error::new("learned.md write canceled"));
+	}
+	let store = MemoryStore::open(agent_dir)?;
+	// Exactly-once migration of the pre-store artifact. The file is only read;
+	// the store keeps the canonical rows.
+	store.import_learned_lessons(agent_dir, cwd)?;
+	let cwd_text = cwd.to_string_lossy();
+	store.add(&AddInput {
+		scope:   Scope::Project,
+		cwd:     Some(cwd_text.as_ref()),
+		body:    &content,
+		context: context.as_deref(),
+		origin:  Origin::Inferred,
+		actor:   Some("agent"),
+		source:  Some("learn"),
+		dedupe:  true,
 	})?;
+	// Derived export: bullets come from rows only (no append to the old file).
+	store.export_learned_lessons(agent_dir, cwd)?;
 
 	Ok(SaveResult { stored: 1, message: format!("Lesson saved to {LEARNED_LESSONS_FILE}.") })
 }
@@ -442,32 +454,53 @@ fn is_cancelled(cancel: Option<&CancelProbe<'_>>) -> bool {
 	cancel.is_some_and(|probe| probe())
 }
 
-/// Treat the file as an ordered line list; only bullet lines are managed.
-fn merge_lesson_lines(existing: &str, line: &str) -> String {
-	let mut lines: Vec<&str> = existing.split('\n').collect();
-	// A well-formed file ends with "\n"; drop the terminal split artifact so
-	// repeated saves stay idempotent instead of growing a blank line each time.
-	if lines.last() == Some(&"") {
+/// Rebuild the managed bullet block from store rows while keeping hand-edited
+/// prose and headings in place.
+///
+/// Only bullet lines are managed: bullets are replaced by the store rows and
+/// never reinterpreted back into memory, so a deleted or edited row cannot be
+/// resurrected from the file. Rows beyond [`MAX_LEARNED_LESSONS`] stay in the
+/// database; only the derived file is bounded like the legacy artifact.
+fn merge_lesson_bullets(existing: &str, lessons: &[String]) -> String {
+	let mut lines: Vec<String> = existing.split('\n').map(str::to_string).collect();
+	// A well-formed file ends with "\n"; drop the terminal split artifact.
+	if lines.last().is_some_and(String::is_empty) {
 		lines.pop();
 	}
 	let is_lesson = |line: &str| line.trim_start().starts_with("- ");
-	lines.retain(|candidate| !(is_lesson(candidate) && candidate.trim() == line));
-	match lines.iter().position(|candidate| is_lesson(candidate)) {
-		Some(first_bullet) => lines.insert(first_bullet, line),
-		None => lines.push(line),
-	}
-	let mut lesson_count = lines.iter().filter(|candidate| is_lesson(candidate)).count();
-	let mut index = lines.len();
-	while index > 0 && lesson_count > MAX_LEARNED_LESSONS {
-		index -= 1;
-		if is_lesson(lines[index]) {
-			lines.remove(index);
-			lesson_count -= 1;
-		}
-	}
-	let mut out = lines.join("\n");
+	let insert_at = lines.iter().position(|line| is_lesson(line)).unwrap_or(lines.len());
+	lines.retain(|line| !is_lesson(line));
+	let insert_at = insert_at.min(lines.len());
+	let mut merged: Vec<String> = Vec::with_capacity(lines.len() + lessons.len());
+	merged.extend(lines.iter().take(insert_at).cloned());
+	merged.extend(lessons.iter().take(MAX_LEARNED_LESSONS).cloned());
+	merged.extend(lines.into_iter().skip(insert_at));
+	let mut out = merged.join("\n");
 	out.push('\n');
 	out
+}
+
+/// Serialize one `learned.md` read-merge-write under the per-path lock.
+///
+/// The store's export takes this lock around both the row read and the write,
+/// so two concurrent exports cannot rewrite the file from stale row lists.
+pub(crate) fn with_lesson_lock<T>(path: &Path, op: impl FnOnce() -> Result<T>) -> Result<T> {
+	with_path_lock(path, op)
+}
+
+/// Replace `learned.md` with a store-derived bullet block.
+///
+/// The caller must hold the per-path lock ([`with_lesson_lock`]).
+pub(crate) fn write_learned_lessons_locked(path: &Path, lessons: &[String]) -> Result<()> {
+	let existing = match fs::read_to_string(path) {
+		Ok(existing) => existing,
+		Err(err) if err.kind() == std::io::ErrorKind::NotFound => String::new(),
+		Err(err) => {
+			return Err(Error::with_source(format!("cannot read {}", path.display()), err));
+		},
+	};
+	let merged = merge_lesson_bullets(&existing, lessons);
+	write_atomic(path, &merged, None)
 }
 
 static NEXT_TEMP: AtomicU32 = AtomicU32::new(0);
@@ -582,8 +615,7 @@ mod tests {
 		assert_eq!(lines[3], "- second");
 		assert_eq!(lines[4], "- first");
 		assert_eq!(lines[5], "- old lesson");
-		assert_eq!(lines[6], "");
-		assert_eq!(lines[7], "- oldest lesson");
+		assert_eq!(lines[6], "- oldest lesson");
 		assert!(text.ends_with('\n'));
 
 		// Re-saving an existing lesson moves it to the head without duplicating.
@@ -591,6 +623,9 @@ mod tests {
 		let text = fs::read_to_string(&file).expect("read");
 		assert_eq!(text.matches("- old lesson").count(), 1);
 		assert_eq!(text.lines().nth(3), Some("- old lesson"));
+		assert_eq!(text.lines().nth(4), Some("- second"));
+		assert_eq!(text.lines().nth(5), Some("- first"));
+		assert_eq!(text.lines().nth(6), Some("- oldest lesson"));
 	}
 
 	#[test]
@@ -705,11 +740,71 @@ mod tests {
 	}
 
 	#[test]
-	fn status_reports_writable_without_search() {
+	fn edit_then_relearn_original_is_not_dropped() {
+		let dir = temp_dir();
+		let cwd = Path::new("/work/project");
+
+		save_learned_lesson(&dir, cwd, &SaveInput { content: "original wording", context: None }, None)
+			.expect("save");
+		let store = MemoryStore::open(&dir).expect("store");
+		let cwd_text = cwd.to_string_lossy().to_string();
+		let records = store.list(&crate::memory_store::Filter::project(&cwd_text)).expect("list");
+		assert_eq!(records.len(), 1);
+		store
+			.update(&records[0].id, Some(&cwd_text), "edited wording")
+			.expect("edit");
+		drop(store);
+
+		// Re-learning the pre-edit text must create a new row instead of being
+		// swallowed by a stale dedupe key while the tool still reports success.
+		save_learned_lesson(&dir, cwd, &SaveInput { content: "original wording", context: None }, None)
+			.expect("relearn");
+		let store = MemoryStore::open(&dir).expect("reopen");
+		let records = store.list(&crate::memory_store::Filter::project(&cwd_text)).expect("list");
+		assert_eq!(records.len(), 2, "edited and re-learned rows both exist");
+		assert!(records.iter().any(|record| record.body == "edited wording"));
+		assert!(records.iter().any(|record| record.body == "original wording"));
+		let exported =
+			fs::read_to_string(memory_root(&dir, cwd).join(LEARNED_LESSONS_FILE)).expect("export");
+		assert!(
+			exported.contains("- edited wording") && exported.contains("- original wording"),
+			"{exported}"
+		);
+	}
+
+	#[test]
+	fn learn_path_migrates_legacy_bullets_into_the_store() {
+		let dir = temp_dir();
+		let cwd = Path::new("/work/project");
+		let file = memory_root(&dir, cwd).join(LEARNED_LESSONS_FILE);
+		fs::create_dir_all(file.parent().expect("parent")).expect("mkdir");
+		fs::write(&file, "- legacy one\n- legacy two\n").expect("seed");
+
+		for _ in 0..2 {
+			save_learned_lesson(&dir, cwd, &SaveInput { content: "fresh", context: Some("ctx") }, None)
+				.expect("save");
+		}
+
+		let store = MemoryStore::open(&dir).expect("store");
+		let cwd_text = cwd.to_string_lossy().to_string();
+		let records = store.list(&crate::memory_store::Filter::project(&cwd_text)).expect("list");
+		assert_eq!(records.len(), 3, "two imported bullets + one deduped lesson");
+		assert!(records.iter().all(|record| record.origin == Origin::Inferred));
+		let fresh = records.iter().find(|record| record.body == "fresh").expect("fresh");
+		assert_eq!(fresh.source.as_deref(), Some("learn"));
+		assert_eq!(fresh.context.as_deref(), Some("ctx"));
+
+		let exported = fs::read_to_string(&file).expect("file");
+		assert_eq!(exported.matches("- fresh _(context: ctx)_").count(), 1);
+		assert!(exported.contains("- legacy one") && exported.contains("- legacy two"));
+	}
+
+	#[test]
+	fn status_reports_writable_and_searchable() {
 		let status = status();
 		assert_eq!(status.backend, "local");
-		assert!(status.active && status.writable);
-		assert!(!status.searchable);
+		assert!(status.active && status.writable && status.searchable);
+		assert!(status.message.contains("lexical recall"));
 	}
 
 	#[test]
