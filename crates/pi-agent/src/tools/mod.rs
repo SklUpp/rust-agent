@@ -2521,16 +2521,16 @@ impl WriteTool {
 				};
 				return Err(ToolError::ExecutionFailed(err_msg));
 			}
+			let ops_count = ops.len();
 			let action = crate::tools::staged_ops::FileOpsAction::new(
 				"write",
-				format!("resolve conflicts in {} file(s)", ops.len()),
+				format!("resolve conflicts in {ops_count} file(s)"),
 				ops,
 				self.snapshots.clone().unwrap_or_else(|| Arc::new(hashline::SnapshotStore::new())),
 			).with_conflict_ids(staged_conflict_ids);
 			let action_id = pending_store.register(Arc::new(action));
 			let mut message = format!(
-				"Staged resolution for {} conflict file(s). Workspace NOT modified yet.\nWrite to xd://resolve to apply or xd://reject to discard.",
-				action.ops().len()
+				"Staged resolution for {ops_count} conflict file(s). Workspace NOT modified yet.\nWrite to xd://resolve to apply or xd://reject to discard."
 			);
 			if !failed.is_empty() {
 				message.push_str(&format!("\n\n{} file(s) could not be staged:", failed.len()));

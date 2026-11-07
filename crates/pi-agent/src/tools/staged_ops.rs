@@ -283,11 +283,11 @@ fn generate_temp_name(file_name: &str) -> Result<String, String> {
 struct TempDescriptorGuard<'a> {
 	dir_pin: &'a DirPin,
 	temp_info: Option<(String, Option<(u64, u64)>)>,
-	cleanup_warnings: &'a mut Vec<String>,
+	cleanup_warnings: Arc<Mutex<Vec<String>>>,
 }
 
 impl<'a> TempDescriptorGuard<'a> {
-	fn new(dir_pin: &'a DirPin, cleanup_warnings: &'a mut Vec<String>) -> Self {
+	fn new(dir_pin: &'a DirPin, cleanup_warnings: Arc<Mutex<Vec<String>>>) -> Self {
 		Self {
 			dir_pin,
 			temp_info: None,
@@ -320,7 +320,7 @@ impl<'a> TempDescriptorGuard<'a> {
 				match self.dir_pin.stat_file(&temp_name) {
 					Ok(Some(current_dev_ino)) => {
 						if current_dev_ino != expected_dev_ino {
-							self.cleanup_warnings.push(format!(
+							self.cleanup_warnings.lock().unwrap().push(format!(
 								"temp file {temp_name} inode mismatch (expected {expected_dev_ino:?}, found {current_dev_ino:?}); aborting unlink to avoid deleting foreign file"
 							));
 							return;
@@ -331,7 +331,7 @@ impl<'a> TempDescriptorGuard<'a> {
 						return;
 					}
 					Err(err) => {
-						self.cleanup_warnings.push(format!("stat temp file {temp_name} failed before cleanup: {err}"));
+						self.cleanup_warnings.lock().unwrap().push(format!("stat temp file {temp_name} failed before cleanup: {err}"));
 						return;
 					}
 				}
@@ -342,7 +342,7 @@ impl<'a> TempDescriptorGuard<'a> {
 				// After renameat, temp_name was consumed by the kernel; ENOENT is expected and not an error.
 				Err(err) if err.kind() == std::io::ErrorKind::NotFound => {},
 				Err(err) => {
-					self.cleanup_warnings.push(format!("failed to unlink temp {temp_name}: {err}"));
+					self.cleanup_warnings.lock().unwrap().push(format!("failed to unlink temp {temp_name}: {err}"));
 				}
 			}
 		}
@@ -360,9 +360,9 @@ impl<'a> Drop for TempDescriptorGuard<'a> {
 fn create_temp_file<'a>(
 	dir_pin: &'a DirPin,
 	file_name: &str,
-	cleanup_warnings: &'a mut Vec<String>,
+	cleanup_warnings: &Arc<Mutex<Vec<String>>>,
 ) -> Result<(std::fs::File, String, (u64, u64), TempDescriptorGuard<'a>), String> {
-	let mut temp_guard = TempDescriptorGuard::new(dir_pin, cleanup_warnings);
+	let mut temp_guard = TempDescriptorGuard::new(dir_pin, Arc::clone(cleanup_warnings));
 	for _ in 0..10 {
 		let candidate_name = generate_temp_name(file_name)?;
 		#[cfg(unix)]
@@ -745,6 +745,7 @@ pub struct FileOpsAction {
 	cumulative_written: Arc<Mutex<Vec<String>>>,
 	cumulative_invalidated: Arc<Mutex<Vec<String>>>,
 	created_dirs: Arc<Mutex<Vec<String>>>,
+	cleanup_warnings: Arc<Mutex<Vec<String>>>,
 	conflict_ids: Vec<u64>,
 	extra_details: Option<Value>,
 }
@@ -766,6 +767,7 @@ impl FileOpsAction {
 			cumulative_written: Arc::new(Mutex::new(Vec::new())),
 			cumulative_invalidated: Arc::new(Mutex::new(Vec::new())),
 			created_dirs: Arc::new(Mutex::new(Vec::new())),
+			cleanup_warnings: Arc::new(Mutex::new(Vec::new())),
 			conflict_ids: Vec::new(),
 			extra_details: None,
 		}
@@ -814,6 +816,12 @@ impl FileOpsAction {
 		let cum_written = self.cumulative_written.lock().unwrap().clone();
 		let cum_invalidated = self.cumulative_invalidated.lock().unwrap().clone();
 		let cum_created_dirs = self.created_dirs.lock().unwrap().clone();
+		let mut all_cleanup_warnings = self.cleanup_warnings.lock().unwrap().clone();
+		for w in cleanup_warnings {
+			if !all_cleanup_warnings.contains(&w) {
+				all_cleanup_warnings.push(w);
+			}
+		}
 		let is_partial = partial || self.has_any_partial_effects() || !attempt_written.is_empty() || !attempt_created_dirs.is_empty();
 		let is_stale = stale || (!cum_written.is_empty() && attempt_written.is_empty());
 
@@ -833,9 +841,9 @@ impl FileOpsAction {
 			text.push_str("\nCreated directories: ");
 			text.push_str(&cum_created_dirs.join(", "));
 		}
-		if !cleanup_warnings.is_empty() {
+		if !all_cleanup_warnings.is_empty() {
 			text.push_str("\nCleanup warnings: ");
-			text.push_str(&cleanup_warnings.join(", "));
+			text.push_str(&all_cleanup_warnings.join(", "));
 		}
 
 		let statuses = self.op_statuses.lock().unwrap().clone();
@@ -885,8 +893,8 @@ impl FileOpsAction {
 			details["failedFile"] = json!(target.clone());
 			details["failedTarget"] = json!(target);
 		}
-		if !cleanup_warnings.is_empty() {
-			details["cleanupWarnings"] = json!(cleanup_warnings);
+		if !all_cleanup_warnings.is_empty() {
+			details["cleanupWarnings"] = json!(all_cleanup_warnings);
 		}
 		if let Some(extra) = &self.extra_details {
 			if let Some(obj) = details.as_object_mut() {
@@ -1199,7 +1207,7 @@ impl PendingAction for FileOpsAction {
 						}
 						Ok(None) => {}
 					}
-					let (mut temp_file, temp_name, temp_dev_ino, mut temp_guard) = match create_temp_file(&dir_pin, file_name, &mut cleanup_warnings) {
+					let (mut temp_file, temp_name, temp_dev_ino, mut temp_guard) = match create_temp_file(&dir_pin, file_name, &self.cleanup_warnings) {
 						Ok(res) => res,
 						Err(err) => {
 							return Ok(self.partial_result(
@@ -1455,7 +1463,7 @@ impl PendingAction for FileOpsAction {
 					#[cfg(not(unix))]
 					let source_mode = 0o600;
 
-					let (mut temp_file, temp_name, temp_dev_ino, mut temp_guard) = match create_temp_file(&dir_pin, file_name, &mut cleanup_warnings) {
+					let (mut temp_file, temp_name, temp_dev_ino, mut temp_guard) = match create_temp_file(&dir_pin, file_name, &self.cleanup_warnings) {
 						Ok(res) => res,
 						Err(err) => {
 							return Ok(self.partial_result(
@@ -2071,7 +2079,7 @@ impl PendingAction for FileOpsAction {
 							let source_mode = 0o600;
 
 							// Create temp file in dest_dir_pin with private 0600
-							let (mut temp_dest_file, temp_dest_name, temp_dest_dev_ino, mut temp_dest_guard) = match create_temp_file(&dest_dir_pin, dest_file_name, &mut cleanup_warnings) {
+							let (mut temp_dest_file, temp_dest_name, temp_dest_dev_ino, mut temp_dest_guard) = match create_temp_file(&dest_dir_pin, dest_file_name, &self.cleanup_warnings) {
 								Ok(res) => res,
 								Err(err) => {
 									return Ok(self.partial_result(
@@ -2673,8 +2681,14 @@ impl PendingAction for FileOpsAction {
 			"attemptCreatedDirectories": attempt_created_dirs,
 			"freshTags": fresh_tags,
 		});
-		if !cleanup_warnings.is_empty() {
-			details["cleanupWarnings"] = json!(cleanup_warnings);
+		let mut all_cleanup_warnings = self.cleanup_warnings.lock().unwrap().clone();
+		for w in cleanup_warnings {
+			if !all_cleanup_warnings.contains(&w) {
+				all_cleanup_warnings.push(w);
+			}
+		}
+		if !all_cleanup_warnings.is_empty() {
+			details["cleanupWarnings"] = json!(all_cleanup_warnings);
 		}
 		if let Some(extra) = &self.extra_details {
 			if let Some(obj) = details.as_object_mut() {
