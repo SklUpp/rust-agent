@@ -2077,3 +2077,127 @@ async fn clear_projection_clears_both_sqlite_and_in_memory_state() {
 
 	std::fs::remove_dir_all(dir).ok();
 }
+
+#[tokio::test]
+async fn reopened_session_preserves_compaction_with_offbranch_sibling_tool_results() {
+	let dir = temp_dir("compact-sibling-replay");
+	let db = dir.join("sessions.db");
+	let session = DurableSession::create(db.clone(), header("s-sib-replay", &dir)).expect("create");
+
+	let call1 = ToolCall {
+		id: "call-1".to_string(),
+		name: "effect".to_string(),
+		arguments: json!({}),
+	};
+	let call2 = ToolCall {
+		id: "call-2".to_string(),
+		name: "effect".to_string(),
+		arguments: json!({}),
+	};
+
+	let asst = Message::assistant_with_tools("calling batch", vec![call1.clone(), call2.clone()]);
+	session
+		.persist_messages(&[Message::user("do batch"), asst.clone()])
+		.await
+		.expect("persist user + asst");
+
+	// Finish call-1 on active branch:
+	let exec1 = session.begin_execution(&call1).await.expect("begin 1");
+	let res1 = ToolResult {
+		tool_call_id: "call-1".to_string(),
+		content: "result 1".to_string(),
+		is_error: false,
+		terminate: false,
+		details: None,
+	};
+	session.finish_execution(&exec1, &call1, &res1).await.expect("finish 1");
+
+	// Add sibling tool result for call-2 off-branch (recorded on child branch):
+	let loaded_mid = session.load().expect("load mid");
+	let tool1_id = loaded_mid.branch_messages[2].id.clone();
+
+	let tool2_id = "msg-tool-sibling-2".to_string();
+	{
+		let mut store = SqliteStore::open(&db).expect("open store");
+		store
+			.create_branch(omp_cli::session_store::NewBranch {
+				id: "s-sib-replay.alt".to_string(),
+				session_id: "s-sib-replay".to_string(),
+				parent_branch_id: Some("s-sib-replay.main".to_string()),
+				parent_message_id: Some(tool1_id.clone()),
+				payload: json!({}),
+			})
+			.expect("create alt branch");
+
+		store
+			.append_message(omp_cli::session_store::NewMessage {
+				id: tool2_id.clone(),
+				session_id: "s-sib-replay".to_string(),
+				branch_id: "s-sib-replay.alt".to_string(),
+				parent_message_id: Some(tool1_id.clone()),
+				payload: json!({
+					"type": "message",
+					"id": tool2_id,
+					"parentId": tool1_id,
+					"timestamp": "2026-11-08T00:00:00.000Z",
+					"message": {
+						"role": "toolResult",
+						"toolCallId": "call-2",
+						"toolName": "effect",
+						"content": "result 2",
+						"isError": false,
+						"timestamp": 2000
+					}
+				}),
+			})
+			.expect("append sibling tool 2");
+	}
+
+	// Compaction runs: notice, asst(call1, call2), tool1, tool2.
+	let notice = Message::system(format!(
+		"{}1 earlier turn(s) were pruned to fit the context limit]",
+		pi_agent::compaction::COMPACTION_NOTICE_PREFIX
+	));
+	let compacted = vec![
+		notice.clone(),
+		asst.clone(),
+		Message::tool_with_status("call-1", "effect", "result 1", false),
+		Message::tool_with_status("call-2", "effect", "result 2", false),
+	];
+	let report = pi_agent::CompactionReport { old_len: 4, kept_from: 1, kept_at: 1 };
+	session.compacted(&compacted, &report).await.expect("compacted");
+	session.persist_messages(&compacted).await.expect("persist compacted");
+
+	let proj_before = session.load().expect("load").projection.expect("has projection");
+	assert!(proj_before.kept.contains(&"msg-tool-sibling-2".to_string()));
+
+	drop(session);
+
+	// Reopen session: reconcile_durable_projection must tolerate the off-branch sibling toolResult!
+	let (reopened, loaded) =
+		DurableSession::open(db, "s-sib-replay", header("s-sib-replay", &dir)).expect("reopen");
+	let loaded = loaded.expect("loaded session");
+	let proj_reopened = loaded.projection.expect("compaction projection must be preserved");
+	assert!(
+		proj_reopened.kept.contains(&"msg-tool-sibling-2".to_string()),
+		"reopened projection must keep the offbranch sibling tool result"
+	);
+
+	// Replay / next turn write boundary succeeds:
+	let next_turn = vec![
+		notice,
+		asst,
+		Message::tool_with_status("call-1", "effect", "result 1", false),
+		Message::tool_with_status("call-2", "effect", "result 2", false),
+		Message::assistant("all batch tools completed"),
+	];
+	reopened
+		.persist_messages(&next_turn)
+		.await
+		.expect("next turn must align cleanly under compacted projection");
+
+	let final_loaded = reopened.load().expect("final load");
+	assert!(final_loaded.projection.is_some(), "projection must remain active after next turn");
+
+	std::fs::remove_dir_all(dir).ok();
+}

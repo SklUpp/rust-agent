@@ -2399,6 +2399,135 @@ fn branch_messages_tx(
 	Ok(messages)
 }
 
+fn extract_assistant_tool_call_ids(payload: &Value) -> HashSet<String> {
+	let mut ids = HashSet::new();
+	let parts = payload
+		.get("message")
+		.and_then(|m| m.get("content"))
+		.or_else(|| payload.get("content"))
+		.or_else(|| payload.get("parts"));
+	if let Some(parts) = parts.and_then(Value::as_array) {
+		for part in parts {
+			let is_tool_call = part
+				.get("type")
+				.or_else(|| part.get("kind"))
+				.and_then(Value::as_str)
+				== Some("toolCall");
+			if is_tool_call {
+				if let Some(id) = part
+					.get("id")
+					.or_else(|| part.get("toolCallId"))
+					.or_else(|| part.get("tool_call_id"))
+					.and_then(Value::as_str)
+				{
+					ids.insert(id.to_string());
+				}
+			}
+		}
+	}
+	let tool_calls = payload
+		.get("message")
+		.and_then(|m| m.get("tool_calls"))
+		.or_else(|| payload.get("tool_calls"))
+		.or_else(|| payload.get("toolCalls"));
+	if let Some(tool_calls) = tool_calls.and_then(Value::as_array) {
+		for call in tool_calls {
+			if let Some(id) = call
+				.get("id")
+				.or_else(|| call.get("toolCallId"))
+				.and_then(Value::as_str)
+			{
+				ids.insert(id.to_string());
+			}
+		}
+	}
+	ids
+}
+
+fn extract_tool_result_call_id(payload: &Value) -> Option<String> {
+	payload
+		.get("message")
+		.and_then(|m| m.get("toolCallId"))
+		.or_else(|| payload.get("toolCallId"))
+		.or_else(|| payload.get("tool_call_id"))
+		.or_else(|| payload.get("message").and_then(|m| m.get("tool_call_id")))
+		.and_then(Value::as_str)
+		.map(str::to_string)
+}
+
+fn validate_kept_messages_tx(
+	transaction: &Transaction<'_>,
+	session_id: &str,
+	kept_ids: &[String],
+	branch_messages: &[MessageRecord],
+) -> StoreResult<bool> {
+	let branch_msg_map: HashMap<&str, &MessageRecord> =
+		branch_messages.iter().map(|m| (m.id.as_str(), m)).collect();
+
+	let mut pending_tool_calls: HashSet<String> = HashSet::new();
+
+	for id in kept_ids {
+		if let Some(msg) = branch_msg_map.get(id.as_str()) {
+			let role = msg
+				.payload
+				.get("message")
+				.and_then(|m| m.get("role"))
+				.or_else(|| msg.payload.get("role"))
+				.and_then(Value::as_str);
+
+			match role {
+				Some("assistant") => {
+					pending_tool_calls = extract_assistant_tool_call_ids(&msg.payload);
+				},
+				Some("toolResult") => {
+					if let Some(call_id) = extract_tool_result_call_id(&msg.payload) {
+						pending_tool_calls.remove(&call_id);
+					}
+				},
+				_ => {
+					pending_tool_calls.clear();
+				},
+			}
+		} else {
+			let row: Option<String> = transaction
+				.query_row(
+					"SELECT payload_json FROM messages WHERE id = ?1 AND session_id = ?2",
+					params![id, session_id],
+					|r| r.get(0),
+				)
+				.optional()?;
+
+			let Some(payload_json) = row else {
+				return Ok(false);
+			};
+
+			let Ok(payload) = decode_json::<Value>(&payload_json) else {
+				return Ok(false);
+			};
+
+			let role = payload
+				.get("message")
+				.and_then(|m| m.get("role"))
+				.or_else(|| payload.get("role"))
+				.and_then(Value::as_str);
+
+			if role != Some("toolResult") {
+				return Ok(false);
+			}
+
+			let Some(call_id) = extract_tool_result_call_id(&payload) else {
+				return Ok(false);
+			};
+
+			if !pending_tool_calls.remove(&call_id) {
+				return Ok(false);
+			}
+		}
+	}
+
+	Ok(true)
+}
+
 fn reconcile_durable_projection_tx(
 	transaction: &Transaction<'_>,
 	session_id: &str,
@@ -2448,21 +2577,15 @@ fn reconcile_durable_projection_tx(
 
 	let branch_id_set: HashSet<&str> = branch_messages.iter().map(|m| m.id.as_str()).collect();
 
-	// Check if kept_ids has messages not on the active branch:
-	// A projection belongs to the active branch only if all its branch-referenced messages exist on this branch.
-	// If kept contains messages from a diverged/stale branch cut, discard it safely from SQLite payload!
-	for id in &kept_ids {
-		if !branch_id_set.contains(id.as_str()) {
-			session_payload.as_object_mut().unwrap().remove("durableProjection");
-			let updated_json = encode_json(&session_payload)?;
-			transaction.execute(
-				"UPDATE sessions SET payload_json = ?1, updated_at_ms = ?2 WHERE id = ?3",
-				params![updated_json, now, session_id],
-			)?;
-			return Ok(0);
-		}
+	if !validate_kept_messages_tx(transaction, session_id, &kept_ids, &branch_messages)? {
+		session_payload.as_object_mut().unwrap().remove("durableProjection");
+		let updated_json = encode_json(&session_payload)?;
+		transaction.execute(
+			"UPDATE sessions SET payload_json = ?1, updated_at_ms = ?2 WHERE id = ?3",
+			params![updated_json, now, session_id],
+		)?;
+		return Ok(0);
 	}
-
 	let mut last_kept_idx: Option<usize> = None;
 	let kept_set: HashSet<&str> = kept_ids.iter().map(String::as_str).collect();
 
@@ -2473,9 +2596,13 @@ fn reconcile_durable_projection_tx(
 	}
 
 	let Some(last_kept_idx) = last_kept_idx else {
-		return Err(StoreError::Corrupt(format!(
-			"session {session_id} durable projection has no messages on active branch {active_branch_id}"
-		)));
+		session_payload.as_object_mut().unwrap().remove("durableProjection");
+		let updated_json = encode_json(&session_payload)?;
+		transaction.execute(
+			"UPDATE sessions SET payload_json = ?1, updated_at_ms = ?2 WHERE id = ?3",
+			params![updated_json, now, session_id],
+		)?;
+		return Ok(0);
 	};
 
 	let suffix = &branch_messages[last_kept_idx + 1..];
@@ -4024,6 +4151,163 @@ mod tests {
 		let branch_msgs = store.branch_messages("b_active").expect("branch messages");
 		assert_eq!(branch_msgs.len(), 1);
 		assert_eq!(branch_msgs[0].id, "m_user");
+	}
+
+	#[test]
+	fn reconcile_durable_projection_preserves_compaction_with_offbranch_sibling_tool_result() {
+		let mut store = SqliteStore::open_in_memory().expect("open store");
+		store
+			.create_session(NewSession {
+				id: "s_sibling".to_string(),
+				parent_session_id: None,
+				payload: json!({
+					"durableProjection": {
+						"kept": ["m_asst", "m_tool_offbranch"]
+					}
+				}),
+				initial_branch_id: "b_active".to_string(),
+				initial_branch_payload: json!({}),
+			})
+			.expect("create session");
+
+		// Active branch has assistant calling tool call-sibling
+		store
+			.append_message(NewMessage {
+				id: "m_asst".to_string(),
+				session_id: "s_sibling".to_string(),
+				branch_id: "b_active".to_string(),
+				parent_message_id: None,
+				payload: json!({
+					"type": "message",
+					"id": "m_asst",
+					"message": {
+						"role": "assistant",
+						"content": [
+							{
+								"type": "toolCall",
+								"id": "call-sibling",
+								"name": "bash"
+							}
+						]
+					}
+				}),
+			})
+			.expect("append m_asst");
+
+		// Off-branch message on another branch (e.g. b_other) answering call-sibling
+		store
+			.create_branch(NewBranch {
+				id: "b_other".to_string(),
+				session_id: "s_sibling".to_string(),
+				parent_branch_id: Some("b_active".to_string()),
+				parent_message_id: Some("m_asst".to_string()),
+				payload: json!({}),
+			})
+			.expect("create branch b_other");
+
+		store
+			.append_message(NewMessage {
+				id: "m_tool_offbranch".to_string(),
+				session_id: "s_sibling".to_string(),
+				branch_id: "b_other".to_string(),
+				parent_message_id: Some("m_asst".to_string()),
+				payload: json!({
+					"type": "message",
+					"id": "m_tool_offbranch",
+					"message": {
+						"role": "toolResult",
+						"toolCallId": "call-sibling",
+						"toolName": "bash",
+						"content": "sibling result"
+					}
+				}),
+			})
+			.expect("append m_tool_offbranch");
+
+		// Reconcile must recognize m_tool_offbranch as a valid sibling tool result answering call-sibling from m_asst!
+		let backfilled = store
+			.reconcile_durable_projection("s_sibling")
+			.expect("reconcile must succeed without error");
+		assert_eq!(backfilled, 0);
+
+		// durableProjection must be KEPT, not discarded!
+		let session = store.session("s_sibling").expect("get").expect("s");
+		let projection = session.payload.get("durableProjection");
+		assert!(projection.is_some(), "durableProjection must be preserved for valid sibling toolResult");
+		let kept = projection.unwrap()["kept"].as_array().expect("kept array");
+		assert_eq!(kept, &json!(["m_asst", "m_tool_offbranch"]).as_array().unwrap());
+	}
+
+	#[test]
+	fn reconcile_durable_projection_discards_offbranch_tool_result_with_unmatched_call_id() {
+		let mut store = SqliteStore::open_in_memory().expect("open store");
+		store
+			.create_session(NewSession {
+				id: "s_unmatched".to_string(),
+				parent_session_id: None,
+				payload: json!({
+					"durableProjection": {
+						"kept": ["m_asst", "m_tool_unmatched"]
+					}
+				}),
+				initial_branch_id: "b_active".to_string(),
+				initial_branch_payload: json!({}),
+			})
+			.expect("create session");
+
+		store
+			.append_message(NewMessage {
+				id: "m_asst".to_string(),
+				session_id: "s_unmatched".to_string(),
+				branch_id: "b_active".to_string(),
+				parent_message_id: None,
+				payload: json!({
+					"type": "message",
+					"id": "m_asst",
+					"message": {
+						"role": "assistant",
+						"content": [{ "type": "toolCall", "id": "call-A", "name": "bash" }]
+					}
+				}),
+			})
+			.expect("append m_asst");
+
+		store
+			.create_branch(NewBranch {
+				id: "b_other".to_string(),
+				session_id: "s_unmatched".to_string(),
+				parent_branch_id: Some("b_active".to_string()),
+				parent_message_id: Some("m_asst".to_string()),
+				payload: json!({}),
+			})
+			.expect("create branch b_other");
+
+		// Tool result answering call-WRONG
+		store
+			.append_message(NewMessage {
+				id: "m_tool_unmatched".to_string(),
+				session_id: "s_unmatched".to_string(),
+				branch_id: "b_other".to_string(),
+				parent_message_id: Some("m_asst".to_string()),
+				payload: json!({
+					"type": "message",
+					"id": "m_tool_unmatched",
+					"message": {
+						"role": "toolResult",
+						"toolCallId": "call-WRONG",
+						"toolName": "bash",
+						"content": "wrong call id"
+					}
+				}),
+			})
+			.expect("append m_tool_unmatched");
+
+		// Must safely discard projection because call-WRONG was not called by m_asst:
+		let backfilled = store.reconcile_durable_projection("s_unmatched").expect("reconcile");
+		assert_eq!(backfilled, 0);
+
+		let session = store.session("s_unmatched").expect("get").expect("s");
+		assert!(session.payload.get("durableProjection").is_none(), "projection with unmatched tool call id must be discarded");
 	}
 
 	#[test]
