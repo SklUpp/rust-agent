@@ -436,13 +436,48 @@ async fn compaction_remaps_by_stable_revision_not_by_length() {
 		"the new turn joins the compacted projection"
 	);
 
-	// Same lengths, different retained content: revision check must refuse.
+	// Same compacted length, different retained content: the report must name
+	// the current three-message conversation (the appended turn included). Its
+	// shape and length guards pass, so only the retained-revision check can
+	// refuse it, before any write.
 	let diverged = vec![Message::user("notice"), Message::assistant("rewritten")];
-	let error = session
-		.compacted(&diverged, &report)
+	let current = pi_agent::CompactionReport { old_len: 3, kept_from: 2, kept_at: 1 };
+	session
+		.compacted(&diverged, &current)
 		.await
 		.expect_err("a rewritten retained message is not the persisted revision");
-	assert!(error.to_string().contains("never persisted"), "{error}");
+
+	// A refused rewrite must leave the durable view untouched: the archive, the
+	// selected projection, and the write cursor still describe the three
+	// messages written above, and the next write stays a no-op.
+	let refused = session.load().expect("load after refusal");
+	assert_eq!(refused.messages.len(), 3, "a refused compaction appends nothing");
+	assert_eq!(
+		refused.projection.as_ref().map(|projection| projection.kept.len()),
+		Some(2),
+		"a refused compaction keeps the selected projection"
+	);
+	session
+		.persist_messages(&next)
+		.await
+		.expect("the refusal must not disturb later writes");
+	assert_eq!(
+		session.load().expect("load after retry").messages.len(),
+		3,
+		"the durable view is unchanged by the refusal"
+	);
+
+	// A report from before the appended turn is refused too. Staleness is a
+	// behavioral contract, not a message-text one.
+	session
+		.compacted(&compacted, &report)
+		.await
+		.expect_err("a report from before the appended turn is stale");
+	assert_eq!(
+		session.load().expect("load after stale refusal").messages.len(),
+		3,
+		"a stale report must not rewrite the durable view"
+	);
 }
 
 #[tokio::test]
