@@ -857,7 +857,7 @@ async fn interrupt_journals_injections_before_the_next_turn() {
 		calls: AtomicUsize::new(0),
 		seen: Mutex::new(Vec::new()),
 	});
-	let provider_dyn: Arc<dyn ModelProvider> = Arc::clone(&provider);
+	let provider_dyn: Arc<dyn ModelProvider> = provider.clone();
 	let agent = AgentLoop::new(config(&dir), provider_dyn, ToolRegistry::new())
 		.with_durable(Some(Arc::clone(&session) as Arc<dyn DurableBoundary>));
 	let mut state = AgentState::default();
@@ -880,8 +880,7 @@ async fn interrupt_journals_injections_before_the_next_turn() {
 			.expect("accept interrupt");
 		let result = tokio::time::timeout(Duration::from_secs(5), &mut first)
 			.await
-			.expect("the interrupt must stop the dialog")
-			.expect("join dialog");
+			.expect("the interrupt must stop the dialog");
 		assert!(matches!(result, Err(AgentError::InterruptedReason(_))));
 	}
 	// Rows the host would reload on the abort boundary are already durable.
@@ -891,7 +890,7 @@ async fn interrupt_journals_injections_before_the_next_turn() {
 			.messages
 			.iter()
 			.any(|entry| entry.message.role == "user"
-				&& entry.message.content.contains("please also note")),
+				&& entry.message.content.text().contains("please also note")),
 		"the accepted steering must be durable before the interrupt surfaces"
 	);
 
@@ -934,7 +933,7 @@ async fn drain_interrupt_survives_a_host_reload() {
 	let db = dir.join("sessions.db");
 	let session = Arc::new(DurableSession::create(db.clone(), header("s15", &dir)).expect("create"));
 	let provider = Arc::new(RecordingProvider { seen: Mutex::new(Vec::new()) });
-	let provider_dyn: Arc<dyn ModelProvider> = Arc::clone(&provider);
+	let provider_dyn: Arc<dyn ModelProvider> = provider.clone();
 	let agent = AgentLoop::new(config(&dir), provider_dyn, ToolRegistry::new())
 		.with_durable(Some(Arc::clone(&session) as Arc<dyn DurableBoundary>));
 	let mut state = AgentState::default();
@@ -970,7 +969,7 @@ async fn drain_interrupt_survives_a_host_reload() {
 			.any(|message| message.role == Role::User && message.content.contains("steer note")),
 		"the host reload must see the accepted steering row"
 	);
-	let provider_dyn: Arc<dyn ModelProvider> = Arc::clone(&provider);
+	let provider_dyn: Arc<dyn ModelProvider> = provider.clone();
 	let agent = AgentLoop::new(config(&dir), provider_dyn, ToolRegistry::new())
 		.with_durable(Some(Arc::new(reopened) as Arc<dyn DurableBoundary>));
 	let mut state = AgentState { messages: history, total_turns: 0 };
