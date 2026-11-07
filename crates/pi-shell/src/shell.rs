@@ -146,11 +146,10 @@ struct ShellConfig {
 
 #[derive(Debug, Clone, Default)]
 pub struct ShellOptions {
-	/// Initial environment for the persistent session. When set, the ambient
-	/// host environment is not inherited wholesale: only platform essentials
-	/// (`PATH`, `HOME`, temp dirs, locale, `TERM`, Termux's `PREFIX`) are
-	/// copied. These entries are overlaid on top, so pass anything else a
-	/// command needs explicitly.
+	/// Additional environment for the persistent session. The ambient host
+	/// environment is always filtered to platform essentials (`PATH`, `HOME`,
+	/// temp dirs, locale, `TERM`, Termux's `PREFIX`); these entries are
+	/// overlaid on top, so pass anything else a command needs explicitly.
 	pub session_env:   Option<HashMap<String, String>>,
 	pub snapshot_path: Option<String>,
 	pub minimizer:     Option<minimizer::MinimizerOptions>,
@@ -209,8 +208,8 @@ pub struct ShellExecuteOptions {
 	pub command:       String,
 	pub cwd:           Option<String>,
 	pub env:           Option<HashMap<String, String>>,
-	/// Session environment. When set, only platform essentials are inherited
-	/// from the host; pass anything else a command needs here.
+	/// Session environment. Only platform essentials are inherited from the
+	/// host; pass anything else a command needs here.
 	pub session_env:   Option<HashMap<String, String>>,
 	pub timeout_ms:    Option<u32>,
 	pub snapshot_path: Option<String>,
@@ -829,9 +828,9 @@ async fn create_session(config: &ShellConfig) -> Result<ShellSessionCore> {
 	create_session_for_run(config, None, None).await
 }
 
-/// Ambient variables that survive into a session with an explicit
-/// `session_env`. Everything else on the host (API tokens, credential files,
-/// tool-specific configuration) must be opted into via `session_env`.
+/// Ambient variables copied into every session, including one-shot fallbacks.
+/// Everything else on the host (API tokens, credential files, tool-specific
+/// configuration) must be opted in via `session_env` or a per-command `env`.
 fn is_allowlisted_ambient_env(key: &str) -> bool {
 	let key = normalize_env_key(key);
 	matches!(
@@ -991,19 +990,15 @@ async fn create_session_for_run(
 		}
 	}
 
-	// With an explicit `session_env` the caller owns the environment: inherit
+	// Every pathway — persistent sessions, one-shot fallbacks, streams — copies
 	// only the platform basics (PATH/HOME/temp/locale) and never ambient
-	// credentials or tool config. Without one, one-shot wrappers keep the
-	// historical full host environment.
-	if config.session_env.is_some() {
-		copy_env_into_shell(
-			&mut shell,
-			std::env::vars_os()
-				.filter(|(key, _)| key.to_str().is_some_and(is_allowlisted_ambient_env)),
-		)?;
-	} else {
-		copy_env_into_shell(&mut shell, std::env::vars_os())?;
-	}
+	// credentials or tool config. Callers opt into anything else via
+	// `session_env` or a per-command `env` overlay applied below.
+	copy_env_into_shell(
+		&mut shell,
+		std::env::vars_os()
+			.filter(|(key, _)| key.to_str().is_some_and(is_allowlisted_ambient_env)),
+	)?;
 
 	if let Some(env) = config.session_env.as_ref() {
 		for (key, value) in env {

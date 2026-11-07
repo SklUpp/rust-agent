@@ -8,6 +8,7 @@
 
 #![cfg(unix)]
 
+use std::collections::HashMap;
 use std::os::unix::ffi::OsStrExt;
 
 use pi_shell::{ShellExecuteOptions, cancel::CancelToken, execute_shell};
@@ -49,9 +50,16 @@ impl Drop for ScopedEnvVar {
 /// Runs one shell command through the public one-shot entry point and returns
 /// its exit code plus captured stdout.
 async fn run(command: &str) -> (Option<i32>, String) {
+	run_with_env(command, None).await
+}
+
+async fn run_with_env(
+	command: &str,
+	env: Option<HashMap<String, String>>,
+) -> (Option<i32>, String) {
 	let (tx, rx) = flume::unbounded();
 	let result = execute_shell(
-		ShellExecuteOptions { command: command.to_string(), ..Default::default() },
+		ShellExecuteOptions { command: command.to_string(), env, ..Default::default() },
 		Some(tx),
 		CancelToken::default(),
 	)
@@ -61,9 +69,10 @@ async fn run(command: &str) -> (Option<i32>, String) {
 	(result.exit_code, output)
 }
 
-/// The session (re)created by each `execute_shell` call copies the host
-/// environment key by key. A corrupt value must be skipped, not panicked over,
-/// while other entries (here the sentinel and PATH) still land.
+/// The session (re)created by each `execute_shell` call copies the allowlisted
+/// host environment key by key. A corrupt value must be skipped, not panicked
+/// over, PATH must still land, and ambient entries outside the allowlist stay
+/// out — only an explicit per-command `env` may add them.
 #[tokio::test(flavor = "multi_thread")]
 async fn session_start_skips_non_utf8_value_and_preserves_env() {
 	let path = std::env::var("PATH").unwrap_or_default();
@@ -72,11 +81,18 @@ async fn session_start_skips_non_utf8_value_and_preserves_env() {
 	let _sentinel = ScopedEnvVar::set("OMP_TEST_SENTINEL_8925", "sentinel-value");
 
 	// Starts with a corrupt var present: must not panic.
-	let (code, output) = run("echo $OMP_TEST_SENTINEL_8925").await;
+	let mut explicit = HashMap::new();
+	explicit.insert("OMP_TEST_EXPLICIT_8925".to_string(), "explicit-value".to_string());
+	let (code, output) = run_with_env(
+		"echo \"$OMP_TEST_EXPLICIT_8925|${OMP_TEST_SENTINEL_8925:-absent}\"",
+		Some(explicit),
+	)
+	.await;
 	assert_eq!(code, Some(0), "session start must succeed with a corrupt env var");
-	assert!(
-		output.contains("sentinel-value"),
-		"valid env entries must still be copied; got {output:?}"
+	assert_eq!(
+		output.trim_end(),
+		"explicit-value|absent",
+		"explicit env must apply while non-allowlisted ambient entries stay out; got {output:?}"
 	);
 
 	// PATH survives the copy unchanged.
