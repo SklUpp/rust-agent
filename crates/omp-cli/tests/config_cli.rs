@@ -633,6 +633,89 @@ fn first_write_seeds_the_legacy_settings_instead_of_losing_them() {
 }
 
 #[test]
+fn effective_view_does_not_report_project_approval_grants() {
+	let sandbox = Sandbox::new("project-approval-view");
+	sandbox.write(&sandbox.agent_config(), "tools:\n  approvalMode: write\n");
+	sandbox.write(
+		&sandbox.project().join(".omp/settings.json"),
+		r#"{"tools":{"approvalMode":"yolo"}}"#,
+	);
+	sandbox.write(
+		&sandbox.project().join(".omp/config.yml"),
+		"approvalMode: yolo\nallow: [bash]\n",
+	);
+	assert_eq!(get_json(&sandbox, "tools.approvalMode")["value"], serde_json::json!("write"));
+
+	// With no host mode the ignored grant must pin the runtime default, not
+	// fall back to the schema's `yolo` default.
+	sandbox.write(&sandbox.agent_config(), "defaultThinkingLevel: low\n");
+	assert_eq!(
+		get_json(&sandbox, "tools.approvalMode")["value"],
+		serde_json::json!("always-ask")
+	);
+
+	// A later project grant must not erase an accepted restrictive layer:
+	// runtime order is settings.json (always-ask accepted) then config.yml
+	// (yolo rejected), so the effective view must stay always-ask.
+	sandbox.write(&sandbox.agent_config(), "tools:\n  approvalMode: yolo\n");
+	sandbox.write(
+		&sandbox.project().join(".omp/settings.json"),
+		r#"{"tools":{"approvalMode":"always-ask"}}"#,
+	);
+	sandbox.write(&sandbox.project().join(".omp/config.yml"), "approvalMode: yolo\n");
+	assert_eq!(
+		get_json(&sandbox, "tools.approvalMode")["value"],
+		serde_json::json!("always-ask")
+	);
+}
+
+#[cfg(unix)]
+#[test]
+fn effective_view_does_not_trust_aliased_base_config() {
+	let sandbox = Sandbox::new("aliased-base");
+	let target = sandbox.project().join("config.yml");
+	sandbox.write(&target, "approvalMode: yolo\nallow: [bash]\n");
+	let base = sandbox.agent_config();
+	fs::create_dir_all(base.parent().unwrap()).expect("agent dir");
+
+	std::os::unix::fs::symlink(&target, &base).expect("symlink base");
+	assert_eq!(
+		get_json(&sandbox, "tools.approvalMode")["value"],
+		serde_json::json!("always-ask")
+	);
+
+	fs::remove_file(&base).expect("remove symlink");
+	fs::hard_link(&target, &base).expect("hardlink base");
+	assert_eq!(
+		get_json(&sandbox, "tools.approvalMode")["value"],
+		serde_json::json!("always-ask")
+	);
+}
+
+#[test]
+fn effective_view_resolves_nested_approval_before_clamping() {
+	let sandbox = Sandbox::new("nested-approval");
+	sandbox.write(&sandbox.agent_config(), "tools:\n  approvalMode: yolo\n");
+	sandbox.write(
+		&sandbox.project().join(".omp/config.yml"),
+		"approvalMode: always-ask\ntools:\n  approvalMode: yolo\n",
+	);
+	assert_eq!(
+		get_json(&sandbox, "tools.approvalMode")["value"],
+		serde_json::json!("yolo")
+	);
+
+	sandbox.write(
+		&sandbox.project().join(".omp/config.yml"),
+		"approvalMode: yolo\ntools:\n  approvalMode: always-ask\n",
+	);
+	assert_eq!(
+		get_json(&sandbox, "tools.approvalMode")["value"],
+		serde_json::json!("always-ask")
+	);
+}
+
+#[test]
 fn provider_project_layers_override_builtin_but_native_model_roles_win() {
 	let sandbox = Sandbox::new("project-order");
 	let project = sandbox.project();

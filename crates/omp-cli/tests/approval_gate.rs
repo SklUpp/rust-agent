@@ -132,6 +132,9 @@ fn make_run_request(
 			..ProviderConfig::default()
 		},
 	);
+	// These tests pass `Approvals` directly to stand in for explicit operator
+	// `--allow`; project MCP sources require that launch-time provenance.
+	config.explicit_allow = approvals.allow.iter().cloned().collect();
 
 	RunRequest {
 		prompt: "call tool".to_string(),

@@ -4,7 +4,7 @@
 //! root keys are ignored because the file is shared with the full TS app.
 
 use std::{
-	collections::{BTreeMap, HashMap, HashSet},
+	collections::{BTreeMap, BTreeSet, HashMap, HashSet},
 	env, fs,
 	path::{Component, Path, PathBuf},
 };
@@ -814,6 +814,12 @@ pub struct Config {
 	pub append_system_prompt: Option<String>,
 	pub approval_mode:        Option<ApprovalMode>,
 	pub allow:                Vec<String>,
+	/// Allow entries the operator supplied at launch: CLI `--allow`,
+	/// `PI_CONFIG_FILES`, or explicit `--config` overlays. The MCP launch gate
+	/// requires these (or trusted `yolo`) before auto-launching a
+	/// project-defined/overridden stdio server; plain host config `allow` is
+	/// name-based and cannot authorize a repository-controlled command.
+	pub explicit_allow:       BTreeSet<String>,
 	pub cwd:                  Option<PathBuf>,
 	pub tools:                Option<Vec<String>>,
 	pub edit:                 EditConfig,
@@ -1058,6 +1064,10 @@ impl Config {
 		}
 		if !overlay.allow.is_empty() {
 			self.allow = overlay.allow;
+			// Provenance follows the effective list. An overlay that replaces
+			// `allow` also replaces where those entries came from; historical
+			// grant entries must not survive.
+			self.explicit_allow = overlay.explicit_allow;
 		}
 		for (id, provider) in overlay.providers {
 			self.providers.entry(id).or_default().merge(provider);
@@ -1069,7 +1079,8 @@ impl Config {
 	/// under `cwd`, `PI_CONFIG_FILES`, then each `--config` overlay in order;
 	/// later files win. Mirrors `Settings` precedence: global <- project <-
 	/// environment overlays <- CLI overlays <- runtime overrides (applied by the
-	/// caller).
+	/// caller). Project layers are repository-controlled, so the loader lets
+	/// them tighten but never grant approval.
 	pub fn load(overlays: &[PathBuf]) -> Result<Self> {
 		Self::load_with_cwd(overlays, None, &env_config_files())
 	}
@@ -1094,20 +1105,20 @@ impl Config {
 		env_overlays: &[PathBuf],
 		overlays: &[PathBuf],
 	) -> Result<Self> {
-		let mut config = Self::default();
-		let mut has_base = false;
-		if let Some(base) = base {
-			config.merge(Self::load_file(base)?);
-			has_base = true;
-		}
-		if !has_base {
+		let process_cwd = env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+		let base_overlay = match base {
+			Some(base) => Some((base.to_path_buf(), Self::load_file(base)?)),
+			None => None,
+		};
+		let mut legacy_overlay = None;
+		if base_overlay.is_none() {
 			// `docs/settings.md`: `agent/settings.json` is the legacy global
 			// settings file, superseded once any main YAML exists. Reading it
 			// here mirrors the migration result without writing.
 			let legacy = dirs::agent_dir().join("settings.json");
 			if legacy.is_file() {
 				match Self::load_settings_json(&legacy) {
-					Ok(Some(overlay)) => config.merge(overlay),
+					Ok(Some(overlay)) => legacy_overlay = Some((legacy, overlay)),
 					Ok(None) => {
 						eprintln!("warning: skipping malformed global settings {}", legacy.display());
 					},
@@ -1117,20 +1128,65 @@ impl Config {
 				}
 			}
 		}
-		let process_cwd = env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-		let cwd = explicit_cwd
-			.map(|path| dirs::absolute(&process_cwd, path))
+
+		let explicit_root = explicit_cwd.map(|path| dirs::absolute(&process_cwd, path));
+		let preliminary_roots: Vec<PathBuf> = std::iter::once(&process_cwd)
+			.chain(explicit_root.iter())
+			.map(|path| absolute_canonical(path))
+			.collect();
+		let base_alias = base_overlay
+			.as_ref()
+			.is_some_and(|(path, _)| implicit_config_is_untrusted(path, &preliminary_roots));
+		let cwd = explicit_root
+			.clone()
 			.or_else(|| {
-				config
-					.cwd
-					.as_ref()
-					.map(|path| dirs::absolute(&process_cwd, path))
+				if base_alias {
+					None
+				} else {
+					base_overlay
+						.as_ref()
+						.and_then(|(_, overlay)| overlay.cwd.as_ref())
+						.map(|path| dirs::absolute(&process_cwd, path))
+				}
 			})
-			.unwrap_or(process_cwd);
+			.unwrap_or_else(|| process_cwd.clone());
+		let mut roots = vec![absolute_canonical(&process_cwd), absolute_canonical(&cwd)];
+		if let Some(explicit) = &explicit_root {
+			roots.push(absolute_canonical(explicit));
+		}
+
+		let mut config = Self::default();
+		if let Some((path, mut overlay)) = base_overlay {
+			if implicit_config_is_untrusted(&path, &roots) {
+				eprintln!(
+					"warning: treating implicit config {} as untrusted (symlink/hardlink/project \
+					 path); approval grants are ignored",
+					path.display()
+				);
+				Self::drop_untrusted_permissions(&mut overlay, &Self::default(), &path);
+				Self::drop_project_searxng(&mut overlay, &path);
+			}
+			config.merge(overlay);
+		} else if let Some((path, mut overlay)) = legacy_overlay {
+			if implicit_config_is_untrusted(&path, &roots) {
+				eprintln!(
+					"warning: treating implicit global settings {} as untrusted \
+					 (symlink/hardlink/project path); approval grants are ignored",
+					path.display()
+				);
+				Self::drop_untrusted_permissions(&mut overlay, &Self::default(), &path);
+				Self::drop_project_searxng(&mut overlay, &path);
+			}
+			config.merge(overlay);
+		}
 		Self::apply_project_layers(&mut config, &cwd)?;
 		for path in env_overlays.iter().chain(overlays) {
 			let resolved = resolve_layer_path(&cwd, path);
-			config.merge(Self::load_file(&resolved)?);
+			let mut overlay = Self::load_file(&resolved)?;
+			// These files are selected by the operator at launch (`PI_CONFIG_FILES`
+			// / `--config`), unlike the base and project layers.
+			overlay.explicit_allow.extend(overlay.allow.iter().cloned());
+			config.merge(overlay);
 		}
 		Ok(config)
 	}
@@ -1142,6 +1198,7 @@ impl Config {
 			match Self::load_settings_json(&settings_path) {
 				Ok(Some(mut overlay)) => {
 					Self::drop_project_searxng(&mut overlay, &settings_path);
+					Self::drop_untrusted_permissions(&mut overlay, config, &settings_path);
 					config.merge(overlay);
 				},
 				Ok(None) => {
@@ -1168,9 +1225,42 @@ impl Config {
 		if project_config.is_file() {
 			let mut overlay = Self::load_file(&project_config)?;
 			Self::drop_project_searxng(&mut overlay, &project_config);
+			Self::drop_untrusted_permissions(&mut overlay, config, &project_config);
 			config.merge(overlay);
 		}
 		Ok(())
+	}
+
+	/// Repository-controlled layers may tighten the approval posture but never
+	/// grant it. `approvalMode` may only move toward `always-ask`; `allow` is
+	/// dropped because every entry grants auto-approval (including
+	/// `mcp:<server>` / `mcp-server:<server>`, which auto-launch project stdio
+	/// MCP servers). Host files, `PI_CONFIG_FILES`, explicit `--config`, and
+	/// CLI flags are applied outside this function and stay authoritative.
+	fn drop_untrusted_permissions(overlay: &mut Self, inherited: &Self, path: &Path) {
+		if let Some(mode) = overlay.approval_mode {
+			let floor = inherited.approval_mode.unwrap_or_default();
+			if mode.permissiveness() > floor.permissiveness() {
+				eprintln!(
+					"warning: ignoring approvalMode `{}` from untrusted config {}: implicit config may only \
+					 tighten approval (trusted mode `{}`)",
+					mode.as_str(),
+					path.display(),
+					floor.as_str()
+				);
+				overlay.approval_mode = None;
+			}
+		}
+		if !overlay.allow.is_empty() {
+			eprintln!(
+				"warning: ignoring allow list from untrusted config {}: tool allowlists require explicit \
+				 --allow",
+				path.display()
+			);
+			overlay.allow.clear();
+		}
+		// Untrusted implicit files can never supply launch-time provenance.
+		overlay.explicit_allow.clear();
 	}
 
 	/// Repository-controlled layers must never set the web-search endpoint or
@@ -1182,8 +1272,8 @@ impl Config {
 	fn drop_project_searxng(overlay: &mut Self, path: &Path) {
 		if overlay.searxng != SearxngConfig::default() {
 			eprintln!(
-				"warning: ignoring searxng.* from project {}: the web-search endpoint and its \
-				 credentials are host settings",
+				"warning: ignoring searxng.* from untrusted config {}: the web-search endpoint and \
+				 its credentials are host settings",
 				path.display()
 			);
 			overlay.searxng = SearxngConfig::default();
@@ -1358,6 +1448,7 @@ impl Config {
 			self.approval_mode = Some(ApprovalMode::Yolo);
 		}
 		if !cli.allow.is_empty() {
+			self.explicit_allow.extend(cli.allow.iter().cloned());
 			let mut allow = cli.allow.clone();
 			allow.append(&mut self.allow);
 			self.allow = allow;
@@ -2165,6 +2256,37 @@ pub fn env_config_files() -> Vec<PathBuf> {
 		.unwrap_or_default()
 }
 
+/// Canonical or absolute path used for project-boundary comparisons.
+pub(crate) fn absolute_canonical(path: &Path) -> PathBuf {
+	fs::canonicalize(path)
+		.or_else(|_| std::path::absolute(path))
+		.unwrap_or_else(|_| path.to_path_buf())
+}
+
+/// Implicit config files (base config, legacy global settings) are trusted only
+/// if they are regular, single-link files outside every project root. Symlinks
+/// and hardlinks are rejected because the other endpoint is not knowable from
+/// the path: a project can control the bytes without write access to the host
+/// directory. Explicit `--config` / `PI_CONFIG_FILES` are operator choices and
+/// bypass this check.
+pub(crate) fn implicit_config_is_untrusted(path: &Path, roots: &[PathBuf]) -> bool {
+	let Ok(meta) = fs::symlink_metadata(path) else {
+		return true;
+	};
+	if meta.file_type().is_symlink() {
+		return true;
+	}
+	#[cfg(unix)]
+	{
+		use std::os::unix::fs::MetadataExt;
+		if meta.nlink() > 1 {
+			return true;
+		}
+	}
+	let canonical = absolute_canonical(path);
+	roots.iter().any(|root| canonical.starts_with(root))
+}
+
 /// Overlay paths resolve relative to the effective project cwd after `~`
 /// expansion, matching the TS `Settings` constructor.
 pub(crate) fn resolve_layer_path(cwd: &Path, raw: &Path) -> PathBuf {
@@ -2426,6 +2548,10 @@ pub struct DiscoveredMcpServer {
 	pub name:        String,
 	pub config:      MCPServerConfig,
 	pub source_path: PathBuf,
+	/// False when the file resolves into the project directory or came from a
+	/// project-level candidate. Untrusted servers are gated before any connect
+	/// and their `${ENV}` references are expanded only after approval.
+	pub trusted:     bool,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -2531,14 +2657,32 @@ pub fn parse_enabled_value(val: Option<&serde_json::Value>) -> (Option<bool>, Op
 	}
 }
 
-/// Validate raw JSON value against MCP server schema and construct
-/// `MCPServerConfig`.
+/// Validate and expand env vars in an MCP server value. Used for host/trusted
+/// discovery and client-supplied ACP servers.
 pub fn parse_and_validate_mcp_server(
 	name: &str,
 	val: &serde_json::Value,
 ) -> std::result::Result<MCPServerConfig, String> {
-	let expanded_val = expand_env_vars_deep(val);
-	let obj = expanded_val
+	let expanded = expand_env_vars_deep(val);
+	validate_mcp_server_value(name, &expanded, true)
+}
+
+/// Validate an untrusted (project-controlled) MCP server value without
+/// expanding `${ENV}` references. Expansion happens only after the launch gate
+/// authorizes the source; see [`expand_mcp_server_config_env`].
+pub fn parse_and_validate_mcp_server_unexpanded(
+	name: &str,
+	val: &serde_json::Value,
+) -> std::result::Result<MCPServerConfig, String> {
+	validate_mcp_server_value(name, val, false)
+}
+
+fn validate_mcp_server_value(
+	name: &str,
+	val: &serde_json::Value,
+	validate_transport: bool,
+) -> std::result::Result<MCPServerConfig, String> {
+	let obj = val
 		.as_object()
 		.ok_or_else(|| format!("Server \"{name}\": configuration must be a JSON object"))?;
 
@@ -2737,8 +2881,54 @@ pub fn parse_and_validate_mcp_server(
 		_ => unreachable!(),
 	};
 
-	validate_server_config(name, &config).map_err(|errs| errs.join("; "))?;
+	if validate_transport {
+		validate_server_config(name, &config).map_err(|errs| errs.join("; "))?;
+	}
 	Ok(config)
+}
+
+/// Expand `${ENV}` references in an untrusted MCP config after its launch gate
+/// passed. Host/ACP values are already expanded during parsing.
+pub fn expand_mcp_server_config_env(config: &mut MCPServerConfig) {
+	fn expand_map(map: &mut HashMap<String, String>) {
+		let expanded = map
+			.drain()
+			.map(|(key, value)| (expand_env_vars(&key), expand_env_vars(&value)))
+			.collect();
+		*map = expanded;
+	}
+	match config {
+		MCPServerConfig::Stdio(stdio) => {
+			stdio.command = expand_env_vars(&stdio.command);
+			for arg in &mut stdio.args {
+				*arg = expand_env_vars(arg);
+			}
+			expand_map(&mut stdio.env);
+			if let Some(cwd) = &mut stdio.cwd {
+				*cwd = expand_env_vars(cwd);
+			}
+		},
+		MCPServerConfig::Http(http) => {
+			http.url = expand_env_vars(&http.url);
+			expand_map(&mut http.headers);
+			if let Some(auth) = &mut http.auth {
+				*auth = expand_env_vars_deep(auth);
+			}
+			if let Some(oauth) = &mut http.oauth {
+				*oauth = expand_env_vars_deep(oauth);
+			}
+		},
+		MCPServerConfig::Sse(sse) => {
+			sse.url = expand_env_vars(&sse.url);
+			expand_map(&mut sse.headers);
+			if let Some(auth) = &mut sse.auth {
+				*auth = expand_env_vars_deep(auth);
+			}
+			if let Some(oauth) = &mut sse.oauth {
+				*oauth = expand_env_vars_deep(oauth);
+			}
+		},
+	}
 }
 
 /// Discover MCP servers following discovery priority:
@@ -2751,25 +2941,33 @@ pub fn parse_and_validate_mcp_server(
 #[must_use]
 pub fn discover_mcp_servers_with_paths(cwd: &Path, agent_dir: &Path) -> McpDiscoveryReport {
 	let candidate_paths = [
-		cwd.join(".omp").join("mcp.json"),
-		cwd.join(".omp").join(".mcp.json"),
-		agent_dir.join("mcp.json"),
-		agent_dir.join(".mcp.json"),
-		cwd.join("mcp.json"),
-		cwd.join(".mcp.json"),
+		(cwd.join(".omp").join("mcp.json"), false),
+		(cwd.join(".omp").join(".mcp.json"), false),
+		(agent_dir.join("mcp.json"), true),
+		(agent_dir.join(".mcp.json"), true),
+		(cwd.join("mcp.json"), false),
+		(cwd.join(".mcp.json"), false),
 	];
 
 	let mut report = McpDiscoveryReport::default();
 	let mut seen_paths = HashSet::new();
+	let canonical_or_self =
+		|path: &Path| fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+	let project_root = fs::canonicalize(cwd)
+		.or_else(|_| std::path::absolute(cwd))
+		.unwrap_or_else(|_| cwd.to_path_buf());
+	let trust_roots = [project_root.clone()];
+	let is_untrusted = |path: &Path| implicit_config_is_untrusted(path, &trust_roots);
 
 	// Step 1: Collect user-level disabledServers and enabledServers ONLY from
-	// agent_dir configs
+	// agent_dir configs. A host path that resolves into the project (symlink
+	// alias) is repository-controlled and contributes no user-level policy.
 	let mut disabled_servers = HashSet::new();
 	let mut forced_enabled_servers = HashSet::new();
 	let user_candidate_paths = [agent_dir.join("mcp.json"), agent_dir.join(".mcp.json")];
 
 	for path in &user_candidate_paths {
-		if !path.is_file() {
+		if !path.is_file() || is_untrusted(path) {
 			continue;
 		}
 		if let Ok(content) = fs::read_to_string(path) {
@@ -2795,14 +2993,17 @@ pub fn discover_mcp_servers_with_paths(cwd: &Path, agent_dir: &Path) -> McpDisco
 	// Step 2: Iterate paths in priority order with first-wins key reservation
 	let mut seen_servers = HashSet::new();
 
-	for path in &candidate_paths {
-		let canonical = fs::canonicalize(path).unwrap_or_else(|_| path.clone());
-		if !seen_paths.insert(canonical) {
+	for (path, host_class) in &candidate_paths {
+		let canonical = canonical_or_self(path);
+		if !seen_paths.insert(canonical.clone()) {
 			continue;
 		}
 		if !path.is_file() {
 			continue;
 		}
+		// Host candidates that resolve into, or share an inode with, the project
+		// are aliases of repository-controlled bytes, not host trust.
+		let trusted = *host_class && !implicit_config_is_untrusted(path, &trust_roots);
 
 		let content = match fs::read_to_string(path) {
 			Ok(c) => c,
@@ -2824,7 +3025,6 @@ pub fn discover_mcp_servers_with_paths(cwd: &Path, agent_dir: &Path) -> McpDisco
 			},
 		};
 
-		let val = expand_env_vars_deep(&val);
 		let Some(servers_obj) = val.get("mcpServers").and_then(|v| v.as_object()) else {
 			continue;
 		};
@@ -2860,12 +3060,18 @@ pub fn discover_mcp_servers_with_paths(cwd: &Path, agent_dir: &Path) -> McpDisco
 				continue;
 			}
 
-			match parse_and_validate_mcp_server(server_name, server_val) {
+			let parsed = if trusted {
+				parse_and_validate_mcp_server(server_name, server_val)
+			} else {
+				parse_and_validate_mcp_server_unexpanded(server_name, server_val)
+			};
+			match parsed {
 				Ok(config) => {
 					report.servers.push(DiscoveredMcpServer {
 						name: server_name.clone(),
 						config,
 						source_path: path.clone(),
+						trusted,
 					});
 				},
 				Err(err) => {
@@ -3652,6 +3858,10 @@ mod tests {
 		assert_eq!(config.approval_mode, Some(ApprovalMode::Yolo));
 		assert_eq!(config.tools.as_deref(), Some(["bash".to_string(), "edit".to_string()].as_slice()));
 		assert_eq!(config.allow, ["cli-allow", "config-allow"]);
+		// Only the operator flag carries launch-time provenance; the file layer
+		// entry does not, so it cannot authorize a project MCP command.
+		assert!(config.explicit_allow.contains("cli-allow"));
+		assert!(!config.explicit_allow.contains("config-allow"));
 		assert_eq!(config.system_prompt.as_deref(), Some("cli-system"));
 		assert_eq!(config.append_system_prompt.as_deref(), Some("cli-append"));
 		// A flag does not overwrite unrelated file fields.

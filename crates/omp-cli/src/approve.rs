@@ -48,6 +48,17 @@ impl ApprovalMode {
 			Self::Yolo => "yolo",
 		}
 	}
+
+	/// Higher means more auto-approval. Project config layers may only lower
+	/// or keep this value; see `Config::apply_project_layers`.
+	#[must_use]
+	pub fn permissiveness(self) -> u8 {
+		match self {
+			Self::AlwaysAsk => 0,
+			Self::Write => 1,
+			Self::Yolo => 2,
+		}
+	}
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

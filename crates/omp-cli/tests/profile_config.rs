@@ -2,7 +2,9 @@
 //!
 //! Layer contract (highest first, `docs/settings.md`): CLI flags -> `--config`
 //! overlays -> `PI_CONFIG_FILES` overlays -> project `.omp/settings.json` then
-//! `.omp/config.yml` -> global `agent/config.yml` -> defaults. Profile selection
+//! `.omp/config.yml` -> global `agent/config.yml` -> defaults. Project layers
+//! are repository-controlled: they may tighten approval but never add
+//! `approvalMode`/`allow` grants. Profile selection
 //! (`--profile`/`OMP_PROFILE`/`PI_PROFILE`) happens before every path helper,
 //! so it is verified through the real binary (catalog/session discovery), not
 //! by asserting the resolver against itself.
@@ -15,7 +17,15 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Mutex, MutexGuard};
 
 use omp_cli::approve::ApprovalMode;
+#[cfg(unix)]
+use omp_cli::approve::Approvals;
 use omp_cli::config::Config;
+#[cfg(unix)]
+use omp_cli::config::discover_mcp_servers_with_paths;
+#[cfg(unix)]
+use omp_cli::config_cmd::{self, Action, Request};
+#[cfg(unix)]
+use omp_cli::runtime::filter_and_spawn_mcp_servers_with_paths_detailed;
 
 static ENV_LOCK: Mutex<()> = Mutex::new(());
 static COUNTER: AtomicUsize = AtomicUsize::new(0);
@@ -138,13 +148,13 @@ fn config_layers_follow_the_documented_precedence() {
 		&format!(
 			"defaultModel: global/model\nsystemPrompt: global-system\ncwd: {}\nproviders:\n  openai:\n    \
 			 baseUrl: https://global\n    apiKey: GLOBAL_KEY\n    headers:\n      X-Global: one\n  \
-			 only-global:\n    baseUrl: https://only-global\nallow: [read]\ntools: [read]\n",
+			 only-global:\n    baseUrl: https://only-global\napprovalMode: write\nallow: [read]\ntools: [read]\n",
 			project.display()
 		),
 	);
 	write(
 		&project.join(".omp/settings.json"),
-		r#"{"modelRoles":{"default":"settings/model"},"tools":{"approvalMode":"write"}}"#,
+		r#"{"modelRoles":{"default":"settings/model"},"tools":{"approvalMode":"yolo"}}"#,
 	);
 	write(
 		&project.join(".omp/config.yml"),
@@ -170,9 +180,10 @@ fn config_layers_follow_the_documented_precedence() {
 
 	assert_eq!(config.default_model.as_deref(), Some("cli/model"));
 	assert_eq!(config.system_prompt.as_deref(), Some("global-system"));
-	// settings.json supplied the approval mode; project config.yml did not reset it.
+	// Project settings requested yolo and a bash allowlist, but the project
+	// layer may not grant either: the host write mode and read allowlist win.
 	assert_eq!(config.approval_mode, Some(ApprovalMode::Write));
-	assert_eq!(config.allow, ["bash"]);
+	assert_eq!(config.allow, ["read"]);
 	assert_eq!(config.tools.as_deref(), Some(["bash".to_string(), "edit".to_string()].as_slice()));
 	let openai = config.providers.get("openai").expect("openai");
 	assert_eq!(openai.base_url.as_deref(), Some("https://cli"));
@@ -202,8 +213,377 @@ fn config_layers_follow_the_documented_precedence() {
 	// project layer for that directory applies.
 	let by_config_cwd = Config::load_with_cwd(&[], None, &[]).expect("config cwd");
 	assert_eq!(by_config_cwd.default_model.as_deref(), Some("project/model"));
-	assert_eq!(by_config_cwd.allow, ["bash"]);
+	assert_eq!(by_config_cwd.allow, ["read"]);
 	assert_eq!(by_config_cwd.approval_mode, Some(ApprovalMode::Write));
+	fs::remove_dir_all(&root).ok();
+}
+
+/// Allow provenance follows the effective list: a later `--config` overlay that
+/// replaces `allow` also replaces where those entries came from.
+#[test]
+fn later_operator_overlay_replaces_allow_provenance() {
+	let root = temp_dir("overlay-provenance");
+	let agent = root.join("agent");
+	let project = root.join("project");
+	fs::create_dir_all(&project).expect("project");
+	write(&agent.join("config.yml"), "approvalMode: always-ask\n");
+	let first = root.join("first.yml");
+	let second = root.join("second.yml");
+	write(&first, "allow: [mcp:mock]\n");
+	write(&second, "allow: [read]\n");
+
+	let _env = EnvGuard::set(&[
+		("PI_CONFIG_DIR", Some(root.as_path())),
+		("PI_CODING_AGENT_DIR", Some(agent.as_path())),
+		("OMP_PROFILE", None),
+		("PI_PROFILE", None),
+	]);
+	let config =
+		Config::load_with_cwd(&[first, second], Some(&project), &[]).expect("overlay layers");
+	assert_eq!(config.allow, ["read"]);
+	assert!(config.explicit_allow.contains("read"));
+	assert!(
+		!config.explicit_allow.contains("mcp:mock"),
+		"a superseded overlay grant must not keep launch-time provenance"
+	);
+	fs::remove_dir_all(&root).ok();
+}
+
+/// Implicit base/legacy config files that are symlinks or hardlinks may alias
+/// project-controlled bytes. They may not grant approval, even though explicit
+/// `--config` overlays remain an operator choice.
+#[cfg(unix)]
+#[test]
+fn implicit_config_aliases_cannot_grant_approval() {
+	let root = temp_dir("implicit-alias");
+	let agent = root.join("agent");
+	let project = root.join("project");
+	fs::create_dir_all(&agent).expect("agent");
+	fs::create_dir_all(&project).expect("project");
+	let target = project.join("config.yml");
+	write(&target, "approvalMode: yolo\nallow: [bash]\n");
+
+	let _env = EnvGuard::set(&[
+		("PI_CONFIG_DIR", Some(root.as_path())),
+		("PI_CODING_AGENT_DIR", Some(agent.as_path())),
+		("OMP_PROFILE", None),
+		("PI_PROFILE", None),
+	]);
+
+	// Symlinked base config.
+	std::os::unix::fs::symlink(&target, agent.join("config.yml")).expect("symlink base");
+	let config = Config::load_with_cwd(&[], Some(&project), &[]).expect("symlink base");
+	assert_eq!(config.approval_mode, None);
+	assert!(config.allow.is_empty());
+
+	// Hardlinked base config.
+	fs::remove_file(agent.join("config.yml")).expect("remove symlink");
+	fs::hard_link(&target, agent.join("config.yml")).expect("hardlink base");
+	let config = Config::load_with_cwd(&[], Some(&project), &[]).expect("hardlink base");
+	assert_eq!(config.approval_mode, None);
+	assert!(config.allow.is_empty());
+
+	// Symlinked legacy global settings.json.
+	fs::remove_file(agent.join("config.yml")).expect("remove hardlink");
+	let legacy_target = project.join("settings.json");
+	write(&legacy_target, r#"{"tools":{"approvalMode":"yolo"},"allow":["bash"]}"#);
+	std::os::unix::fs::symlink(&legacy_target, agent.join("settings.json"))
+		.expect("symlink legacy");
+	let config = Config::load_with_cwd(&[], Some(&project), &[]).expect("symlink legacy");
+	assert_eq!(config.approval_mode, None);
+	assert!(config.allow.is_empty());
+
+	// Hardlinked legacy global settings.json.
+	fs::remove_file(agent.join("settings.json")).expect("remove symlink");
+	fs::hard_link(&legacy_target, agent.join("settings.json")).expect("hardlink legacy");
+	let config = Config::load_with_cwd(&[], Some(&project), &[]).expect("hardlink legacy");
+	assert_eq!(config.approval_mode, None);
+	assert!(config.allow.is_empty());
+
+	// Explicit operator overlay is still authoritative even when aliased.
+	fs::remove_file(agent.join("settings.json")).expect("remove legacy hardlink");
+	let overlay = root.join("operator-config.yml");
+	std::os::unix::fs::symlink(&target, &overlay).expect("symlink overlay");
+	let config =
+		Config::load_with_cwd(&[overlay], Some(&project), &[]).expect("explicit overlay");
+	assert_eq!(config.approval_mode, Some(ApprovalMode::Yolo));
+	assert_eq!(config.allow, ["bash"]);
+	assert!(config.explicit_allow.contains("bash"));
+	fs::remove_dir_all(&root).ok();
+}
+
+/// `omp config get` migrates `settings.json` into a fresh single-link
+/// `config.yml`. An aliased legacy file must not carry its grants through that
+/// cutover: the new trusted file has to contain only sanitized values.
+#[cfg(unix)]
+#[test]
+fn legacy_aliases_do_not_launder_grants_through_migration() {
+	let root = temp_dir("legacy-migration-alias");
+	let agent = root.join("agent");
+	let project = root.join("project");
+	fs::create_dir_all(&agent).expect("agent");
+	fs::create_dir_all(&project).expect("project");
+	let target = project.join("settings.json");
+	write(
+		&target,
+		r#"{"autoResume":true,"approvalMode":"yolo","tools":{"approvalMode":"yolo"},"allow":["bash"]}"#,
+	);
+
+	let _env = EnvGuard::set(&[
+		("PI_CONFIG_DIR", Some(root.as_path())),
+		("PI_CODING_AGENT_DIR", Some(agent.as_path())),
+		("OMP_PROFILE", None),
+		("PI_PROFILE", None),
+	]);
+	let migrate = || {
+		config_cmd::run(
+			&Request {
+				action:   Action::Get,
+				key:      Some("tools.approvalMode".to_string()),
+				value:    None,
+				json:     true,
+				cwd:      project.clone(),
+				overlays: Vec::new(),
+			},
+			&mut Vec::<u8>::new(),
+		)
+		.expect("config get migration");
+	};
+
+	// Symlinked legacy settings.json.
+	std::os::unix::fs::symlink(&target, agent.join("settings.json"))
+		.expect("symlink legacy");
+	migrate();
+	assert!(agent.join("config.yml").is_file(), "migration must write a trusted base");
+	let config = Config::load_with_cwd(&[], Some(&project), &[]).expect("symlink migration");
+	assert_eq!(config.approval_mode, Some(ApprovalMode::AlwaysAsk));
+	assert!(config.allow.is_empty());
+	let written = fs::read_to_string(agent.join("config.yml")).expect("migrated base");
+	assert!(!written.contains("yolo"), "approval grant leaked through migration: {written}");
+	assert!(!written.contains("allow"), "allow grant leaked through migration: {written}");
+	assert!(written.contains("autoResume"), "unrelated legacy value was lost: {written}");
+
+	// Hardlinked legacy settings.json. The nested mode is restrictive, but the
+	// legacy root key is a grant; normalizing must drop it rather than leave a
+	// latent `yolo` behind for a later reset.
+	fs::remove_file(agent.join("config.yml")).expect("remove migrated base");
+	fs::remove_file(agent.join("settings.json")).ok();
+	write(
+		&target,
+		r#"{"autoResume":true,"approvalMode":"yolo","tools":{"approvalMode":"always-ask"},"allow":["bash"]}"#,
+	);
+	fs::hard_link(&target, agent.join("settings.json")).expect("hardlink legacy");
+	migrate();
+	let config = Config::load_with_cwd(&[], Some(&project), &[]).expect("hardlink migration");
+	assert_eq!(config.approval_mode, Some(ApprovalMode::AlwaysAsk));
+	assert!(config.allow.is_empty());
+	let written = fs::read_to_string(agent.join("config.yml")).expect("migrated base");
+	assert!(!written.contains("yolo"), "approval grant leaked through migration: {written}");
+	assert!(!written.contains("allow"), "allow grant leaked through migration: {written}");
+	assert!(written.contains("autoResume"), "unrelated legacy value was lost: {written}");
+
+	// The migrated config is what the launch gate consumes: even if the
+	// project server's name were allowed, the alias grants must not let it
+	// spawn. A leaked `yolo` would skip the gate entirely.
+	let marker = project.join("spawned.marker");
+	write(
+		&project.join(".omp/mcp.json"),
+		&serde_json::json!({
+			"mcpServers": {
+				"mock": {
+					"command": "sh",
+					"args": ["-c", format!("touch {}", marker.display())]
+				}
+			}
+		})
+		.to_string(),
+	);
+	let report = discover_mcp_servers_with_paths(&project, &agent);
+	assert_eq!(report.servers.len(), 1);
+	assert!(!report.servers[0].trusted, "project MCP must be untrusted");
+	let approvals = Approvals::new(
+		config.approval_mode.unwrap_or_default(),
+		config.explicit_allow.iter().cloned(),
+	);
+	let rt = tokio::runtime::Builder::new_current_thread()
+		.enable_all()
+		.build()
+		.expect("tokio runtime");
+	let cancel_token = pi_agent::CancellationToken::new();
+	let tools = rt
+		.block_on(filter_and_spawn_mcp_servers_with_paths_detailed(
+			report.servers,
+			&project,
+			&agent,
+			&config,
+			&approvals,
+			&cancel_token,
+		))
+		.expect("unapproved project server must be skipped");
+	assert!(tools.tools.is_empty());
+	assert!(!marker.exists(), "migrated alias grants must not authorize a project MCP spawn");
+
+	// The same cutover folds `agent.db` settings into `config.yml`; a
+	// project-owned hardlink must not carry DB grants either.
+	fs::remove_file(agent.join("config.yml")).expect("remove migrated base");
+	let db_target = project.join("agent.db");
+	let db = rusqlite::Connection::open(&db_target).expect("open project db");
+	db.execute_batch(
+		r#"CREATE TABLE settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+		INSERT INTO settings VALUES ('autoResume', 'true');
+		INSERT INTO settings VALUES ('approvalMode', '"yolo"');
+		INSERT INTO settings VALUES ('tools', '{"approvalMode":"yolo"}');
+		INSERT INTO settings VALUES ('tools.approvalMode', '"yolo"');
+		INSERT INTO settings VALUES ('allow', '["bash"]');"#,
+	)
+	.expect("seed project db");
+	drop(db);
+	fs::hard_link(&db_target, agent.join("agent.db")).expect("hardlink db");
+	migrate();
+	let config = Config::load_with_cwd(&[], Some(&project), &[]).expect("db migration");
+	assert_eq!(config.approval_mode, Some(ApprovalMode::AlwaysAsk));
+	assert!(config.allow.is_empty());
+	let written = fs::read_to_string(agent.join("config.yml")).expect("migrated db base");
+	assert!(!written.contains("yolo"), "approval grant leaked from db: {written}");
+	assert!(!written.contains("allow"), "allow grant leaked from db: {written}");
+	assert!(written.contains("autoResume"), "unrelated db value was lost: {written}");
+	fs::remove_dir_all(&root).ok();
+}
+
+/// A write to an unrelated key re-reads the hardlinked base and atomically
+/// replaces the host path. That cutover must drop the aliased grants before the
+/// new single-link file becomes trusted.
+#[cfg(unix)]
+#[test]
+fn hardlinked_base_unrelated_write_does_not_launder_grants() {
+	let root = temp_dir("hardlink-persist");
+	let agent = root.join("agent");
+	let project = root.join("project");
+	fs::create_dir_all(&agent).expect("agent");
+	fs::create_dir_all(&project).expect("project");
+	let target = project.join("config.yml");
+	write(&target, "approvalMode: yolo\nallow: [bash]\n");
+	fs::hard_link(&target, agent.join("config.yml")).expect("hardlink base");
+
+	let _env = EnvGuard::set(&[
+		("PI_CONFIG_DIR", Some(root.as_path())),
+		("PI_CODING_AGENT_DIR", Some(agent.as_path())),
+		("OMP_PROFILE", None),
+		("PI_PROFILE", None),
+	]);
+	config_cmd::run(
+		&Request {
+			action:   Action::Set,
+			key:      Some("autoResume".to_string()),
+			value:    Some("true".to_string()),
+			json:     false,
+			cwd:      project.clone(),
+			overlays: Vec::new(),
+		},
+		&mut Vec::<u8>::new(),
+	)
+	.expect("unrelated write");
+
+	use std::os::unix::fs::MetadataExt;
+	assert_eq!(
+		fs::metadata(agent.join("config.yml")).expect("written base").nlink(),
+		1,
+		"atomic write must replace the hardlink with a single-link file"
+	);
+	let config = Config::load_with_cwd(&[], Some(&project), &[]).expect("after unrelated write");
+	assert_eq!(config.approval_mode, Some(ApprovalMode::AlwaysAsk));
+	assert!(config.allow.is_empty());
+	let written = fs::read_to_string(agent.join("config.yml")).expect("written base");
+	assert!(!written.contains("yolo"), "approval grant leaked through persist: {written}");
+	assert!(!written.contains("allow"), "allow grant leaked through persist: {written}");
+	assert!(written.contains("autoResume"), "the requested key was not persisted: {written}");
+	fs::remove_dir_all(&root).ok();
+}
+
+/// Inside one YAML layer, runtime applies the legacy root key first and the
+/// nested `tools.approvalMode` second, so the nested value wins.
+#[test]
+fn project_yaml_nested_approval_wins_over_root() {
+	let root = temp_dir("nested-precedence");
+	let agent = root.join("agent");
+	let project = root.join("project");
+	fs::create_dir_all(&project).expect("project");
+	write(&agent.join("config.yml"), "approvalMode: yolo\n");
+	write(
+		&project.join(".omp/config.yml"),
+		"approvalMode: always-ask\ntools:\n  approvalMode: yolo\n",
+	);
+
+	let _env = EnvGuard::set(&[
+		("PI_CONFIG_DIR", Some(root.as_path())),
+		("PI_CODING_AGENT_DIR", Some(agent.as_path())),
+		("OMP_PROFILE", None),
+		("PI_PROFILE", None),
+	]);
+	let config = Config::load_with_cwd(&[], Some(&project), &[]).expect("nested precedence");
+	assert_eq!(config.approval_mode, Some(ApprovalMode::Yolo));
+	fs::remove_dir_all(&root).ok();
+}
+
+/// A repository-controlled `.omp/config.yml` or `.omp/settings.json` may not
+/// add auto-approval: `approvalMode` can only move toward `always-ask` and the
+/// `allow` list is a host/CLI setting. The effective approvals must also deny
+/// a project stdio MCP launch that a project allowlist would otherwise grant.
+#[test]
+fn project_layers_cannot_grant_approval_or_allowlists() {
+	let root = temp_dir("project-grant");
+	let agent = root.join("agent");
+	let project = root.join("project");
+	fs::create_dir_all(&project).expect("project");
+	write(&agent.join("config.yml"), "approvalMode: always-ask\nallow: [read]\n");
+	write(
+		&project.join(".omp/settings.json"),
+		r#"{"tools":{"approvalMode":"yolo"}}"#,
+	);
+	write(
+		&project.join(".omp/config.yml"),
+		"approvalMode: yolo\nallow: [bash, mcp-server:project]\n",
+	);
+
+	let _env = EnvGuard::set(&[
+		("PI_CONFIG_DIR", Some(root.as_path())),
+		("PI_CODING_AGENT_DIR", Some(agent.as_path())),
+		("OMP_PROFILE", None),
+		("PI_PROFILE", None),
+	]);
+	let config = Config::load_with_cwd(&[], Some(&project), &[]).expect("project layers");
+	assert_eq!(config.approval_mode, Some(ApprovalMode::AlwaysAsk));
+	assert_eq!(config.allow, ["read"]);
+
+	let approvals = omp_cli::approve::Approvals::new(
+		config.approval_mode.unwrap_or_default(),
+		config.allow.iter().cloned(),
+	);
+	assert!(
+		!omp_cli::runtime::is_stdio_mcp_launch_allowed("project", &approvals),
+		"a project grant must not auto-launch the project's MCP server"
+	);
+
+	// Explicit host overlays (`--config` / `PI_CONFIG_FILES`) stay authoritative.
+	let overlay = root.join("host-overlay.yml");
+	write(&overlay, "approvalMode: yolo\nallow: [bash]\n");
+	let trusted = Config::load_with_cwd(&[overlay], Some(&project), &[]).expect("host overlay");
+	assert_eq!(trusted.approval_mode, Some(ApprovalMode::Yolo));
+	assert_eq!(trusted.allow, ["bash"]);
+	assert!(trusted.explicit_allow.contains("bash"), "operator overlay allows are explicit");
+
+	// A project may still tighten a permissive host posture.
+	write(&agent.join("config.yml"), "approvalMode: yolo\nallow: [read]\n");
+	write(
+		&project.join(".omp/settings.json"),
+		r#"{"tools":{"approvalMode":"always-ask"}}"#,
+	);
+	// Runtime order: settings.json tightens to always-ask, then config.yml's
+	// yolo grant is rejected. The later grant must not undo the restriction.
+	write(&project.join(".omp/config.yml"), "approvalMode: yolo\n");
+	let tightened = Config::load_with_cwd(&[], Some(&project), &[]).expect("tightened layers");
+	assert_eq!(tightened.approval_mode, Some(ApprovalMode::AlwaysAsk));
+	assert_eq!(tightened.allow, ["read"]);
 	fs::remove_dir_all(&root).ok();
 }
 

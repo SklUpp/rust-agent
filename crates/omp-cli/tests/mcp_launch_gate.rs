@@ -1,12 +1,18 @@
-//! Tests for stdio MCP launch approval gate, --tools filtering before spawn,
-//! truthful connection errors, and early discovery cancellation.
+//! Tests for the MCP launch approval gate (stdio and project remote), `--tools`
+//! filtering before spawn, provenance, truthful connection errors, and early
+//! discovery cancellation.
 
 use std::fs;
+use std::io::Read;
+use std::net::TcpListener;
 use std::path::Path;
+use std::time::Duration;
 
 use omp_cli::approve::{ApprovalMode, Approvals};
-use omp_cli::config::{Config, DiscoveredMcpServer};
-use omp_cli::runtime::filter_and_spawn_mcp_servers;
+use omp_cli::config::{Config, DiscoveredMcpServer, discover_mcp_servers_with_paths};
+use omp_cli::runtime::{
+	filter_and_spawn_mcp_servers, filter_and_spawn_mcp_servers_with_paths_detailed,
+};
 use pi_agent::mcp::{MCPServerConfig, MCPStdioServerConfig};
 use pi_agent::tools::naming::create_mcp_tool_name;
 struct TempDir(std::path::PathBuf);
@@ -76,6 +82,7 @@ for line in sys.stdin:
 		name: server_name.to_string(),
 		config,
 		source_path: dir.to_path_buf(),
+		trusted: true,
 	};
 
 	(server, marker_file)
@@ -155,6 +162,7 @@ for line in sys.stdin:
 		name: server_name.to_string(),
 		config,
 		source_path: dir.to_path_buf(),
+		trusted: true,
 	};
 
 	(server, spawned, listed, pid_file)
@@ -313,6 +321,361 @@ fn test_stdio_mcp_launch_allowed_with_explicit_server_allow() {
 	);
 }
 
+/// A repository-controlled `mcp.json` names the command that runs. A host
+/// config allow entry matches only the server name, so it must not authorize a
+/// project-defined or project-overridden command.
+#[test]
+fn test_project_mcp_source_does_not_inherit_config_allow() {
+	let temp_dir = TempDir::new();
+	let (mut server, marker_file) = make_mock_stdio_server(temp_dir.path(), "mock");
+	fs::create_dir_all(temp_dir.path().join(".omp")).unwrap();
+	let project_source = temp_dir.path().join(".omp/mcp.json");
+	fs::write(&project_source, "{}").unwrap();
+	server.source_path = project_source;
+	server.trusted = false;
+
+	let rt = tokio::runtime::Builder::new_current_thread()
+		.enable_all()
+		.build()
+		.unwrap();
+
+	// Config-file allow (no explicit_allow provenance) reaches `Approvals`
+	// through the normal host-config path.
+	let config = Config::default();
+	let approvals = Approvals::new(ApprovalMode::AlwaysAsk, vec!["mcp:mock".to_string()]);
+	let cancel_token = pi_agent::CancellationToken::new();
+
+	let tools = rt
+		.block_on(filter_and_spawn_mcp_servers(
+			vec![server],
+			temp_dir.path(),
+			&config,
+			&approvals,
+			&cancel_token,
+		))
+		.expect("an unapproved project server must be skipped, not abort the run");
+
+	assert!(tools.is_empty(), "project server tools must not register without approval");
+	assert!(
+		!marker_file.exists(),
+		"host config allow must not auto-launch a project-defined command"
+	);
+}
+
+/// The operator's explicit launch-time allow (`--allow`, `--config`,
+/// `PI_CONFIG_FILES`) still authorizes the project server.
+#[test]
+fn test_project_mcp_source_launches_with_explicit_operator_allow() {
+	let temp_dir = TempDir::new();
+	let (mut server, marker_file) = make_mock_stdio_server(temp_dir.path(), "mock");
+	fs::create_dir_all(temp_dir.path().join(".omp")).unwrap();
+	let project_source = temp_dir.path().join(".omp/mcp.json");
+	fs::write(&project_source, "{}").unwrap();
+	server.source_path = project_source;
+	server.trusted = false;
+
+	let rt = tokio::runtime::Builder::new_current_thread()
+		.enable_all()
+		.build()
+		.unwrap();
+
+	let mut config = Config::default();
+	config.explicit_allow.insert("mcp:mock".to_string());
+	let approvals = Approvals::new(ApprovalMode::AlwaysAsk, vec!["mcp:mock".to_string()]);
+	let cancel_token = pi_agent::CancellationToken::new();
+
+	let tools = rt
+		.block_on(filter_and_spawn_mcp_servers(
+			vec![server],
+			temp_dir.path(),
+			&config,
+			&approvals,
+			&cancel_token,
+		))
+		.expect("explicit operator allow must permit the project server");
+
+	assert_eq!(tools.len(), 1);
+	assert_eq!(tools[0].name(), "mcp__mock_echo");
+	assert!(
+		marker_file.exists(),
+		"explicit operator allow must still launch the project server"
+	);
+}
+
+/// A later operator overlay that replaces `allow` must also replace its
+/// provenance. A server permitted only by an earlier, superseded overlay is not
+/// authorized to launch a project-defined command.
+#[test]
+fn test_project_mcp_source_ignores_superseded_operator_allow() {
+	let temp_dir = TempDir::new();
+	let (mut server, marker_file) = make_mock_stdio_server(temp_dir.path(), "mock");
+	fs::create_dir_all(temp_dir.path().join(".omp")).unwrap();
+	let project_source = temp_dir.path().join(".omp/mcp.json");
+	fs::write(&project_source, "{}").unwrap();
+	server.source_path = project_source;
+	server.trusted = false;
+
+	let mut config = Config::default();
+	let mut first = Config::default();
+	first.allow = vec!["mcp:mock".to_string()];
+	first.explicit_allow.insert("mcp:mock".to_string());
+	config.merge(first);
+	let mut second = Config::default();
+	second.allow = vec!["read".to_string()];
+	second.explicit_allow.insert("read".to_string());
+	config.merge(second);
+	assert!(!config.explicit_allow.contains("mcp:mock"));
+	assert_eq!(config.allow, ["read"]);
+
+	let rt = tokio::runtime::Builder::new_current_thread()
+		.enable_all()
+		.build()
+		.unwrap();
+	let approvals = Approvals::new(ApprovalMode::AlwaysAsk, config.allow.iter().cloned());
+	let cancel_token = pi_agent::CancellationToken::new();
+
+	let tools = rt
+		.block_on(filter_and_spawn_mcp_servers(
+			vec![server],
+			temp_dir.path(),
+			&config,
+			&approvals,
+			&cancel_token,
+		))
+		.expect("a superseded grant must skip, not abort the run");
+
+	assert!(tools.is_empty(), "superseded allow must not register project tools");
+	assert!(
+		!marker_file.exists(),
+		"an allow replaced by a later overlay must not launch the project server"
+	);
+}
+
+/// A project HTTP MCP config must not connect (or expand `${ENV}` secrets)
+/// before approval. Once the operator explicitly allows it, expansion happens
+/// and the configured header reaches the server.
+#[test]
+fn test_project_http_mcp_gated_before_env_expansion() {
+	let root = TempDir::new();
+	let project = root.path().join("project");
+	let agent = root.path().join("agent");
+	fs::create_dir_all(project.join(".omp")).unwrap();
+	fs::create_dir_all(&agent).unwrap();
+
+	let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+	listener.set_nonblocking(true).unwrap();
+	let addr = listener.local_addr().unwrap();
+	let var = format!("OMP_MCP_TEST_SECRET_{}", std::process::id());
+	// SAFETY: unique name per test process; removed before returning.
+	unsafe { std::env::set_var(&var, "secret-value") };
+	fs::write(
+		project.join(".omp/mcp.json"),
+		format!(
+			r#"{{"mcpServers":{{"remote":{{"url":"http://{addr}/mcp","headers":{{"Authorization":"Bearer ${{{var}}}"}},"timeout":500}}}}}}"#
+		),
+	)
+	.unwrap();
+
+	let report = discover_mcp_servers_with_paths(&project, &agent);
+	assert_eq!(report.servers.len(), 1);
+	let server = &report.servers[0];
+	assert!(!server.trusted, "project HTTP MCP source must be untrusted");
+	let expected_header = format!("Bearer ${{{var}}}");
+	match &server.config {
+		MCPServerConfig::Http(http) => assert_eq!(
+			http.headers.get("Authorization").map(String::as_str),
+			Some(expected_header.as_str()),
+			"env refs must stay literal before approval"
+		),
+		_ => panic!("expected HTTP config"),
+	}
+
+	let rt = tokio::runtime::Builder::new_current_thread()
+		.enable_all()
+		.build()
+		.unwrap();
+	let approvals = Approvals::new(ApprovalMode::AlwaysAsk, vec!["mcp:remote".to_string()]);
+	let cancel_token = pi_agent::CancellationToken::new();
+
+	// Host config allow alone does not authorize a project remote server.
+	let config = Config::default();
+	let tools = rt
+		.block_on(filter_and_spawn_mcp_servers_with_paths_detailed(
+			report.servers.clone(),
+			&project,
+			&agent,
+			&config,
+			&approvals,
+			&cancel_token,
+		))
+		.expect("unapproved project remote server must be skipped");
+	assert!(tools.tools.is_empty());
+	assert!(
+		matches!(listener.accept(), Err(err) if err.kind() == std::io::ErrorKind::WouldBlock),
+		"project HTTP MCP must not connect before approval"
+	);
+
+	// Explicit operator allow: gate passes, then env expansion feeds the header.
+	listener.set_nonblocking(false).unwrap();
+	let (tx, rx) = std::sync::mpsc::channel();
+	let handle = std::thread::spawn(move || {
+		if let Ok((mut socket, _)) = listener.accept() {
+			socket.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+			let mut data = Vec::new();
+			let mut buf = [0u8; 4096];
+			loop {
+				match socket.read(&mut buf) {
+					Ok(0) => break,
+					Ok(n) => {
+						data.extend_from_slice(&buf[..n]);
+						if data.windows(4).any(|window| window == b"\r\n\r\n") {
+							break;
+						}
+					},
+					Err(_) => break,
+				}
+			}
+			let _ = tx.send(String::from_utf8_lossy(&data).into_owned());
+		}
+	});
+	let mut config = Config::default();
+	config.allow = vec!["mcp:remote".to_string()];
+	config.explicit_allow.insert("mcp:remote".to_string());
+	let _ = rt.block_on(filter_and_spawn_mcp_servers_with_paths_detailed(
+		report.servers,
+		&project,
+		&agent,
+		&config,
+		&approvals,
+		&cancel_token,
+	));
+	let received = rx.recv_timeout(Duration::from_secs(5)).expect("explicit allow must connect");
+	assert!(
+		received.contains("Bearer secret-value") && !received.contains("${"),
+		"authorized launch must expand env refs before sending headers: {received}"
+	);
+	handle.join().unwrap();
+	// SAFETY: see set_var above.
+	unsafe { std::env::remove_var(&var) };
+}
+
+/// A host-side `mcp.json` that is a symlink to a project file is an alias of
+/// project-controlled bytes, not host trust. Real discovery must classify it
+/// untrusted so name-based host allow cannot launch it.
+#[cfg(unix)]
+#[test]
+fn test_host_mcp_symlink_to_project_is_untrusted() {
+	let root = TempDir::new();
+	let project = root.path().join("project");
+	let agent = root.path().join("agent");
+	fs::create_dir_all(&project).unwrap();
+	fs::create_dir_all(&agent).unwrap();
+
+	let (fixture, marker_file) = make_mock_stdio_server(root.path(), "mock");
+	let MCPServerConfig::Stdio(stdio) = fixture.config else {
+		panic!("fixture must be stdio");
+	};
+	fs::write(
+		project.join("mcp.json"),
+		serde_json::json!({
+			"mcpServers": {
+				"mock": { "command": stdio.command, "args": stdio.args }
+			}
+		})
+		.to_string(),
+	)
+	.unwrap();
+	std::os::unix::fs::symlink(project.join("mcp.json"), agent.join("mcp.json")).unwrap();
+
+	let report = discover_mcp_servers_with_paths(&project, &agent);
+	assert_eq!(report.servers.len(), 1);
+	assert_eq!(report.servers[0].name, "mock");
+	assert_eq!(report.servers[0].source_path, agent.join("mcp.json"));
+	assert!(
+		!report.servers[0].trusted,
+		"host path resolving into the project must not keep host trust"
+	);
+
+	let rt = tokio::runtime::Builder::new_current_thread()
+		.enable_all()
+		.build()
+		.unwrap();
+	let approvals = Approvals::new(ApprovalMode::AlwaysAsk, vec!["mcp:mock".to_string()]);
+	let cancel_token = pi_agent::CancellationToken::new();
+	let tools = rt
+		.block_on(filter_and_spawn_mcp_servers_with_paths_detailed(
+			report.servers,
+			&project,
+			&agent,
+			&Config::default(),
+			&approvals,
+			&cancel_token,
+		))
+		.expect("an unapproved alias server must be skipped");
+	assert!(tools.tools.is_empty());
+	assert!(
+		!marker_file.exists(),
+		"host-config allow must not launch a project command through a host symlink alias"
+	);
+}
+
+/// Same guarantee for a hardlink: nlink>1 means the other endpoint is not
+/// knowable, so the host path cannot carry host trust.
+#[cfg(unix)]
+#[test]
+fn test_host_mcp_hardlink_to_project_is_untrusted() {
+	let root = TempDir::new();
+	let project = root.path().join("project");
+	let agent = root.path().join("agent");
+	fs::create_dir_all(&project).unwrap();
+	fs::create_dir_all(&agent).unwrap();
+
+	let (fixture, marker_file) = make_mock_stdio_server(root.path(), "mock");
+	let MCPServerConfig::Stdio(stdio) = fixture.config else {
+		panic!("fixture must be stdio");
+	};
+	fs::write(
+		project.join("mcp.json"),
+		serde_json::json!({
+			"mcpServers": {
+				"mock": { "command": stdio.command, "args": stdio.args }
+			}
+		})
+		.to_string(),
+	)
+	.unwrap();
+	fs::hard_link(project.join("mcp.json"), agent.join("mcp.json")).unwrap();
+
+	let report = discover_mcp_servers_with_paths(&project, &agent);
+	assert_eq!(report.servers.len(), 1);
+	assert!(
+		!report.servers[0].trusted,
+		"host hardlink to a project file must not keep host trust"
+	);
+
+	let rt = tokio::runtime::Builder::new_current_thread()
+		.enable_all()
+		.build()
+		.unwrap();
+	let approvals = Approvals::new(ApprovalMode::AlwaysAsk, vec!["mcp:mock".to_string()]);
+	let cancel_token = pi_agent::CancellationToken::new();
+	let tools = rt
+		.block_on(filter_and_spawn_mcp_servers_with_paths_detailed(
+			report.servers,
+			&project,
+			&agent,
+			&Config::default(),
+			&approvals,
+			&cancel_token,
+		))
+		.expect("an unapproved alias server must be skipped");
+	assert!(tools.tools.is_empty());
+	assert!(
+		!marker_file.exists(),
+		"host-config allow must not launch a project command through a hardlink alias"
+	);
+}
+
 #[test]
 fn test_stdio_mcp_launch_allowed_with_explicit_tool_allow() {
 	let temp_dir = TempDir::new();
@@ -394,6 +757,7 @@ fn test_truthful_connection_error_when_server_fails() {
 		name: "broken_srv".to_string(),
 		config: broken_config,
 		source_path: temp_dir.path().to_path_buf(),
+		trusted: true,
 	};
 
 	let rt = tokio::runtime::Builder::new_current_thread()

@@ -35,6 +35,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use serde::Deserialize;
 use serde_json::{Map, Value as Json};
 
+use crate::approve::ApprovalMode;
 use crate::config::{self, env_config_files, json_to_value};
 use crate::dirs;
 use crate::yaml::{self, Value};
@@ -178,7 +179,7 @@ pub fn run(request: &Request, out: &mut impl Write) -> Result<()> {
 	// `runConfigCommand` awaits `Settings.init()` before dispatching, and init
 	// migrates legacy settings into config.yml. Running the same seed here means
 	// `list`/`get` see migrated values exactly like upstream.
-	init_legacy_migration()?;
+	init_legacy_migration(&request.cwd)?;
 	match request.action {
 		Action::List => list(request, out),
 		Action::Get => get(request, out),
@@ -201,18 +202,39 @@ fn merged(request: &Request) -> Result<Value> {
 	merged_layers(&request.cwd, &request.overlays)
 }
 
+fn trust_roots(cwd: &Path) -> Vec<PathBuf> {
+	let process_cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+	vec![
+		config::absolute_canonical(&process_cwd),
+		config::absolute_canonical(cwd),
+	]
+}
+
 fn merged_layers(cwd: &Path, overlays: &[PathBuf]) -> Result<Value> {
+	let process_cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+	let mut roots = trust_roots(cwd);
 	let mut merged = Value::Map(Vec::new());
 	if let Some(base) = config::base_path() {
 		let mut global = read_target(&base)?;
+		if let Some(base_cwd) = lookup(&global, "cwd").and_then(Value::as_str) {
+			roots.push(config::absolute_canonical(&config::resolve_layer_path(
+				&process_cwd,
+				Path::new(base_cwd),
+			)));
+		}
 		migrate_settings(&mut global);
+		sanitize_implicit_grants(&mut global, &base, true, &roots);
+		normalize_legacy_approval(&mut global);
 		merge(&mut merged, global);
-	} else if let Some(mut legacy) = legacy_global_settings() {
+	} else if let Some((path, mut legacy)) = legacy_global_settings() {
 		// Reached only when init could not seed (e.g. an unwritable config dir).
+		// Legacy settings.json does not map a root `approvalMode` at runtime.
 		migrate_settings(&mut legacy);
+		sanitize_implicit_grants(&mut legacy, &path, false, &roots);
 		merge(&mut merged, legacy);
 	}
-	merge(&mut merged, project_layer(cwd)?);
+	let project = project_layer(cwd, &merged)?;
+	merge(&mut merged, project);
 	for path in env_config_files().iter().chain(overlays.iter()) {
 		let resolved = config::resolve_layer_path(cwd, path);
 		if !resolved.is_file() {
@@ -220,9 +242,142 @@ fn merged_layers(cwd: &Path, overlays: &[PathBuf]) -> Result<Value> {
 		}
 		let mut overlay = read_target(&resolved)?;
 		migrate_settings(&mut overlay);
+		normalize_legacy_approval(&mut overlay);
 		merge(&mut merged, overlay);
 	}
+	// The headless runtime defaults to `always-ask`; the schema snapshot's
+	// `yolo` default is not the effective runtime value.
+	if lookup(&merged, "tools.approvalMode").is_none() {
+		set_tools_approval(&mut merged, ApprovalMode::default());
+	}
 	Ok(merged)
+}
+
+/// Approval mode currently effective in a view value, or the runtime default
+/// (`always-ask`) when no layer set one.
+fn approval_mode_from_view(view: &Value) -> ApprovalMode {
+	lookup(view, "tools.approvalMode")
+		.or_else(|| lookup(view, "approvalMode"))
+		.and_then(Value::as_str)
+		.and_then(ApprovalMode::parse)
+		.unwrap_or_default()
+}
+
+fn set_tools_approval(layer: &mut Value, mode: ApprovalMode) {
+	if let Value::Map(pairs) = layer {
+		map_set(
+			ensure_map(pairs, "tools"),
+			"approvalMode",
+			Value::Str(mode.as_str().to_string()),
+		);
+	}
+}
+
+/// `config.yml` accepts a legacy root `approvalMode`; the runtime maps it to
+/// the same field as `tools.approvalMode`. Expose the nested form so effective
+/// reads see what the runtime would use.
+fn normalize_legacy_approval(layer: &mut Value) {
+	if lookup(layer, "tools.approvalMode").is_some() {
+		return;
+	}
+	let Some(mode) = lookup(layer, "approvalMode")
+		.and_then(Value::as_str)
+		.and_then(ApprovalMode::parse)
+	else {
+		return;
+	};
+	set_tools_approval(layer, mode);
+}
+
+fn strip_approval_keys(layer: &mut Value) {
+	if let Value::Map(pairs) = layer {
+		if let Some(Value::Map(tools)) = map_get_mut(pairs, "tools") {
+			map_take(tools, "approvalMode");
+		}
+		map_take(pairs, "tools.approvalMode");
+		map_take(pairs, "approvalMode");
+	}
+}
+
+fn strip_searxng(layer: &mut Value) {
+	if let Value::Map(entries) = layer {
+		entries.retain(|(key, _)| key != "searxng");
+	}
+}
+
+/// Runtime parity for one project layer: it may tighten but never grant.
+/// Resolves nested-over-root precedence first, then returns the strictest of
+/// the current floor and that one effective mode; a grant is removed with a
+/// warning. `legacy_root` admits the `config.yml` root `approvalMode` key,
+/// which the runtime maps but `settings.json` does not.
+fn clamp_project_approval(
+	layer: &mut Value,
+	floor: ApprovalMode,
+	legacy_root: bool,
+) -> Option<ApprovalMode> {
+	// Runtime precedence inside one layer: nested `tools.approvalMode` is
+	// applied after the legacy root key and wins. Do not take the minimum of
+	// two contradictory keys: resolve the effective one first.
+	let requested = if let Some(value) = lookup(layer, "tools.approvalMode") {
+		ApprovalMode::parse(value.as_str()?)?
+	} else if legacy_root {
+		match lookup(layer, "approvalMode") {
+			Some(value) => ApprovalMode::parse(value.as_str()?)?,
+			None => return None,
+		}
+	} else {
+		return None;
+	};
+	if requested.permissiveness() > floor.permissiveness() {
+		strip_approval_keys(layer);
+		eprintln!(
+			"warning: ignoring project approvalMode grant: project settings may only tighten \
+			 approval (host mode `{}`)",
+			floor.as_str()
+		);
+	}
+	Some(if requested.permissiveness() < floor.permissiveness() {
+		requested
+	} else {
+		floor
+	})
+}
+
+/// Remove grants from an implicit config file that is a symlink, a hardlink,
+/// or otherwise resolves inside the project. Used before a read→write cutover
+/// (legacy migration, persist) as well as when rendering the effective view:
+/// writing the bytes to a fresh trusted file must not launder project grants.
+fn sanitize_implicit_grants(
+	layer: &mut Value,
+	source: &Path,
+	legacy_root: bool,
+	roots: &[PathBuf],
+) {
+	if !config::implicit_config_is_untrusted(source, roots) {
+		return;
+	}
+	eprintln!(
+		"warning: treating implicit config {} as untrusted (symlink/hardlink/project path); \
+		 permission grants are ignored",
+		source.display()
+	);
+	let pinned = clamp_project_approval(layer, ApprovalMode::AlwaysAsk, legacy_root);
+	// Normalize every approval key into the one nested mode the runtime
+	// resolves. A contradictory root grant (for example root `yolo` plus a
+	// restrictive nested mode) must not survive to be re-exposed by a later
+	// reset of the nested key.
+	strip_approval_keys(layer);
+	if let Some(mode) = pinned {
+		set_tools_approval(layer, mode);
+	}
+	strip_searxng(layer);
+	strip_allow(layer);
+}
+
+fn strip_allow(layer: &mut Value) {
+	if let Value::Map(pairs) = layer {
+		map_take(pairs, "allow");
+	}
 }
 
 /// Effective value of one setting after layers, defaults and path-scoped
@@ -238,8 +393,8 @@ pub fn effective_setting(cwd: &Path, overlays: &[PathBuf], key: &str) -> Result<
 
 /// `agent/settings.json` is the legacy global settings file, superseded once a
 /// main YAML exists; read without migrating, like the run path does.
-fn legacy_global_settings() -> Option<Value> {
-	read_legacy_source().map(|source| source.value)
+fn legacy_global_settings() -> Option<(PathBuf, Value)> {
+	read_legacy_source().map(|source| (source.path, source.value))
 }
 
 /// Legacy `settings.json` plus the identity of the exact bytes that were read,
@@ -276,41 +431,57 @@ fn read_legacy_source() -> Option<LegacySource> {
 /// Project layer: every capability provider that contributes project settings,
 /// merged in provider-priority order (builtin 100, claude 80, gemini 60,
 /// opencode 55, cursor 50; codex 70 is skipped upstream) exactly like `#readProjectSettings`, then migrated.
-fn project_layer(cwd: &Path) -> Result<Value> {
+fn project_layer(cwd: &Path, inherited: &Value) -> Result<Value> {
 	let dir = dirs::project_config_dir(cwd);
 	let mut layer = Value::Map(Vec::new());
-	let merge_json = |layer: &mut Value, path: &Path, jsonc: bool| {
-		let Ok(mut text) = fs::read_to_string(path) else { return };
-		if jsonc {
-			text = substitute_config_vars(&text, path);
+	let mut floor = approval_mode_from_view(inherited);
+
+	// Runtime order: `.omp/settings.json`, then `.omp/config.yml`. Clamp each
+	// before merging so a later grant cannot overwrite an accepted restriction.
+	if let Some(json) = read_project_json(&dir.join("settings.json"), false) {
+		let mut settings = drop_group_shadows(&json);
+		// `settings.json` does not map a legacy root `approvalMode` in the run path.
+		if let Some(pinned) = clamp_project_approval(&mut settings, floor, false) {
+			set_tools_approval(&mut settings, pinned);
+			floor = pinned;
 		}
-		let parsed = if jsonc { jsonc_to_json(&text) } else { serde_json::from_str::<Json>(&text).ok() };
-		match parsed {
-			Some(json) => merge(layer, drop_group_shadows(&json_to_value(&json))),
-			None => eprintln!("warning: skipping invalid settings {}", path.display()),
-		}
-	};
-	merge_json(&mut layer, &dir.join("settings.json"), false);
+		merge(&mut layer, settings);
+	}
 	let project_config = dir.join(dirs::MAIN_CONFIG_FILENAMES[0]);
 	let native_project = if project_config.is_file() {
 		// Capability-provided project settings drop a scalar written where the
 		// schema expects a group, in `.omp/config.yml` just like `settings.json`.
-		Some(drop_group_shadows(&read_target(&project_config)?))
+		let mut native = drop_group_shadows(&read_target(&project_config)?);
+		// The runtime `config.yml` reader accepts the legacy root key.
+		if let Some(pinned) = clamp_project_approval(&mut native, floor, true) {
+			set_tools_approval(&mut native, pinned);
+			floor = pinned;
+		}
+		Some(native)
 	} else {
 		None
 	};
 	if let Some(native) = &native_project {
 		merge(&mut layer, native.clone());
 	}
-	merge_json(&mut layer, &cwd.join(".claude").join("settings.json"), false);
-	merge_json(&mut layer, &cwd.join(".gemini").join("settings.json"), false);
+	let merge_other = |layer: &mut Value, path: &Path, jsonc: bool| {
+		if let Some(json) = read_project_json(path, jsonc) {
+			let mut value = drop_group_shadows(&json);
+			// The headless runtime does not consume these providers, so their
+			// approval keys must not appear as effective settings.
+			strip_approval_keys(&mut value);
+			merge(layer, value);
+		}
+	};
+	merge_other(&mut layer, &cwd.join(".claude").join("settings.json"), false);
+	merge_other(&mut layer, &cwd.join(".gemini").join("settings.json"), false);
 	for name in ["opencode.json", "opencode.jsonc"] {
-		merge_json(&mut layer, &cwd.join(name), true);
+		merge_other(&mut layer, &cwd.join(name), true);
 	}
 	for name in ["opencode.json", "opencode.jsonc"] {
-		merge_json(&mut layer, &dir.join(name), true);
+		merge_other(&mut layer, &dir.join(name), true);
 	}
-	merge_json(&mut layer, &cwd.join(".cursor").join("settings.json"), false);
+	merge_other(&mut layer, &cwd.join(".cursor").join("settings.json"), false);
 	// Only the native file's model roles are re-merged after every provider.
 	if let Some(roles) = native_project.as_ref().and_then(|native| native.get("modelRoles").cloned()) {
 		merge(&mut layer, Value::Map(vec![("modelRoles".to_string(), roles)]));
@@ -324,6 +495,23 @@ fn project_layer(cwd: &Path) -> Result<Value> {
 		entries.retain(|(key, _)| key != "searxng");
 	}
 	Ok(layer)
+}
+
+/// Read a project JSON/JSONC settings layer. Invalid JSON warns and contributes
+/// nothing, matching the view's existing behaviour.
+fn read_project_json(path: &Path, jsonc: bool) -> Option<Value> {
+	let mut text = fs::read_to_string(path).ok()?;
+	if jsonc {
+		text = substitute_config_vars(&text, path);
+	}
+	let parsed = if jsonc { jsonc_to_json(&text) } else { serde_json::from_str::<Json>(&text).ok() };
+	match parsed {
+		Some(json) => Some(json_to_value(&json)),
+		None => {
+			eprintln!("warning: skipping invalid settings {}", path.display());
+			None
+		},
+	}
 }
 
 /// Strip `//` and `/* */` comments from JSONC without touching string bodies.
@@ -412,13 +600,15 @@ fn legacy_db_settings() -> Option<Value> {
 
 /// `#migrateFromLegacy`: fold `settings.json` (JSONC, renamed to `.bak`) and
 /// the `agent.db` settings into a fresh `config.yml` before the first write.
-fn seed_legacy_global(path: &Path) -> Result<Value> {
+fn seed_legacy_global(path: &Path, cwd: &Path) -> Result<Value> {
+	let roots = trust_roots(cwd);
 	let mut seeded = Value::Map(Vec::new());
 	let mut migrated = false;
 	let mut archived_source = None;
 	if let Some(source) = read_legacy_source() {
 		let mut legacy = source.value;
 		migrate_settings(&mut legacy);
+		sanitize_implicit_grants(&mut legacy, &source.path, false, &roots);
 		if matches!(legacy, Value::Map(_)) {
 			merge(&mut seeded, legacy);
 			migrated = true;
@@ -427,6 +617,7 @@ fn seed_legacy_global(path: &Path) -> Result<Value> {
 	}
 	if let Some(mut db) = legacy_db_settings() {
 		migrate_settings(&mut db);
+		sanitize_implicit_grants(&mut db, &dirs::agent_dir().join("agent.db"), false, &roots);
 		merge(&mut seeded, db);
 		migrated = true;
 	}
@@ -580,7 +771,7 @@ fn archive_legacy_symlink(settings_json: &Path, expected: (u64, u64, Option<Syst
 
 /// `Settings.init()` migration, under the same lock the writer uses so the
 /// absent-check, seed, write and archive form one critical section.
-fn init_legacy_migration() -> Result<()> {
+fn init_legacy_migration(cwd: &Path) -> Result<()> {
 	let path = resolve_write_path(&global_config_path())?;
 	if path.exists() {
 		return Ok(());
@@ -593,7 +784,7 @@ fn init_legacy_migration() -> Result<()> {
 	if path.exists() {
 		return Ok(());
 	}
-	seed_legacy_global(&path).map(|_| ())
+	seed_legacy_global(&path, cwd).map(|_| ())
 }
 
 /// OpenCode expands `{env:VAR}` and `{file:path}` before parsing its config
@@ -1899,7 +2090,7 @@ fn set(request: &Request, out: &mut impl Write) -> Result<()> {
 	let segments: Vec<&str> = def.path.split('.').collect();
 	// Upstream initializes settings (and fails on a broken layer) before writing.
 	merged(request)?;
-	persist_global(&segments, Some(parsed))?;
+	persist_global(&request.cwd, &segments, Some(parsed))?;
 
 	let merged = merged(request)?;
 	let value = effective_value(&merged, def, &request.cwd);
@@ -1930,7 +2121,7 @@ fn reset(request: &Request, out: &mut impl Write) -> Result<()> {
 		Some(json_to_value(&def.default.clone().unwrap_or(Json::Null)))
 	};
 	merged(request)?;
-	persist_global(&segments, default)?;
+	persist_global(&request.cwd, &segments, default)?;
 
 	// Upstream reports `getDefault(path)`, not the re-merged value, so a
 	// project-layer override cannot make `reset` claim something it did not write.
@@ -2138,8 +2329,10 @@ fn resolve_write_path(path: &Path) -> Result<PathBuf> {
 
 /// Apply one mutation to the global file under a cross-process lock, re-reading
 /// first so a concurrent disjoint write is merged rather than overwritten.
-fn persist_global(segments: &[&str], value: Option<Value>) -> Result<()> {
-	let path = resolve_write_path(&global_config_path())?;
+fn persist_global(cwd: &Path, segments: &[&str], value: Option<Value>) -> Result<()> {
+	let source = global_config_path();
+	let roots = trust_roots(cwd);
+	let path = resolve_write_path(&source)?;
 	// The lock file lives next to the config, so the directory must exist first.
 	if let Some(dir) = path.parent() {
 		fs::create_dir_all(dir)
@@ -2152,8 +2345,12 @@ fn persist_global(segments: &[&str], value: Option<Value>) -> Result<()> {
 	let mut root = if path.is_file() {
 		read_target(&path)?
 	} else {
-		seed_legacy_global(&path)?
+		seed_legacy_global(&path, cwd)?
 	};
+	// A disjoint write must not copy grants out of an aliased implicit file
+	// into the fresh single-link file written below. Explicit `set` grants are
+	// applied after this point and remain authoritative.
+	sanitize_implicit_grants(&mut root, &source, true, &roots);
 	match value {
 		Some(value) => set_at(&mut root, segments, value),
 		None => {

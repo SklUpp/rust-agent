@@ -470,6 +470,7 @@ fn mcp_servers(
 			name: name.to_string(),
 			config,
 			source_path: std::path::PathBuf::from("<acp>"),
+			trusted: true,
 		});
 	}
 	Ok(parsed)

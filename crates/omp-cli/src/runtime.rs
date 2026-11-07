@@ -5706,21 +5706,26 @@ pub fn is_stdio_mcp_launch_allowed_with_servers(
 	all_servers: &[String],
 	approvals: &crate::approve::Approvals,
 ) -> bool {
-	if approvals.mode == crate::approve::ApprovalMode::Yolo {
-		return true;
-	}
+	approvals.mode == crate::approve::ApprovalMode::Yolo
+		|| allowlist_allows_stdio_launch(server_name, all_servers, &approvals.allow)
+}
 
+/// Name-based allow matching shared by the general gate and the stricter
+/// project-source gate. Callers decide which allow set is authoritative.
+fn allowlist_allows_stdio_launch(
+	server_name: &str,
+	all_servers: &[String],
+	allow: &std::collections::BTreeSet<String>,
+) -> bool {
 	// Explicit scoped server-level allow is always definitive and unambiguous.
 	let prompt_name = format!("mcp-server:{server_name}");
-	if approvals.allow.contains(&format!("mcp:{server_name}"))
-		|| approvals.allow.contains(&prompt_name)
-	{
+	if allow.contains(&format!("mcp:{server_name}")) || allow.contains(&prompt_name) {
 		return true;
 	}
 
 	// Unambiguous colon-delimited tool allow (e.g. mcp:foo:read).
 	let colon_prefix = format!("mcp:{server_name}:");
-	if approvals.allow.iter().any(|a| a.starts_with(&colon_prefix)) {
+	if allow.iter().any(|a| a.starts_with(&colon_prefix)) {
 		return true;
 	}
 
@@ -5734,7 +5739,7 @@ pub fn is_stdio_mcp_launch_allowed_with_servers(
 	// servers collected from config layers) is excluded from tool-matching to prevent discovery-shaping
 	// bypasses.
 	// ponytail: tool-level allow maps to server launch before tools/list; add per-tool RPC authorization once protocol supports it.
-	approvals.allow.iter().any(|entry| {
+	allow.iter().any(|entry| {
 		if let Some(rest) = entry.strip_prefix("mcp__") {
 			if all_servers.iter().any(|s| {
 				let s_san = sanitize_mcp_tool_name_part(s, "server");
@@ -5815,10 +5820,12 @@ pub(crate) fn flush_tty_stdin() {
 	}
 }
 
-async fn check_or_prompt_stdio_mcp_launch(
+async fn check_or_prompt_mcp_launch(
 	server_name: &str,
 	all_servers: &[String],
-	stdio: &MCPStdioServerConfig,
+	detail: &str,
+	project_source: bool,
+	config: &crate::config::Config,
 	approvals: &crate::approve::Approvals,
 	cancel_token: &pi_agent::CancellationToken,
 ) -> Result<bool> {
@@ -5826,19 +5833,26 @@ async fn check_or_prompt_stdio_mcp_launch(
 		return Err(Error::new("MCP discovery interrupted"));
 	}
 
-	if is_stdio_mcp_launch_allowed_with_servers(server_name, all_servers, approvals) {
+	// A repository-controlled `mcp.json` names the command/URL that runs, so a
+	// host config allow entry for the same server name must not authorize it.
+	// Only trusted `yolo` (project layers cannot set it) or an allow entry the
+	// operator supplied at launch (`--allow`, `PI_CONFIG_FILES`, `--config`)
+	// permits an unprompted project/overridden MCP launch.
+	let auto_allowed = if project_source {
+		approvals.mode == crate::approve::ApprovalMode::Yolo
+			|| allowlist_allows_stdio_launch(server_name, all_servers, &config.explicit_allow)
+	} else {
+		is_stdio_mcp_launch_allowed_with_servers(server_name, all_servers, approvals)
+	};
+	if auto_allowed {
 		return Ok(true);
 	}
 
 	let prompt_name = format!("mcp-server:{server_name}");
-	let detail = format!("{} {}", stdio.command, stdio.args.join(" "));
 	if let Some(approver) = approvals.alternate_approver() {
 		// A front-end (TUI) owns the terminal: ask through its approval surface
 		// instead of spawning a second stdin reader that would steal its keys.
-		let args = serde_json::json!({
-			"command": stdio.command.clone(),
-			"args": stdio.args.clone(),
-		});
+		let args = serde_json::json!({ "detail": detail });
 		let approved = approver.approve(&prompt_name, &args).await.is_ok();
 		if cancel_token.is_cancelled() {
 			return Err(Error::new("MCP discovery interrupted"));
@@ -6078,12 +6092,25 @@ pub async fn filter_and_spawn_mcp_servers_with_paths_detailed(
 			}
 		}
 
+		let project_source = !server.trusted;
 		let mut server_config = server.config;
-		if let MCPServerConfig::Stdio(stdio) = &mut server_config {
-			let allowed = match check_or_prompt_stdio_mcp_launch(
+		let detail = match &server_config {
+			MCPServerConfig::Stdio(stdio) =>
+				format!("{} {}", stdio.command, stdio.args.join(" ")),
+			MCPServerConfig::Http(_) | MCPServerConfig::Sse(_) => "remote MCP server".to_string(),
+		};
+		// Every project-controlled transport needs approval before connect: an
+		// HTTP/SSE handshake already sends configured headers/URL to the
+		// project-selected origin. Host HTTP/SSE stays unprompted; host stdio
+		// keeps its existing launch gate.
+		let needs_gate = project_source || matches!(&server_config, MCPServerConfig::Stdio(_));
+		if needs_gate {
+			let allowed = match check_or_prompt_mcp_launch(
 				&server.name,
 				&all_server_names,
-				stdio,
+				&detail,
+				project_source,
+				config,
 				approvals,
 				cancel_token,
 			)
@@ -6096,14 +6123,26 @@ pub async fn filter_and_spawn_mcp_servers_with_paths_detailed(
 				},
 			};
 			if !allowed {
+				let kind = match &server_config {
+					MCPServerConfig::Stdio(_) => "stdio",
+					MCPServerConfig::Http(_) => "http",
+					MCPServerConfig::Sse(_) => "sse",
+				};
 				let err_msg = format!(
-					"MCP server \"{}\" was not launched: stdio launch was not approved",
+					"MCP server \"{}\" was not launched: {kind} launch was not approved",
 					server.name
 				);
 				eprintln!("{err_msg}");
 				server_errors.push((server.name.clone(), err_msg));
 				continue;
 			}
+		}
+		// Project `${ENV}` references stay literal through discovery and the
+		// gate; resolve them only after this source is authorized.
+		if project_source {
+			crate::config::expand_mcp_server_config_env(&mut server_config);
+		}
+		if let MCPServerConfig::Stdio(stdio) = &mut server_config {
 			if stdio.cwd.is_none() {
 				stdio.cwd = Some(cwd.to_string_lossy().to_string());
 			}
