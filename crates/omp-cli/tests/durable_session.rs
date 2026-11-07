@@ -2153,6 +2153,21 @@ async fn reopened_session_preserves_compaction_with_offbranch_sibling_tool_resul
 			.expect("append sibling tool 2");
 	}
 
+	// Reopen session to align tracked across all 4 messages (including off-branch sibling injected via seed_entries):
+	drop(session);
+	let (session, _) =
+		DurableSession::open(db.clone(), "s-sib-replay", header("s-sib-replay", &dir)).expect("open");
+	let full_history = vec![
+		Message::user("do batch"),
+		asst.clone(),
+		Message::tool_with_status("call-1", "effect", "result 1", false),
+		Message::tool_with_status("call-2", "effect", "result 2", false),
+	];
+	session
+		.persist_messages(&full_history)
+		.await
+		.expect("align tracked history of 4 messages");
+
 	// Compaction runs: notice, asst(call1, call2), tool1, tool2.
 	let notice = Message::system(format!(
 		"{}1 earlier turn(s) were pruned to fit the context limit]",
@@ -2167,7 +2182,6 @@ async fn reopened_session_preserves_compaction_with_offbranch_sibling_tool_resul
 	let report = pi_agent::CompactionReport { old_len: 4, kept_from: 1, kept_at: 1 };
 	session.compacted(&compacted, &report).await.expect("compacted");
 	session.persist_messages(&compacted).await.expect("persist compacted");
-
 	let proj_before = session.load().expect("load").projection.expect("has projection");
 	assert!(proj_before.kept.contains(&"msg-tool-sibling-2".to_string()));
 

@@ -2399,8 +2399,8 @@ fn branch_messages_tx(
 	Ok(messages)
 }
 
-fn extract_assistant_tool_call_ids(payload: &Value) -> HashSet<String> {
-	let mut ids = HashSet::new();
+fn extract_assistant_tool_call_counts(payload: &Value) -> HashMap<String, usize> {
+	let mut counts = HashMap::new();
 	let parts = payload
 		.get("message")
 		.and_then(|m| m.get("content"))
@@ -2420,7 +2420,7 @@ fn extract_assistant_tool_call_ids(payload: &Value) -> HashSet<String> {
 					.or_else(|| part.get("tool_call_id"))
 					.and_then(Value::as_str)
 				{
-					ids.insert(id.to_string());
+					*counts.entry(id.to_string()).or_insert(0) += 1;
 				}
 			}
 		}
@@ -2437,11 +2437,24 @@ fn extract_assistant_tool_call_ids(payload: &Value) -> HashSet<String> {
 				.or_else(|| call.get("toolCallId"))
 				.and_then(Value::as_str)
 			{
-				ids.insert(id.to_string());
+				*counts.entry(id.to_string()).or_insert(0) += 1;
 			}
 		}
 	}
-	ids
+	counts
+}
+
+fn decrement_call_count(counts: &mut HashMap<String, usize>, call_id: &str) -> bool {
+	if let Some(count) = counts.get_mut(call_id) {
+		if *count > 0 {
+			*count -= 1;
+			if *count == 0 {
+				counts.remove(call_id);
+			}
+			return true;
+		}
+	}
+	false
 }
 
 fn extract_tool_result_call_id(payload: &Value) -> Option<String> {
@@ -2464,7 +2477,7 @@ fn validate_kept_messages_tx(
 	let branch_msg_map: HashMap<&str, &MessageRecord> =
 		branch_messages.iter().map(|m| (m.id.as_str(), m)).collect();
 
-	let mut pending_tool_calls: HashSet<String> = HashSet::new();
+	let mut pending_tool_calls: HashMap<String, usize> = HashMap::new();
 
 	for id in kept_ids {
 		if let Some(msg) = branch_msg_map.get(id.as_str()) {
@@ -2477,11 +2490,11 @@ fn validate_kept_messages_tx(
 
 			match role {
 				Some("assistant") => {
-					pending_tool_calls = extract_assistant_tool_call_ids(&msg.payload);
+					pending_tool_calls = extract_assistant_tool_call_counts(&msg.payload);
 				},
 				Some("toolResult") => {
 					if let Some(call_id) = extract_tool_result_call_id(&msg.payload) {
-						pending_tool_calls.remove(&call_id);
+						decrement_call_count(&mut pending_tool_calls, &call_id);
 					}
 				},
 				_ => {
@@ -2501,7 +2514,7 @@ fn validate_kept_messages_tx(
 				return Ok(false);
 			};
 
-			let Ok(payload) = decode_json::<Value>(&payload_json) else {
+			let Ok(payload) = decode_json(&payload_json) else {
 				return Ok(false);
 			};
 
@@ -2519,7 +2532,7 @@ fn validate_kept_messages_tx(
 				return Ok(false);
 			};
 
-			if !pending_tool_calls.remove(&call_id) {
+			if !decrement_call_count(&mut pending_tool_calls, &call_id) {
 				return Ok(false);
 			}
 		}
@@ -4235,7 +4248,110 @@ mod tests {
 		let projection = session.payload.get("durableProjection");
 		assert!(projection.is_some(), "durableProjection must be preserved for valid sibling toolResult");
 		let kept = projection.unwrap()["kept"].as_array().expect("kept array");
-		assert_eq!(kept, &json!(["m_asst", "m_tool_offbranch"]).as_array().unwrap());
+		assert_eq!(kept, json!(["m_asst", "m_tool_offbranch"]).as_array().unwrap());
+	}
+
+	#[test]
+	fn reconcile_durable_projection_preserves_compaction_with_duplicate_call_ids() {
+		let mut store = SqliteStore::open_in_memory().expect("open store");
+		store
+			.create_session(NewSession {
+				id: "s_dup".to_string(),
+				parent_session_id: None,
+				payload: json!({
+					"durableProjection": {
+						"kept": ["m_asst", "m_tool_onbranch", "m_tool_offbranch"]
+					}
+				}),
+				initial_branch_id: "b_active".to_string(),
+				initial_branch_payload: json!({}),
+			})
+			.expect("create session");
+
+		// Assistant calls tool "dup-call" TWICE with same provider call id
+		store
+			.append_message(NewMessage {
+				id: "m_asst".to_string(),
+				session_id: "s_dup".to_string(),
+				branch_id: "b_active".to_string(),
+				parent_message_id: None,
+				payload: json!({
+					"type": "message",
+					"id": "m_asst",
+					"message": {
+						"role": "assistant",
+						"content": [
+							{ "type": "toolCall", "id": "dup-call", "name": "bash" },
+							{ "type": "toolCall", "id": "dup-call", "name": "bash" }
+						]
+					}
+				}),
+			})
+			.expect("append m_asst");
+
+		// First tool result is on active branch
+		store
+			.append_message(NewMessage {
+				id: "m_tool_onbranch".to_string(),
+				session_id: "s_dup".to_string(),
+				branch_id: "b_active".to_string(),
+				parent_message_id: Some("m_asst".to_string()),
+				payload: json!({
+					"type": "message",
+					"id": "m_tool_onbranch",
+					"message": {
+						"role": "toolResult",
+						"toolCallId": "dup-call",
+						"toolName": "bash",
+						"content": "res 1"
+					}
+				}),
+			})
+			.expect("append m_tool_onbranch");
+
+		// Second tool result is off-branch on b_other
+		store
+			.create_branch(NewBranch {
+				id: "b_other".to_string(),
+				session_id: "s_dup".to_string(),
+				parent_branch_id: Some("b_active".to_string()),
+				parent_message_id: Some("m_tool_onbranch".to_string()),
+				payload: json!({}),
+			})
+			.expect("create branch b_other");
+
+		store
+			.append_message(NewMessage {
+				id: "m_tool_offbranch".to_string(),
+				session_id: "s_dup".to_string(),
+				branch_id: "b_other".to_string(),
+				parent_message_id: Some("m_tool_onbranch".to_string()),
+				payload: json!({
+					"type": "message",
+					"id": "m_tool_offbranch",
+					"message": {
+						"role": "toolResult",
+						"toolCallId": "dup-call",
+						"toolName": "bash",
+						"content": "res 2"
+					}
+				}),
+			})
+			.expect("append m_tool_offbranch");
+
+		let backfilled = store
+			.reconcile_durable_projection("s_dup")
+			.expect("reconcile must succeed with duplicate call ids");
+		assert_eq!(backfilled, 0);
+
+		let session = store.session("s_dup").expect("get").expect("s");
+		let projection = session.payload.get("durableProjection");
+		assert!(projection.is_some(), "projection must be preserved for duplicate call ids");
+		let kept = projection.unwrap()["kept"].as_array().expect("kept array");
+		assert_eq!(
+			kept,
+			json!(["m_asst", "m_tool_onbranch", "m_tool_offbranch"]).as_array().unwrap()
+		);
 	}
 
 	#[test]
