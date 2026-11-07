@@ -1879,7 +1879,7 @@ mod tests {
 
 		// Opening is a read: the corrupt branch stays available while the seed
 		// carries its projection error.
-		let reopened = DurableSession::open(&path, "corrupt", header("corrupt", None))
+		let (reopened, _) = DurableSession::open(&path, "corrupt", header("corrupt", None))
 			.expect("a corrupt branch must stay readable");
 		let before = reopened.load().expect("read").branch_messages.len();
 		assert_eq!(before, 2, "both stored rows must load");
