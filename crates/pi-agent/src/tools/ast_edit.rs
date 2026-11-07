@@ -21,7 +21,7 @@
 use std::{
 	collections::{BTreeMap, BTreeSet, HashMap},
 	path::PathBuf,
-	sync::{Arc, Mutex},
+	sync::Arc,
 };
 
 use async_trait::async_trait;
