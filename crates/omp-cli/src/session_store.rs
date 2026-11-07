@@ -23,7 +23,7 @@
 //!   at-least-once; marking processed is not implied by handing it to a context.
 
 use std::{
-	collections::HashSet,
+	collections::{HashMap, HashSet},
 	path::{Path, PathBuf},
 	sync::atomic::{AtomicU64, Ordering},
 	time::{SystemTime, UNIX_EPOCH},
@@ -32,7 +32,7 @@ use std::{
 use rusqlite::{
 	Connection, OptionalExtension as _, Transaction, TransactionBehavior, params,
 };
-use serde_json::Value;
+use serde_json::{Value, json};
 
 /// Current schema version. Bump only with a new branch in [`SqliteStore::initialize`].
 pub const SCHEMA_VERSION: i64 = 1;
@@ -301,6 +301,21 @@ pub struct UnresolvedIntent {
 	pub tool_name: String,
 	pub payload: Value,
 	pub created_at_ms: i64,
+}
+
+/// Execution row in the store, recording intent and optional terminal outcome.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ExecutionRecord {
+	pub seq: i64,
+	pub execution_id: String,
+	pub session_id: String,
+	pub branch_id: String,
+	pub provider_call_id: String,
+	pub tool_name: String,
+	pub intent: Value,
+	pub created_at_ms: i64,
+	pub outcome: Option<Value>,
+	pub outcome_at_ms: Option<i64>,
 }
 
 /// Worker completion and the parent notification that must commit with it.
@@ -735,6 +750,119 @@ impl SqliteStore {
 		Ok(())
 	}
 
+	/// Atomically cut to a new branch: create the new branch, switch active branch,
+	/// clear durableProjection from the session payload, and append the branch summary message.
+	/// All committed in a single IMMEDIATE transaction.
+	pub fn cut_branch(
+		&mut self,
+		branch: NewBranch,
+		summary_message: NewMessage,
+	) -> StoreResult<()> {
+		validate_id("branch id", &branch.id)?;
+		validate_id("branch session id", &branch.session_id)?;
+		validate_id("summary message id", &summary_message.id)?;
+		validate_id("summary session id", &summary_message.session_id)?;
+		validate_id("summary branch id", &summary_message.branch_id)?;
+		if branch.session_id != summary_message.session_id {
+			return Err(StoreError::Validation(
+				"branch and summary message session ids do not match".to_string(),
+			));
+		}
+		if branch.id != summary_message.branch_id {
+			return Err(StoreError::Validation(
+				"summary message branch id does not match new branch id".to_string(),
+			));
+		}
+		let now = now_ms();
+		let transaction = self
+			.connection
+			.transaction_with_behavior(TransactionBehavior::Immediate)?;
+
+		// Validate session exists
+		let session_row: Option<(String, Option<String>)> = transaction
+			.query_row(
+				"SELECT payload_json, active_branch_id FROM sessions WHERE id = ?1",
+				params![branch.session_id],
+				|row| Ok((row.get(0)?, row.get(1)?)),
+			)
+			.optional()?;
+		let Some((session_payload_json, _active_branch)) = session_row else {
+			return Err(StoreError::NotFound(format!(
+				"session {} not found",
+				branch.session_id
+			)));
+		};
+
+		// Validate branch does not already exist
+		let exists: bool = transaction.query_row(
+			"SELECT COUNT(*) > 0 FROM branches WHERE id = ?1",
+			params![branch.id],
+			|row| row.get(0),
+		)?;
+		if exists {
+			return Err(StoreError::Conflict(format!("branch {} already exists", branch.id)));
+		}
+		match (&branch.parent_branch_id, &branch.parent_message_id) {
+			(None, None) => {},
+			(None, Some(_)) => {
+				return Err(StoreError::Validation(
+					"branch point message requires a parent branch".to_string(),
+				));
+			},
+			(Some(_), None) => {
+				return Err(StoreError::Validation(
+					"parent branch requires an explicit branch point message".to_string(),
+				));
+			},
+			(Some(parent_branch_id), Some(parent_message_id)) => {
+				validate_id("parent branch id", parent_branch_id)?;
+				validate_id("parent message id", parent_message_id)?;
+				if !branch_point_on_ancestry(
+					&transaction,
+					parent_branch_id,
+					&branch.session_id,
+					parent_message_id,
+				)? {
+					return Err(StoreError::Validation(
+						"branch point message is not on the declared parent branch ancestry"
+							.to_string(),
+					));
+				}
+			},
+		}
+
+		transaction.execute(
+			"INSERT INTO branches \
+			 (id, session_id, parent_branch_id, parent_message_id, leaf_message_id, payload_json, created_at_ms) \
+			 VALUES (?1, ?2, ?3, ?4, NULL, ?5, ?6)",
+			params![
+				branch.id,
+				branch.session_id,
+				branch.parent_branch_id,
+				branch.parent_message_id,
+				encode_json(&branch.payload)?,
+				now
+			],
+		)?;
+
+		// Update session: switch active_branch_id and clear durableProjection
+		let mut session_payload: Value = decode_json(&session_payload_json)?;
+		if let Some(map) = session_payload.as_object_mut() {
+			map.remove("durableProjection");
+		}
+		let updated_payload_json = encode_json(&session_payload)?;
+		transaction.execute(
+			"UPDATE sessions SET active_branch_id = ?1, payload_json = ?2, updated_at_ms = ?3 WHERE id = ?4",
+			params![branch.id, updated_payload_json, now, branch.session_id],
+		)?;
+
+		// Append the summary message on the new branch
+		append_message_tx(&transaction, &summary_message, now)?;
+
+		transaction.commit()?;
+		Ok(())
+	}
+
 	/// Append one message to an explicit branch. The branch leaf advances; the
 	/// session's active branch does not change.
 	pub fn append_message(&mut self, message: NewMessage) -> StoreResult<()> {
@@ -897,62 +1025,441 @@ impl SqliteStore {
 	/// errors still propagate to the caller; this is not a no-busy guarantee.
 	pub fn record_outcome(&mut self, execution_id: &str, outcome: Value) -> StoreResult<()> {
 		validate_id("execution id", execution_id)?;
-		let encoded = encode_json(&outcome)?;
 		let now = now_ms();
 		let transaction = self
 			.connection
 			.transaction_with_behavior(TransactionBehavior::Immediate)?;
-		let existing: Option<Option<String>> = transaction
+		record_outcome_tx(&transaction, execution_id, &outcome, now)?;
+		transaction.commit()?;
+		Ok(())
+	}
+
+	/// Atomically persist a terminal outcome and its corresponding tool-result
+	/// message within a single `IMMEDIATE` transaction.
+	///
+	/// Preserves branch/leaf stale checks: if `message.parent_message_id` does
+	/// not match the branch's current leaf, validation fails and neither row is
+	/// committed.
+	/// Repeating the exact same outcome and message is idempotent. Any conflicting
+	/// outcome or lineage mismatch is rejected without updating either row.
+	pub fn record_outcome_with_message(
+		&mut self,
+		execution_id: &str,
+		outcome: Value,
+		message: NewMessage,
+	) -> StoreResult<bool> {
+		validate_id("execution id", execution_id)?;
+		validate_id("message id", &message.id)?;
+		validate_id("message session id", &message.session_id)?;
+		validate_id("message branch id", &message.branch_id)?;
+		let now = now_ms();
+		let transaction = self
+			.connection
+			.transaction_with_behavior(TransactionBehavior::Immediate)?;
+
+		let exec_meta: Option<(String, String, String, String)> = transaction
 			.query_row(
-				"SELECT outcome_json FROM executions WHERE execution_id = ?1",
+				"SELECT session_id, branch_id, provider_call_id, tool_name FROM executions WHERE execution_id = ?1",
 				params![execution_id],
-				|row| row.get(0),
+				|row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
 			)
 			.optional()?;
-		let Some(existing) = existing else {
+		let Some((exec_session, exec_branch, exec_call_id, exec_tool_name)) = exec_meta else {
 			return Err(StoreError::NotFound(format!(
 				"execution {execution_id} does not exist"
 			)));
 		};
-		if let Some(existing) = existing {
-			let existing = decode_json(&existing)?;
-			if existing == outcome {
-				transaction.commit()?;
-				return Ok(());
+		if exec_session != message.session_id {
+			return Err(StoreError::Validation(format!(
+				"execution {execution_id} belongs to session {exec_session}, not {}",
+				message.session_id
+			)));
+		}
+		if exec_branch != message.branch_id {
+			return Err(StoreError::Validation(format!(
+				"execution {execution_id} belongs to branch {exec_branch}, not {}",
+				message.branch_id
+			)));
+		}
+
+		let msg_call_id = message
+			.payload
+			.get("message")
+			.and_then(|m| m.get("toolCallId"))
+			.or_else(|| message.payload.get("toolCallId"))
+			.or_else(|| message.payload.get("tool_call_id"))
+			.and_then(Value::as_str);
+		if let Some(call_id) = msg_call_id {
+			if call_id != exec_call_id {
+				return Err(StoreError::Validation(format!(
+					"message tool call id {call_id} does not match execution provider call id {exec_call_id}"
+				)));
 			}
-			return Err(StoreError::Conflict(format!(
-				"execution {execution_id} already has a different terminal outcome"
-			)));
 		}
-		let changed = transaction.execute(
-			"UPDATE executions SET outcome_json = ?1, outcome_at_ms = ?2 \
-			 WHERE execution_id = ?3 AND outcome_json IS NULL",
-			params![encoded, now, execution_id],
-		)?;
-		if changed != 1 {
-			return Err(StoreError::Corrupt(format!(
-				"execution {execution_id} changed while recording its outcome"
-			)));
+
+		let msg_tool_name = message
+			.payload
+			.get("message")
+			.and_then(|m| m.get("toolName"))
+			.or_else(|| message.payload.get("toolName"))
+			.or_else(|| message.payload.get("tool_name"))
+			.and_then(Value::as_str);
+		if let Some(tool_name) = msg_tool_name {
+			if tool_name != exec_tool_name {
+				return Err(StoreError::Validation(format!(
+					"message tool name {tool_name} does not match execution tool name {exec_tool_name}"
+				)));
+			}
 		}
-		transaction.commit()?;
-		Ok(())
+
+		let msg_exec_id = message
+			.payload
+			.get("message")
+			.and_then(|m| m.get("details"))
+			.or_else(|| message.payload.get("details"))
+			.and_then(|d| d.get("executionId"))
+			.and_then(Value::as_str);
+		if let Some(eid) = msg_exec_id {
+			if eid != execution_id {
+				return Err(StoreError::Validation(format!(
+					"message execution id {eid} does not match execution id {execution_id}"
+				)));
+			}
+		}
+
+		let newly_recorded = record_outcome_tx(&transaction, execution_id, &outcome, now)?;
+		if newly_recorded {
+			append_message_tx(&transaction, &message, now)?;
+			update_projection_kept_tx(&transaction, &message.session_id, &message.id, now)?;
+			transaction.commit()?;
+			Ok(true)
+		} else {
+			let existing_msg_id: Option<String> = transaction
+				.query_row(
+					"SELECT id FROM messages WHERE branch_id = ?1 AND ( \
+						 json_extract(payload_json, '$.message.details.executionId') = ?2 OR \
+						 json_extract(payload_json, '$.details.executionId') = ?2 \
+					 ) LIMIT 1",
+					params![message.branch_id, execution_id],
+					|row| row.get(0),
+				)
+				.optional()?;
+			if existing_msg_id.is_some() {
+				transaction.commit()?;
+				Ok(false)
+			} else {
+				append_message_tx(&transaction, &message, now)?;
+				update_projection_kept_tx(&transaction, &message.session_id, &message.id, now)?;
+				transaction.commit()?;
+				Ok(true)
+			}
+		}
+	}
+
+	/// Read an execution record by id, returning `None` when the execution does not exist.
+	pub fn execution(&self, execution_id: &str) -> StoreResult<Option<ExecutionRecord>> {
+		let row = self
+			.connection
+			.query_row(
+				"SELECT seq, execution_id, session_id, branch_id, provider_call_id, tool_name, \
+				 intent_json, created_at_ms, outcome_json, outcome_at_ms \
+				 FROM executions WHERE execution_id = ?1",
+				params![execution_id],
+				|row| {
+					Ok((
+						row.get::<_, i64>(0)?,
+						row.get::<_, String>(1)?,
+						row.get::<_, String>(2)?,
+						row.get::<_, String>(3)?,
+						row.get::<_, String>(4)?,
+						row.get::<_, String>(5)?,
+						row.get::<_, String>(6)?,
+						row.get::<_, i64>(7)?,
+						row.get::<_, Option<String>>(8)?,
+						row.get::<_, Option<i64>>(9)?,
+					))
+				},
+			)
+			.optional()?;
+		let Some((
+			seq,
+			execution_id,
+			session_id,
+			branch_id,
+			provider_call_id,
+			tool_name,
+			intent_json,
+			created_at_ms,
+			outcome_json,
+			outcome_at_ms,
+		)) = row
+		else {
+			return Ok(None);
+		};
+		let intent = decode_json(&intent_json)?;
+		let outcome = match outcome_json {
+			Some(json) => Some(decode_json(&json)?),
+			None => None,
+		};
+		Ok(Some(ExecutionRecord {
+			seq,
+			execution_id,
+			session_id,
+			branch_id,
+			provider_call_id,
+			tool_name,
+			intent,
+			created_at_ms,
+			outcome,
+			outcome_at_ms,
+		}))
 	}
 
 	/// Read a terminal outcome, or `None` when the execution is unresolved or
 	/// unknown.
 	pub fn outcome(&self, execution_id: &str) -> StoreResult<Option<Value>> {
-		let row: Option<Option<String>> = self
-			.connection
-			.query_row(
-				"SELECT outcome_json FROM executions WHERE execution_id = ?1",
-				params![execution_id],
-				|row| row.get(0),
-			)
-			.optional()?;
-		match row.flatten() {
-			Some(json) => Ok(Some(decode_json(&json)?)),
-			None => Ok(None),
+		self.execution(execution_id).map(|rec| rec.and_then(|r| r.outcome))
+	}
+
+	/// Executions that have a terminal outcome recorded in SQLite, but no corresponding
+	/// tool-result message in `messages`.
+	pub fn executions_needing_recovery(
+		&self,
+		session_id: &str,
+	) -> StoreResult<Vec<ExecutionRecord>> {
+		let mut stmt = self.connection.prepare(
+			"SELECT seq, execution_id, session_id, branch_id, provider_call_id, tool_name, \
+			 intent_json, created_at_ms, outcome_json, outcome_at_ms \
+			 FROM executions \
+			 WHERE session_id = ?1 AND outcome_json IS NOT NULL \
+			 ORDER BY seq",
+		)?;
+		let exec_rows = stmt.query_map(params![session_id], |row| {
+			Ok((
+				row.get::<_, i64>(0)?,
+				row.get::<_, String>(1)?,
+				row.get::<_, String>(2)?,
+				row.get::<_, String>(3)?,
+				row.get::<_, String>(4)?,
+				row.get::<_, String>(5)?,
+				row.get::<_, String>(6)?,
+				row.get::<_, i64>(7)?,
+				row.get::<_, Option<String>>(8)?,
+				row.get::<_, Option<i64>>(9)?,
+			))
+		})?;
+		let mut executions = Vec::new();
+		for row in exec_rows {
+			let (
+				seq,
+				execution_id,
+				session_id,
+				branch_id,
+				provider_call_id,
+				tool_name,
+				intent_json,
+				created_at_ms,
+				outcome_json,
+				outcome_at_ms,
+			) = row?;
+			let intent = decode_json(&intent_json)?;
+			let outcome = match outcome_json {
+				Some(json) => Some(decode_json(&json)?),
+				None => None,
+			};
+			executions.push(ExecutionRecord {
+				seq,
+				execution_id,
+				session_id,
+				branch_id,
+				provider_call_id,
+				tool_name,
+				intent,
+				created_at_ms,
+				outcome,
+				outcome_at_ms,
+			});
 		}
+
+		if executions.is_empty() {
+			return Ok(Vec::new());
+		}
+
+		let messages = self.session_messages(session_id)?;
+		let mut messaged_execution_ids: HashSet<String> = HashSet::new();
+		let mut legacy_messages_by_branch_call: HashMap<(String, String), usize> = HashMap::new();
+
+		for msg in messages {
+			let val = &msg.payload;
+			let exec_id = val
+				.get("message")
+				.and_then(|m| m.get("details"))
+				.or_else(|| val.get("details"))
+				.and_then(|d| d.get("executionId"))
+				.and_then(Value::as_str);
+			if let Some(id) = exec_id {
+				messaged_execution_ids.insert(id.to_string());
+			} else {
+				let role = val
+					.get("message")
+					.and_then(|m| m.get("role"))
+					.or_else(|| val.get("role"))
+					.and_then(Value::as_str);
+				if role == Some("toolResult") {
+					let call_id = val
+						.get("message")
+						.and_then(|m| m.get("toolCallId"))
+						.or_else(|| val.get("toolCallId"))
+						.or_else(|| val.get("tool_call_id"))
+						.and_then(Value::as_str);
+					if let Some(call_id) = call_id {
+						*legacy_messages_by_branch_call
+							.entry((msg.branch_id.clone(), call_id.to_string()))
+							.or_insert(0) += 1;
+					}
+				}
+			}
+		}
+
+		let mut needing_recovery = Vec::new();
+		for exec in executions {
+			if messaged_execution_ids.contains(&exec.execution_id) {
+				continue;
+			}
+			let key = (exec.branch_id.clone(), exec.provider_call_id.clone());
+			if let Some(count) = legacy_messages_by_branch_call.get_mut(&key) {
+				if *count > 0 {
+					*count -= 1;
+					continue;
+ 				}
+ 			}
+			needing_recovery.push(exec);
+		}
+
+		Ok(needing_recovery)
+	}
+
+	/// Recover executions that have an outcome recorded in SQLite but no message on the branch.
+	/// Appends recovered toolResult messages only when safely resolvable (active branch leaf matches
+	/// the assistant turn that made the call). Returns number of recovered messages.
+	pub fn recover_unmessaged_outcomes(&mut self, session_id: &str) -> StoreResult<usize> {
+		let needing = self.executions_needing_recovery(session_id)?;
+		if needing.is_empty() {
+			return Ok(0);
+		}
+		let Some(session) = self.session(session_id)? else {
+			return Ok(0);
+		};
+		let Some(active_branch_id) = session.active_branch_id else {
+			return Ok(0);
+		};
+
+		let mut recovered_count = 0;
+		for exec in needing {
+			if exec.branch_id != active_branch_id {
+				continue;
+			}
+			let Some(branch) = self.branch(&active_branch_id)? else {
+				continue;
+			};
+			let Some(leaf_id) = branch.leaf_message_id else {
+				continue;
+			};
+			let Some(leaf_msg) = self.message(&leaf_id)? else {
+				continue;
+			};
+
+			let is_matching_assistant = is_assistant_with_call(&leaf_msg.payload, &exec.provider_call_id);
+			let is_matching_sibling_tool =
+				is_sibling_tool_result(self, &leaf_msg, &exec.provider_call_id)?;
+
+			if !is_matching_assistant && !is_matching_sibling_tool {
+				continue;
+			}
+
+			let Some(outcome) = &exec.outcome else {
+				continue;
+			};
+			let content = outcome
+				.get("content")
+				.and_then(Value::as_str)
+				.unwrap_or("")
+				.to_string();
+			let is_error = outcome
+				.get("isError")
+				.and_then(Value::as_bool)
+				.unwrap_or(false);
+			let mut details = outcome.get("details").cloned().unwrap_or_else(|| json!({}));
+			if let Some(map) = details.as_object_mut() {
+				map.insert("executionId".to_string(), json!(exec.execution_id));
+				map.insert("recovered".to_string(), json!(true));
+			} else {
+				let mut map = serde_json::Map::new();
+				map.insert("value".to_string(), details);
+				map.insert("executionId".to_string(), json!(exec.execution_id));
+				map.insert("recovered".to_string(), json!(true));
+				details = Value::Object(map);
+			}
+
+			let now_time = SystemTime::now();
+			let iso_ts = crate::output::iso8601(now_time);
+			let now = now_ms();
+			let msg_id = format!("msg-rec-{}", exec.execution_id);
+			let sess_msg = json!({
+				"role": "toolResult",
+				"toolCallId": exec.provider_call_id,
+				"toolName": exec.tool_name,
+				"content": content,
+				"isError": is_error,
+				"timestamp": now,
+				"details": details,
+			});
+			let entry = json!({
+				"type": "message",
+				"id": msg_id,
+				"parentId": leaf_id,
+				"timestamp": iso_ts,
+				"message": sess_msg,
+			});
+
+			let new_msg = NewMessage {
+				id: msg_id.clone(),
+				session_id: exec.session_id.clone(),
+				branch_id: active_branch_id.clone(),
+				parent_message_id: Some(leaf_id),
+				payload: entry,
+			};
+
+			let transaction = self
+				.connection
+				.transaction_with_behavior(TransactionBehavior::Immediate)?;
+
+			append_message_tx(&transaction, &new_msg, now)?;
+			update_projection_kept_tx(&transaction, &exec.session_id, &msg_id, now)?;
+			transaction.commit()?;
+			recovered_count += 1;
+		}
+
+		Ok(recovered_count)
+	}
+
+	/// Reconcile a session's `durableProjection.kept` with the active branch suffix.
+	///
+	/// Reads, computes, and updates within a single IMMEDIATE transaction so
+	/// concurrent updates cannot resurrect a stale or cleared projection.
+	/// Validates the entire branch suffix lineage, but only backfills conversation
+	/// messages (filtering out metadata rows like branch_summary or custom).
+	/// If the projection contains messages not on the active branch, fails closed
+	/// with `StoreError::Corrupt` without altering branch history.
+	pub fn reconcile_durable_projection(&mut self, session_id: &str) -> StoreResult<usize> {
+		validate_id("session id", session_id)?;
+		let now = now_ms();
+		let transaction = self
+			.connection
+			.transaction_with_behavior(TransactionBehavior::Immediate)?;
+		let count = reconcile_durable_projection_tx(&transaction, session_id, now)?;
+		transaction.commit()?;
+		Ok(count)
 	}
 
 	/// Intents with no terminal outcome. Presence here is not proof the effect
@@ -1742,6 +2249,378 @@ fn append_message_tx(
 	Ok(())
 }
 
+fn record_outcome_tx(
+	transaction: &Transaction<'_>,
+	execution_id: &str,
+	outcome: &Value,
+	now: i64,
+) -> StoreResult<bool> {
+	validate_id("execution id", execution_id)?;
+	let encoded = encode_json(outcome)?;
+	let existing: Option<Option<String>> = transaction
+		.query_row(
+			"SELECT outcome_json FROM executions WHERE execution_id = ?1",
+			params![execution_id],
+			|row| row.get(0),
+		)
+		.optional()?;
+	let Some(existing) = existing else {
+		return Err(StoreError::NotFound(format!(
+			"execution {execution_id} does not exist"
+		)));
+	};
+	if let Some(existing) = existing {
+		let existing = decode_json(&existing)?;
+		if existing == *outcome {
+			return Ok(false);
+		}
+		return Err(StoreError::Conflict(format!(
+			"execution {execution_id} already has a different terminal outcome"
+		)));
+	}
+	let changed = transaction.execute(
+		"UPDATE executions SET outcome_json = ?1, outcome_at_ms = ?2 \
+		 WHERE execution_id = ?3 AND outcome_json IS NULL",
+		params![encoded, now, execution_id],
+	)?;
+	if changed != 1 {
+		return Err(StoreError::Corrupt(format!(
+			"execution {execution_id} changed while recording its outcome"
+		)));
+	}
+	Ok(true)
+}
+
+fn update_projection_kept_tx(
+	transaction: &Transaction<'_>,
+	session_id: &str,
+	message_id: &str,
+	now: i64,
+) -> StoreResult<()> {
+	let session_payload_json: Option<String> = transaction
+		.query_row(
+			"SELECT payload_json FROM sessions WHERE id = ?1",
+			params![session_id],
+			|row| row.get(0),
+		)
+		.optional()?;
+	let Some(session_payload_json) = session_payload_json else {
+		return Ok(());
+	};
+	let mut session_payload: Value = decode_json(&session_payload_json)?;
+	let mut updated = false;
+	if let Some(map) = session_payload.as_object_mut() {
+		if let Some(proj_val) = map.get_mut("durableProjection") {
+			if let Some(proj_obj) = proj_val.as_object_mut() {
+				if let Some(kept_val) = proj_obj.get_mut("kept") {
+					if let Some(kept_arr) = kept_val.as_array_mut() {
+						if !kept_arr.iter().any(|v| v.as_str() == Some(message_id)) {
+							kept_arr.push(Value::String(message_id.to_string()));
+							updated = true;
+						}
+					}
+				}
+			}
+		}
+	}
+	if updated {
+		let updated_json = encode_json(&session_payload)?;
+		transaction.execute(
+			"UPDATE sessions SET payload_json = ?1, updated_at_ms = ?2 WHERE id = ?3",
+			params![updated_json, now, session_id],
+		)?;
+	}
+	Ok(())
+}
+
+fn branch_messages_tx(
+	transaction: &Transaction<'_>,
+	branch_id: &str,
+) -> StoreResult<Vec<MessageRecord>> {
+	let branch_row: Option<(String, Option<String>, Option<String>)> = transaction
+		.query_row(
+			"SELECT session_id, parent_message_id, leaf_message_id FROM branches WHERE id = ?1",
+			params![branch_id],
+			|row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+		)
+		.optional()?;
+	let Some((session_id, parent_message_id, leaf_message_id)) = branch_row else {
+		return Err(StoreError::NotFound(format!("branch {branch_id} does not exist")));
+	};
+	let mut cursor = leaf_message_id.or(parent_message_id);
+	let mut seen = HashSet::new();
+	let mut messages = Vec::new();
+	while let Some(id) = cursor {
+		if !seen.insert(id.clone()) {
+			return Err(StoreError::Corrupt(format!(
+				"branch {branch_id} contains a message cycle at {id}"
+			)));
+		}
+		let msg_row: Option<(i64, String, String, String, Option<String>, String, i64)> = transaction
+			.query_row(
+				"SELECT seq, id, session_id, branch_id, parent_message_id, payload_json, created_at_ms \
+				 FROM messages WHERE id = ?1",
+				params![id],
+				|row| {
+					Ok((
+						row.get(0)?,
+						row.get(1)?,
+						row.get(2)?,
+						row.get(3)?,
+						row.get(4)?,
+						row.get(5)?,
+						row.get(6)?,
+					))
+				},
+			)
+			.optional()?;
+		let Some((seq, id, msg_session, msg_branch, parent, payload_json, created_at_ms)) = msg_row else {
+			return Err(StoreError::Corrupt(format!(
+				"branch {branch_id} references missing message {id}"
+			)));
+		};
+		if msg_session != session_id {
+			return Err(StoreError::Corrupt(format!(
+				"branch {branch_id} chain crosses into session {msg_session} at {id}"
+			)));
+		}
+		cursor = parent.clone();
+		messages.push(MessageRecord {
+			id,
+			session_id: msg_session,
+			branch_id: msg_branch,
+			parent_message_id: parent,
+			payload: decode_json(&payload_json)?,
+			seq,
+			created_at_ms,
+		});
+	}
+	messages.reverse();
+	Ok(messages)
+}
+
+fn reconcile_durable_projection_tx(
+	transaction: &Transaction<'_>,
+	session_id: &str,
+	now: i64,
+) -> StoreResult<usize> {
+	let session_row: Option<(Option<String>, String)> = transaction
+		.query_row(
+			"SELECT active_branch_id, payload_json FROM sessions WHERE id = ?1",
+			params![session_id],
+			|row| Ok((row.get(0)?, row.get(1)?)),
+		)
+		.optional()?;
+	let Some((active_branch_id, payload_json)) = session_row else {
+		return Ok(0);
+	};
+	let Some(active_branch_id) = active_branch_id else {
+		return Ok(0);
+	};
+	let mut session_payload: Value = decode_json(&payload_json)?;
+	let Some(proj_val) = session_payload.get_mut("durableProjection") else {
+		return Ok(0);
+	};
+	let Some(proj_obj) = proj_val.as_object_mut() else {
+		return Ok(0);
+	};
+	let Some(kept_val) = proj_obj.get_mut("kept") else {
+		return Ok(0);
+	};
+	let Some(kept_arr) = kept_val.as_array_mut() else {
+		return Ok(0);
+	};
+
+	let kept_ids: Vec<String> = kept_arr
+		.iter()
+		.filter_map(Value::as_str)
+		.map(str::to_string)
+		.collect();
+
+	if kept_ids.is_empty() {
+		return Ok(0);
+	}
+
+	let branch_messages = branch_messages_tx(transaction, &active_branch_id)?;
+	if branch_messages.is_empty() {
+		return Ok(0);
+	}
+
+	let branch_id_set: HashSet<&str> = branch_messages.iter().map(|m| m.id.as_str()).collect();
+
+	// Check if kept_ids has messages not on the active branch:
+	// A projection belongs to the active branch only if all its branch-referenced messages exist on this branch.
+	// If kept contains messages from a diverged/stale branch cut, discard it safely from SQLite payload!
+	for id in &kept_ids {
+		if !branch_id_set.contains(id.as_str()) {
+			session_payload.as_object_mut().unwrap().remove("durableProjection");
+			let updated_json = encode_json(&session_payload)?;
+			transaction.execute(
+				"UPDATE sessions SET payload_json = ?1, updated_at_ms = ?2 WHERE id = ?3",
+				params![updated_json, now, session_id],
+			)?;
+			return Ok(0);
+		}
+	}
+
+	let mut last_kept_idx: Option<usize> = None;
+	let kept_set: HashSet<&str> = kept_ids.iter().map(String::as_str).collect();
+
+	for (idx, msg) in branch_messages.iter().enumerate() {
+		if kept_set.contains(msg.id.as_str()) {
+			last_kept_idx = Some(idx);
+		}
+	}
+
+	let Some(last_kept_idx) = last_kept_idx else {
+		return Err(StoreError::Corrupt(format!(
+			"session {session_id} durable projection has no messages on active branch {active_branch_id}"
+		)));
+	};
+
+	let suffix = &branch_messages[last_kept_idx + 1..];
+	if suffix.is_empty() {
+		return Ok(0);
+	}
+
+	// Validate the suffix: each message must be a valid confirmed branch message chaining from the previous
+	let mut backfill_ids = Vec::new();
+	let mut expected_parent = Some(branch_messages[last_kept_idx].id.clone());
+
+	for msg in suffix {
+		if msg.parent_message_id != expected_parent {
+			return Err(StoreError::Corrupt(format!(
+				"broken lineage in branch suffix at message {}: expected parent {:?}, found {:?}",
+				msg.id, expected_parent, msg.parent_message_id
+			)));
+		}
+		expected_parent = Some(msg.id.clone());
+
+		// Defect 1: only conversation messages (not metadata rows like branch_summary, custom, etc.) go into kept!
+		let is_message = msg.payload.get("type").and_then(Value::as_str) == Some("message");
+		if is_message {
+			backfill_ids.push(msg.id.clone());
+		}
+	}
+
+	if backfill_ids.is_empty() {
+		return Ok(0);
+	}
+
+	for id in &backfill_ids {
+		if !kept_arr.iter().any(|v| v.as_str() == Some(id.as_str())) {
+			kept_arr.push(Value::String(id.clone()));
+		}
+	}
+
+	let updated_json = encode_json(&session_payload)?;
+	transaction.execute(
+		"UPDATE sessions SET payload_json = ?1, updated_at_ms = ?2 WHERE id = ?3",
+		params![updated_json, now, session_id],
+	)?;
+
+	Ok(backfill_ids.len())
+}
+
+fn is_assistant_with_call(payload: &Value, provider_call_id: &str) -> bool {
+	let role = payload
+		.get("message")
+		.and_then(|m| m.get("role"))
+		.or_else(|| payload.get("role"))
+		.and_then(Value::as_str);
+	if role != Some("assistant") {
+		return false;
+	}
+	let parts = payload
+		.get("message")
+		.and_then(|m| m.get("content"))
+		.or_else(|| payload.get("content"))
+		.or_else(|| payload.get("parts"));
+	if let Some(parts) = parts.and_then(Value::as_array) {
+		for part in parts {
+			let is_tool_call = part
+				.get("type")
+				.or_else(|| part.get("kind"))
+				.and_then(Value::as_str)
+				== Some("toolCall");
+			if is_tool_call {
+				let id = part
+					.get("id")
+					.or_else(|| part.get("toolCallId"))
+					.or_else(|| part.get("tool_call_id"))
+					.and_then(Value::as_str);
+				if id == Some(provider_call_id) {
+					return true;
+				}
+			}
+		}
+	}
+	let tool_calls = payload
+		.get("message")
+		.and_then(|m| m.get("tool_calls"))
+		.or_else(|| payload.get("tool_calls"))
+		.or_else(|| payload.get("toolCalls"));
+	if let Some(tool_calls) = tool_calls.and_then(Value::as_array) {
+		for call in tool_calls {
+			let id = call
+				.get("id")
+				.or_else(|| call.get("toolCallId"))
+				.and_then(Value::as_str);
+			if id == Some(provider_call_id) {
+				return true;
+			}
+		}
+	}
+	false
+}
+
+fn is_sibling_tool_result(
+	store: &SqliteStore,
+	leaf_msg: &MessageRecord,
+	provider_call_id: &str,
+) -> StoreResult<bool> {
+	let mut cursor = Some(leaf_msg.clone());
+	let mut seen = HashSet::new();
+	let mut answered_calls = HashSet::new();
+
+	while let Some(msg) = cursor {
+		if !seen.insert(msg.id.clone()) {
+			break;
+		}
+		let payload = &msg.payload;
+		let role = payload
+			.get("message")
+			.and_then(|m| m.get("role"))
+			.or_else(|| payload.get("role"))
+			.and_then(Value::as_str);
+
+		if role == Some("toolResult") {
+			let call_id = payload
+				.get("message")
+				.and_then(|m| m.get("toolCallId"))
+				.or_else(|| payload.get("toolCallId"))
+				.or_else(|| payload.get("tool_call_id"))
+				.and_then(Value::as_str);
+			if let Some(call_id) = call_id {
+				answered_calls.insert(call_id.to_string());
+			}
+			cursor = msg
+				.parent_message_id
+				.and_then(|id| store.message(&id).ok().flatten());
+		} else if role == Some("assistant") {
+			if is_assistant_with_call(payload, provider_call_id) {
+				if !answered_calls.contains(provider_call_id) {
+					return Ok(true);
+				}
+			}
+			break;
+		} else {
+			break;
+		}
+	}
+	Ok(false)
+}
+
 fn branch_point_on_ancestry(
 	transaction: &Transaction<'_>,
 	parent_branch_id: &str,
@@ -2331,5 +3210,990 @@ mod tests {
 		let artifacts = store.artifacts("s1").expect("artifacts");
 		assert_eq!(artifacts.len(), 1);
 		assert_eq!(artifacts[0].branch_id.as_deref(), Some("b2"));
+	}
+
+	#[test]
+	fn record_outcome_with_message_commits_atomically() {
+		let mut store = seeded_store();
+		store.append_message(message("m1", None)).expect("append m1");
+		let execution_id = store
+			.record_intent(NewIntent {
+				session_id: "s1".to_string(),
+				branch_id: "b1".to_string(),
+				provider_call_id: "call-1".to_string(),
+				tool_name: "test_tool".to_string(),
+				payload: json!({ "arg": 1 }),
+			})
+			.expect("record intent");
+
+		let outcome = json!({ "content": "success", "isError": false });
+		let msg = NewMessage {
+			id: "m2".to_string(),
+			session_id: "s1".to_string(),
+			branch_id: "b1".to_string(),
+			parent_message_id: Some("m1".to_string()),
+			payload: json!({
+				"type": "message",
+				"id": "m2",
+				"parentId": "m1",
+				"message": {
+					"role": "toolResult",
+					"toolCallId": "call-1",
+					"toolName": "test_tool",
+					"content": "success",
+					"isError": false,
+					"details": { "executionId": execution_id }
+				}
+			}),
+		};
+
+		let first = store
+			.record_outcome_with_message(&execution_id, outcome.clone(), msg.clone())
+			.expect("atomic record outcome with message");
+		assert!(first, "first record must commit rows");
+
+		// Both outcome and message are committed.
+		assert_eq!(store.outcome(&execution_id).expect("read outcome"), Some(outcome.clone()));
+		let branch = store.branch("b1").expect("read branch").expect("b1");
+		assert_eq!(branch.leaf_message_id.as_deref(), Some("m2"));
+		assert!(store.unresolved_intents("s1").expect("unresolved").is_empty());
+
+		// Duplicate call with exact same message is idempotent no-op.
+		let duplicate = store
+			.record_outcome_with_message(&execution_id, outcome.clone(), msg)
+			.expect("idempotent duplicate");
+		assert!(!duplicate, "duplicate must be a no-op");
+
+		// Duplicate call with DIFFERENT message id is also idempotent no-op (does not duplicate message row or change leaf).
+		let diff_msg = NewMessage {
+			id: "m2_retry_different_id".to_string(),
+			session_id: "s1".to_string(),
+			branch_id: "b1".to_string(),
+			parent_message_id: Some("m1".to_string()),
+			payload: json!({
+				"type": "message",
+				"id": "m2_retry_different_id",
+				"parentId": "m1",
+				"message": {
+					"role": "toolResult",
+					"toolCallId": "call-1",
+					"toolName": "test_tool",
+					"content": "success",
+					"isError": false,
+					"details": { "executionId": execution_id }
+				}
+			}),
+		};
+		let diff_dup = store
+			.record_outcome_with_message(&execution_id, outcome, diff_msg)
+			.expect("duplicate with different message id is idempotent");
+		assert!(!diff_dup, "duplicate with different message id must not append row");
+		let branch = store.branch("b1").expect("read branch").expect("b1");
+		assert_eq!(branch.leaf_message_id.as_deref(), Some("m2"), "leaf must remain m2");
+		assert!(store.message("m2_retry_different_id").expect("read retry").is_none());
+
+		// Conflicting outcome is rejected.
+		let conflict = store.record_outcome_with_message(
+			&execution_id,
+			json!({ "content": "different", "isError": true }),
+			NewMessage {
+				id: "m3".to_string(),
+				session_id: "s1".to_string(),
+				branch_id: "b1".to_string(),
+				parent_message_id: Some("m2".to_string()),
+				payload: json!({ "id": "m3" }),
+			},
+		);
+		assert!(matches!(conflict, Err(StoreError::Conflict(_))));
+	}
+
+	#[test]
+	fn record_outcome_with_message_validates_call_id_linkage() {
+		let mut store = seeded_store();
+		store.append_message(message("m1", None)).expect("append m1");
+		let execution_id = store
+			.record_intent(NewIntent {
+				session_id: "s1".to_string(),
+				branch_id: "b1".to_string(),
+				provider_call_id: "call-expected".to_string(),
+				tool_name: "tool_expected".to_string(),
+				payload: json!({}),
+			})
+			.expect("record intent");
+
+		let outcome = json!({ "content": "ok", "isError": false });
+
+		// Mismatched toolCallId
+		let bad_call_msg = NewMessage {
+			id: "m2".to_string(),
+			session_id: "s1".to_string(),
+			branch_id: "b1".to_string(),
+			parent_message_id: Some("m1".to_string()),
+			payload: json!({
+				"message": {
+					"toolCallId": "call-WRONG",
+					"toolName": "tool_expected"
+				}
+			}),
+		};
+		let err = store.record_outcome_with_message(&execution_id, outcome.clone(), bad_call_msg);
+		assert!(matches!(err, Err(StoreError::Validation(_))));
+
+		// Mismatched toolName
+		let bad_tool_msg = NewMessage {
+			id: "m2".to_string(),
+			session_id: "s1".to_string(),
+			branch_id: "b1".to_string(),
+			parent_message_id: Some("m1".to_string()),
+			payload: json!({
+				"message": {
+					"toolCallId": "call-expected",
+					"toolName": "tool_WRONG"
+				}
+			}),
+		};
+		let err = store.record_outcome_with_message(&execution_id, outcome.clone(), bad_tool_msg);
+		assert!(matches!(err, Err(StoreError::Validation(_))));
+
+		// Mismatched details.executionId
+		let bad_exec_msg = NewMessage {
+			id: "m2".to_string(),
+			session_id: "s1".to_string(),
+			branch_id: "b1".to_string(),
+			parent_message_id: Some("m1".to_string()),
+			payload: json!({
+				"message": {
+					"toolCallId": "call-expected",
+					"toolName": "tool_expected",
+					"details": { "executionId": "other_execution" }
+				}
+			}),
+		};
+		let err = store.record_outcome_with_message(&execution_id, outcome, bad_exec_msg);
+		assert!(matches!(err, Err(StoreError::Validation(_))));
+	}
+	#[test]
+	fn record_outcome_with_message_rolls_back_on_stale_leaf() {
+		let mut store = seeded_store();
+		store.append_message(message("m1", None)).expect("append m1");
+		store.append_message(message("m2", Some("m1"))).expect("append m2");
+
+		let execution_id = store
+			.record_intent(NewIntent {
+				session_id: "s1".to_string(),
+				branch_id: "b1".to_string(),
+				provider_call_id: "call-stale".to_string(),
+				tool_name: "test_tool".to_string(),
+				payload: json!({}),
+			})
+			.expect("record intent");
+
+		// Message chains to stale parent "m1" instead of current leaf "m2".
+		let stale_msg = NewMessage {
+			id: "m3".to_string(),
+			session_id: "s1".to_string(),
+			branch_id: "b1".to_string(),
+			parent_message_id: Some("m1".to_string()),
+			payload: json!({ "id": "m3", "role": "toolResult" }),
+		};
+
+		let outcome = json!({ "content": "should not commit", "isError": false });
+		let err = store.record_outcome_with_message(&execution_id, outcome, stale_msg);
+		assert!(matches!(err, Err(StoreError::Validation(_))));
+
+		// Neither row was committed.
+		assert_eq!(store.outcome(&execution_id).expect("read outcome"), None);
+		let unresolved = store.unresolved_intents("s1").expect("unresolved");
+		assert_eq!(unresolved.len(), 1);
+		assert_eq!(unresolved[0].execution_id, execution_id);
+
+		let branch = store.branch("b1").expect("read branch").expect("b1");
+		assert_eq!(branch.leaf_message_id.as_deref(), Some("m2"));
+		assert!(store.message("m3").expect("read m3").is_none());
+	}
+
+	#[test]
+	fn recover_unmessaged_outcomes_recovers_resolvable_legacy_row() {
+		let mut store = seeded_store();
+		// Assistant message calls tool "call-rec"
+		store
+			.append_message(NewMessage {
+				id: "m_asst".to_string(),
+				session_id: "s1".to_string(),
+				branch_id: "b1".to_string(),
+				parent_message_id: None,
+				payload: json!({
+					"type": "message",
+					"id": "m_asst",
+					"message": {
+						"role": "assistant",
+						"content": [
+							{
+								"type": "toolCall",
+								"id": "call-rec",
+								"name": "bash"
+							}
+						]
+					}
+				}),
+			})
+			.expect("append assistant message");
+
+		let execution_id = store
+			.record_intent(NewIntent {
+				session_id: "s1".to_string(),
+				branch_id: "b1".to_string(),
+				provider_call_id: "call-rec".to_string(),
+				tool_name: "bash".to_string(),
+				payload: json!({ "cmd": "ls" }),
+			})
+			.expect("record intent");
+
+		let outcome = json!({ "content": "file1.txt", "isError": false });
+		// Simulate pre-atomic crash: outcome is committed, but message was not appended.
+		store
+			.record_outcome(&execution_id, outcome.clone())
+			.expect("record outcome");
+
+		let needing = store.executions_needing_recovery("s1").expect("needing recovery");
+		assert_eq!(needing.len(), 1);
+		assert_eq!(needing[0].execution_id, execution_id);
+
+		let recovered_count = store.recover_unmessaged_outcomes("s1").expect("recover");
+		assert_eq!(recovered_count, 1);
+
+		// Now no executions need recovery.
+		assert!(store.executions_needing_recovery("s1").expect("needing").is_empty());
+
+		// Branch leaf has advanced to the recovered toolResult message.
+		let branch = store.branch("b1").expect("read branch").expect("b1");
+		let leaf_id = branch.leaf_message_id.expect("leaf id");
+		let leaf = store.message(&leaf_id).expect("read leaf").expect("leaf message");
+		let payload = &leaf.payload;
+		assert_eq!(payload["message"]["role"], "toolResult");
+		assert_eq!(payload["message"]["toolCallId"], "call-rec");
+		assert_eq!(payload["message"]["details"]["executionId"], execution_id);
+		assert_eq!(payload["message"]["details"]["recovered"], true);
+		assert!(payload["timestamp"].is_string(), "entry timestamp must be ISO string");
+		assert!(payload["message"]["timestamp"].is_number(), "message timestamp must be number");
+
+		// Subsequent recovery call is a no-op.
+		assert_eq!(store.recover_unmessaged_outcomes("s1").expect("recover 2"), 0);
+	}
+
+	#[test]
+	fn recover_unmessaged_outcomes_refuses_when_branch_moved_past() {
+		let mut store = seeded_store();
+		store
+			.append_message(NewMessage {
+				id: "m_asst".to_string(),
+				session_id: "s1".to_string(),
+				branch_id: "b1".to_string(),
+				parent_message_id: None,
+				payload: json!({
+					"type": "message",
+					"id": "m_asst",
+					"message": {
+						"role": "assistant",
+						"content": [
+							{
+								"type": "toolCall",
+								"id": "call-lost",
+								"name": "bash"
+							}
+						]
+					}
+				}),
+			})
+			.expect("append assistant message");
+
+		let execution_id = store
+			.record_intent(NewIntent {
+				session_id: "s1".to_string(),
+				branch_id: "b1".to_string(),
+				provider_call_id: "call-lost".to_string(),
+				tool_name: "bash".to_string(),
+				payload: json!({}),
+			})
+			.expect("record intent");
+
+		store
+			.record_outcome(&execution_id, json!({ "content": "ok", "isError": false }))
+			.expect("record outcome");
+
+		// Branch moves past to a subsequent user message.
+		store
+			.append_message(NewMessage {
+				id: "m_user_next".to_string(),
+				session_id: "s1".to_string(),
+				branch_id: "b1".to_string(),
+				parent_message_id: Some("m_asst".to_string()),
+				payload: json!({
+					"type": "message",
+					"id": "m_user_next",
+					"message": {
+						"role": "user",
+						"content": "next turn"
+					}
+				}),
+			})
+			.expect("append next user turn");
+
+		// Recovery must refuse to attach the tool result after the subsequent user turn.
+		let recovered = store.recover_unmessaged_outcomes("s1").expect("recover");
+		assert_eq!(recovered, 0);
+
+		// Branch leaf remains untouched at m_user_next.
+		let branch = store.branch("b1").expect("branch").expect("b1");
+		assert_eq!(branch.leaf_message_id.as_deref(), Some("m_user_next"));
+	}
+
+	#[test]
+	fn recover_unmessaged_outcomes_skips_legacy_message_without_execution_id() {
+		let mut store = seeded_store();
+		store
+			.append_message(NewMessage {
+				id: "m_asst".to_string(),
+				session_id: "s1".to_string(),
+				branch_id: "b1".to_string(),
+				parent_message_id: None,
+				payload: json!({
+					"type": "message",
+					"id": "m_asst",
+					"message": {
+						"role": "assistant",
+						"content": [
+							{
+								"type": "toolCall",
+								"id": "call-leg-present",
+								"name": "bash"
+							}
+						]
+					}
+				}),
+			})
+			.expect("append assistant message");
+
+		// Legacy tool result message on branch with matching toolCallId but NO details.executionId:
+		store
+			.append_message(NewMessage {
+				id: "m_tool_legacy".to_string(),
+				session_id: "s1".to_string(),
+				branch_id: "b1".to_string(),
+				parent_message_id: Some("m_asst".to_string()),
+				payload: json!({
+					"type": "message",
+					"id": "m_tool_legacy",
+					"message": {
+						"role": "toolResult",
+						"toolCallId": "call-leg-present",
+						"toolName": "bash",
+						"content": "already ran",
+						"isError": false
+					}
+				}),
+			})
+			.expect("append legacy tool message");
+
+		let execution_id = store
+			.record_intent(NewIntent {
+				session_id: "s1".to_string(),
+				branch_id: "b1".to_string(),
+				provider_call_id: "call-leg-present".to_string(),
+				tool_name: "bash".to_string(),
+				payload: json!({}),
+			})
+			.expect("record intent");
+
+		store
+			.record_outcome(&execution_id, json!({ "content": "already ran", "isError": false }))
+			.expect("record outcome");
+
+		// Because a legacy message for call-leg-present already exists, recovery must skip it.
+		let needing = store.executions_needing_recovery("s1").expect("needing recovery");
+		assert!(needing.is_empty(), "execution must not need recovery when legacy message is present");
+
+		let recovered = store.recover_unmessaged_outcomes("s1").expect("recover");
+		assert_eq!(recovered, 0);
+
+		let branch = store.branch("b1").expect("branch").expect("b1");
+		assert_eq!(branch.leaf_message_id.as_deref(), Some("m_tool_legacy"));
+	}
+
+	#[test]
+	fn recover_unmessaged_outcomes_recovers_missing_sibling_when_first_already_persisted() {
+		let mut store = seeded_store();
+		// Assistant calls two tools: call-A and call-B in batch.
+		store
+			.append_message(NewMessage {
+				id: "m_asst".to_string(),
+				session_id: "s1".to_string(),
+				branch_id: "b1".to_string(),
+				parent_message_id: None,
+				payload: json!({
+					"type": "message",
+					"id": "m_asst",
+					"message": {
+						"role": "assistant",
+						"content": [
+							{
+								"type": "toolCall",
+								"id": "call-A",
+								"name": "bash"
+							},
+							{
+								"type": "toolCall",
+								"id": "call-B",
+								"name": "bash"
+							}
+						]
+					}
+				}),
+			})
+			.expect("append batch assistant message");
+
+		let exec_a = store
+			.record_intent(NewIntent {
+				session_id: "s1".to_string(),
+				branch_id: "b1".to_string(),
+				provider_call_id: "call-A".to_string(),
+				tool_name: "bash".to_string(),
+				payload: json!({}),
+			})
+			.expect("intent A");
+		let exec_b = store
+			.record_intent(NewIntent {
+				session_id: "s1".to_string(),
+				branch_id: "b1".to_string(),
+				provider_call_id: "call-B".to_string(),
+				tool_name: "bash".to_string(),
+				payload: json!({}),
+			})
+			.expect("intent B");
+
+		// Tool A finished and its message was appended:
+		store
+			.record_outcome_with_message(
+				&exec_a,
+				json!({ "content": "output A", "isError": false }),
+				NewMessage {
+					id: "m_tool_A".to_string(),
+					session_id: "s1".to_string(),
+					branch_id: "b1".to_string(),
+					parent_message_id: Some("m_asst".to_string()),
+					payload: json!({
+						"type": "message",
+						"id": "m_tool_A",
+						"parentId": "m_asst",
+						"message": {
+							"role": "toolResult",
+							"toolCallId": "call-A",
+							"toolName": "bash",
+							"content": "output A",
+							"isError": false,
+							"details": { "executionId": exec_a }
+						}
+					}),
+				},
+			)
+			.expect("record outcome A with message");
+
+		// Tool B finished in SQLite, but crashed before message was appended:
+		store
+			.record_outcome(&exec_b, json!({ "content": "output B", "isError": false }))
+			.expect("record outcome B");
+
+		// Only B needs recovery:
+		let needing = store.executions_needing_recovery("s1").expect("needing");
+		assert_eq!(needing.len(), 1);
+		assert_eq!(needing[0].execution_id, exec_b);
+
+		// Recovery must see leaf m_tool_A as a valid sibling tool result and attach B to it:
+		let recovered = store.recover_unmessaged_outcomes("s1").expect("recover");
+		assert_eq!(recovered, 1);
+
+		let branch = store.branch("b1").expect("branch").expect("b1");
+		let leaf_id = branch.leaf_message_id.expect("leaf id");
+		let leaf_b = store.message(&leaf_id).expect("message").expect("leaf message");
+		assert_eq!(leaf_b.parent_message_id.as_deref(), Some("m_tool_A"));
+		assert_eq!(leaf_b.payload["message"]["toolCallId"], "call-B");
+		assert_eq!(leaf_b.payload["message"]["details"]["executionId"], exec_b);
+
+		// No more unmessaged outcomes:
+		assert!(store.executions_needing_recovery("s1").expect("needing").is_empty());
+	}
+
+	#[test]
+	fn recover_unmessaged_outcomes_recovers_multiple_unmessaged_batch_results() {
+		let mut store = seeded_store();
+		// Assistant calls two tools: call-A and call-B in batch.
+		store
+			.append_message(NewMessage {
+				id: "m_asst".to_string(),
+				session_id: "s1".to_string(),
+				branch_id: "b1".to_string(),
+				parent_message_id: None,
+				payload: json!({
+					"type": "message",
+					"id": "m_asst",
+					"message": {
+						"role": "assistant",
+						"content": [
+							{
+								"type": "toolCall",
+								"id": "call-A",
+								"name": "bash"
+							},
+							{
+								"type": "toolCall",
+								"id": "call-B",
+								"name": "bash"
+							}
+						]
+					}
+				}),
+			})
+			.expect("append batch assistant message");
+
+		let exec_a = store
+			.record_intent(NewIntent {
+				session_id: "s1".to_string(),
+				branch_id: "b1".to_string(),
+				provider_call_id: "call-A".to_string(),
+				tool_name: "bash".to_string(),
+				payload: json!({}),
+			})
+			.expect("intent A");
+		let exec_b = store
+			.record_intent(NewIntent {
+				session_id: "s1".to_string(),
+				branch_id: "b1".to_string(),
+				provider_call_id: "call-B".to_string(),
+				tool_name: "bash".to_string(),
+				payload: json!({}),
+			})
+			.expect("intent B");
+
+		// Both A and B executed in SQLite, but crash happened before messages were appended.
+		store
+			.record_outcome(&exec_a, json!({ "content": "output A", "isError": false }))
+			.expect("record outcome A");
+		store
+			.record_outcome(&exec_b, json!({ "content": "output B", "isError": false }))
+			.expect("record outcome B");
+
+		let needing = store.executions_needing_recovery("s1").expect("needing");
+		assert_eq!(needing.len(), 2);
+
+		let recovered = store.recover_unmessaged_outcomes("s1").expect("recover");
+		assert_eq!(recovered, 2);
+
+		// Verify chain: m_asst -> msg-rec-A -> msg-rec-B
+		let branch = store.branch("b1").expect("branch").expect("b1");
+		let leaf_id = branch.leaf_message_id.expect("leaf id");
+		let leaf_b = store.message(&leaf_id).expect("message").expect("leaf message");
+		assert_eq!(leaf_b.payload["message"]["toolCallId"], "call-B");
+
+		let leaf_a_id = leaf_b.parent_message_id.expect("parent A");
+		let leaf_a = store.message(&leaf_a_id).expect("message").expect("message A");
+		assert_eq!(leaf_a.parent_message_id.as_deref(), Some("m_asst"));
+		assert_eq!(leaf_a.payload["message"]["toolCallId"], "call-A");
+
+		assert!(store.executions_needing_recovery("s1").expect("needing").is_empty());
+	}
+
+	#[test]
+	fn recover_unmessaged_outcomes_atomically_updates_durable_projection_kept() {
+		let mut store = SqliteStore::open_in_memory().expect("open store");
+		store
+			.create_session(NewSession {
+				id: "s_proj".to_string(),
+				parent_session_id: None,
+				payload: json!({
+					"cwd": "/tmp",
+					"durableProjection": {
+						"kept": ["m_asst"]
+					}
+				}),
+				initial_branch_id: "b1".to_string(),
+				initial_branch_payload: json!({ "kind": "root" }),
+			})
+			.expect("create session with projection");
+
+		store
+			.append_message(NewMessage {
+				id: "m_asst".to_string(),
+				session_id: "s_proj".to_string(),
+				branch_id: "b1".to_string(),
+				parent_message_id: None,
+				payload: json!({
+					"type": "message",
+					"id": "m_asst",
+					"message": {
+						"role": "assistant",
+						"content": [
+							{
+								"type": "toolCall",
+								"id": "call-compact-test",
+								"name": "bash"
+							}
+						]
+					}
+				}),
+			})
+			.expect("append assistant message");
+
+		let execution_id = store
+			.record_intent(NewIntent {
+				session_id: "s_proj".to_string(),
+				branch_id: "b1".to_string(),
+				provider_call_id: "call-compact-test".to_string(),
+				tool_name: "bash".to_string(),
+				payload: json!({}),
+			})
+			.expect("record intent");
+
+		store
+			.record_outcome(&execution_id, json!({ "content": "compact result", "isError": false }))
+			.expect("record outcome");
+
+		let recovered = store.recover_unmessaged_outcomes("s_proj").expect("recover");
+		assert_eq!(recovered, 1);
+
+		let expected_msg_id = format!("msg-rec-{}", execution_id);
+
+		// Verify durableProjection.kept was updated atomically with the message:
+		let session_rec = store.session("s_proj").expect("read session").expect("session");
+		let kept = session_rec
+			.payload
+			.get("durableProjection")
+			.and_then(|p| p.get("kept"))
+			.and_then(Value::as_array)
+			.expect("kept array");
+		assert_eq!(kept.len(), 2);
+		assert_eq!(kept[0].as_str(), Some("m_asst"));
+		assert_eq!(kept[1].as_str(), Some(expected_msg_id.as_str()));
+	}
+
+	#[test]
+	fn reconcile_durable_projection_filters_metadata_rows_while_verifying_lineage() {
+		let mut store = SqliteStore::open_in_memory().expect("open store");
+		store
+			.create_session(NewSession {
+				id: "s_meta".to_string(),
+				parent_session_id: None,
+				payload: json!({
+					"durableProjection": {
+						"kept": ["m_asst"]
+					}
+				}),
+				initial_branch_id: "b1".to_string(),
+				initial_branch_payload: json!({}),
+			})
+			.expect("create session");
+
+		// Assistant message (kept)
+		store
+			.append_message(NewMessage {
+				id: "m_asst".to_string(),
+				session_id: "s_meta".to_string(),
+				branch_id: "b1".to_string(),
+				parent_message_id: None,
+				payload: json!({
+					"type": "message",
+					"id": "m_asst",
+					"message": { "role": "assistant", "content": "calling" }
+				}),
+			})
+			.expect("m_asst");
+
+		// Suffix message 1: metadata row (e.g. custom/service_tier_change)
+		store
+			.append_message(NewMessage {
+				id: "m_meta_1".to_string(),
+				session_id: "s_meta".to_string(),
+				branch_id: "b1".to_string(),
+				parent_message_id: Some("m_asst".to_string()),
+				payload: json!({
+					"type": "custom",
+					"id": "m_meta_1",
+					"data": { "key": "value" }
+				}),
+			})
+			.expect("m_meta_1");
+
+		// Suffix message 2: tool result message
+		store
+			.append_message(NewMessage {
+				id: "m_tool_1".to_string(),
+				session_id: "s_meta".to_string(),
+				branch_id: "b1".to_string(),
+				parent_message_id: Some("m_meta_1".to_string()),
+				payload: json!({
+					"type": "message",
+					"id": "m_tool_1",
+					"message": { "role": "toolResult", "content": "res 1" }
+				}),
+			})
+			.expect("m_tool_1");
+
+		// Suffix message 3: another metadata row (e.g. branch_summary or title_change)
+		store
+			.append_message(NewMessage {
+				id: "m_meta_2".to_string(),
+				session_id: "s_meta".to_string(),
+				branch_id: "b1".to_string(),
+				parent_message_id: Some("m_tool_1".to_string()),
+				payload: json!({
+					"type": "branch_summary",
+					"id": "m_meta_2",
+					"summary": "checkpoint"
+				}),
+			})
+			.expect("m_meta_2");
+
+		// Suffix message 4: assistant message
+		store
+			.append_message(NewMessage {
+				id: "m_asst_2".to_string(),
+				session_id: "s_meta".to_string(),
+				branch_id: "b1".to_string(),
+				parent_message_id: Some("m_meta_2".to_string()),
+				payload: json!({
+					"type": "message",
+					"id": "m_asst_2",
+					"message": { "role": "assistant", "content": "done" }
+				}),
+			})
+			.expect("m_asst_2");
+
+		// Reconcile projection:
+		let backfilled = store.reconcile_durable_projection("s_meta").expect("reconcile");
+		// Exactly 2 messages backfilled (m_tool_1 and m_asst_2), metadata rows m_meta_1 and m_meta_2 skipped!
+		assert_eq!(backfilled, 2);
+
+		let session = store.session("s_meta").expect("session").expect("s_meta");
+		let kept = session.payload["durableProjection"]["kept"].as_array().expect("kept array");
+		let kept_ids: Vec<&str> = kept.iter().filter_map(Value::as_str).collect();
+		assert_eq!(kept_ids, vec!["m_asst", "m_tool_1", "m_asst_2"]);
+		assert!(!kept_ids.contains(&"m_meta_1"));
+		assert!(!kept_ids.contains(&"m_meta_2"));
+	}
+
+	#[test]
+	fn reconcile_durable_projection_discards_stale_diverged_projection_preserving_history() {
+		let mut store = SqliteStore::open_in_memory().expect("open store");
+		store
+			.create_session(NewSession {
+				id: "s_diverge".to_string(),
+				parent_session_id: None,
+				payload: json!({
+					"durableProjection": {
+						"kept": ["m_user", "m_stale_branch1_msg"]
+					}
+				}),
+				initial_branch_id: "b_active".to_string(),
+				initial_branch_payload: json!({}),
+			})
+			.expect("create session");
+
+		// On active branch, only m_user exists, m_stale_branch1_msg does NOT exist on b_active:
+		store
+			.append_message(NewMessage {
+				id: "m_user".to_string(),
+				session_id: "s_diverge".to_string(),
+				branch_id: "b_active".to_string(),
+				parent_message_id: None,
+				payload: json!({
+					"type": "message",
+					"id": "m_user",
+					"message": { "role": "user", "content": "hi" }
+				}),
+			})
+			.expect("m_user");
+
+		let backfilled = store
+			.reconcile_durable_projection("s_diverge")
+			.expect("must safely discard stale projection without failing session");
+		assert_eq!(backfilled, 0);
+
+		let session = store.session("s_diverge").expect("session").expect("s_diverge");
+		assert!(session.payload.get("durableProjection").is_none());
+
+		// History is preserved: reading branch messages remains valid
+		let branch_msgs = store.branch_messages("b_active").expect("branch messages");
+		assert_eq!(branch_msgs.len(), 1);
+		assert_eq!(branch_msgs[0].id, "m_user");
+	}
+
+	#[test]
+	fn reconcile_durable_projection_fails_closed_on_broken_branch_suffix_lineage() {
+		let mut store = SqliteStore::open_in_memory().expect("open store");
+		store
+			.create_session(NewSession {
+				id: "s_broken".to_string(),
+				parent_session_id: None,
+				payload: json!({
+					"durableProjection": {
+						"kept": ["m1"]
+					}
+				}),
+				initial_branch_id: "b1".to_string(),
+				initial_branch_payload: json!({}),
+			})
+			.expect("create session");
+
+		store
+			.append_message(NewMessage {
+				id: "m1".to_string(),
+				session_id: "s_broken".to_string(),
+				branch_id: "b1".to_string(),
+				parent_message_id: None,
+				payload: json!({ "type": "message", "id": "m1" }),
+			})
+			.expect("m1");
+
+		store
+			.connection
+			.execute(
+				"INSERT INTO messages (id, session_id, branch_id, parent_message_id, payload_json, created_at_ms) \
+				 VALUES ('m2', 's_broken', 'b1', 'wrong_parent', '{\"type\":\"message\",\"id\":\"m2\"}', 1000)",
+				[],
+			)
+			.expect("inject broken row");
+		store
+			.connection
+			.execute("UPDATE branches SET leaf_message_id = 'm2' WHERE id = 'b1'", [])
+			.expect("update leaf");
+
+		let err = store
+			.reconcile_durable_projection("s_broken")
+			.expect_err("broken suffix lineage must fail closed");
+		assert!(matches!(err, StoreError::Corrupt(_)));
+		assert!(err.to_string().contains("wrong_parent"));
+	}
+
+	#[test]
+	fn reconcile_durable_projection_concurrent_interleaving_race() {
+		let (dir, path) = temp_db("concurrent-race");
+		let mut store1 = SqliteStore::open(&path).expect("open store 1");
+		let mut store2 = SqliteStore::open(&path).expect("open store 2");
+
+		store1
+			.create_session(NewSession {
+				id: "s_race".to_string(),
+				parent_session_id: None,
+				payload: json!({
+					"durableProjection": {
+						"kept": ["m_asst"]
+					}
+				}),
+				initial_branch_id: "b1".to_string(),
+				initial_branch_payload: json!({}),
+			})
+			.expect("create session");
+
+		store1
+			.append_message(NewMessage {
+				id: "m_asst".to_string(),
+				session_id: "s_race".to_string(),
+				branch_id: "b1".to_string(),
+				parent_message_id: None,
+				payload: json!({
+					"type": "message",
+					"id": "m_asst",
+					"message": { "role": "assistant", "content": "hello" }
+				}),
+			})
+			.expect("append m_asst");
+
+		store1
+			.append_message(NewMessage {
+				id: "m_tool_1".to_string(),
+				session_id: "s_race".to_string(),
+				branch_id: "b1".to_string(),
+				parent_message_id: Some("m_asst".to_string()),
+				payload: json!({
+					"type": "message",
+					"id": "m_tool_1",
+					"message": { "role": "toolResult", "content": "res" }
+				}),
+			})
+			.expect("append m_tool_1");
+
+		// Interleaving: connection 2 starts an IMMEDIATE transaction and clears the projection (e.g. branch cut).
+		{
+			let tx2 = store2
+				.connection
+				.transaction_with_behavior(TransactionBehavior::Immediate)
+				.expect("tx2 immediate");
+			let payload_json: String = tx2
+				.query_row(
+					"SELECT payload_json FROM sessions WHERE id = 's_race'",
+					[],
+					|row| row.get(0),
+				)
+				.expect("query payload");
+			let mut payload: Value = decode_json(&payload_json).unwrap();
+			payload.as_object_mut().unwrap().remove("durableProjection");
+			let encoded = serde_json::to_string(&payload).unwrap();
+			tx2.execute(
+				"UPDATE sessions SET payload_json = ?1 WHERE id = 's_race'",
+				params![encoded],
+			)
+			.expect("tx2 update");
+			tx2.commit().expect("tx2 commit");
+		}
+
+		// Now connection 1 runs reconcile_durable_projection.
+		// Because reconcile_durable_projection reads the session INSIDE its own IMMEDIATE transaction,
+		// it sees that durableProjection was already cleared by connection 2.
+		// It returns Ok(0) and DOES NOT RESURRECT the cleared projection!
+		let backfilled = store1.reconcile_durable_projection("s_race").expect("reconcile");
+		assert_eq!(backfilled, 0, "must not backfill into a concurrently cleared projection");
+
+		let session = store1.session("s_race").expect("get").expect("s");
+		assert!(
+			session.payload.get("durableProjection").is_none(),
+			"projection must remain None, not resurrected by stale snapshot"
+		);
+
+		let _ = std::fs::remove_dir_all(dir);
+	}
+
+	#[test]
+	fn reconcile_durable_projection_locks_against_concurrent_immediate_write() {
+		let (dir, path) = temp_db("concurrent-lock");
+		let mut store1 = SqliteStore::open(&path).expect("open store 1");
+		let mut store2 = SqliteStore::open(&path).expect("open store 2");
+
+		store1
+			.create_session(NewSession {
+				id: "s_lock".to_string(),
+				parent_session_id: None,
+				payload: json!({
+					"durableProjection": {
+						"kept": ["m1"]
+					}
+				}),
+				initial_branch_id: "b1".to_string(),
+				initial_branch_payload: json!({}),
+			})
+			.expect("create session");
+
+		// When store1 holds an open IMMEDIATE transaction, store2 attempting to begin an IMMEDIATE transaction
+		// must fail immediately due to SQLite write lock contention!
+		let tx1 = store1
+			.connection
+			.transaction_with_behavior(TransactionBehavior::Immediate)
+			.expect("tx1");
+
+		let tx2_err = store2
+			.connection
+			.transaction_with_behavior(TransactionBehavior::Immediate);
+		assert!(tx2_err.is_err(), "concurrent immediate transaction must be blocked by SQLite write lock");
+
+		drop(tx1);
+		let _ = std::fs::remove_dir_all(dir);
 	}
 }

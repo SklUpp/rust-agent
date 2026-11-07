@@ -40,7 +40,7 @@ use crate::{
 	},
 	session_store::{
 		NewBranch, NewDelivery, NewIntent, NewMessage, NewSession, SessionRecord, SqliteStore,
-		StoreError, StoreResult, UnresolvedIntent, WorkerCompletion,
+		ExecutionRecord, StoreError, StoreResult, UnresolvedIntent, WorkerCompletion,
 	},
 };
 
@@ -179,6 +179,17 @@ pub struct StoredProjection {
 	pub synthetic: Vec<Value>,
 }
 
+pub(crate) struct LoadedParts {
+	pub branch_id: String,
+	pub leaf: Option<String>,
+	pub entries: Vec<SessionEntry>,
+	pub messages: Vec<MessageEntry>,
+	pub branch_messages: Vec<MessageEntry>,
+	pub header: Option<SessionHeader>,
+	pub projection: Option<StoredProjection>,
+	pub projection_error: Option<StoreError>,
+}
+
 /// Session state loaded from the authoritative database.
 #[derive(Debug)]
 pub struct LoadedSession {
@@ -259,49 +270,46 @@ impl DurableSession {
 		};
 		match existing {
 			Some(_) => {
-				let (
-					branch_id,
-					leaf,
-					entries,
-					messages,
-					branch_messages,
-					stored_header,
-					projection,
-				) = {
+				let parts = {
 					let id = id.clone();
 					writer.call(move |store| load_parts(store, &id))?
 				};
 				let mut header = header;
-				if let Some(stored) = stored_header {
+				if let Some(stored) = parts.header {
 					header = stored;
 				}
+				let seed = if let Some(err) = parts.projection_error {
+					Err(err)
+				} else {
+					seed_entries(
+						&parts.branch_messages,
+						parts.projection.as_ref(),
+						&parts.messages,
+					)
+				};
 				Ok((
 					Self {
 						writer,
 						session_id: id,
 						cursor: Arc::new(Mutex::new(Cursor {
-							branch: branch_id.clone(),
-							leaf: leaf.clone(),
+							branch: parts.branch_id.clone(),
+							leaf: parts.leaf.clone(),
 						})),
 						written_tools: Arc::new(Mutex::new(HashMap::new())),
 						written_tool_ids: Arc::new(Mutex::new(HashMap::new())),
-						projection: Arc::new(Mutex::new(projection.clone())),
-						resume_seed: Arc::new(Mutex::new(Some(seed_entries(
-							&branch_messages,
-							projection.as_ref(),
-							&messages,
-						)))),
+						projection: Arc::new(Mutex::new(parts.projection.clone())),
+						resume_seed: Arc::new(Mutex::new(Some(seed))),
 						tracked: Arc::new(Mutex::new(Vec::new())),
 						tracked_ids: Arc::new(Mutex::new(Vec::new())),
 					},
 					Some(LoadedSession {
 						header,
-						branch_id,
-						leaf,
-						entries,
-						messages,
-						branch_messages,
-						projection,
+						branch_id: parts.branch_id,
+						leaf: parts.leaf,
+						entries: parts.entries,
+						messages: parts.messages,
+						branch_messages: parts.branch_messages,
+						projection: parts.projection,
 					}),
 				))
 			},
@@ -355,37 +363,42 @@ impl DurableSession {
 	pub fn load(&self) -> StoreResult<LoadedSession> {
 		let session_id = self.session_id.clone();
 		let writer = Arc::clone(&self.writer);
-		let (branch_id, leaf, entries, messages, branch_messages, header, projection) = {
+		let parts = {
 			let session_id = session_id.clone();
 			writer.call(move |store| load_parts(store, &session_id))?
 		};
-		let header = header.ok_or_else(|| {
+		let header = parts.header.ok_or_else(|| {
 			StoreError::NotFound(format!("session {session_id} has no stored header"))
 		})?;
 		{
 			let mut cursor = lock(&self.cursor);
-			cursor.branch = branch_id.clone();
-			cursor.leaf = leaf.clone();
+			cursor.branch = parts.branch_id.clone();
+			cursor.leaf = parts.leaf.clone();
 		}
 		// Existing tool rows are part of the seed prefix, not pending outcomes.
 		lock(&self.written_tools).clear();
 		lock(&self.written_tool_ids).clear();
-		*lock(&self.projection) = projection.clone();
+		*lock(&self.projection) = parts.projection.clone();
 		if lock(&self.tracked).is_empty() {
-			*lock(&self.resume_seed) = Some(seed_entries(
-				&branch_messages,
-				projection.as_ref(),
-				&messages,
-			));
+			let seed = if let Some(err) = parts.projection_error {
+				Err(err)
+			} else {
+				seed_entries(
+					&parts.branch_messages,
+					parts.projection.as_ref(),
+					&parts.messages,
+				)
+			};
+			*lock(&self.resume_seed) = Some(seed);
 		}
 		Ok(LoadedSession {
 			header,
-			branch_id,
-			leaf,
-			entries,
-			messages,
-			branch_messages,
-			projection,
+			branch_id: parts.branch_id,
+			leaf: parts.leaf,
+			entries: parts.entries,
+			messages: parts.messages,
+			branch_messages: parts.branch_messages,
+			projection: parts.projection,
 		})
 	}
 
@@ -395,6 +408,8 @@ impl DurableSession {
 		let id = entry.id.clone();
 		let cursor = Arc::clone(&self.cursor);
 		let session_id = self.session_id.clone();
+		let projection_arc = Arc::clone(&self.projection);
+		let resume_seed_arc = Arc::clone(&self.resume_seed);
 		self.writer.call(move |store| {
 			let mut cursor = lock(&cursor);
 			// A metadata entry chains to the current leaf; only a branch cut
@@ -412,21 +427,29 @@ impl DurableSession {
 					// the current branch with a missing point.
 					None => (None, None),
 				};
-				store.create_branch(NewBranch {
+				let new_branch = NewBranch {
 					id: branch_id.clone(),
 					session_id: session_id.clone(),
 					parent_branch_id,
-					parent_message_id,
+					parent_message_id: parent.clone(),
 					payload: Value::Null,
-				})?;
-				store.set_active_branch(&session_id, &branch_id)?;
+				};
+				let summary_message = NewMessage {
+					id: entry.id.clone(),
+					session_id: session_id.clone(),
+					branch_id: branch_id.clone(),
+					parent_message_id: parent.clone(),
+					payload: serde_json::to_value(&entry)?,
+				};
+				store.cut_branch(new_branch, summary_message)?;
+				*lock(&projection_arc) = None;
+				*lock(&resume_seed_arc) = None;
 				cursor.branch = branch_id;
-				cursor.leaf = parent.clone();
+				cursor.leaf = Some(entry.id);
+				return Ok(());
 			}
 			let mut stored = entry;
-			if stored.kind != "branch_summary" {
-				stored.parent_id = parent.clone();
-			}
+			stored.parent_id = parent.clone();
 			store.append_message(NewMessage {
 				id: stored.id.clone(),
 				session_id: session_id.clone(),
@@ -545,7 +568,7 @@ impl DurableSession {
 				*lock(&self.tracked_ids) = matched[..boundary].to_vec();
 			}
 			let start = tracked.len();
-			if messages.len() >= start && tracked.as_slice() == &digests[..start] {
+			if start > 0 && messages.len() >= start && tracked.as_slice() == &digests[..start] {
 				return Ok(start);
 			}
 			start
@@ -553,18 +576,25 @@ impl DurableSession {
 		// Rebuild the seed from the stored branch and require the exact same
 		// replay projection the incoming view carries.
 		let session_id = self.session_id.clone();
-		let (branch_id, leaf, _, all_messages, branch_messages, _, projection) = self
+		let parts = self
 			.writer
 			.call_async(move |store| load_parts(store, &session_id))
 			.await
 			.map_err(|error| DurableError::new(error.to_string()))?;
+		if let Some(err) = parts.projection_error {
+			return Err(DurableError::new(err.to_string()));
+		}
 		{
 			let mut cursor = lock(&self.cursor);
-			cursor.branch = branch_id;
-			cursor.leaf = leaf;
+			cursor.branch = parts.branch_id;
+			cursor.leaf = parts.leaf;
 		}
-		let seed = seed_entries(&branch_messages, projection.as_ref(), &all_messages)
-			.map_err(|error| DurableError::new(error.to_string()))?;
+		let seed = seed_entries(
+			&parts.branch_messages,
+			parts.projection.as_ref(),
+			&parts.messages,
+		)
+		.map_err(|error| DurableError::new(error.to_string()))?;
 		let Some((boundary, matched)) = align_seed(messages, digests, &seed) else {
 			return Err(DurableError::new(if messages.len() < previous {
 				"conversation shrank without a compaction mapping"
@@ -622,7 +652,18 @@ impl DurableSession {
 			};
 			map.remove("durableProjection");
 			store.update_session_payload(&session_id, payload)
-		})
+		})?;
+		*lock(&self.projection) = None;
+		let parts = self.writer.call({
+			let session_id = self.session_id.clone();
+			move |store| load_parts(store, &session_id)
+		})?;
+		*lock(&self.resume_seed) = Some(seed_entries(
+			&parts.branch_messages,
+			None,
+			&parts.messages,
+		));
+		Ok(())
 	}
 
 	/// Unresolved executions for startup surfacing. Presence is not proof the
@@ -630,6 +671,19 @@ impl DurableSession {
 	pub fn unresolved_intents(&self) -> StoreResult<Vec<UnresolvedIntent>> {
 		let session_id = self.session_id.clone();
 		self.writer.call(move |store| store.unresolved_intents(&session_id))
+	}
+
+	/// Executions that have a terminal outcome recorded in SQLite, but no corresponding
+	/// tool-result message on the branch.
+	pub fn executions_needing_recovery(&self) -> StoreResult<Vec<ExecutionRecord>> {
+		let session_id = self.session_id.clone();
+		self.writer.call(move |store| store.executions_needing_recovery(&session_id))
+	}
+
+	/// Read an execution record by id.
+	pub fn execution(&self, execution_id: &str) -> StoreResult<Option<ExecutionRecord>> {
+		let id = execution_id.to_string();
+		self.writer.call(move |store| store.execution(&id))
 	}
 
 	/// Persist a whole `MessageEntry` batch atomically on the current branch.
@@ -806,6 +860,7 @@ impl DurableSession {
 
 	fn to_tool_entry(
 		&self,
+		execution_id: &str,
 		call: &ToolCall,
 		result: &ToolResult,
 		leaf: Option<String>,
@@ -816,6 +871,16 @@ impl DurableSession {
 		// replay must agree, or a multimodal result would lose its images (and a
 		// later turn would see a different revision than the live loop tracked).
 		let mut details = result.details.clone();
+		if let Some(map) = details.as_mut().and_then(Value::as_object_mut) {
+			map.insert("executionId".to_string(), Value::String(execution_id.to_string()));
+		} else {
+			let mut map = serde_json::Map::new();
+			if let Some(val) = details {
+				map.insert("value".to_string(), val);
+			}
+			map.insert("executionId".to_string(), Value::String(execution_id.to_string()));
+			details = Some(Value::Object(map));
+		}
 		let (content, is_error, parts) = match pi_agent::tool_image_parts_of(result) {
 			Ok(parts) => (result.content.clone(), result.is_error, parts),
 			Err(error) => {
@@ -944,7 +1009,11 @@ impl DurableBoundary for DurableSession {
 			let projection = {
 				let mut current = lock(&self.projection);
 				current.as_mut().map(|projection| {
-					projection.kept.extend(appended_kept);
+					for id in appended_kept {
+						if !projection.kept.contains(&id) {
+							projection.kept.push(id);
+						}
+					}
 					projection.clone()
 				})
 			};
@@ -1029,21 +1098,24 @@ impl DurableBoundary for DurableSession {
 
 	async fn resync_messages(&self, messages: &[Message]) -> Result<(), DurableError> {
 		let session_id = self.session_id.clone();
-		let (branch_id, leaf, _entries, _all, branch_messages, _, projection) = self
+		let parts = self
 			.writer
 			.call_async(move |store| load_parts(store, &session_id))
 			.await
 			.map_err(|error| DurableError::new(error.to_string()))?;
+		if let Some(err) = parts.projection_error {
+			return Err(DurableError::new(err.to_string()));
+		}
 		{
 			let mut cursor = lock(&self.cursor);
-			cursor.branch = branch_id;
-			cursor.leaf = leaf;
+			cursor.branch = parts.branch_id;
+			cursor.leaf = parts.leaf;
 		}
 		// Existing tool rows are part of the seed prefix, not pending outcomes.
 		lock(&self.written_tools).clear();
 		lock(&self.written_tool_ids).clear();
 		let ids = self
-			.align_ids(messages, &branch_messages)
+			.align_ids(messages, &parts.branch_messages)
 			.map_err(|error| DurableError::new(error.to_string()))?;
 		*lock(&self.tracked) = messages
 			.iter()
@@ -1051,7 +1123,7 @@ impl DurableBoundary for DurableSession {
 			.collect();
 		*lock(&self.tracked_ids) = ids;
 		*lock(&self.resume_seed) = None;
-		*lock(&self.projection) = projection;
+		*lock(&self.projection) = parts.projection;
 		Ok(())
 	}
 
@@ -1100,29 +1172,37 @@ impl DurableBoundary for DurableSession {
 		let result = result.clone();
 		let tool_entry = {
 			let leaf = lock(&cursor).leaf.clone();
-			self.to_tool_entry(&call, &result, leaf)
+			self.to_tool_entry(&execution_id, &call, &result, leaf)
 		};
 		let branch = lock(&cursor).branch.clone();
+		let projection_arc = Arc::clone(&self.projection);
 		self
 			.writer
 			.call_async(move |store| {
-				store.record_outcome(&execution_id, outcome)?;
 				let mut state = lock(&cursor);
 				let mut tool_entry = tool_entry;
 				tool_entry.parent_id = state.leaf.clone();
-				store.append_message(NewMessage {
+				let msg = NewMessage {
 					id: tool_entry.id.clone(),
 					session_id,
 					branch_id: branch,
 					parent_message_id: state.leaf.clone(),
 					payload: serde_json::to_value(&tool_entry)?,
-				})?;
-				state.leaf = Some(tool_entry.id.clone());
-				*lock(&written_tools).entry(call.id.clone()).or_insert(0) += 1;
-				lock(&written_tool_ids)
-					.entry(call.id.clone())
-					.or_default()
-					.push_back(tool_entry.id);
+				};
+				let recorded = store.record_outcome_with_message(&execution_id, outcome, msg)?;
+				if recorded {
+					state.leaf = Some(tool_entry.id.clone());
+					*lock(&written_tools).entry(call.id.clone()).or_insert(0) += 1;
+					lock(&written_tool_ids)
+						.entry(call.id.clone())
+						.or_default()
+						.push_back(tool_entry.id.clone());
+					if let Some(projection) = lock(&projection_arc).as_mut() {
+						if !projection.kept.contains(&tool_entry.id) {
+							projection.kept.push(tool_entry.id);
+						}
+					}
+				}
 				Ok(())
 			})
 		.await
@@ -1288,16 +1368,16 @@ impl ChildDurabilityFactory for StoreChildDurabilityFactory {
 			if store.session(&id)?.is_none() {
 				return Ok(None);
 			}
-			let (_, _, _, all, branch, _, projection) = load_parts(store, &id)?;
-			let Some(projection) = projection else {
-				return crate::runtime::history_messages_from_entries(&branch)
+			let parts = load_parts(store, &id)?;
+			let Some(projection) = parts.projection else {
+				return crate::runtime::history_messages_from_entries(&parts.branch_messages)
 					.map(Some)
 					.map_err(|error| StoreError::Corrupt(error.to_string()));
 			};
 			// A compacted child must revive from the same synthetic prefix plus
 			// retained-entry order the root build uses, not from the raw branch.
 			let by_id: HashMap<&str, &MessageEntry> =
-				all.iter().map(|entry| (entry.id.as_str(), entry)).collect();
+				parts.messages.iter().map(|entry| (entry.id.as_str(), entry)).collect();
 			let mut restored = Vec::with_capacity(projection.kept.len() + projection.synthetic.len());
 			for value in &projection.synthetic {
 				restored.push(serde_json::from_value::<Message>(value.clone()).map_err(
@@ -1443,23 +1523,25 @@ impl DurableSession {
 fn load_parts(
 	store: &mut SqliteStore,
 	session_id: &str,
-) -> StoreResult<(
-	String,
-	Option<String>,
-	Vec<SessionEntry>,
-	Vec<MessageEntry>,
-	Vec<MessageEntry>,
-	Option<SessionHeader>,
-	Option<StoredProjection>,
-)> {
+) -> StoreResult<LoadedParts> {
+	store.recover_unmessaged_outcomes(session_id)?;
+	let projection_error = match store.reconcile_durable_projection(session_id) {
+		Ok(_) => None,
+		Err(StoreError::Corrupt(msg)) => Some(StoreError::Corrupt(msg)),
+		Err(err) => return Err(err),
+	};
 	let record: SessionRecord = store
 		.session(session_id)?
 		.ok_or_else(|| StoreError::NotFound(format!("session {session_id} not found")))?;
-	let projection = record
-		.payload
-		.get("durableProjection")
-		.cloned()
-		.and_then(|value| serde_json::from_value::<StoredProjection>(value).ok());
+	let projection = if projection_error.is_some() {
+		None
+	} else {
+		record
+			.payload
+			.get("durableProjection")
+			.cloned()
+			.and_then(|value| serde_json::from_value::<StoredProjection>(value).ok())
+	};
 	let header = serde_json::from_value::<SessionHeader>(record.payload.clone()).ok();
 	let branch_id = record
 		.active_branch_id
@@ -1486,7 +1568,16 @@ fn load_parts(
 		}
 	}
 	derive_turn_history(&branch_messages).map_err(StoreError::Corrupt)?;
-	Ok((branch_id, leaf, entries, messages, branch_messages, header, projection))
+	Ok(LoadedParts {
+		branch_id,
+		leaf,
+		entries,
+		messages,
+		branch_messages,
+		header,
+		projection,
+		projection_error,
+	})
 }
 
 fn session_digest(message: &SessionMessage) -> u64 {
@@ -1568,7 +1659,49 @@ fn seed_entries(
 	};
 	// Use the exact provider-replay projection: terminal error/aborted turns
 	// and their paired tool results stay archived but are not part of the seed.
-	crate::session::replayable_message_entries(&source)
+	let replayable = crate::session::replayable_message_entries(&source);
+
+	// Ensure replay avoids dangling calls, failing closed when unresolvable.
+	for (idx, entry) in replayable.iter().enumerate() {
+		if entry.message.role == "assistant" {
+			let tool_calls: Vec<String> = entry
+				.message
+				.content
+				.parts()
+				.iter()
+				.filter(|part| part.kind == "toolCall")
+				.filter_map(|part| {
+					part
+						.extra
+						.get("id")
+						.and_then(Value::as_str)
+						.map(str::to_string)
+				})
+				.collect();
+			if !tool_calls.is_empty() {
+				let mut matched = HashSet::new();
+				for next in &replayable[idx + 1..] {
+					if next.message.role == "toolResult" {
+						if let Some(id) = &next.message.tool_call_id {
+							matched.insert(id.clone());
+						}
+					} else if next.message.role == "assistant" || next.message.role == "user" {
+						break;
+					}
+				}
+				for call_id in &tool_calls {
+					if !matched.contains(call_id) {
+						return Err(StoreError::Corrupt(format!(
+							"unresolvable dangling tool call {call_id} in assistant turn {}; replay refused",
+							entry.id
+						)));
+					}
+				}
+			}
+		}
+	}
+
+	replayable
 		.into_iter()
 		.filter(|entry| {
 			matches!(entry.message.role.as_str(), "user" | "assistant" | "toolResult")

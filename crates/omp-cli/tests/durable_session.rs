@@ -19,15 +19,16 @@ use pi_agent::{
 	DurableError, Message, ModelProvider, ProviderError, Role, SteeringEvent, StopReason, Tool,
 	ToolCall, ToolChoice, ToolRegistry, ToolResult,
 };
-use serde_json::json;
+use serde_json::{Value, json};
 
 use omp_cli::{
 	durable_session::DurableSession,
 	output,
 	session::{
-		CURRENT_SESSION_VERSION, MessageContent, MessageEntry, SessionHeader, SessionMessage,
-		SessionOptions, SessionStore,
+		CURRENT_SESSION_VERSION, MessageContent, MessageEntry, SessionEntry, SessionHeader,
+		SessionMessage, SessionOptions, SessionStore,
 	},
+	session_store::{NewIntent, SqliteStore, StoreError},
 };
 
 struct CountingTool {
@@ -1054,4 +1055,1025 @@ async fn run_interrupted_stall(
 		.expect("join dialog");
 	assert!(matches!(result, Err(AgentError::Interrupted | AgentError::InterruptedReason(_))));
 	(session, dir)
+}
+
+#[tokio::test]
+async fn finish_execution_records_outcome_and_message_atomically() {
+	let dir = temp_dir("atomic-finish");
+	let db = dir.join("sessions.db");
+	let session = DurableSession::create(db.clone(), header("s-atomic", &dir)).expect("create");
+
+	let call = ToolCall {
+		id: "call-atomic-1".to_string(),
+		name: "effect".to_string(),
+		arguments: json!({}),
+	};
+	let execution_id = session.begin_execution(&call).await.expect("begin");
+
+	let result = ToolResult {
+		tool_call_id: call.id.clone(),
+		content: "atomic output".to_string(),
+		is_error: false,
+		terminate: false,
+		details: None,
+	};
+	session
+		.finish_execution(&execution_id, &call, &result)
+		.await
+		.expect("finish");
+
+	// Both outcome and message are durable.
+	let loaded = session.load().expect("load");
+	let tool_entry = loaded
+		.messages
+		.iter()
+		.find(|m| m.message.role == "toolResult")
+		.expect("toolResult message must be present");
+	assert_eq!(tool_entry.message.content.text(), "atomic output");
+	let details = tool_entry.message.extra.get("details").expect("details");
+	assert_eq!(details.get("executionId").and_then(Value::as_str), Some(execution_id.as_str()));
+
+	// No unresolved intents or unmessaged outcomes.
+	assert!(session.unresolved_intents().expect("unresolved").is_empty());
+	assert!(session.executions_needing_recovery().expect("needing recovery").is_empty());
+
+	std::fs::remove_dir_all(dir).ok();
+}
+
+#[tokio::test]
+async fn reopened_session_recovers_legacy_outcome_without_message() {
+	let dir = temp_dir("legacy-recover");
+	let db = dir.join("sessions.db");
+	let session = DurableSession::create(db.clone(), header("s-legacy", &dir)).expect("create");
+
+	// Persist an assistant message calling tool "call-leg-1".
+	let asst_msg = Message::assistant_with_tools(
+		"calling tool",
+		vec![ToolCall {
+			id: "call-leg-1".to_string(),
+			name: "effect".to_string(),
+			arguments: json!({}),
+		}],
+	);
+	session
+		.persist_messages(&[Message::user("hi"), asst_msg])
+		.await
+		.expect("persist assistant");
+	drop(session);
+
+	// Simulate legacy crash: open store directly, record intent and outcome, but no message.
+	let execution_id;
+	{
+		let mut store = SqliteStore::open(&db).expect("open store");
+		execution_id = store
+			.record_intent(NewIntent {
+				session_id: "s-legacy".to_string(),
+				branch_id: "s-legacy.main".to_string(),
+				provider_call_id: "call-leg-1".to_string(),
+				tool_name: "effect".to_string(),
+				payload: json!({}),
+			})
+			.expect("record intent");
+		store
+			.record_outcome(
+				&execution_id,
+				json!({ "content": "legacy output", "isError": false }),
+			)
+			.expect("record outcome");
+		// Verify 1 execution needing recovery.
+		assert_eq!(store.executions_needing_recovery("s-legacy").expect("needing").len(), 1);
+	}
+
+	// Reopen session with DurableSession::open.
+	let (reopened, loaded) =
+		DurableSession::open(db, "s-legacy", header("s-legacy", &dir)).expect("reopen");
+	let loaded = loaded.expect("loaded session");
+
+	// Verify full deserialization of recovered message:
+	assert_eq!(loaded.messages.len(), 3);
+	assert_eq!(loaded.branch_messages.len(), 3);
+
+	let recovered_msg = loaded
+		.branch_messages
+		.iter()
+		.find(|m| m.message.role == "toolResult")
+		.expect("recovered toolResult message must be on branch");
+	assert_eq!(recovered_msg.message.content.text(), "legacy output");
+	assert_eq!(recovered_msg.message.tool_call_id.as_deref(), Some("call-leg-1"));
+	assert_eq!(recovered_msg.message.tool_name.as_deref(), Some("effect"));
+	assert_eq!(recovered_msg.message.is_error, Some(false));
+	let details = recovered_msg.message.extra.get("details").expect("details");
+	assert_eq!(details.get("executionId").and_then(Value::as_str), Some(execution_id.as_str()));
+	assert_eq!(details.get("recovered").and_then(Value::as_bool), Some(true));
+
+	// Replay / write boundary succeeds with the recovered turn!
+	reopened
+		.persist_messages(&[
+			Message::user("hi"),
+			Message::assistant_with_tools("calling tool", vec![ToolCall {
+				id: "call-leg-1".to_string(),
+				name: "effect".to_string(),
+				arguments: json!({}),
+			}]),
+			Message::tool_with_status("call-leg-1", "effect", "legacy output", false),
+			Message::assistant("next response"),
+		])
+		.await
+		.expect("write boundary must succeed after recovery without dangling calls");
+
+	// Reopening resolved it: no executions need recovery anymore.
+	assert!(reopened.executions_needing_recovery().expect("needing").is_empty());
+	assert!(reopened.unresolved_intents().expect("unresolved").is_empty());
+
+	std::fs::remove_dir_all(dir).ok();
+}
+
+#[tokio::test]
+async fn finish_execution_is_idempotent_with_different_message_id() {
+	let dir = temp_dir("atomic-idempotent");
+	let db = dir.join("sessions.db");
+	let session = DurableSession::create(db.clone(), header("s-idem", &dir)).expect("create");
+
+	let call = ToolCall {
+		id: "call-idem-1".to_string(),
+		name: "effect".to_string(),
+		arguments: json!({}),
+	};
+
+	let asst = Message::assistant_with_tools("calling tool", vec![call.clone()]);
+	session
+		.persist_messages(&[Message::user("start"), asst.clone()])
+		.await
+		.expect("persist assistant");
+
+	let execution_id = session.begin_execution(&call).await.expect("begin");
+
+	let result = ToolResult {
+		tool_call_id: call.id.clone(),
+		content: "first output".to_string(),
+		is_error: false,
+		terminate: false,
+		details: None,
+	};
+
+	// First finish:
+	session
+		.finish_execution(&execution_id, &call, &result)
+		.await
+		.expect("first finish");
+
+	// Second finish on the live session WITHOUT intermediate load (intermediate load resets in-memory cursor):
+	// to_tool_entry generates a fresh UUID for the message entry, but it must be an idempotent no-op!
+	session
+		.finish_execution(&execution_id, &call, &result)
+		.await
+		.expect("second finish must succeed idempotently on live cursor");
+
+	// Сначала выполни следующую запись на живом курсоре (без промежуточного load!):
+	session
+		.persist_messages(&[
+			Message::user("start"),
+			asst,
+			Message::tool_with_status("call-idem-1", "effect", "first output", false),
+			Message::assistant("post-tool turn done"),
+		])
+		.await
+		.expect("followup persist_messages on live hot cursor must succeed");
+
+	// Затем проверяй цепочку:
+	let loaded = session.load().expect("load");
+	let tool_count = loaded
+		.messages
+		.iter()
+		.filter(|m| m.message.role == "toolResult")
+		.count();
+	assert_eq!(tool_count, 1, "live duplicate finish must not append second toolResult message");
+	assert_eq!(loaded.branch_messages.len(), 4, "User -> Asst -> ToolResult -> Asst");
+	assert_eq!(loaded.branch_messages[0].message.role, "user");
+	assert_eq!(loaded.branch_messages[1].message.role, "assistant");
+	assert_eq!(loaded.branch_messages[2].message.role, "toolResult");
+	assert_eq!(loaded.branch_messages[3].message.role, "assistant");
+	assert_eq!(
+		loaded.branch_messages[3].parent_id.as_deref(),
+		Some(loaded.branch_messages[2].id.as_str()),
+		"followup assistant must chain directly to the single tool result"
+	);
+
+	std::fs::remove_dir_all(dir).ok();
+}
+
+#[tokio::test]
+async fn reopened_session_skips_legacy_result_without_execution_id() {
+	let dir = temp_dir("legacy-no-exec-id");
+	let db = dir.join("sessions.db");
+	let session = DurableSession::create(db.clone(), header("s-leg-no-exec", &dir)).expect("create");
+
+	let asst_msg = Message::assistant_with_tools(
+		"calling legacy tool",
+		vec![ToolCall {
+			id: "call-leg-no-exec".to_string(),
+			name: "effect".to_string(),
+			arguments: json!({}),
+		}],
+	);
+	session
+		.persist_messages(&[Message::user("hi"), asst_msg])
+		.await
+		.expect("persist assistant");
+	drop(session);
+
+	// Simulate legacy session: toolResult is already in messages with matching toolCallId but NO details.executionId.
+	// Executions row has terminal outcome.
+	let execution_id;
+	{
+		let mut store = SqliteStore::open(&db).expect("open store");
+		let branch = store.branch("s-leg-no-exec.main").expect("branch").expect("main branch");
+		let asst_id = branch.leaf_message_id.expect("leaf");
+
+		store
+			.append_message(omp_cli::session_store::NewMessage {
+				id: "msg-legacy-tool".to_string(),
+				session_id: "s-leg-no-exec".to_string(),
+				branch_id: "s-leg-no-exec.main".to_string(),
+				parent_message_id: Some(asst_id),
+				payload: json!({
+					"type": "message",
+					"id": "msg-legacy-tool",
+					"parentId": "msg-u",
+					"timestamp": "2026-11-07T00:00:00.000Z",
+					"message": {
+						"role": "toolResult",
+						"toolCallId": "call-leg-no-exec",
+						"toolName": "effect",
+						"content": "legacy output",
+						"isError": false,
+						"timestamp": 123456789
+					}
+				}),
+			})
+			.expect("append legacy tool message");
+
+		execution_id = store
+			.record_intent(NewIntent {
+				session_id: "s-leg-no-exec".to_string(),
+				branch_id: "s-leg-no-exec.main".to_string(),
+				provider_call_id: "call-leg-no-exec".to_string(),
+				tool_name: "effect".to_string(),
+				payload: json!({}),
+			})
+			.expect("record intent");
+		store
+			.record_outcome(
+				&execution_id,
+				json!({ "content": "legacy output", "isError": false }),
+			)
+			.expect("record outcome");
+
+		// Crucial guarantee: execution is NOT marked as needing recovery because the legacy message exists!
+		assert!(store.executions_needing_recovery("s-leg-no-exec").expect("needing").is_empty());
+	}
+
+	// Reopen session:
+	let (reopened, loaded) =
+		DurableSession::open(db, "s-leg-no-exec", header("s-leg-no-exec", &dir)).expect("reopen");
+	let loaded = loaded.expect("loaded session");
+
+	// Exactly 3 messages (User, Assistant, Legacy ToolResult). No duplicate recovered message appended!
+	assert_eq!(loaded.branch_messages.len(), 3);
+	assert!(reopened.executions_needing_recovery().expect("needing").is_empty());
+
+	// Replay / next turn write succeeds cleanly:
+	reopened
+		.persist_messages(&[
+			Message::user("hi"),
+			Message::assistant_with_tools("calling legacy tool", vec![ToolCall {
+				id: "call-leg-no-exec".to_string(),
+				name: "effect".to_string(),
+				arguments: json!({}),
+			}]),
+			Message::tool_with_status("call-leg-no-exec", "effect", "legacy output", false),
+			Message::assistant("next turn response"),
+		])
+		.await
+		.expect("next turn must align cleanly with legacy message");
+
+	std::fs::remove_dir_all(dir).ok();
+}
+
+#[tokio::test]
+async fn reopened_session_recovers_missing_sibling_tool_result_when_first_already_persisted() {
+	let dir = temp_dir("sibling-leaf-recover");
+	let db = dir.join("sessions.db");
+	let session = DurableSession::create(db.clone(), header("s-sibling", &dir)).expect("create");
+
+	// Assistant calls two tools: call-A and call-B in batch.
+	let asst_msg = Message::assistant_with_tools(
+		"calling batch",
+		vec![
+			ToolCall {
+				id: "call-A".to_string(),
+				name: "effect".to_string(),
+				arguments: json!({}),
+			},
+			ToolCall {
+				id: "call-B".to_string(),
+				name: "effect".to_string(),
+				arguments: json!({}),
+			},
+		],
+	);
+	session
+		.persist_messages(&[Message::user("run batch"), asst_msg])
+		.await
+		.expect("persist assistant");
+	drop(session);
+
+	let exec_b_id;
+	{
+		let mut store = SqliteStore::open(&db).expect("open store");
+		let branch = store.branch("s-sibling.main").expect("branch").expect("main branch");
+		let asst_id = branch.leaf_message_id.expect("leaf");
+
+		let exec_a = store
+			.record_intent(NewIntent {
+				session_id: "s-sibling".to_string(),
+				branch_id: "s-sibling.main".to_string(),
+				provider_call_id: "call-A".to_string(),
+				tool_name: "effect".to_string(),
+				payload: json!({}),
+			})
+			.expect("intent A");
+
+		exec_b_id = store
+			.record_intent(NewIntent {
+				session_id: "s-sibling".to_string(),
+				branch_id: "s-sibling.main".to_string(),
+				provider_call_id: "call-B".to_string(),
+				tool_name: "effect".to_string(),
+				payload: json!({}),
+			})
+			.expect("intent B");
+
+		// Tool A finished and its message was appended:
+		store
+			.record_outcome_with_message(
+				&exec_a,
+				json!({ "content": "output A", "isError": false }),
+				omp_cli::session_store::NewMessage {
+					id: "msg-tool-A".to_string(),
+					session_id: "s-sibling".to_string(),
+					branch_id: "s-sibling.main".to_string(),
+					parent_message_id: Some(asst_id),
+					payload: json!({
+						"type": "message",
+						"id": "msg-tool-A",
+						"parentId": asst_id,
+						"timestamp": "2026-11-07T00:00:00.000Z",
+						"message": {
+							"role": "toolResult",
+							"toolCallId": "call-A",
+							"toolName": "effect",
+							"content": "output A",
+							"isError": false,
+							"timestamp": 1000,
+							"details": { "executionId": exec_a }
+						}
+					}),
+				},
+			)
+			.expect("record outcome A with message");
+
+		// Tool B recorded outcome, but crash happened before its message was appended:
+		store
+			.record_outcome(
+				&exec_b_id,
+				json!({ "content": "output B", "isError": false }),
+			)
+			.expect("record outcome B");
+
+		// Only B needs recovery:
+		let needing = store.executions_needing_recovery("s-sibling").expect("needing");
+		assert_eq!(needing.len(), 1);
+		assert_eq!(needing[0].execution_id, exec_b_id);
+	}
+
+	// Reopen session:
+	let (reopened, loaded) =
+		DurableSession::open(db, "s-sibling", header("s-sibling", &dir)).expect("reopen");
+	let loaded = loaded.expect("loaded session");
+
+	// Exactly 4 messages on branch: User, Assistant, ToolResult A, ToolResult B (recovered)!
+	assert_eq!(loaded.branch_messages.len(), 4);
+	assert_eq!(loaded.branch_messages[2].id, "msg-tool-A");
+	assert_eq!(loaded.branch_messages[2].message.content.text(), "output A");
+
+	let recovered_b = &loaded.branch_messages[3];
+	assert_eq!(recovered_b.message.role, "toolResult");
+	assert_eq!(recovered_b.message.tool_call_id.as_deref(), Some("call-B"));
+	assert_eq!(recovered_b.message.content.text(), "output B");
+	assert_eq!(recovered_b.parent_id.as_deref(), Some("msg-tool-A"), "recovered B must chain to sibling leaf A");
+	let details_b = recovered_b.message.extra.get("details").expect("details");
+	assert_eq!(details_b.get("executionId").and_then(Value::as_str), Some(exec_b_id.as_str()));
+	assert_eq!(details_b.get("recovered").and_then(Value::as_bool), Some(true));
+
+	// Reopening resolved B:
+	assert!(reopened.executions_needing_recovery().expect("needing").is_empty());
+
+	// Next turn write boundary succeeds:
+	reopened
+		.persist_messages(&[
+			Message::user("run batch"),
+			Message::assistant_with_tools("calling batch", vec![
+				ToolCall { id: "call-A".to_string(), name: "effect".to_string(), arguments: json!({}) },
+				ToolCall { id: "call-B".to_string(), name: "effect".to_string(), arguments: json!({}) },
+			]),
+			Message::tool_with_status("call-A", "effect", "output A", false),
+			Message::tool_with_status("call-B", "effect", "output B", false),
+			Message::assistant("batch done"),
+		])
+		.await
+		.expect("next turn must align cleanly with recovered sibling B");
+
+	std::fs::remove_dir_all(dir).ok();
+}
+
+#[tokio::test]
+async fn reopened_session_recovers_multiple_batch_tool_results_across_sibling_leaves() {
+	let dir = temp_dir("multi-recover");
+	let db = dir.join("sessions.db");
+	let session = DurableSession::create(db.clone(), header("s-multi", &dir)).expect("create");
+
+	let asst_msg = Message::assistant_with_tools(
+		"calling batch multi",
+		vec![
+			ToolCall { id: "call-M1".to_string(), name: "effect".to_string(), arguments: json!({}) },
+			ToolCall { id: "call-M2".to_string(), name: "effect".to_string(), arguments: json!({}) },
+		],
+	);
+	session
+		.persist_messages(&[Message::user("run multi"), asst_msg])
+		.await
+		.expect("persist assistant");
+	drop(session);
+
+	let (exec_1, exec_2);
+	{
+		let mut store = SqliteStore::open(&db).expect("open store");
+		exec_1 = store
+			.record_intent(NewIntent {
+				session_id: "s-multi".to_string(),
+				branch_id: "s-multi.main".to_string(),
+				provider_call_id: "call-M1".to_string(),
+				tool_name: "effect".to_string(),
+				payload: json!({}),
+			})
+			.expect("intent 1");
+		exec_2 = store
+			.record_intent(NewIntent {
+				session_id: "s-multi".to_string(),
+				branch_id: "s-multi.main".to_string(),
+				provider_call_id: "call-M2".to_string(),
+				tool_name: "effect".to_string(),
+				payload: json!({}),
+			})
+			.expect("intent 2");
+
+		// Both recorded outcomes in SQLite, neither appended message before crash:
+		store
+			.record_outcome(&exec_1, json!({ "content": "out 1", "isError": false }))
+			.expect("outcome 1");
+		store
+			.record_outcome(&exec_2, json!({ "content": "out 2", "isError": false }))
+			.expect("outcome 2");
+
+		assert_eq!(store.executions_needing_recovery("s-multi").expect("needing").len(), 2);
+	}
+
+	// Reopen session:
+	let (reopened, loaded) =
+		DurableSession::open(db, "s-multi", header("s-multi", &dir)).expect("reopen");
+	let loaded = loaded.expect("loaded session");
+
+	// Both tool results recovered in chain!
+	assert_eq!(loaded.branch_messages.len(), 4);
+	let rec_1 = &loaded.branch_messages[2];
+	let rec_2 = &loaded.branch_messages[3];
+
+	assert_eq!(rec_1.message.tool_call_id.as_deref(), Some("call-M1"));
+	assert_eq!(rec_1.message.content.text(), "out 1");
+
+	assert_eq!(rec_2.message.tool_call_id.as_deref(), Some("call-M2"));
+	assert_eq!(rec_2.message.content.text(), "out 2");
+	assert_eq!(rec_2.parent_id.as_deref(), Some(rec_1.id.as_str()), "M2 must chain to sibling M1");
+
+	assert!(reopened.executions_needing_recovery().expect("needing").is_empty());
+
+	// Next turn write boundary succeeds:
+	reopened
+		.persist_messages(&[
+			Message::user("run multi"),
+			Message::assistant_with_tools("calling batch multi", vec![
+				ToolCall { id: "call-M1".to_string(), name: "effect".to_string(), arguments: json!({}) },
+				ToolCall { id: "call-M2".to_string(), name: "effect".to_string(), arguments: json!({}) },
+			]),
+			Message::tool_with_status("call-M1", "effect", "out 1", false),
+			Message::tool_with_status("call-M2", "effect", "out 2", false),
+			Message::assistant("multi done"),
+		])
+		.await
+		.expect("next turn must align cleanly with both recovered siblings");
+
+	std::fs::remove_dir_all(dir).ok();
+}
+
+#[tokio::test]
+async fn finish_execution_validates_call_id_linkage() {
+	let dir = temp_dir("call-id-link");
+	let db = dir.join("sessions.db");
+	let session = DurableSession::create(db.clone(), header("s-link", &dir)).expect("create");
+
+	let call = ToolCall {
+		id: "call-correct".to_string(),
+		name: "effect".to_string(),
+		arguments: json!({}),
+	};
+	let execution_id = session.begin_execution(&call).await.expect("begin");
+
+	// Finish with mismatched provider call ID
+	let wrong_call = ToolCall {
+		id: "call-WRONG".to_string(),
+		name: "effect".to_string(),
+		arguments: json!({}),
+	};
+	let result = ToolResult {
+		tool_call_id: "call-WRONG".to_string(),
+		content: "out".to_string(),
+		is_error: false,
+		terminate: false,
+		details: None,
+	};
+	let err = session
+		.finish_execution(&execution_id, &wrong_call, &result)
+		.await
+		.expect_err("mismatched call ID must fail validation");
+	assert!(err.to_string().contains("call id"));
+
+	// Neither outcome nor message committed
+	assert_eq!(session.execution(&execution_id).expect("exec").unwrap().outcome, None);
+	assert_eq!(session.unresolved_intents().expect("unresolved").len(), 1);
+
+	std::fs::remove_dir_all(dir).ok();
+}
+
+#[tokio::test]
+async fn reopen_with_unresolved_intent_refuses_dangling_replay_fail_closed() {
+	let dir = temp_dir("fail-closed");
+	let db = dir.join("sessions.db");
+	let session = DurableSession::create(db.clone(), header("s-fail", &dir)).expect("create");
+
+	// Persist an assistant message with a tool call.
+	let asst_msg = Message::assistant_with_tools(
+		"calling tool",
+		vec![ToolCall {
+			id: "call-dangling".to_string(),
+			name: "effect".to_string(),
+			arguments: json!({}),
+		}],
+	);
+	session
+		.persist_messages(&[Message::user("hi"), asst_msg])
+		.await
+		.expect("persist assistant");
+
+	// Record intent, but NO outcome (simulating crash during effect).
+	let call = ToolCall {
+		id: "call-dangling".to_string(),
+		name: "effect".to_string(),
+		arguments: json!({}),
+	};
+	let execution_id = session.begin_execution(&call).await.expect("begin");
+	drop(session);
+
+	// Reopen session.
+	let (reopened, loaded) =
+		DurableSession::open(db, "s-fail", header("s-fail", &dir)).expect("reopen");
+	assert!(loaded.is_some());
+
+	// Intent remains Unknown in unresolved_intents.
+	let unresolved = reopened.unresolved_intents().expect("unresolved");
+	assert_eq!(unresolved.len(), 1);
+	assert_eq!(unresolved[0].execution_id, execution_id);
+
+	// Reading stays available: load succeeds and returns the raw branch messages.
+	let loaded_again = reopened.load().expect("raw read of branch must stay available");
+	assert_eq!(loaded_again.branch_messages.len(), 2);
+
+	// But write boundary fails closed on dangling unresolvable tool call!
+	let err = reopened
+		.persist_messages(&[Message::user("next turn")])
+		.await
+		.expect_err("write boundary must fail closed on dangling call");
+	assert!(err.to_string().contains("dangling tool call call-dangling"));
+
+	std::fs::remove_dir_all(dir).ok();
+}
+
+#[tokio::test]
+async fn multiple_outcomes_keep_distinct_execution_ids_and_call_ids() {
+	let dir = temp_dir("multi-exec-ids");
+	let db = dir.join("sessions.db");
+	let session = DurableSession::create(db.clone(), header("s-multi-ids", &dir)).expect("create");
+
+	let call1 = ToolCall {
+		id: "call-1".to_string(),
+		name: "effect".to_string(),
+		arguments: json!({"n": 1}),
+	};
+	let call2 = ToolCall {
+		id: "call-2".to_string(),
+		name: "effect".to_string(),
+		arguments: json!({"n": 2}),
+	};
+
+	let asst = Message::assistant_with_tools("calling two", vec![call1.clone(), call2.clone()]);
+	session
+		.persist_messages(&[Message::user("go"), asst.clone()])
+		.await
+		.expect("persist asst");
+
+	let exec1 = session.begin_execution(&call1).await.expect("begin 1");
+	let exec2 = session.begin_execution(&call2).await.expect("begin 2");
+	assert_ne!(exec1, exec2, "execution IDs must be distinct");
+
+	let res1 = ToolResult {
+		tool_call_id: "call-1".to_string(),
+		content: "result 1".to_string(),
+		is_error: false,
+		terminate: false,
+		details: None,
+	};
+	let res2 = ToolResult {
+		tool_call_id: "call-2".to_string(),
+		content: "result 2".to_string(),
+		is_error: false,
+		terminate: false,
+		details: None,
+	};
+
+	// Cross-finishing exec1 with call2 must be rejected by validation
+	let bad_finish = session.finish_execution(&exec1, &call2, &res2).await;
+	assert!(bad_finish.is_err(), "cross-finishing exec1 with call2 must be rejected");
+
+	// Finish exec1 with call1
+	session.finish_execution(&exec1, &call1, &res1).await.expect("finish 1");
+	// Finish exec2 with call2
+	session.finish_execution(&exec2, &call2, &res2).await.expect("finish 2");
+
+	// Perform next write on live hot cursor:
+	session
+		.persist_messages(&[
+			Message::user("go"),
+			asst,
+			Message::tool_with_status("call-1", "effect", "result 1", false),
+			Message::tool_with_status("call-2", "effect", "result 2", false),
+			Message::assistant("both done"),
+		])
+		.await
+		.expect("persist batch on hot cursor");
+
+	// Verify chain and executionId mapping
+	let loaded = session.load().expect("load");
+	let tool_entries: Vec<_> = loaded
+		.messages
+		.iter()
+		.filter(|m| m.message.role == "toolResult")
+		.collect();
+	assert_eq!(tool_entries.len(), 2);
+
+	let entry1 = tool_entries.iter().find(|m| m.message.tool_call_id.as_deref() == Some("call-1")).expect("tool 1");
+	let entry2 = tool_entries.iter().find(|m| m.message.tool_call_id.as_deref() == Some("call-2")).expect("tool 2");
+
+	let eid1 = entry1.message.extra.get("details").and_then(|d| d.get("executionId")).and_then(Value::as_str);
+	let eid2 = entry2.message.extra.get("details").and_then(|d| d.get("executionId")).and_then(Value::as_str);
+
+	assert_eq!(eid1, Some(exec1.as_str()));
+	assert_eq!(eid2, Some(exec2.as_str()));
+	assert_ne!(eid1, eid2);
+
+	std::fs::remove_dir_all(dir).ok();
+}
+
+#[tokio::test]
+async fn reopened_session_with_compaction_recovers_unmessaged_outcome_and_preserves_context() {
+	let dir = temp_dir("compact-crash-recover");
+	let db = dir.join("sessions.db");
+	let session = DurableSession::create(db.clone(), header("s-comp", &dir)).expect("create");
+
+	// 1. Initial turns before compaction
+	let original = vec![Message::user("first turn"), Message::assistant("first answer")];
+	session.persist_messages(&original).await.expect("persist original");
+
+	// 2. Compaction: retained tail is assistant("first answer") with a real system notice
+	let notice = Message::system(format!(
+		"{}1 earlier turn(s) were pruned to fit the context limit]",
+		pi_agent::compaction::COMPACTION_NOTICE_PREFIX
+	));
+	let compacted = vec![notice.clone(), Message::assistant("first answer")];
+	let report = pi_agent::CompactionReport { old_len: 2, kept_from: 1, kept_at: 1 };
+	session.compacted(&compacted, &report).await.expect("compacted");
+	session.persist_messages(&compacted).await.expect("persist compacted");
+	// 3. New assistant turn with a tool call after compaction
+	let call = ToolCall {
+		id: "call-compact-1".to_string(),
+		name: "effect".to_string(),
+		arguments: json!({}),
+	};
+	let asst_tool = Message::assistant_with_tools("calling tool after compaction", vec![call.clone()]);
+	let conversation_with_tool = vec![
+		notice.clone(),
+		Message::assistant("first answer"),
+		Message::user("trigger tool"),
+		asst_tool.clone(),
+	];
+	session.persist_messages(&conversation_with_tool).await.expect("persist conversation with tool");
+
+	// 4. Begin execution
+	let execution_id = session.begin_execution(&call).await.expect("begin");
+	drop(session);
+
+	// 5. Simulate pre-atomic / legacy crash: outcome is recorded in SQLite executions, but no toolResult message on branch
+	{
+		let mut store = SqliteStore::open(&db).expect("open store");
+		store
+			.record_outcome(
+				&execution_id,
+				json!({ "content": "compact effect output", "isError": false }),
+			)
+			.expect("record outcome");
+		assert_eq!(store.executions_needing_recovery("s-comp").expect("needing").len(), 1);
+	}
+
+	// 6. Reopen session: load_parts runs recover_unmessaged_outcomes, which inserts message AND updates durableProjection.kept atomically!
+	let (reopened, loaded) =
+		DurableSession::open(db, "s-comp", header("s-comp", &dir)).expect("reopen");
+	let loaded = loaded.expect("loaded session");
+
+	// Verify recovered message was inserted
+	let recovered_msg = loaded
+		.branch_messages
+		.iter()
+		.find(|m| m.message.role == "toolResult")
+		.expect("recovered toolResult message must be present");
+	assert_eq!(recovered_msg.message.content.text(), "compact effect output");
+	let rec_id = recovered_msg.id.clone();
+
+	// Verify durableProjection.kept was ATOMICALLY UPDATED to include the recovered message ID
+	let projection = loaded.projection.expect("session must have durableProjection");
+	assert!(
+		projection.kept.contains(&rec_id),
+		"durableProjection.kept must contain the recovered message ID {rec_id}, got: {:?}",
+		projection.kept
+	);
+
+	// 7. Replay / next turn write boundary on reopened session must succeed without losing context!
+	let next_turn = vec![
+		notice,
+		Message::assistant("first answer"),
+		Message::user("trigger tool"),
+		asst_tool,
+		Message::tool_with_status("call-compact-1", "effect", "compact effect output", false),
+		Message::assistant("final answer after tool"),
+	];
+	reopened
+		.persist_messages(&next_turn)
+		.await
+		.expect("write boundary after compaction recovery must align and succeed");
+
+	let final_loaded = reopened.load().expect("load final");
+	let final_proj = final_loaded.projection.expect("final projection");
+	assert!(final_proj.kept.contains(&rec_id));
+
+	std::fs::remove_dir_all(dir).ok();
+}
+
+#[tokio::test]
+async fn reopened_session_with_compaction_backfills_unprojected_branch_suffix() {
+	let dir = temp_dir("compact-backfill");
+	let db = dir.join("sessions.db");
+	let session = DurableSession::create(db.clone(), header("s-backfill", &dir)).expect("create");
+
+	let notice = Message::system(format!(
+		"{}1 earlier turn(s) were pruned to fit the context limit]",
+		pi_agent::compaction::COMPACTION_NOTICE_PREFIX
+	));
+	let original = vec![Message::user("first turn"), Message::assistant("first answer")];
+	session.persist_messages(&original).await.expect("persist original");
+
+	let compacted = vec![notice.clone(), Message::assistant("first answer")];
+	let report = pi_agent::CompactionReport { old_len: 2, kept_from: 1, kept_at: 1 };
+	session.compacted(&compacted, &report).await.expect("compacted");
+	session.persist_messages(&compacted).await.expect("persist compacted");
+
+	let call = ToolCall {
+		id: "call-backfill-1".to_string(),
+		name: "effect".to_string(),
+		arguments: json!({}),
+	};
+	let asst_tool = Message::assistant_with_tools("calling tool", vec![call.clone()]);
+	session
+		.persist_messages(&[
+			notice.clone(),
+			Message::assistant("first answer"),
+			Message::user("do tool"),
+			asst_tool.clone(),
+		])
+		.await
+		.expect("persist asst with tool");
+
+	let execution_id = session.begin_execution(&call).await.expect("begin");
+	let result = ToolResult {
+		tool_call_id: call.id.clone(),
+		content: "backfill tool output".to_string(),
+		is_error: false,
+		terminate: false,
+		details: None,
+	};
+	session
+		.finish_execution(&execution_id, &call, &result)
+		.await
+		.expect("finish");
+	drop(session);
+
+	// Simulate legacy crash state: tool result message is in SQLite `messages`,
+	// but its ID is missing from `durableProjection.kept`.
+	let tool_msg_id;
+	{
+		let mut store = SqliteStore::open(&db).expect("open store");
+		let branch = store.branch("s-backfill.main").expect("branch").expect("main branch");
+		tool_msg_id = branch.leaf_message_id.expect("toolResult leaf");
+
+		// Strip tool_msg_id from durableProjection.kept in sessions.payload_json:
+		let mut payload = store.session("s-backfill").expect("session").expect("s-backfill").payload;
+		let kept_arr = payload
+			.get_mut("durableProjection")
+			.and_then(|p| p.get_mut("kept"))
+			.and_then(Value::as_array_mut)
+			.expect("kept array");
+		kept_arr.retain(|id| id.as_str() != Some(&tool_msg_id));
+		store.update_session_payload("s-backfill", payload).expect("update payload");
+
+		// Verify it is missing:
+		let payload_check = store.session("s-backfill").expect("session").expect("s-backfill").payload;
+		let kept_check = payload_check["durableProjection"]["kept"].as_array().expect("kept");
+		assert!(!kept_check.iter().any(|v| v.as_str() == Some(&tool_msg_id)));
+	}
+
+	// Reopen session: load_parts calls reconcile_durable_projection which safely backfills the suffix!
+	let (reopened, loaded) =
+		DurableSession::open(db, "s-backfill", header("s-backfill", &dir)).expect("reopen");
+	let loaded = loaded.expect("loaded session");
+
+	let projection = loaded.projection.expect("projection");
+	assert!(
+		projection.kept.contains(&tool_msg_id),
+		"reconcile_durable_projection must backfill tool_msg_id into projection.kept"
+	);
+
+	// Next turn write boundary succeeds without dropping the tool result from context:
+	let next_turn = vec![
+		notice,
+		Message::assistant("first answer"),
+		Message::user("do tool"),
+		asst_tool,
+		Message::tool_with_status("call-backfill-1", "effect", "backfill tool output", false),
+		Message::assistant("final response"),
+	];
+	reopened
+		.persist_messages(&next_turn)
+		.await
+		.expect("next turn must align cleanly with reconciled projection suffix");
+
+	std::fs::remove_dir_all(dir).ok();
+}
+
+#[tokio::test]
+async fn reopened_session_with_diverged_projection_discards_stale_projection_and_resumes() {
+	let dir = temp_dir("compact-corrupt-branch");
+	let db = dir.join("sessions.db");
+	let session = DurableSession::create(db.clone(), header("s-corrupt", &dir)).expect("create");
+
+	let original = vec![Message::user("first"), Message::assistant("first answer")];
+	session.persist_messages(&original).await.expect("persist");
+	drop(session);
+
+	// Invalidate durableProjection.kept with an ID completely absent from the active branch (legacy branch cut crash state):
+	{
+		let mut store = SqliteStore::open(&db).expect("open store");
+		let mut payload = store.session("s-corrupt").expect("session").expect("s-corrupt").payload;
+		payload.as_object_mut().unwrap().insert(
+			"durableProjection".to_string(),
+			json!({
+				"kept": ["msg-nonexistent-unrelated-branch"],
+				"synthetic": []
+			}),
+		);
+		store.update_session_payload("s-corrupt", payload).expect("update payload");
+	}
+
+	// 1. Safe readability: opening the session succeeds, stale projection is discarded!
+	let (reopened, loaded) = DurableSession::open(db, "s-corrupt", header("s-corrupt", &dir))
+		.expect("reopen must succeed for safe readability even with diverged projection");
+	let loaded = loaded.expect("loaded session");
+	assert_eq!(loaded.branch_messages.len(), 2, "history messages must be fully preserved and readable");
+	assert_eq!(loaded.branch_messages[0].message.role, "user");
+	assert_eq!(loaded.branch_messages[1].message.role, "assistant");
+	assert!(loaded.projection.is_none(), "stale diverged projection must be discarded, not exposed to reader");
+
+	let load_again = reopened.load().expect("load must succeed for reading");
+	assert_eq!(load_again.branch_messages.len(), 2);
+	assert!(load_again.projection.is_none());
+
+	// 2. Writing resumes against the real active branch without duplicating rows:
+	reopened
+		.persist_messages(&[Message::user("first"), Message::assistant("first answer"), Message::user("new turn")])
+		.await
+		.expect("write must succeed by aligning against the real branch");
+	let final_loaded = reopened.load().expect("read final");
+	assert_eq!(final_loaded.branch_messages.len(), 3, "must append exactly 1 new turn, not duplicate history");
+	assert_eq!(final_loaded.branch_messages[2].message.content.text(), "new turn");
+
+	std::fs::remove_dir_all(dir).ok();
+}
+
+#[tokio::test]
+async fn branch_cut_via_append_entry_clears_projection_in_sqlite_and_in_memory() {
+	let dir = temp_dir("branch-cut-proj");
+	let db = dir.join("sessions.db");
+	let session = DurableSession::create(db.clone(), header("s-cut", &dir)).expect("create");
+
+	let notice = Message::system(format!(
+		"{}1 earlier turn(s) were pruned to fit the context limit]",
+		pi_agent::compaction::COMPACTION_NOTICE_PREFIX
+	));
+	let compacted = vec![notice, Message::assistant("first answer")];
+	let report = pi_agent::CompactionReport { old_len: 2, kept_from: 1, kept_at: 1 };
+	session.compacted(&compacted, &report).await.expect("compacted");
+	session.persist_messages(&compacted).await.expect("persist compacted");
+
+	let loaded_before = session.load().expect("load");
+	assert!(loaded_before.projection.is_some());
+	let parent_id = loaded_before.leaf.clone();
+
+	// Perform branch cut via append_entry with valid existing parent
+	let cut_entry = SessionEntry {
+		kind: "branch_summary".to_string(),
+		id: "msg-cut-1".to_string(),
+		parent_id,
+		timestamp: output::iso8601(std::time::SystemTime::now()),
+		extra: json!({}),
+	};
+	session.append_entry(cut_entry).expect("append branch cut");
+
+	// Both in SQLite and in-memory, projection is None:
+	let loaded = session.load().expect("load after cut");
+	assert!(loaded.projection.is_none(), "projection must be None after branch cut");
+
+	{
+		let store = SqliteStore::open(&db).expect("open store");
+		let payload = store.session("s-cut").expect("session").expect("s-cut").payload;
+		assert!(payload.get("durableProjection").is_none(), "SQLite payload must not contain durableProjection");
+	}
+
+	std::fs::remove_dir_all(dir).ok();
+}
+
+#[tokio::test]
+async fn clear_projection_clears_both_sqlite_and_in_memory_state() {
+	let dir = temp_dir("clear-proj");
+	let db = dir.join("sessions.db");
+	let session = DurableSession::create(db.clone(), header("s-clear", &dir)).expect("create");
+
+	let notice = Message::system(format!(
+		"{}1 earlier turn(s) were pruned to fit the context limit]",
+		pi_agent::compaction::COMPACTION_NOTICE_PREFIX
+	));
+	let compacted = vec![notice, Message::assistant("first answer")];
+	let report = pi_agent::CompactionReport { old_len: 2, kept_from: 1, kept_at: 1 };
+	session.compacted(&compacted, &report).await.expect("compacted");
+	session.persist_messages(&compacted).await.expect("persist compacted");
+
+	assert!(session.load().expect("load").projection.is_some());
+
+	session.clear_projection().expect("clear_projection");
+
+	// Verified: both in memory and SQLite cleared
+	assert!(session.load().expect("load after clear").projection.is_none());
+
+	{
+		let store = SqliteStore::open(&db).expect("open store");
+		let payload = store.session("s-clear").expect("session").expect("s-clear").payload;
+		assert!(payload.get("durableProjection").is_none());
+	}
+
+	std::fs::remove_dir_all(dir).ok();
 }
