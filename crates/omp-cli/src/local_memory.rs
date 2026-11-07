@@ -620,10 +620,14 @@ fn write_atomic(file_path: &Path, contents: &str, cancel: Option<&CancelProbe<'_
 type WriteChains = Mutex<HashMap<PathBuf, Arc<Mutex<()>>>>;
 static WRITE_CHAINS: LazyLock<WriteChains> = LazyLock::new(WriteChains::default);
 
-/// Serialize the read-modify-write per file. Parallel `learn` calls share one
-/// project memory root, so an unguarded RMW would let the last writer drop the
-/// other's lesson. Entries are dropped once the chain drains.
-fn with_path_lock<T>(path: &Path, op: impl FnOnce() -> Result<T>) -> Result<T> {
+/// Serialize work on one path inside this process. Parallel `learn` calls
+/// share one project memory root, so an unguarded read-modify-write would let
+/// the last writer drop the other's lesson; the SQLite memory store uses the
+/// same registry to serialize writers of one `memory.db`. Different paths never
+/// wait on each other. Entries are dropped once the chain drains.
+///
+/// Process-local only: it orders threads of one `omp`, never two processes.
+pub(crate) fn with_path_lock<T, E>(path: &Path, op: impl FnOnce() -> Result<T, E>) -> Result<T, E> {
 	let arc = {
 		let mut chains = lock_unpoisoned(&WRITE_CHAINS);
 		chains.entry(path.to_path_buf()).or_default().clone()

@@ -23,6 +23,12 @@
 //! index only when the corpus grows enough that bounded LIKE scans hurt. All
 //! calls block on one mutex-guarded connection; move to a writer thread if a
 //! session starts issuing memory operations in the middle of model streaming.
+//! Writers of one `memory.db` serialize on a per-path lock that also covers
+//! store opens (WAL switch + schema init), so concurrent `learn` calls queue on
+//! a mutex instead of racing SQLite's `busy_timeout`, whose expiry surfaces as
+//! `database is locked`; different agent directories never wait on each other.
+//! The lock is process-local: two `omp` processes still race, and a lost race is
+//! reported, never retried (a retried commit would have unknown effect).
 //!
 //! Security: content is neutralized and secret-redacted on write and again on
 //! read, so hand-edited or corrupted rows cannot inject prompt delimiters or
@@ -380,18 +386,54 @@ impl MemoryStore {
 				"memory store path must not be empty".to_string(),
 			));
 		}
-		if let Some(parent) = path
+		// One file must mean one lock. The directory is created first and then
+		// resolved, so `..`, relative and symlinked-directory spellings of the
+		// same store collapse onto one key and one connection target. Only the
+		// directory is resolved — a symlinked `memory.db` file keeps its own key —
+		// and hardlinks, bind mounts or a second process are NOT unified here:
+		// those keep relying on SQLite's own file locking.
+		let parent = path
 			.parent()
-			.filter(|parent| !parent.as_os_str().is_empty())
-		{
-			fs::create_dir_all(parent)?;
-		}
-		let mut connection = Connection::open(&path)?;
-		connection.busy_timeout(std::time::Duration::from_secs(5))?;
-		let _: String = connection.query_row("PRAGMA journal_mode=WAL", [], |row| row.get(0))?;
-		connection.pragma_update(None, "synchronous", "FULL")?;
-		initialize(&mut connection)?;
-		Ok(Self { path, connection: Mutex::new(connection) })
+			.filter(|parent| !parent.as_os_str().is_empty());
+		let file_name = path
+			.file_name()
+			.ok_or_else(|| {
+				MemoryStoreError::Validation(format!(
+					"memory store path {} has no file name",
+					path.display()
+				))
+			})?
+			.to_os_string();
+		let parent = match parent {
+			Some(parent) => {
+				fs::create_dir_all(parent)?;
+				fs::canonicalize(parent)?
+			},
+			None => fs::canonicalize(".")?,
+		};
+		let path = parent.join(file_name);
+		// WAL switch, pragmas and schema init all take filesystem locks on this
+		// one file. Serialized per database path, so a second thread opening the
+		// same fresh store cannot race the switch into `database is locked`,
+		// while other agent dirs open in parallel. Cross-process writers are not
+		// ordered by this lock: they still resolve through `busy_timeout`, and a
+		// lost race is reported instead of retried.
+		crate::local_memory::with_path_lock(&path, || {
+			let mut connection = Connection::open(&path)?;
+			connection.busy_timeout(std::time::Duration::from_secs(5))?;
+			let journal_mode: String =
+				connection.query_row("PRAGMA journal_mode=WAL", [], |row| row.get(0))?;
+			if !journal_mode.eq_ignore_ascii_case("wal") {
+				// Falling back to the rollback journal silently would make readers
+				// block writers and turn recall into a `database is locked` source.
+				return Err(MemoryStoreError::Schema(format!(
+					"memory store journal mode is {journal_mode}, expected wal"
+				)));
+			}
+			connection.pragma_update(None, "synchronous", "FULL")?;
+			initialize(&mut connection)?;
+			Ok(Self { path: path.clone(), connection: Mutex::new(connection) })
+		})
 	}
 
 	/// In-memory store with the same schema, for tests.
@@ -427,51 +469,54 @@ impl MemoryStore {
 			.dedupe
 			.then(|| record_dedupe_key(input.scope, cwd.as_deref(), &body, context.as_deref()));
 
-		let mut guard = self.lock();
-		let transaction = guard.transaction_with_behavior(TransactionBehavior::Immediate)?;
-		if let Some(key) = dedupe_key.as_deref()
-			&& let Some(id) = transaction
-				.query_row("SELECT id FROM memories WHERE dedupe_key = ?1", params![key], |row| {
-					row.get::<_, String>(0)
-				})
-				.optional()?
-		{
-			let updated_at = next_timestamp(&transaction)?;
-			transaction.execute(
-				"UPDATE memories SET updated_at = ?1 WHERE id = ?2",
-				params![updated_at, id],
-			)?;
-			let record = load_record(&transaction, &id)?
-				.ok_or_else(|| MemoryStoreError::NotFound(format!("memory record not found: {id}")))?;
-			transaction.commit()?;
-			return Ok(record);
-		}
+		crate::local_memory::with_path_lock(&self.path, || {
+			let mut guard = self.lock();
+			let transaction = guard.transaction_with_behavior(TransactionBehavior::Immediate)?;
+			if let Some(key) = dedupe_key.as_deref()
+				&& let Some(id) = transaction
+					.query_row("SELECT id FROM memories WHERE dedupe_key = ?1", params![key], |row| {
+						row.get::<_, String>(0)
+					})
+					.optional()?
+			{
+				let updated_at = next_timestamp(&transaction)?;
+				transaction.execute(
+					"UPDATE memories SET updated_at = ?1 WHERE id = ?2",
+					params![updated_at, id],
+				)?;
+				let record = load_record(&transaction, &id)?.ok_or_else(|| {
+					MemoryStoreError::NotFound(format!("memory record not found: {id}"))
+				})?;
+				transaction.commit()?;
+				return Ok(record);
+			}
 
-		let updated_at = next_timestamp(&transaction)?;
-		let id: String = transaction.query_row(
-			"INSERT INTO memories \
-			 (id, scope, cwd, body, context, origin, actor, source, created_at, updated_at, dedupe_key) \
-			 VALUES (lower(hex(randomblob(16))), ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10) \
-			 RETURNING id",
-			params![
-				input.scope.as_str(),
-				cwd,
-				body,
-				context,
-				input.origin.as_str(),
-				actor,
-				source,
-				updated_at,
-				updated_at,
-				dedupe_key,
-			],
-			|row| row.get(0),
-		)?;
-		let record = load_record(&transaction, &id)?.ok_or_else(|| {
-			MemoryStoreError::NotFound(format!("memory record not found after insert: {id}"))
-		})?;
-		transaction.commit()?;
-		Ok(record)
+			let updated_at = next_timestamp(&transaction)?;
+			let id: String = transaction.query_row(
+				"INSERT INTO memories \
+				 (id, scope, cwd, body, context, origin, actor, source, created_at, updated_at, dedupe_key) \
+				 VALUES (lower(hex(randomblob(16))), ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10) \
+				 RETURNING id",
+				params![
+					input.scope.as_str(),
+					cwd,
+					body,
+					context,
+					input.origin.as_str(),
+					actor,
+					source,
+					updated_at,
+					updated_at,
+					dedupe_key,
+				],
+				|row| row.get(0),
+			)?;
+			let record = load_record(&transaction, &id)?.ok_or_else(|| {
+				MemoryStoreError::NotFound(format!("memory record not found after insert: {id}"))
+			})?;
+			transaction.commit()?;
+			Ok(record)
+		})
 	}
 
 	/// List visible records newest-first. `ScopeFilter::All` without a `cwd` is
@@ -518,54 +563,58 @@ impl MemoryStore {
 				"memory body is empty after sanitization".to_string(),
 			));
 		}
-		let mut guard = self.lock();
-		let transaction = guard.transaction_with_behavior(TransactionBehavior::Immediate)?;
-		let current = load_record(&transaction, &id)?
-			.ok_or_else(|| MemoryStoreError::NotFound(format!("memory record not found: {id}")))?;
-		ensure_visible(&current, cwd)?;
-		// Identity (dedupe key) follows the body, or a later legacy-free import
-		// and a re-learned original would otherwise duplicate or silently vanish.
-		let dedupe_key = record_dedupe_key(
-			current.scope,
-			current.cwd.as_deref(),
-			&body,
-			current.context.as_deref(),
-		);
-		let collision: Option<String> = transaction
-			.query_row(
-				"SELECT id FROM memories WHERE dedupe_key = ?1 AND id != ?2",
-				params![dedupe_key, id],
-				|row| row.get(0),
-			)
-			.optional()?;
-		if let Some(other) = collision {
-			return Err(MemoryStoreError::Conflict(format!(
-				"record {other} already has this body in the same scope"
-			)));
-		}
-		let updated_at = next_timestamp(&transaction)?;
-		transaction.execute(
-			"UPDATE memories SET body = ?1, dedupe_key = ?2, updated_at = ?3 WHERE id = ?4",
-			params![body, dedupe_key, updated_at, id],
-		)?;
-		let record = load_record(&transaction, &id)?
-			.ok_or_else(|| MemoryStoreError::NotFound(format!("memory record not found: {id}")))?;
-		transaction.commit()?;
-		Ok(record)
+		crate::local_memory::with_path_lock(&self.path, || {
+			let mut guard = self.lock();
+			let transaction = guard.transaction_with_behavior(TransactionBehavior::Immediate)?;
+			let current = load_record(&transaction, &id)?
+				.ok_or_else(|| MemoryStoreError::NotFound(format!("memory record not found: {id}")))?;
+			ensure_visible(&current, cwd)?;
+			// Identity (dedupe key) follows the body, or a later legacy-free import
+			// and a re-learned original would otherwise duplicate or silently vanish.
+			let dedupe_key = record_dedupe_key(
+				current.scope,
+				current.cwd.as_deref(),
+				&body,
+				current.context.as_deref(),
+			);
+			let collision: Option<String> = transaction
+				.query_row(
+					"SELECT id FROM memories WHERE dedupe_key = ?1 AND id != ?2",
+					params![dedupe_key, id],
+					|row| row.get(0),
+				)
+				.optional()?;
+			if let Some(other) = collision {
+				return Err(MemoryStoreError::Conflict(format!(
+					"record {other} already has this body in the same scope"
+				)));
+			}
+			let updated_at = next_timestamp(&transaction)?;
+			transaction.execute(
+				"UPDATE memories SET body = ?1, dedupe_key = ?2, updated_at = ?3 WHERE id = ?4",
+				params![body, dedupe_key, updated_at, id],
+			)?;
+			let record = load_record(&transaction, &id)?
+				.ok_or_else(|| MemoryStoreError::NotFound(format!("memory record not found: {id}")))?;
+			transaction.commit()?;
+			Ok(record)
+		})
 	}
 
 	/// Delete one record and nothing else. This never touches `sessions.db`
 	/// (conversation history is a different file and a different authority).
 	pub fn delete(&self, id: &str, cwd: Option<&str>) -> MemoryResult<()> {
 		let id = normalize_record_id(id)?;
-		let mut guard = self.lock();
-		let transaction = guard.transaction_with_behavior(TransactionBehavior::Immediate)?;
-		let current = load_record(&transaction, &id)?
-			.ok_or_else(|| MemoryStoreError::NotFound(format!("memory record not found: {id}")))?;
-		ensure_visible(&current, cwd)?;
-		transaction.execute("DELETE FROM memories WHERE id = ?1", params![id])?;
-		transaction.commit()?;
-		Ok(())
+		crate::local_memory::with_path_lock(&self.path, || {
+			let mut guard = self.lock();
+			let transaction = guard.transaction_with_behavior(TransactionBehavior::Immediate)?;
+			let current = load_record(&transaction, &id)?
+				.ok_or_else(|| MemoryStoreError::NotFound(format!("memory record not found: {id}")))?;
+			ensure_visible(&current, cwd)?;
+			transaction.execute("DELETE FROM memories WHERE id = ?1", params![id])?;
+			transaction.commit()?;
+			Ok(())
+		})
 	}
 
 	/// Bounded lexical recall over the visible scope.
@@ -667,6 +716,20 @@ impl MemoryStore {
 	/// insert, or an import that reports lessons while the store stays empty,
 	/// is an explicit error — never a silent success.
 	pub fn import_learned_lessons(
+		&self,
+		agent_dir: &Path,
+		cwd: &Path,
+	) -> MemoryResult<ImportReport> {
+		// Serialized per database path: in-process peers must not both read the
+		// artifact and race the marker insert. A second process is still ordered
+		// only by the marker re-check inside the write transaction.
+		crate::local_memory::with_path_lock(&self.path, || {
+			self.import_learned_lessons_locked(agent_dir, cwd)
+		})
+	}
+
+	/// Caller holds the store's per-path lock (`import_learned_lessons`).
+	fn import_learned_lessons_locked(
 		&self,
 		agent_dir: &Path,
 		cwd: &Path,
@@ -1771,5 +1834,126 @@ mod tests {
 			.add(&AddInput::project_lesson("/work/one", "context lesson", Some("review turn")))
 			.expect("context");
 		assert_eq!(render_learned_line(&with_context), "- context lesson _(context: review turn)_");
+	}
+
+	#[test]
+	fn concurrent_legacy_imports_run_once_and_keep_every_bullet() {
+		let dir = temp_dir();
+		let agent = dir.join("agent");
+		let cwd = dir.join("project");
+		fs::create_dir_all(&cwd).expect("cwd");
+		let file = crate::local_memory::memory_root(&agent, &cwd).join(LEARNED_LESSONS_FILE);
+		fs::create_dir_all(file.parent().expect("root")).expect("root");
+		fs::write(&file, "- legacy one\n- legacy two\n").expect("seed");
+
+		let mut handles = Vec::new();
+		for _ in 0..8 {
+			let agent = agent.clone();
+			let cwd = cwd.clone();
+			handles.push(std::thread::spawn(move || {
+				let store = MemoryStore::open(&agent).expect("open");
+				store.import_learned_lessons(&agent, &cwd).expect("import");
+			}));
+		}
+		for handle in handles {
+			handle.join().expect("thread");
+		}
+
+		let store = MemoryStore::open(&agent).expect("reopen");
+		let records = store
+			.list(&Filter::project(&cwd.to_string_lossy()))
+			.expect("list");
+		assert_eq!(records.len(), 2, "legacy bullets are imported exactly once");
+		assert!(
+			records
+				.iter()
+				.all(|record| matches!(record.body.as_str(), "legacy one" | "legacy two")),
+			"{records:?}"
+		);
+	}
+
+	#[test]
+	fn aliased_spellings_of_one_store_share_a_path_and_a_lock() {
+		let dir = temp_dir();
+		let agent = dir.join("agent");
+		let store = MemoryStore::open(&agent).expect("open");
+		let canonical = store.path().to_path_buf();
+		drop(store);
+
+		// `agent/../agent`: same directory, different spelling, no symlink needed.
+		let dotted = dir
+			.join("agent")
+			.join("..")
+			.join("agent")
+			.join(MEMORY_DB_FILE);
+		let through_dots = MemoryStore::open_at(dotted.clone()).expect("open dotted");
+		assert_eq!(
+			through_dots.path(),
+			canonical.as_path(),
+			"`..` spelling must resolve to the same store"
+		);
+		drop(through_dots);
+
+		#[cfg(unix)]
+		{
+			let alias = dir.join("alias");
+			std::os::unix::fs::symlink(&agent, &alias).expect("symlink");
+			let through_link = MemoryStore::open_at(alias.join(MEMORY_DB_FILE)).expect("open link");
+			assert_eq!(
+				through_link.path(),
+				canonical.as_path(),
+				"symlink spelling must resolve to the same store"
+			);
+			drop(through_link);
+
+			// Both spellings must write one file under one lock.
+			let mut handles = Vec::new();
+			for index in 0..8 {
+				let spelled = if index % 2 == 0 {
+					alias.join(MEMORY_DB_FILE)
+				} else {
+					dotted.clone()
+				};
+				handles.push(std::thread::spawn(move || {
+					let store = MemoryStore::open_at(spelled).expect("open");
+					store
+						.add(&AddInput::project_lesson("/work/one", &format!("alias {index}"), None))
+						.expect("add");
+				}));
+			}
+			for handle in handles {
+				handle.join().expect("thread");
+			}
+			let store = MemoryStore::open(&agent).expect("reopen");
+			let records = store.list(&Filter::project("/work/one")).expect("list");
+			assert_eq!(records.len(), 8, "both spellings write the same store");
+		}
+	}
+
+	#[test]
+	fn concurrent_opens_and_writes_keep_every_record() {
+		let dir = temp_dir();
+		let cwd = "/work/one".to_string();
+		let mut handles = Vec::new();
+		for index in 0..12 {
+			let dir = dir.clone();
+			let cwd = cwd.clone();
+			handles.push(std::thread::spawn(move || {
+				let store = MemoryStore::open(&dir).expect("open");
+				store
+					.add(&AddInput::project_lesson(&cwd, &format!("record {index}"), None))
+					.expect("add");
+			}));
+		}
+		for handle in handles {
+			handle.join().expect("thread");
+		}
+		let store = MemoryStore::open(&dir).expect("reopen");
+		let records = store.list(&Filter::project(&cwd)).expect("list");
+		assert_eq!(records.len(), 12, "every concurrent writer keeps its record");
+		for index in 0..12 {
+			let expected = format!("record {index}");
+			assert!(records.iter().any(|record| record.body == expected), "missing {expected}");
+		}
 	}
 }
