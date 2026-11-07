@@ -1062,6 +1062,21 @@ impl AgentLoop {
 			.map_err(|error| AgentError::Durable(error.to_string()))
 	}
 
+	/// Amend the active turn's assistant record with its terminal status in durable storage.
+	async fn finish_turn(
+		&self,
+		stop_reason: &str,
+		error_message: Option<&str>,
+	) -> Result<(), AgentError> {
+		let Some(durable) = &self.durable else {
+			return Ok(());
+		};
+		durable
+			.finish_turn(stop_reason, error_message)
+			.await
+			.map_err(|error| AgentError::Durable(error.to_string()))
+	}
+
 	fn begin_turn_ack(
 		&self,
 		turn_start: usize,
@@ -1850,6 +1865,16 @@ impl AgentLoop {
 			// TS ToolAbortError interrupts the whole turn; never issue another
 			// provider request merely because the tool returned an Aborted result.
 			let cancelled = outcome.interrupted || cancellation_token.is_cancelled();
+			if cancelled {
+				assistant = interrupted_message(assistant, outcome.interrupt_reason.clone());
+				state.messages[turn_start] = assistant.clone();
+				let stop_reason = assistant
+					.stop_reason
+					.map(StopReason::as_str)
+					.unwrap_or("aborted");
+				self.finish_turn(stop_reason, assistant.error_message.as_deref())
+					.await?;
+			}
 			let status = if cancelled {
 				TurnStatus::Aborted
 			} else {

@@ -96,6 +96,20 @@ pub trait DurableBoundary: Send + Sync + std::fmt::Debug {
 		result: &ToolResult,
 	) -> Result<(), DurableError>;
 
+	/// Amend the active turn's assistant record with its terminal status.
+	///
+	/// When an assistant message requesting tools is persisted before tool
+	/// execution, its initial stop reason is `toolUse`. If the turn terminates
+	/// (e.g. cancelled/aborted by SIGINT during tool execution), the host must
+	/// amend the pre-execution assistant row with its terminal `stop_reason`
+	/// and optional `error_message` so that durable history and replay reflect
+	/// the terminal state without losing completed tool effects or intents.
+	async fn finish_turn(
+		&self,
+		stop_reason: &str,
+		error_message: Option<&str>,
+	) -> Result<(), DurableError>;
+
 	/// Child scopes this root boundary can own. `None` is explicit ephemeral
 	/// mode; a boundary backed by a session store returns a real factory.
 	fn child_durability_factory(&self) -> Option<Arc<dyn ChildDurabilityFactory>> {

@@ -2169,6 +2169,144 @@ impl SqliteStore {
 		}
 		Ok(())
 	}
+
+	/// Amend the terminal stop reason and optional error message of an assistant message row.
+	pub fn update_message_terminal(
+		&mut self,
+		session_id: &str,
+		branch_id: &str,
+		message_id: Option<&str>,
+		stop_reason: &str,
+		error_message: Option<&str>,
+	) -> StoreResult<String> {
+		validate_id("session id", session_id)?;
+		validate_id("branch id", branch_id)?;
+		if let Some(id) = message_id {
+			validate_id("message id", id)?;
+		}
+		let now = now_ms();
+		let transaction = self
+			.connection
+			.transaction_with_behavior(TransactionBehavior::Immediate)?;
+
+		let branch_row: Option<(String, Option<String>, Option<String>)> = transaction
+			.query_row(
+				"SELECT session_id, parent_message_id, leaf_message_id FROM branches WHERE id = ?1",
+				params![branch_id],
+				|row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+			)
+			.optional()?;
+		let Some((b_session, parent_message_id, leaf_message_id)) = branch_row else {
+			return Err(StoreError::NotFound(format!("branch {branch_id} does not exist")));
+		};
+		if b_session != session_id {
+			return Err(StoreError::Validation(format!(
+				"branch {branch_id} belongs to session {b_session}, not {session_id}"
+			)));
+		}
+
+		let (target_id, raw_payload) = if let Some(id) = message_id {
+			let row: Option<(String, String)> = transaction
+				.query_row(
+					"SELECT branch_id, payload_json FROM messages WHERE id = ?1 AND session_id = ?2",
+					params![id, session_id],
+					|row| Ok((row.get(0)?, row.get(1)?)),
+				)
+				.optional()?;
+			let Some((msg_branch, payload)) = row else {
+				return Err(StoreError::NotFound(format!(
+					"message {id} not found in session {session_id}"
+				)));
+			};
+			if msg_branch != branch_id {
+				return Err(StoreError::Validation(format!(
+					"message {id} belongs to branch {msg_branch}, not {branch_id}"
+				)));
+			}
+			(id.to_string(), payload)
+		} else {
+			let mut cursor = leaf_message_id.or(parent_message_id);
+			let mut seen = HashSet::new();
+			let mut found: Option<(String, String)> = None;
+			while let Some(id) = cursor {
+				if !seen.insert(id.clone()) {
+					return Err(StoreError::Corrupt(format!(
+						"branch {branch_id} contains a message cycle at {id}"
+					)));
+				}
+				let row: Option<(String, String, Option<String>, String)> = transaction
+					.query_row(
+						"SELECT session_id, branch_id, parent_message_id, payload_json FROM messages WHERE id = ?1",
+						params![id],
+						|r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+					)
+					.optional()?;
+				let Some((msg_session, msg_branch, parent, payload)) = row else {
+					return Err(StoreError::Corrupt(format!(
+						"branch {branch_id} refers to missing message {id}"
+					)));
+				};
+				if msg_session != session_id {
+					return Err(StoreError::Corrupt(format!(
+						"branch {branch_id} refers to message {id} belonging to session {msg_session}, not {session_id}"
+					)));
+				}
+				if msg_branch != branch_id {
+					// Ancestry traversed beyond branch root; do not mutate parent branch messages
+					break;
+				}
+				let parsed: Value = decode_json(&payload)?;
+				let role = parsed
+					.get("message")
+					.and_then(|m| m.get("role"))
+					.or_else(|| parsed.get("role"))
+					.and_then(Value::as_str);
+				if role == Some("assistant") {
+					found = Some((id, payload));
+					break;
+				}
+				cursor = parent;
+			}
+			let Some(target) = found else {
+				return Err(StoreError::NotFound(format!(
+					"no assistant message found on branch {branch_id} for session {session_id}"
+				)));
+			};
+			target
+		};
+
+		let mut payload: Value = decode_json(&raw_payload)?;
+		let canon_stop = crate::session::canonical_stop_reason(stop_reason);
+
+		if let Some(msg_obj) = payload.get_mut("message").and_then(Value::as_object_mut) {
+			msg_obj.insert("stopReason".to_string(), Value::String(canon_stop.to_string()));
+			if let Some(err) = error_message {
+				msg_obj.insert("errorMessage".to_string(), Value::String(err.to_string()));
+			} else {
+				msg_obj.remove("errorMessage");
+			}
+		} else if let Some(top_obj) = payload.as_object_mut() {
+			top_obj.insert("stopReason".to_string(), Value::String(canon_stop.to_string()));
+			if let Some(err) = error_message {
+				top_obj.insert("errorMessage".to_string(), Value::String(err.to_string()));
+			} else {
+				top_obj.remove("errorMessage");
+			}
+		}
+
+		let encoded = encode_json(&payload)?;
+		transaction.execute(
+			"UPDATE messages SET payload_json = ?1 WHERE id = ?2",
+			params![encoded, target_id],
+		)?;
+		transaction.execute(
+			"UPDATE sessions SET updated_at_ms = ?1 WHERE id = ?2",
+			params![now, session_id],
+		)?;
+		transaction.commit()?;
+
+		Ok(target_id)
+	}
 }
 
 fn append_message_tx(
@@ -4594,6 +4732,185 @@ mod tests {
 		assert!(tx2_err.is_err(), "concurrent immediate transaction must be blocked by SQLite write lock");
 
 		drop(tx1);
+		let _ = std::fs::remove_dir_all(dir);
+	}
+
+	#[test]
+	fn update_message_terminal_amends_assistant_stop_reason_and_error() {
+		let (dir, path) = temp_db("update-terminal");
+		let mut store = SqliteStore::open(&path).expect("open store");
+
+		store
+			.create_session(NewSession {
+				id: "s_term".to_string(),
+				parent_session_id: None,
+				payload: json!({}),
+				initial_branch_id: "b1".to_string(),
+				initial_branch_payload: json!({}),
+			})
+			.expect("create session");
+
+		store
+			.append_message(NewMessage {
+				id: "m_asst".to_string(),
+				session_id: "s_term".to_string(),
+				branch_id: "b1".to_string(),
+				parent_message_id: None,
+				payload: json!({
+					"kind": "message",
+					"id": "m_asst",
+					"message": {
+						"role": "assistant",
+						"content": "",
+						"stopReason": "toolUse"
+					}
+				}),
+			})
+			.expect("append assistant message");
+
+		let updated_id = store
+			.update_message_terminal(
+				"s_term",
+				"b1",
+				Some("m_asst"),
+				"aborted",
+				Some("Interrupted by user"),
+			)
+			.expect("update terminal");
+		assert_eq!(updated_id, "m_asst");
+
+		let messages = store.session_messages("s_term").expect("session messages");
+		assert_eq!(messages.len(), 1);
+		let payload = &messages[0].payload;
+		assert_eq!(
+			payload
+				.get("message")
+				.and_then(|m| m.get("stopReason"))
+				.and_then(Value::as_str),
+			Some("aborted")
+		);
+		assert_eq!(
+			payload
+				.get("message")
+				.and_then(|m| m.get("errorMessage"))
+				.and_then(Value::as_str),
+			Some("Interrupted by user")
+		);
+
+		let _ = std::fs::remove_dir_all(dir);
+	}
+
+	#[test]
+	fn update_message_terminal_finds_active_assistant_by_branch_ancestry() {
+		let (dir, path) = temp_db("update-terminal-ancestry");
+		let mut store = SqliteStore::open(&path).expect("open store");
+
+		store
+			.create_session(NewSession {
+				id: "s_ancestry".to_string(),
+				parent_session_id: None,
+				payload: json!({}),
+				initial_branch_id: "b1".to_string(),
+				initial_branch_payload: json!({}),
+			})
+			.expect("create session");
+
+		store
+			.append_message(NewMessage {
+				id: "m_asst".to_string(),
+				session_id: "s_ancestry".to_string(),
+				branch_id: "b1".to_string(),
+				parent_message_id: None,
+				payload: json!({
+					"kind": "message",
+					"id": "m_asst",
+					"message": {
+						"role": "assistant",
+						"content": "",
+						"stopReason": "toolUse"
+					}
+				}),
+			})
+			.expect("append assistant message");
+
+		// A tool result was completed and appended before the interrupt
+		store
+			.append_message(NewMessage {
+				id: "m_tool".to_string(),
+				session_id: "s_ancestry".to_string(),
+				branch_id: "b1".to_string(),
+				parent_message_id: Some("m_asst".to_string()),
+				payload: json!({
+					"kind": "message",
+					"id": "m_tool",
+					"message": {
+						"role": "toolResult",
+						"content": "ok"
+					}
+				}),
+			})
+			.expect("append tool message");
+
+		// Calling with message_id: None finds m_asst by walking back from leaf (m_tool)
+		let updated_id = store
+			.update_message_terminal(
+				"s_ancestry",
+				"b1",
+				None,
+				"aborted",
+				Some("Interrupted by user"),
+			)
+			.expect("update terminal");
+		assert_eq!(updated_id, "m_asst");
+
+		let messages = store.session_messages("s_ancestry").expect("session messages");
+		assert_eq!(messages.len(), 2);
+		let asst = messages.iter().find(|m| m.id == "m_asst").unwrap();
+		assert_eq!(
+			asst.payload
+				.get("message")
+				.and_then(|m| m.get("stopReason"))
+				.and_then(Value::as_str),
+			Some("aborted")
+		);
+		let tool = messages.iter().find(|m| m.id == "m_tool").unwrap();
+		assert_eq!(
+			tool.payload
+				.get("message")
+				.and_then(|m| m.get("role"))
+				.and_then(Value::as_str),
+			Some("toolResult")
+		);
+
+		let _ = std::fs::remove_dir_all(dir);
+	}
+
+	#[test]
+	fn update_message_terminal_validates_branch_and_session() {
+		let (dir, path) = temp_db("update-terminal-validation");
+		let mut store = SqliteStore::open(&path).expect("open store");
+
+		store
+			.create_session(NewSession {
+				id: "s_val".to_string(),
+				parent_session_id: None,
+				payload: json!({}),
+				initial_branch_id: "b1".to_string(),
+				initial_branch_payload: json!({}),
+			})
+			.expect("create session");
+
+		let err = store
+			.update_message_terminal(
+				"s_val",
+				"b_nonexistent",
+				None,
+				"aborted",
+				None,
+			)
+			.expect_err("nonexistent branch must fail");
+		assert!(matches!(err, StoreError::NotFound(_)));
+
 		let _ = std::fs::remove_dir_all(dir);
 	}
 }

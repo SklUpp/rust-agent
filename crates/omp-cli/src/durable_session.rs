@@ -165,6 +165,9 @@ pub struct DurableSession {
 	written_tool_ids: Arc<Mutex<HashMap<String, VecDeque<String>>>>,
 	/// Selected compacted projection, mirrored in the session payload.
 	projection: Arc<Mutex<Option<StoredProjection>>>,
+	/// Last persisted assistant message id on the active branch, updated by
+	/// `persist_messages` and amended on terminal abort by `finish_turn`.
+	last_assistant_id: Arc<Mutex<Option<String>>>,
 }
 
 /// The selected compressed conversation: archive rows referenced by id plus
@@ -242,6 +245,7 @@ impl DurableSession {
 			tracked_ids: Arc::new(Mutex::new(Vec::new())),
 			projection: Arc::new(Mutex::new(None)),
 			resume_seed: Arc::new(Mutex::new(None)),
+			last_assistant_id: Arc::new(Mutex::new(None)),
 		})
 	}
 
@@ -301,6 +305,7 @@ impl DurableSession {
 						resume_seed: Arc::new(Mutex::new(Some(seed))),
 						tracked: Arc::new(Mutex::new(Vec::new())),
 						tracked_ids: Arc::new(Mutex::new(Vec::new())),
+						last_assistant_id: Arc::new(Mutex::new(None)),
 					},
 					Some(LoadedSession {
 						header,
@@ -341,6 +346,7 @@ impl DurableSession {
 						tracked_ids: Arc::new(Mutex::new(Vec::new())),
 						projection: Arc::new(Mutex::new(None)),
 						resume_seed: Arc::new(Mutex::new(None)),
+						last_assistant_id: Arc::new(Mutex::new(None)),
 					},
 					None,
 				))
@@ -964,10 +970,13 @@ impl DurableBoundary for DurableSession {
 					);
 					continue;
 				}
-				let Some(entry) = self.to_message_entry(message, parent.clone()) else {
-					tail_ids.push(None);
-					continue;
-				};
+ 				let Some(entry) = self.to_message_entry(message, parent.clone()) else {
+ 					tail_ids.push(None);
+ 					continue;
+ 				};
+				if message.role == Role::Assistant {
+					*lock(&self.last_assistant_id) = Some(entry.id.clone());
+				}
 				parent = Some(entry.id.clone());
 				tail_ids.push(Some(entry.id.clone()));
 				entries.push(entry);
@@ -1121,10 +1130,11 @@ impl DurableBoundary for DurableSession {
 			.iter()
 			.map(|message| self.incoming_digest(message))
 			.collect();
-		*lock(&self.tracked_ids) = ids;
-		*lock(&self.resume_seed) = None;
-		*lock(&self.projection) = parts.projection;
-		Ok(())
+ 		*lock(&self.tracked_ids) = ids;
+		*lock(&self.last_assistant_id) = None;
+ 		*lock(&self.resume_seed) = None;
+ 		*lock(&self.projection) = parts.projection;
+ 		Ok(())
 	}
 
 	async fn begin_execution(&self, call: &ToolCall) -> Result<String, DurableError> {
@@ -1207,6 +1217,33 @@ impl DurableBoundary for DurableSession {
 			})
 		.await
 		.map_err(|error| DurableError::new(error.to_string()))
+	}
+
+	async fn finish_turn(
+		&self,
+		stop_reason: &str,
+		error_message: Option<&str>,
+	) -> Result<(), DurableError> {
+		let session_id = self.session_id.clone();
+		let branch_id = lock(&self.cursor).branch.clone();
+		let assistant_id = lock(&self.last_assistant_id).clone();
+		let stop_reason = stop_reason.to_string();
+		let error_message = error_message.map(str::to_string);
+		let target_id = self
+			.writer
+			.call_async(move |store| {
+				store.update_message_terminal(
+					&session_id,
+					&branch_id,
+					assistant_id.as_deref(),
+					&stop_reason,
+					error_message.as_deref(),
+				)
+			})
+			.await
+			.map_err(|error| DurableError::new(error.to_string()))?;
+		*lock(&self.last_assistant_id) = Some(target_id);
+		Ok(())
 	}
 
 	fn child_durability_factory(&self) -> Option<Arc<dyn ChildDurabilityFactory>> {

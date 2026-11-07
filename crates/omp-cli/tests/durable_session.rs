@@ -142,6 +142,14 @@ impl DurableBoundary for FailBegin {
 	) -> Result<(), DurableError> {
 		self.0.finish_execution(execution_id, call, result).await
 	}
+
+	async fn finish_turn(
+		&self,
+		stop_reason: &str,
+		error_message: Option<&str>,
+	) -> Result<(), DurableError> {
+		self.0.finish_turn(stop_reason, error_message).await
+	}
 }
 
 fn temp_dir(label: &str) -> PathBuf {
@@ -2212,6 +2220,92 @@ async fn reopened_session_preserves_compaction_with_offbranch_sibling_tool_resul
 
 	let final_loaded = reopened.load().expect("final load");
 	assert!(final_loaded.projection.is_some(), "projection must remain active after next turn");
+}
+
+#[tokio::test]
+async fn durable_session_finish_turn_amends_assistant_row_and_drops_from_replay() {
+	let dir = temp_dir("finish-turn-replay");
+	let db = dir.join("sessions.db");
+	let session = Arc::new(DurableSession::create(db.clone(), header("s-finish-turn", &dir)).expect("create"));
+
+	let user_msg = Message::user("call a tool");
+	let asst_msg = Message::assistant_with_tools(
+		"starting tool",
+		vec![ToolCall {
+			id: "call_123".to_string(),
+			name: "read".to_string(),
+			arguments: serde_json::json!({"path": "foo.txt"}),
+		}],
+	);
+	session
+		.persist_messages(&[user_msg.clone(), asst_msg.clone()])
+		.await
+		.expect("persist initial turn");
+
+	let loaded_initial = session.load().expect("load initial");
+	let initial_asst = loaded_initial
+		.messages
+		.iter()
+		.find(|m| m.message.role == "assistant")
+		.expect("assistant message");
+	assert_eq!(initial_asst.message.stop_reason.as_deref(), Some("toolUse"));
+
+	// SIGINT interrupt: finish_turn is called with terminal aborted status
+	session
+		.finish_turn("aborted", Some("Interrupted by user"))
+		.await
+		.expect("finish_turn");
+
+	// Interrupted tool results are persisted
+	let tool_res = Message::tool_with_status(
+		"call_123",
+		"read",
+		"[Tool execution interrupted by user]",
+		true,
+	);
+	session
+		.persist_messages(&[user_msg.clone(), asst_msg.clone(), tool_res.clone()])
+		.await
+		.expect("persist synthetic tool result");
+
+	// The durable record in SQLite must have the amended stop_reason, error_message, and tool result
+	let loaded_after = session.load().expect("load after finish_turn");
+	let amended_asst = loaded_after
+		.messages
+		.iter()
+		.find(|m| m.message.role == "assistant")
+		.expect("assistant message");
+	assert_eq!(amended_asst.message.stop_reason.as_deref(), Some("aborted"));
+	assert_eq!(
+		amended_asst.message.error_message.as_deref(),
+		Some("Interrupted by user")
+	);
+
+	let stored_tool = loaded_after
+		.messages
+		.iter()
+		.find(|m| m.message.role == "toolResult")
+		.expect("toolResult message");
+	assert_eq!(stored_tool.message.tool_call_id.as_deref(), Some("call_123"));
+	assert_eq!(stored_tool.message.is_error, Some(true));
+
+	// Replay projection drops both the terminal aborted turn and its paired tool results
+	let replayable = omp_cli::session::replayable_message_entries(&loaded_after.branch_messages);
+	assert!(
+		!replayable.iter().any(|m| m.message.role == "assistant"),
+		"aborted assistant must be dropped from replay: {replayable:?}"
+	);
+	assert!(
+		!replayable.iter().any(|m| m.message.role == "toolResult"),
+		"paired toolResult must be dropped from replay: {replayable:?}"
+	);
+	assert_eq!(replayable.len(), 1, "only user message remains in replay");
+	// FailBegin wrapper also forwards finish_turn cleanly
+	let fail_begin = FailBegin(Arc::clone(&session));
+	fail_begin
+		.finish_turn("aborted", Some("Interrupted by user"))
+		.await
+		.expect("fail_begin finish_turn forward");
 
 	std::fs::remove_dir_all(dir).ok();
 }

@@ -12,10 +12,11 @@ use pi_agent::provider::OpenAiChatRequest;
 use pi_agent::provider::http::OpenAiCompatibleProvider;
 use pi_agent::{
 	AgentConfig, AgentError, AgentError::Interrupted, AgentEvent, AgentLoop, AgentState,
-	CancellationToken, ChunkStream, ContentPart, DelegationLimits, EditTool, GlobTool, GrepTool,
-	ImagePart, Message, ModelProvider, ProviderError, ReadTool, Role,
+	CancellationToken, ChunkStream, ContentPart, DelegationLimits, DurableBoundary, DurableError,
+	EditTool, GlobTool, GrepTool, ImagePart, Message, ModelProvider, ProviderError, ReadTool, Role,
 	SteeringEvent, StopReason, StreamAssembler, StreamChunk, Supervisor, Tool, ToolCall,
-	ToolCallDelta, ToolChoice, ToolRegistry, TurnStatus, WriteTool, parse_sse_line, sse_stream,
+	ToolCallDelta, ToolChoice, ToolRegistry, ToolResult, TurnStatus, WriteTool, parse_sse_line,
+	sse_stream,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use serde_json::json;
@@ -4390,4 +4391,298 @@ async fn steering_injection_preserves_text_and_image_parts() {
 		}
 	}
 	assert_eq!(announced, vec![parts], "accepted steering is announced once");
+}
+
+#[derive(Debug, Default)]
+struct RecordingDurableBoundary {
+	persisted: Mutex<Vec<Vec<Message>>>,
+	intents: Mutex<Vec<ToolCall>>,
+	outcomes: Mutex<Vec<(String, ToolResult)>>,
+	finished_turns: Mutex<Vec<(String, Option<String>)>>,
+	fail_finish_turn: Mutex<bool>,
+}
+
+#[async_trait]
+impl DurableBoundary for RecordingDurableBoundary {
+	async fn persist_messages(&self, messages: &[Message]) -> Result<(), DurableError> {
+		self.persisted.lock().expect("persisted").push(messages.to_vec());
+		Ok(())
+	}
+
+	async fn begin_execution(&self, call: &ToolCall) -> Result<String, DurableError> {
+		self.intents.lock().expect("intents").push(call.clone());
+		Ok(format!("exec-{}", call.id))
+	}
+
+	async fn compacted(
+		&self,
+		_messages: &[Message],
+		_report: &pi_agent::CompactionReport,
+	) -> Result<(), DurableError> {
+		Ok(())
+	}
+
+	async fn resync_messages(&self, _messages: &[Message]) -> Result<(), DurableError> {
+		Ok(())
+	}
+
+	async fn finish_execution(
+		&self,
+		execution_id: &str,
+		_call: &ToolCall,
+		result: &ToolResult,
+	) -> Result<(), DurableError> {
+		self.outcomes.lock().expect("outcomes").push((execution_id.to_string(), result.clone()));
+		Ok(())
+	}
+
+	async fn finish_turn(
+		&self,
+		stop_reason: &str,
+		error_message: Option<&str>,
+	) -> Result<(), DurableError> {
+		if *self.fail_finish_turn.lock().expect("fail_finish_turn") {
+			return Err(DurableError::new("injected finish_turn failure"));
+		}
+		self.finished_turns.lock().expect("finished_turns").push((
+			stop_reason.to_string(),
+			error_message.map(str::to_string),
+		));
+		Ok(())
+	}
+}
+
+struct SleepingTool {
+	started: Arc<tokio::sync::Notify>,
+}
+
+#[async_trait]
+impl Tool for SleepingTool {
+	fn name(&self) -> &str {
+		"sleeping"
+	}
+
+	fn description(&self) -> &str {
+		"sleeps until cancelled"
+	}
+
+	fn schema(&self) -> serde_json::Value {
+		json!({ "type": "object" })
+	}
+
+	async fn execute(
+		&self,
+		_args: &serde_json::Value,
+		ctx: &pi_agent::AgentContext,
+	) -> Result<ToolResult, pi_agent::ToolError> {
+		self.started.notify_one();
+		tokio::select! {
+			_ = ctx.cancellation_token.cancelled() => {
+				Ok(ToolResult {
+					tool_call_id: String::new(),
+					content: "interrupted in sleeping tool".to_string(),
+					is_error: true,
+					terminate: false,
+					details: None,
+				})
+			}
+			_ = tokio::time::sleep(std::time::Duration::from_secs(60)) => {
+				Ok(ToolResult {
+					tool_call_id: String::new(),
+					content: "finished".to_string(),
+					is_error: false,
+					terminate: false,
+					details: None,
+				})
+			}
+		}
+	}
+}
+
+#[tokio::test]
+async fn interrupt_during_tool_batch_stamps_assistant_aborted_and_calls_finish_turn() {
+	let dir = TempDir::new("durable-sigint-turn");
+	let durable = Arc::new(RecordingDurableBoundary::default());
+	let started = Arc::new(tokio::sync::Notify::new());
+	let sleeping = SleepingTool { started: Arc::clone(&started) };
+
+	let mut registry = ToolRegistry::new();
+	registry.register(Arc::new(sleeping));
+
+	let mut asst_msg = Message::assistant_with_tools(
+		"starting tools",
+		vec![ToolCall {
+			id: "call_sleep".to_string(),
+			name: "sleeping".to_string(),
+			arguments: json!({}),
+		}],
+	);
+	asst_msg.stop_reason = Some(StopReason::ToolUse);
+	let provider = ScriptedProvider::with_turns(vec![asst_msg]);
+
+	let agent = AgentLoop::new(
+		config(&dir.path, 3),
+		Arc::new(provider),
+		registry,
+	).with_durable(Some(durable.clone()));
+
+	let mut state = AgentState::default();
+	let (steering_tx, steering_rx) = tokio::sync::mpsc::channel(4);
+	let token = CancellationToken::new();
+
+	let started_clone = Arc::clone(&started);
+	tokio::spawn(async move {
+		started_clone.notified().await;
+		let _ = steering_tx.send(SteeringEvent::Interrupt).await;
+	});
+
+	let mut rx = steering_rx;
+	let res = agent
+		.run_dialog_message_with_cancel(
+			Message::user("run"),
+			&mut state,
+			Some(&mut rx),
+			None,
+			token,
+		)
+		.await;
+
+	assert!(matches!(res, Err(AgentError::Interrupted | AgentError::InterruptedReason(_))));
+
+	// 1. In-memory assistant row at turn_start is stamped with terminal Aborted status.
+	let asst = state
+		.messages
+		.iter()
+		.find(|m| m.role == Role::Assistant)
+		.expect("assistant message in state");
+	assert_eq!(asst.stop_reason, Some(StopReason::Aborted));
+	assert_eq!(asst.error_message.as_deref(), Some("Interrupted by user"));
+
+	// 2. All tool calls answered (no orphans).
+	assert_no_orphan_tool_calls(&state);
+
+	// 3. Durable boundary received finish_turn with exact terminal parameters.
+	let finished = durable.finished_turns.lock().unwrap().clone();
+	assert_eq!(
+		finished,
+		vec![("aborted".to_string(), Some("Interrupted by user".to_string()))]
+	);
+
+	// 4. Pre-execution persist had toolUse; final persist captured tool results.
+	let persisted = durable.persisted.lock().unwrap().clone();
+	assert!(persisted.len() >= 2);
+	let pre_exec_asst = persisted
+		.iter()
+		.find_map(|b| b.iter().find(|m| m.role == Role::Assistant).cloned())
+		.expect("pre-execution assistant");
+	assert_eq!(pre_exec_asst.stop_reason, Some(StopReason::ToolUse));
+
+	let post_exec_tools: Vec<_> = persisted.last().unwrap()
+		.iter()
+		.filter(|m| m.role == Role::Tool)
+		.collect();
+	assert_eq!(post_exec_tools.len(), 1);
+	assert_eq!(post_exec_tools[0].tool_call_id.as_deref(), Some("call_sleep"));
+}
+
+#[tokio::test]
+async fn streaming_interrupt_during_tool_batch_emits_turn_end_aborted() {
+	let dir = TempDir::new("streaming-sigint-turn");
+	let started = Arc::new(tokio::sync::Notify::new());
+	let sleeping = SleepingTool { started: Arc::clone(&started) };
+
+	let mut registry = ToolRegistry::new();
+	registry.register(Arc::new(sleeping));
+
+	let provider = Arc::new(StreamingProvider::new(vec![vec![
+		tool_delta(0, Some("call_sleep"), Some("sleeping"), Some("{}")),
+		done_chunk(),
+	]]));
+
+	let agent = AgentLoop::new(config(&dir.path, 3), provider, registry);
+	let mut state = AgentState::default();
+	let (steering_tx, steering_rx) = tokio::sync::mpsc::channel(4);
+	let (events_tx, mut events_rx) = tokio::sync::mpsc::channel(16);
+
+	let started_clone = Arc::clone(&started);
+	tokio::spawn(async move {
+		started_clone.notified().await;
+		let _ = steering_tx.send(SteeringEvent::Interrupt).await;
+	});
+
+	let dialog_task = tokio::spawn(async move {
+		agent
+			.run_dialog_with("run", &mut state, Some(steering_rx), Some(events_tx))
+			.await
+	});
+
+	let mut turn_ends = Vec::new();
+	while let Some(event) = events_rx.recv().await {
+		if let AgentEvent::TurnEnd { message, status, .. } = event {
+			turn_ends.push((message, status));
+			break;
+		}
+	}
+
+	let res = dialog_task.await.unwrap();
+	assert!(matches!(res, Err(AgentError::Interrupted | AgentError::InterruptedReason(_))));
+	assert_eq!(turn_ends.len(), 1);
+	assert_eq!(turn_ends[0].0.stop_reason, Some(StopReason::Aborted));
+	assert_eq!(turn_ends[0].0.error_message.as_deref(), Some("Interrupted by user"));
+	assert_eq!(turn_ends[0].1, TurnStatus::Aborted);
+}
+
+#[tokio::test]
+async fn durable_finish_turn_failure_fails_closed() {
+	let dir = TempDir::new("durable-fail-closed");
+	let durable = Arc::new(RecordingDurableBoundary::default());
+	*durable.fail_finish_turn.lock().unwrap() = true;
+	let started = Arc::new(tokio::sync::Notify::new());
+	let sleeping = SleepingTool { started: Arc::clone(&started) };
+
+	let mut registry = ToolRegistry::new();
+	registry.register(Arc::new(sleeping));
+
+	let provider = ScriptedProvider::with_turns(vec![Message::assistant_with_tools(
+		"starting tools",
+		vec![ToolCall {
+			id: "call_sleep".to_string(),
+			name: "sleeping".to_string(),
+			arguments: json!({}),
+		}],
+	)]);
+
+	let agent = AgentLoop::new(
+		config(&dir.path, 3),
+		Arc::new(provider),
+		registry,
+	).with_durable(Some(durable.clone()));
+
+	let mut state = AgentState::default();
+	let (steering_tx, steering_rx) = tokio::sync::mpsc::channel(4);
+	let token = CancellationToken::new();
+
+	let started_clone = Arc::clone(&started);
+	tokio::spawn(async move {
+		started_clone.notified().await;
+		let _ = steering_tx.send(SteeringEvent::Interrupt).await;
+	});
+
+	let mut rx = steering_rx;
+	let res = agent
+		.run_dialog_message_with_cancel(
+			Message::user("run"),
+			&mut state,
+			Some(&mut rx),
+			None,
+			token,
+		)
+		.await;
+
+	match res {
+		Err(AgentError::Durable(err)) => {
+			assert!(err.contains("injected finish_turn failure"));
+		},
+		other => panic!("expected AgentError::Durable, got {other:?}"),
+	}
 }
