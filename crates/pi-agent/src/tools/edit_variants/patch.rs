@@ -106,6 +106,7 @@ pub struct PatchInput {
 	pub op: Operation,
 	pub rename: Option<String>,
 	pub diff: String,
+	pub exclusive_create: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -211,6 +212,7 @@ pub async fn execute_patch(
 			op,
 			rename: entry.get("rename").and_then(Value::as_str).map(str::to_string),
 			diff: entry.get("diff").and_then(Value::as_str).unwrap_or("").to_string(),
+			exclusive_create: false,
 		});
 	}
 	let changes = apply_inputs(&inputs, &ctx.cwd, &ctx.cancellation_token, pending, snapshots).await?;
@@ -298,7 +300,7 @@ pub async fn prepare_one(
 			let normalized = normalize_create_content(&input.diff);
 			let content = if normalized.ends_with('\n') { normalized } else { format!("{normalized}\n") };
 			let existing_meta = tokio::fs::symlink_metadata(&absolute).await.ok();
-			let (op, old_content) = if let Some(meta) = existing_meta {
+			let (op, old_content) = if let Some(meta) = existing_meta.filter(|_| !input.exclusive_create) {
 				let target_path = if meta.file_type().is_symlink() {
 					tokio::fs::canonicalize(&absolute).await.unwrap_or_else(|_| absolute.clone())
 				} else {

@@ -123,7 +123,7 @@ fn parse_with_options(input: &str, streaming: bool) -> Result<Vec<PatchInput>, T
 					break;
 				}
 			}
-			hunks.push(PatchInput { path, op: Operation::Create, rename: None, diff: contents });
+			hunks.push(PatchInput { path, op: Operation::Create, rename: None, diff: contents, exclusive_create: true });
 			remaining.drain(0..consumed);
 			line_number += consumed;
 			continue;
@@ -134,6 +134,7 @@ fn parse_with_options(input: &str, streaming: bool) -> Result<Vec<PatchInput>, T
 				op: Operation::Delete,
 				rename: None,
 				diff: String::new(),
+				exclusive_create: false,
 			});
 			remaining.remove(0);
 			line_number += 1;
@@ -166,7 +167,7 @@ fn parse_with_options(input: &str, streaming: bool) -> Result<Vec<PatchInput>, T
 			}
 			if diff_lines.is_empty() {
 				if streaming {
-					hunks.push(PatchInput { path, op: Operation::Update, rename: move_path, diff: String::new() });
+					hunks.push(PatchInput { path, op: Operation::Update, rename: move_path, diff: String::new(), exclusive_create: false });
 					continue;
 				}
 				return Err(ToolError::InvalidArguments(format!(
@@ -178,6 +179,7 @@ fn parse_with_options(input: &str, streaming: bool) -> Result<Vec<PatchInput>, T
 				op: Operation::Update,
 				rename: move_path,
 				diff: diff_lines.join("\n"),
+				exclusive_create: false,
 			});
 			continue;
 		}
