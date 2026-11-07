@@ -1550,6 +1550,13 @@ impl AgentRunner for PiAgentRunner {
 		let timed_out = Arc::new(AtomicBool::new(false));
 		let deadline_start = request.turn_started;
 		let max_time = request.max_time;
+		// A turn that begins with its budget already spent must never dispatch a
+		// provider request: the timer task would race the network call, and a
+		// connection error could surface instead of the deadline. Classify from
+		// the turn start here, before discovery or provider work exists.
+		if deadline_expired(&timed_out, max_time, deadline_start) {
+			return Err(Error::new(crate::deadline::TIMEOUT_MESSAGE));
+		}
 
 		let (discovery_steering_tx, mut discovery_steering_rx) = tokio::sync::mpsc::channel(4);
 		let discovery_sig_reg = self.dispatcher.register(discovery_steering_tx);
@@ -8493,15 +8500,11 @@ mod tests {
 
 	#[test]
 	fn deadline_is_measured_from_the_turn_start() {
+		// Nobody accepts, so a provider dispatch would connect into the backlog
+		// and leave its request unanswered: the deadline must win before that.
 		let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+		listener.set_nonblocking(true).unwrap();
 		let addr = listener.local_addr().unwrap();
-		std::thread::spawn(move || {
-			if let Ok((mut socket, _)) = listener.accept() {
-				let mut buf = [0u8; 1024];
-				let _ = std::io::Read::read(&mut socket, &mut buf);
-			}
-			std::thread::sleep(std::time::Duration::from_secs(5));
-		});
 
 		let mut req = request(yolo());
 		req.config.providers.insert("local".to_string(), ProviderConfig {
@@ -8509,8 +8512,8 @@ mod tests {
 			api_key: Some("sk-test".to_string()),
 			..ProviderConfig::default()
 		});
-		// A turn whose budget was spent before the stream existed: the timer
-		// must derive the remaining time from `turn_started`, not from `now()`.
+		// A turn whose budget was spent before the stream existed: the deadline
+		// must be classified from `turn_started`, not from `now()`.
 		req.tools_enabled = false;
 		req.max_time = Some(std::time::Duration::from_secs(30));
 		req.turn_started = std::time::Instant::now() - std::time::Duration::from_secs(60);
@@ -8537,6 +8540,10 @@ mod tests {
 		assert!(
 			message.contains(crate::deadline::TIMEOUT_MESSAGE) || message.contains("timed out"),
 			"the deadline must surface as a timeout, got {message:?}"
+		);
+		assert!(
+			matches!(listener.accept(), Err(err) if err.kind() == std::io::ErrorKind::WouldBlock),
+			"an already-spent budget must never dispatch a provider request"
 		);
 	}
 
