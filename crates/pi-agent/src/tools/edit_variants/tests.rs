@@ -9,7 +9,11 @@ use std::{
 use serde_json::json;
 use tokio_util::sync::CancellationToken;
 
-use crate::state::AgentContext;
+use crate::{
+	state::{AgentContext, ToolResult},
+	tool::ToolError,
+	tools::{hashline::SnapshotStore, pending::PendingStore},
+};
 
 fn temp_dir(label: &str) -> PathBuf {
 	let path = std::env::temp_dir().join(format!(
@@ -39,13 +43,31 @@ fn read(path: &Path) -> String {
 	String::from_utf8(std::fs::read(path).unwrap()).unwrap()
 }
 
+async fn execute(
+	mode: super::EditMode,
+	args: &serde_json::Value,
+	ctx: &AgentContext,
+) -> Result<ToolResult, ToolError> {
+	let pending = std::sync::Arc::new(PendingStore::new());
+	let snapshots = std::sync::Arc::new(SnapshotStore::new());
+	let result = super::execute(mode, args, ctx, Some(&pending), snapshots).await?;
+	if result.is_error {
+		return Err(ToolError::ExecutionFailed(result.content));
+	}
+	let applied = pending.resolve(ctx, "apply").await?;
+	if applied.is_error {
+		return Err(ToolError::ExecutionFailed(applied.content));
+	}
+	Ok(applied)
+}
+
 #[tokio::test]
 async fn replace_refuses_ambiguous_old_string() {
 	let dir = temp_dir("replace-ambiguous");
 	let file = dir.join("demo.txt");
 	std::fs::write(&file, "let x = 1;\nlet x = 1;\n").unwrap();
 	let ctx = context(&dir);
-	let err = super::execute(
+	let err = execute(
 		super::EditMode::Replace,
 		&json!({ "path": "demo.txt", "old_string": "let x = 1;", "new_string": "let x = 2;" }),
 		&ctx,
@@ -65,7 +87,7 @@ async fn replace_preserves_crlf_and_bom() {
 	let file = dir.join("demo.txt");
 	std::fs::write(&file, "\u{feff}a\r\nb\r\nc\r\n").unwrap();
 	let ctx = context(&dir);
-	let result = super::execute(
+	let result = execute(
 		super::EditMode::Replace,
 		&json!({ "path": "demo.txt", "old_string": "b", "new_string": "B", "replace_all": true }),
 		&ctx,
@@ -85,7 +107,7 @@ async fn patch_create_overwrites_and_update_delete_move_are_explicit() {
 	let sentinel = dir.join("keep.txt");
 	std::fs::write(&sentinel, "keep\n").unwrap();
 
-	super::execute(
+	execute(
 		super::EditMode::Patch,
 		&json!({ "path": "note.txt", "edits": [{ "op": "create", "diff": "one\ntwo\n" }] }),
 		&ctx,
@@ -95,7 +117,7 @@ async fn patch_create_overwrites_and_update_delete_move_are_explicit() {
 	assert_eq!(read(&target), "one\ntwo\n");
 
 	// Patch-mode create is documented as a full overwrite.
-	super::execute(
+	execute(
 		super::EditMode::Patch,
 		&json!({ "path": "note.txt", "edits": [{ "op": "create", "diff": "replaced\n" }] }),
 		&ctx,
@@ -105,7 +127,7 @@ async fn patch_create_overwrites_and_update_delete_move_are_explicit() {
 	assert_eq!(read(&target), "replaced\n");
 
 	// Update one line, then move; then delete, leaving the sibling untouched.
-	super::execute(
+	execute(
 		super::EditMode::Patch,
 		&json!({ "path": "note.txt", "edits": [{ "op": "update", "rename": "moved.txt", "diff": "@@\n-replaced\n+updated" }] }),
 		&ctx,
@@ -116,7 +138,7 @@ async fn patch_create_overwrites_and_update_delete_move_are_explicit() {
 	assert_eq!(read(&dir.join("moved.txt")), "updated\n");
 	assert_eq!(read(&sentinel), "keep\n");
 
-	super::execute(
+	execute(
 		super::EditMode::Patch,
 		&json!({ "path": "moved.txt", "edits": [{ "op": "delete" }] }),
 		&ctx,
@@ -135,7 +157,7 @@ async fn patch_update_preserves_crlf_newlines() {
 	let file = dir.join("win.txt");
 	std::fs::write(&file, "alpha\r\nbeta\r\ngamma\r\n").unwrap();
 	let ctx = context(&dir);
-	super::execute(
+	execute(
 		super::EditMode::Patch,
 		&json!({ "path": "win.txt", "edits": [{ "op": "update", "diff": "@@\n-beta\n+BETA" }] }),
 		&ctx,
@@ -155,7 +177,7 @@ async fn apply_patch_create_and_move_refuse_existing_destinations() {
 	std::fs::write(&existing, "existing\n").unwrap();
 	std::fs::write(&source, "source\n").unwrap();
 
-	let err = super::execute(
+	let err = execute(
 		super::EditMode::ApplyPatch,
 		&json!({ "input": "*** Begin Patch\n*** Add File: exists.txt\n+overwrite\n*** End Patch" }),
 		&ctx,
@@ -165,7 +187,7 @@ async fn apply_patch_create_and_move_refuse_existing_destinations() {
 	assert!(err.to_string().contains("already exists"), "{err}");
 	assert_eq!(read(&existing), "existing\n");
 
-	let err = super::execute(
+	let err = execute(
 		super::EditMode::ApplyPatch,
 		&json!({ "input": "*** Begin Patch\n*** Update File: source.txt\n*** Move to: exists.txt\n@@\n-source\n+moved\n*** End Patch" }),
 		&ctx,
@@ -187,7 +209,7 @@ async fn apply_patch_delete_removes_only_named_file() {
 	std::fs::write(&doomed, "bye\n").unwrap();
 	std::fs::write(&keep, "stay\n").unwrap();
 	let ctx = context(&dir);
-	super::execute(
+	execute(
 		super::EditMode::ApplyPatch,
 		&json!({ "input": "*** Begin Patch\n*** Delete File: doomed.txt\n*** End Patch" }),
 		&ctx,
@@ -206,7 +228,7 @@ async fn sloppy_applies_unambiguous_rewrite_and_normalized_fallback() {
 	std::fs::write(&file, "fn main() {\n    let avlue = 1;\n}\n").unwrap();
 	let ctx = context(&dir);
 	let payload = "§demo.txt\n«fn main() {\n    let avlue = 1;\n}\n»\nfn main() {\n    let value = 2;\n}";
-	super::execute(super::EditMode::Sloppy, &json!({ "input": payload }), &ctx)
+	execute(super::EditMode::Sloppy, &json!({ "input": payload }), &ctx)
 		.await
 		.unwrap();
 	assert_eq!(read(&file), "fn main() {\n    let value = 2;\n}\n");
@@ -220,7 +242,7 @@ async fn sloppy_normalized_match_tolerates_indentation_drift() {
 	std::fs::write(&file, "fn main() {\n    let x = 1;\n}\n").unwrap();
 	let ctx = context(&dir);
 	let payload = "§demo.txt\n«fn main() {\nlet x = 1;\n}\n»\nfn main() {\n    let x = 2;\n}";
-	super::execute(super::EditMode::Sloppy, &json!({ "input": payload }), &ctx)
+	execute(super::EditMode::Sloppy, &json!({ "input": payload }), &ctx)
 		.await
 		.unwrap();
 	assert_eq!(read(&file), "fn main() {\n    let x = 2;\n}\n");
@@ -236,7 +258,7 @@ async fn sloppy_refuses_ambiguous_match_atomically() {
 	std::fs::write(&other, "untouched\n").unwrap();
 	let ctx = context(&dir);
 	let payload = "§demo.txt\n«let a = 1;\n»\nlet a = 2;\n§other.txt\n«untouched\n»\nchanged";
-	let err = super::execute(super::EditMode::Sloppy, &json!({ "input": payload }), &ctx)
+	let err = execute(super::EditMode::Sloppy, &json!({ "input": payload }), &ctx)
 		.await
 		.unwrap_err();
 	let message = err.to_string();
@@ -258,7 +280,7 @@ async fn sloppy_infers_gaps_between_non_adjacent_match_lines() {
 	.unwrap();
 	let ctx = context(&dir);
 	let payload = "§demo.txt\n«\n    let a = 1;\n    let b = 2;\n»\n    let a = 10;\n    let b = 20;";
-	super::execute(super::EditMode::Sloppy, &json!({ "input": payload }), &ctx)
+	execute(super::EditMode::Sloppy, &json!({ "input": payload }), &ctx)
 		.await
 		.unwrap();
 	assert_eq!(
@@ -275,7 +297,7 @@ async fn sloppy_trims_boundary_text_double_typed_on_selection_and_literal() {
 	std::fs::write(&file, "const v = crypto.get(name);\n").unwrap();
 	let ctx = context(&dir);
 	let payload = "§demo.txt\n«const v = crypto.⟪.get│set⟫(name);";
-	super::execute(super::EditMode::Sloppy, &json!({ "input": payload }), &ctx)
+	execute(super::EditMode::Sloppy, &json!({ "input": payload }), &ctx)
 		.await
 		.unwrap();
 	assert_eq!(read(&file), "const v = crypto.set(name);\n");
@@ -289,7 +311,7 @@ async fn sloppy_frames_whole_line_insertion() {
 	std::fs::write(&file, "fn main() {\n    let x = 1;\n}\n").unwrap();
 	let ctx = context(&dir);
 	let payload = "§demo.txt\n«fn main() {\n⟪│    let y = 2;⟫";
-	super::execute(super::EditMode::Sloppy, &json!({ "input": payload }), &ctx)
+	execute(super::EditMode::Sloppy, &json!({ "input": payload }), &ctx)
 		.await
 		.unwrap();
 	assert_eq!(
@@ -306,7 +328,7 @@ async fn sloppy_expands_whole_line_deletion_over_separator_blank() {
 	std::fs::write(&file, "head\n\ntarget\n\ntail\n").unwrap();
 	let ctx = context(&dir);
 	let payload = "§demo.txt\n«head\n\n⟪target│⟫\n\ntail";
-	super::execute(super::EditMode::Sloppy, &json!({ "input": payload }), &ctx)
+	execute(super::EditMode::Sloppy, &json!({ "input": payload }), &ctx)
 		.await
 		.unwrap();
 	assert_eq!(read(&file), "head\n\ntail\n");
@@ -324,7 +346,7 @@ async fn sloppy_aligns_explicit_rewrite_that_echoes_surrounding_boundaries() {
 	// shape cannot test boundary alignment. A gap keeps the selection scoped
 	// while the echoed prefix/suffix still lets the aligner drop the duplicate.
 	let payload = "§demo.txt\n«\nconst x = …⟪1⟫…;\n»\nconst x = 2";
-	super::execute(super::EditMode::Sloppy, &json!({ "input": payload }), &ctx)
+	execute(super::EditMode::Sloppy, &json!({ "input": payload }), &ctx)
 		.await
 		.unwrap();
 	assert_eq!(read(&file), "const x = 2;\n");
@@ -341,7 +363,7 @@ async fn sloppy_expands_echoed_bare_selection_rewrite_to_whole_line() {
 	// selection's prefix restates the whole line, so the authored text replaces
 	// it verbatim, delimiter included (or omitted).
 	let payload = "§demo.txt\n«\nconst x = ⟪1⟫;\n»\nconst x = 2";
-	super::execute(super::EditMode::Sloppy, &json!({ "input": payload }), &ctx)
+	execute(super::EditMode::Sloppy, &json!({ "input": payload }), &ctx)
 		.await
 		.unwrap();
 	assert_eq!(read(&file), "const x = 2\n");
@@ -355,7 +377,7 @@ async fn sloppy_merges_overlapping_consistent_edits() {
 	std::fs::write(&file, "let a = 1;\nlet a = 2;\n").unwrap();
 	let ctx = context(&dir);
 	let payload = "§demo.txt\n«*let a\n»let b\n«let a = 2;\n»let b = 2;";
-	super::execute(super::EditMode::Sloppy, &json!({ "input": payload }), &ctx)
+	execute(super::EditMode::Sloppy, &json!({ "input": payload }), &ctx)
 		.await
 		.unwrap();
 	assert_eq!(read(&file), "let b = 1;\nlet b = 2;\n");
@@ -369,7 +391,7 @@ async fn sloppy_refuses_conflicting_overlapping_edits() {
 	std::fs::write(&file, "let a = 1;\nlet a = 2;\n").unwrap();
 	let ctx = context(&dir);
 	let payload = "§demo.txt\n«*let a\n»let b\n«let a = 2;\n»let c = 2;";
-	let err = super::execute(super::EditMode::Sloppy, &json!({ "input": payload }), &ctx)
+	let err = execute(super::EditMode::Sloppy, &json!({ "input": payload }), &ctx)
 		.await
 		.unwrap_err();
 	let message = err.to_string();
@@ -385,7 +407,7 @@ async fn sloppy_substitutes_multiple_bare_selections_positionally() {
 	std::fs::write(&file, "const a = 1 + 2;\n").unwrap();
 	let ctx = context(&dir);
 	let payload = "§demo.txt\n«const a = ⟪1⟫ + ⟪2⟫;\n»\n3\n4";
-	super::execute(super::EditMode::Sloppy, &json!({ "input": payload }), &ctx)
+	execute(super::EditMode::Sloppy, &json!({ "input": payload }), &ctx)
 		.await
 		.unwrap();
 	assert_eq!(read(&file), "const a = 3 + 4;\n");
@@ -399,7 +421,7 @@ async fn sloppy_rejects_multi_selection_rewrite_that_proves_neither_shape() {
 	std::fs::write(&file, "const a = 1 + 2;\n").unwrap();
 	let ctx = context(&dir);
 	let payload = "§demo.txt\n«const a = ⟪1⟫ + ⟪2⟫;\n»\n9";
-	let err = super::execute(super::EditMode::Sloppy, &json!({ "input": payload }), &ctx)
+	let err = execute(super::EditMode::Sloppy, &json!({ "input": payload }), &ctx)
 		.await
 		.unwrap_err();
 	let message = err.to_string();
@@ -418,7 +440,7 @@ async fn sloppy_reemits_lone_deletion_reference_above_its_anchor() {
 	std::fs::write(&file, "keep();\na();\n").unwrap();
 	let ctx = context(&dir);
 	let payload = "§demo.txt\n«\na();\n»\n«\nkeep();\n»\n»1";
-	super::execute(super::EditMode::Sloppy, &json!({ "input": payload }), &ctx)
+	execute(super::EditMode::Sloppy, &json!({ "input": payload }), &ctx)
 		.await
 		.unwrap();
 	assert_eq!(read(&file), "a();\n\nkeep();\n");
@@ -432,7 +454,7 @@ async fn sloppy_reuses_inline_deletion_reference_in_later_insertion() {
 	std::fs::write(&file, "const moved = createMoved();\nbefore();\nafter();\n").unwrap();
 	let ctx = context(&dir);
 	let payload = "§demo.txt\n«\n⟪const moved = createMoved();│⟫\n«\nbefore();\n⟪│\n»1\n⟫\nafter();";
-	super::execute(super::EditMode::Sloppy, &json!({ "input": payload }), &ctx)
+	execute(super::EditMode::Sloppy, &json!({ "input": payload }), &ctx)
 		.await
 		.unwrap();
 	assert_eq!(read(&file), "before();\nconst moved = createMoved();\nafter();\n");
@@ -446,7 +468,7 @@ async fn sloppy_reemits_register_with_glued_markers() {
 	std::fs::write(&file, "keep();\na();\n").unwrap();
 	let ctx = context(&dir);
 	let payload = "§demo.txt\n«a();\n»\n«keep();\n»\n»1";
-	super::execute(super::EditMode::Sloppy, &json!({ "input": payload }), &ctx)
+	execute(super::EditMode::Sloppy, &json!({ "input": payload }), &ctx)
 		.await
 		.unwrap();
 	assert_eq!(read(&file), "a();\n\nkeep();\n");
@@ -460,7 +482,7 @@ async fn sloppy_reemits_register_with_trailing_space() {
 	std::fs::write(&file, "keep();\na();\n").unwrap();
 	let ctx = context(&dir);
 	let payload = "§demo.txt\n«\na();\n»\n«\nkeep();\n»\n»1 ";
-	super::execute(super::EditMode::Sloppy, &json!({ "input": payload }), &ctx)
+	execute(super::EditMode::Sloppy, &json!({ "input": payload }), &ctx)
 		.await
 		.unwrap();
 	assert_eq!(read(&file), "a();\n\nkeep();\n");
@@ -474,7 +496,7 @@ async fn sloppy_rejects_ordinal_opener_instead_of_splitting_it() {
 	std::fs::write(&file, "a();\n").unwrap();
 	let ctx = context(&dir);
 	let payload = "§demo.txt\n«1\na();";
-	let err = super::execute(super::EditMode::Sloppy, &json!({ "input": payload }), &ctx)
+	let err = execute(super::EditMode::Sloppy, &json!({ "input": payload }), &ctx)
 		.await
 		.unwrap_err();
 	assert!(err.to_string().contains("not a valid opener"), "{err}");
@@ -489,7 +511,7 @@ async fn sloppy_collapses_duplicate_markerless_desired_text() {
 	std::fs::write(&file, "alpha();\nalpha();\n").unwrap();
 	let ctx = context(&dir);
 	let payload = "§demo.txt\n«alpha();";
-	super::execute(super::EditMode::Sloppy, &json!({ "input": payload }), &ctx)
+	execute(super::EditMode::Sloppy, &json!({ "input": payload }), &ctx)
 		.await
 		.unwrap();
 	assert_eq!(read(&file), "alpha();\n");
@@ -503,7 +525,7 @@ async fn sloppy_keeps_ambiguity_when_every_candidate_is_sibling_claimed() {
 	std::fs::write(&file, "let a = 1;\nlet a = 2;\n").unwrap();
 	let ctx = context(&dir);
 	let payload = "§demo.txt\n«*let a\n»let z\n«let a\n»let b";
-	let err = super::execute(super::EditMode::Sloppy, &json!({ "input": payload }), &ctx)
+	let err = execute(super::EditMode::Sloppy, &json!({ "input": payload }), &ctx)
 		.await
 		.unwrap_err();
 	let message = err.to_string();
@@ -519,7 +541,7 @@ async fn sloppy_excludes_sibling_claimed_span_from_ambiguous_match() {
 	std::fs::write(&file, "let value = 1;\nif value {\n    let value = 1;\n}\n").unwrap();
 	let ctx = context(&dir);
 	let payload = "§demo.txt\n«if value {\n    let value = 1;\n}\n»\nif value {\n    let value = 2;\n}\n«let value = 1;\n»\nlet value = 3;";
-	super::execute(super::EditMode::Sloppy, &json!({ "input": payload }), &ctx)
+	execute(super::EditMode::Sloppy, &json!({ "input": payload }), &ctx)
 		.await
 		.unwrap();
 	assert_eq!(
@@ -536,7 +558,7 @@ async fn sloppy_reemits_gap_capture_in_rewrite() {
 	std::fs::write(&file, "const a = 1;\nconst b = 2;\n").unwrap();
 	let ctx = context(&dir);
 	let payload = "§demo.txt\n«const … = 1;\n»let … = 3;";
-	super::execute(super::EditMode::Sloppy, &json!({ "input": payload }), &ctx)
+	execute(super::EditMode::Sloppy, &json!({ "input": payload }), &ctx)
 		.await
 		.unwrap();
 	assert_eq!(read(&file), "let a = 3;\nconst b = 2;\n");
@@ -550,7 +572,7 @@ async fn sloppy_rejects_selection_markers_in_rewrite() {
 	std::fs::write(&file, "const x = 1;\n").unwrap();
 	let ctx = context(&dir);
 	let payload = "§demo.txt\n«const x = 1;\n»const x = ⟪2⟫;";
-	let err = super::execute(super::EditMode::Sloppy, &json!({ "input": payload }), &ctx)
+	let err = execute(super::EditMode::Sloppy, &json!({ "input": payload }), &ctx)
 		.await
 		.unwrap_err();
 	let message = err.to_string();
@@ -566,7 +588,7 @@ async fn sloppy_rejects_unclaimed_whole_line_gap_in_rewrite() {
 	std::fs::write(&file, "head\nconst x = 1;\ntail\n").unwrap();
 	let ctx = context(&dir);
 	let payload = "§demo.txt\n«const x = 1;\n»…";
-	let err = super::execute(super::EditMode::Sloppy, &json!({ "input": payload }), &ctx)
+	let err = execute(super::EditMode::Sloppy, &json!({ "input": payload }), &ctx)
 		.await
 		.unwrap_err();
 	let message = err.to_string();
@@ -583,7 +605,7 @@ async fn sloppy_escalates_identical_no_op_after_three_attempts() {
 	let ctx = context(&dir);
 	let payload = "§demo.txt\n«const x = 1;\n»const x = 1;";
 	for attempt in 1..=3 {
-		let err = super::execute(super::EditMode::Sloppy, &json!({ "input": payload }), &ctx)
+		let err = execute(super::EditMode::Sloppy, &json!({ "input": payload }), &ctx)
 			.await
 			.unwrap_err();
 		let message = err.to_string();
@@ -604,7 +626,7 @@ async fn sloppy_add_lines_preserve_selection_glyphs() {
 	std::fs::write(&file, "run();\ndone();\n").unwrap();
 	let ctx = context(&dir);
 	let payload = "§demo.txt\n«run();\n＋const sel = '⟪a│b⟫';";
-	super::execute(super::EditMode::Sloppy, &json!({ "input": payload }), &ctx)
+	execute(super::EditMode::Sloppy, &json!({ "input": payload }), &ctx)
 		.await
 		.unwrap();
 	assert_eq!(read(&file), "run();\nconst sel = '⟪a│b⟫';\ndone();\n");
@@ -618,7 +640,7 @@ async fn sloppy_keeps_mid_line_gap_literal_for_multiline_capture() {
 	std::fs::write(&file, "function f() {\n  a();\n  b();\n}\n").unwrap();
 	let ctx = context(&dir);
 	let payload = "§demo.txt\n«function f() {\n…\n}\n»function f() {\n  return `${x}[… ]${y}`;\n}";
-	super::execute(super::EditMode::Sloppy, &json!({ "input": payload }), &ctx)
+	execute(super::EditMode::Sloppy, &json!({ "input": payload }), &ctx)
 		.await
 		.unwrap();
 	assert_eq!(read(&file), "function f() {\n  return `${x}[… ]${y}`;\n}\n");
@@ -632,7 +654,7 @@ async fn sloppy_deletes_whole_first_line_starting_with_non_ascii() {
 	std::fs::write(&file, "// 🚀 header\nkeep();\n").unwrap();
 	let ctx = context(&dir);
 	let payload = "§demo.txt\n«// 🚀 header\n»";
-	super::execute(super::EditMode::Sloppy, &json!({ "input": payload }), &ctx)
+	execute(super::EditMode::Sloppy, &json!({ "input": payload }), &ctx)
 		.await
 		.unwrap();
 	assert_eq!(read(&file), "keep();\n");
@@ -654,7 +676,7 @@ async fn sloppy_applies_diverging_rewrite_over_inline_sides() {
 	std::fs::write(&file, "const value = oldValue;\nconst other = keep;\n").unwrap();
 	let ctx = context(&dir);
 	let payload = "§demo.txt\n«const value = ⟪oldValue│newValue⟫;\n»\nconst value = newValue; // updated\nconst added = 1;";
-	super::execute(super::EditMode::Sloppy, &json!({ "input": payload }), &ctx)
+	execute(super::EditMode::Sloppy, &json!({ "input": payload }), &ctx)
 		.await
 		.unwrap();
 	assert_eq!(read(&file), "const value = newValue; // updated\nconst added = 1;\nconst other = keep;\n");
@@ -672,7 +694,7 @@ async fn sloppy_deletes_whole_match_for_trailing_empty_inline_selection() {
 	.unwrap();
 	let ctx = context(&dir);
 	let payload = "§demo.txt\n«  const parseAnsi = () => {\n    return 1;\n  };\n⟪│⟫";
-	super::execute(super::EditMode::Sloppy, &json!({ "input": payload }), &ctx)
+	execute(super::EditMode::Sloppy, &json!({ "input": payload }), &ctx)
 		.await
 		.unwrap();
 	assert_eq!(read(&file), "  prepare();\n\n  run();\n");
@@ -686,7 +708,7 @@ async fn sloppy_deletes_every_match_for_star_empty_rewrite() {
 	std::fs::write(&file, "remove();\nkeep();\nremove();\n").unwrap();
 	let ctx = context(&dir);
 	let payload = "§demo.txt\n«*remove();\n»";
-	super::execute(super::EditMode::Sloppy, &json!({ "input": payload }), &ctx)
+	execute(super::EditMode::Sloppy, &json!({ "input": payload }), &ctx)
 		.await
 		.unwrap();
 	assert_eq!(read(&file), "keep();\n");
@@ -700,7 +722,7 @@ async fn sloppy_recovers_unique_non_bracket_punctuation_insertion() {
 	std::fs::write(&file, "runTask:alpha);\n").unwrap();
 	let ctx = context(&dir);
 	let payload = "§demo.txt\n«runTask alpha);\n»runTask(beta);";
-	super::execute(super::EditMode::Sloppy, &json!({ "input": payload }), &ctx)
+	execute(super::EditMode::Sloppy, &json!({ "input": payload }), &ctx)
 		.await
 		.unwrap();
 	assert_eq!(read(&file), "runTask(beta);\n");
@@ -714,7 +736,7 @@ async fn sloppy_refuses_bracket_insertion_punctuation_recovery() {
 	std::fs::write(&file, "runTask(alpha);\n").unwrap();
 	let ctx = context(&dir);
 	let payload = "§demo.txt\n«runTask alpha);\n»runTask(beta);";
-	let result = super::execute(super::EditMode::Sloppy, &json!({ "input": payload }), &ctx).await;
+	let result = execute(super::EditMode::Sloppy, &json!({ "input": payload }), &ctx).await;
 	assert!(result.is_err());
 	assert_eq!(read(&file), "runTask(alpha);\n");
 	std::fs::remove_dir_all(&dir).unwrap();
@@ -727,7 +749,7 @@ async fn sloppy_recovers_multiline_gap_through_normalized_matching() {
 	std::fs::write(&file, "if (x) {\n    return 1;\n    return 2;\n}\n").unwrap();
 	let ctx = context(&dir);
 	let payload = "§demo.txt\n«if (x) {\n  return 1;\n…\n}\n»if (x) {\n    return 3;\n}";
-	super::execute(super::EditMode::Sloppy, &json!({ "input": payload }), &ctx)
+	execute(super::EditMode::Sloppy, &json!({ "input": payload }), &ctx)
 		.await
 		.unwrap();
 	assert_eq!(read(&file), "if (x) {\n    return 3;\n}\n");
@@ -741,7 +763,7 @@ async fn sloppy_maps_non_ascii_prefix_through_normalized_selection() {
 	std::fs::write(&file, "const icon = \"📁\";\n    let π = 3;\n").unwrap();
 	let ctx = context(&dir);
 	let payload = "§demo.txt\n«const icon = \"📁\";\nlet π = ⟪3│4⟫;";
-	super::execute(super::EditMode::Sloppy, &json!({ "input": payload }), &ctx)
+	execute(super::EditMode::Sloppy, &json!({ "input": payload }), &ctx)
 		.await
 		.unwrap();
 	assert_eq!(read(&file), "const icon = \"📁\";\n    let π = 4;\n");
@@ -755,7 +777,7 @@ async fn sloppy_recovers_multiline_gap_and_selection_normalized() {
 	std::fs::write(&file, "if (x) {\n    return 1;\n    return 2;\n}\n").unwrap();
 	let ctx = context(&dir);
 	let payload = "§demo.txt\n«if (x) {\n  return ⟪1│3⟫;\n…\n}";
-	super::execute(super::EditMode::Sloppy, &json!({ "input": payload }), &ctx)
+	execute(super::EditMode::Sloppy, &json!({ "input": payload }), &ctx)
 		.await
 		.unwrap();
 	assert_eq!(read(&file), "if (x) {\n    return 3;\n    return 2;\n}\n");
@@ -769,7 +791,7 @@ async fn sloppy_recovers_multi_literal_fuzzy_with_gap() {
 	std::fs::write(&file, "const alpha = one;\nconst beta = two;\n").unwrap();
 	let ctx = context(&dir);
 	let payload = "§demo.txt\n«const alpha = one;\n…\nconst beta = tw0;\n»const alpha = one;\nconst beta = fixed;";
-	super::execute(super::EditMode::Sloppy, &json!({ "input": payload }), &ctx)
+	execute(super::EditMode::Sloppy, &json!({ "input": payload }), &ctx)
 		.await
 		.unwrap();
 	assert_eq!(read(&file), "const alpha = one;\nconst beta = fixed;\n");
@@ -783,7 +805,7 @@ async fn sloppy_refuses_overlapping_ambiguous_raw_match() {
 	std::fs::write(&file, "abcabcabc\n").unwrap();
 	let ctx = context(&dir);
 	let payload = "§demo.txt\n«\nabcabc\n»\nxyz";
-	let result = super::execute(super::EditMode::Sloppy, &json!({ "input": payload }), &ctx).await;
+	let result = execute(super::EditMode::Sloppy, &json!({ "input": payload }), &ctx).await;
 	assert!(result.is_err());
 	assert_eq!(read(&file), "abcabcabc\n");
 	std::fs::remove_dir_all(&dir).unwrap();
@@ -796,7 +818,7 @@ async fn sloppy_matches_unique_multibyte_literal_without_panicking() {
 	std::fs::write(&file, "éé!\n").unwrap();
 	let ctx = context(&dir);
 	let payload = "§demo.txt\n«\néé\n»\nok";
-	super::execute(super::EditMode::Sloppy, &json!({ "input": payload }), &ctx)
+	execute(super::EditMode::Sloppy, &json!({ "input": payload }), &ctx)
 		.await
 		.unwrap();
 	assert_eq!(read(&file), "ok!\n");
