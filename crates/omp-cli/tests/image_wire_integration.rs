@@ -2,7 +2,7 @@
 //! - Content detection via magic byte sniffing (PNG, JPEG, GIF, WebP)
 //! - CLI positional `@image` argument maps to multipart text and `image_url` wire parts
 //! - Prompt mentions `@image` map to `<file path="...">` and `image_url` wire parts
-//! - Session persistence stores ordered text and image parts in JSONL session log
+//! - Session persistence stores ordered text and image parts in SQLite session database
 //! - Session resume preserves turn history images and text without loss on subsequent wire turns
 //! - Explicit text-only models fail closed without corrupting session logs
 //! - Bounded limits (25 MiB) and invalid files are rejected safely
@@ -17,7 +17,7 @@ use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
 use std::time::Duration;
 
-use omp_cli::session::SessionStore;
+use omp_cli::session::{SessionOptions, SessionStore};
 
 static COUNTER: AtomicU32 = AtomicU32::new(0);
 
@@ -216,25 +216,35 @@ fn test_cli_positional_image_wire_and_session_resume() {
 	let url = content_parts[1]["image_url"]["url"].as_str().unwrap();
 	assert!(url.starts_with("data:image/png;base64,"));
 
-	// Check session file on disk
-	let session_files = fs::read_dir(&session_dir)
-		.expect("read session dir")
-		.flatten()
-		.map(|e| e.path())
-		.filter(|p| {
-			p.extension().and_then(|ext| ext.to_str()) == Some("jsonl")
-				&& p.file_stem()
-					.and_then(|s| s.to_str())
-					.map_or(false, |s| s.ends_with("session-img-1"))
-		})
-		.collect::<Vec<_>>();
-	assert_eq!(session_files.len(), 1, "session file must exist");
-	let log_path = &session_files[0];
-	assert!(log_path.is_file(), "session file must exist");
-	let log_content = fs::read_to_string(log_path).expect("read session log");
-	assert!(log_content.contains("\"type\":\"image\""));
-	assert!(log_content.contains("\"mimeType\":\"image/png\""));
-
+	// Check session in SQLite authority
+	let db_path = session_dir.join("sessions.db");
+	assert!(db_path.is_file(), "sqlite session authority must exist");
+	{
+		let store = SessionStore::open(&SessionOptions {
+			enabled: true,
+			cwd: cwd.clone(),
+			model: None,
+			provider: None,
+			dir: Some(session_dir.clone()),
+			id: Some("session-img-1".to_string()),
+			continue_latest: false,
+			parent_session: None,
+			no_title: true,
+		});
+		assert!(store.enabled(), "session must reopen from sqlite authority");
+		let user = store
+			.messages()
+			.iter()
+			.find(|entry| entry.message.role == "user")
+			.expect("user message in sqlite authority");
+		let parts = user.message.content.parts();
+		assert!(
+			parts
+				.iter()
+				.any(|p| p.is_image() && p.mime_type.as_deref() == Some("image/png")),
+			"persisted user turn must retain image part"
+		);
+	}
 	// 2. Second turn: resume session and verify turn 1 image wire replay
 	let mut resume_cmd = omp();
 	resume_cmd.env("PI_CODING_AGENT_DIR", &agent_dir);
