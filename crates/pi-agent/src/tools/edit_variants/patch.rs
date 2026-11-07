@@ -297,17 +297,43 @@ pub async fn prepare_one(
 			}
 			let normalized = normalize_create_content(&input.diff);
 			let content = if normalized.ends_with('\n') { normalized } else { format!("{normalized}\n") };
-			let op = crate::tools::staged_ops::PreparedOp::new_create(
-				absolute,
-				display.clone(),
-				content.as_bytes().to_vec(),
-				None,
-			);
+			let existing_meta = tokio::fs::symlink_metadata(&absolute).await.ok();
+			let (op, old_content) = if let Some(meta) = existing_meta {
+				let target_path = if meta.file_type().is_symlink() {
+					tokio::fs::canonicalize(&absolute).await.unwrap_or_else(|_| absolute.clone())
+				} else {
+					absolute.clone()
+				};
+				let old_bytes = tokio::fs::read(&target_path).await.map_err(|e| {
+					ToolError::ExecutionFailed(format!("Failed to read existing {display} for overwrite: {e}"))
+				})?;
+				let target_meta = tokio::fs::metadata(&target_path).await.ok();
+				let dev_ino = target_meta.as_ref().map(|m| crate::tools::staged_ops::dev_ino(m));
+				let mode = target_meta.as_ref().map(|m| crate::tools::staged_ops::file_mode(m));
+				let old_str = String::from_utf8_lossy(&old_bytes).into_owned();
+				let op = crate::tools::staged_ops::PreparedOp::new_update(
+					target_path,
+					display.clone(),
+					old_bytes,
+					dev_ino,
+					content.as_bytes().to_vec(),
+					mode,
+				);
+				(op, Some(old_str))
+			} else {
+				let op = crate::tools::staged_ops::PreparedOp::new_create(
+					absolute,
+					display.clone(),
+					content.as_bytes().to_vec(),
+					None,
+				);
+				(op, None)
+			};
 			Ok((
 				FileChange {
 					path: display,
 					new_path: None,
-					old_content: None,
+					old_content,
 					new_content: Some(content),
 					warnings: Vec::new(),
 					op: Operation::Create,
