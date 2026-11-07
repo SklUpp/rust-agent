@@ -505,7 +505,7 @@ mod imp {
 				},
 				b if b < 0x20 => index += 1,
 				0x20..=0x7e => {
-					keys.push(Key::Char(char::from(b)));
+					keys.push(Key::Char(char::from(byte)));
 					index += 1;
 				},
 				_ => {
@@ -1494,7 +1494,7 @@ mod imp {
 						// it is a prompt for the model, not an error.
 						return Some(Action::Submit(text));
 					}
-					Some(Action::Submit(text))
+					return Some(Action::Submit(text));
 				},
 				Key::Backspace => self.input.backspace(),
 				Key::Delete => self.input.delete(),
