@@ -18,13 +18,32 @@ use std::{
 use pi_agent::{
 	AgentContext, Tool, ToolError,
 	tools::{
-		AstEditTool, PendingStore, WriteTool,
-		edit_variants::{EditMode, execute},
+		AstEditTool, EditTool, PendingStore, WriteTool,
+		edit_variants::EditMode,
 		hashline::SnapshotStore,
 	},
 };
 use serde_json::json;
 
+async fn execute(
+	mode: EditMode,
+	args: &serde_json::Value,
+	ctx: &AgentContext,
+) -> Result<pi_agent::state::ToolResult, ToolError> {
+	let pending = Arc::new(PendingStore::new());
+	let snapshots = Arc::new(SnapshotStore::new());
+	let tool = EditTool::with_mode(snapshots, pi_agent::tools::hashline::edit::EditToolOptions::default(), mode)
+		.with_pending(Arc::clone(&pending));
+	let result = tool.execute(args, ctx).await?;
+	if result.is_error {
+		return Err(ToolError::ExecutionFailed(result.content));
+	}
+	let applied = pending.resolve(ctx, "apply").await?;
+	if applied.is_error {
+		return Err(ToolError::ExecutionFailed(applied.content));
+	}
+	Ok(applied)
+}
 struct TempDir {
 	path: PathBuf,
 }
@@ -560,7 +579,9 @@ async fn replace_preserves_bom_crlf_and_multibyte_text() {
 async fn write_refuses_to_overwrite_a_file_without_a_retained_read() {
 	let dir = TempDir::new("write-no-read");
 	dir.write("notes.txt", "original\n");
+	let snapshots = Arc::new(SnapshotStore::new());
 	let result = WriteTool::new()
+		.with_snapshots(Some(snapshots))
 		.execute(
 			&json!({ "path": "notes.txt", "content": "replacement\n" }),
 			&ctx(&dir),
@@ -620,23 +641,30 @@ async fn write_refuses_a_stale_snapshot_and_accepts_the_current_raw_version() {
 		.await
 		.expect("write executes");
 	assert!(!fresh.is_error, "{}", fresh.content);
+	assert_eq!(dir.read("notes.txt"), "v2\n", "workspace must not be modified before apply");
+	let applied = tool.pending().unwrap().resolve(&ctx(&dir), "apply").await.expect("apply");
+	assert!(!applied.is_error, "{}", applied.content);
 	assert_eq!(dir.read("notes.txt"), "v3\n");
 }
 
 #[tokio::test]
 async fn concurrent_new_file_writes_publish_exactly_one_winner() {
 	let dir = TempDir::new("write-new-race");
-	let left_tool = WriteTool::new();
-	let right_tool = WriteTool::new();
+	let left_pending = Arc::new(PendingStore::new());
+	let right_pending = Arc::new(PendingStore::new());
+	let left_tool = WriteTool::with_pending(Arc::clone(&left_pending));
+	let right_tool = WriteTool::with_pending(Arc::clone(&right_pending));
 	let left_ctx = ctx(&dir);
 	let right_ctx = ctx(&dir);
 	let left_args = json!({ "path": "race.txt", "content": "left\n" });
 	let right_args = json!({ "path": "race.txt", "content": "right\n" });
-	let left = left_tool.execute(&left_args, &left_ctx);
-	let right = right_tool.execute(&right_args, &right_ctx);
-	let (left, right) = tokio::join!(left, right);
-	let left = left.expect("write executes");
-	let right = right.expect("write executes");
+	left_tool.execute(&left_args, &left_ctx).await.expect("left stage");
+	right_tool.execute(&right_args, &right_ctx).await.expect("right stage");
+	let left_apply = left_pending.resolve(&left_ctx, "apply");
+	let right_apply = right_pending.resolve(&right_ctx, "apply");
+	let (left, right) = tokio::join!(left_apply, right_apply);
+	let left = left.expect("left resolve");
+	let right = right.expect("right resolve");
 	let winners = [&left, &right].iter().filter(|result| !result.is_error).count();
 	assert_eq!(
 		winners, 1,
@@ -645,4 +673,771 @@ async fn concurrent_new_file_writes_publish_exactly_one_winner() {
 	);
 	let content = dir.read("race.txt");
 	assert!(content == "left\n" || content == "right\n", "{content:?}");
+}
+
+#[tokio::test]
+async fn write_does_not_mutate_workspace_before_explicit_apply() {
+	let dir = TempDir::new("write-stage-only");
+	let pending = Arc::new(PendingStore::new());
+	let tool = WriteTool::with_pending(Arc::clone(&pending));
+	let ctx = ctx(&dir);
+
+	let res = tool
+		.execute(&json!({ "path": "hello.txt", "content": "world\n" }), &ctx)
+		.await
+		.expect("stage");
+	assert!(!res.is_error, "{}", res.content);
+	assert_eq!(pending.len(), 1);
+	assert!(!dir.path.join("hello.txt").exists(), "file must not exist on disk before apply");
+
+	let applied = pending.resolve(&ctx, "apply").await.expect("apply");
+	assert!(!applied.is_error, "{}", applied.content);
+	assert_eq!(dir.read("hello.txt"), "world\n");
+	assert!(pending.is_empty());
+}
+
+#[tokio::test]
+async fn edit_does_not_mutate_workspace_before_explicit_apply() {
+	let dir = TempDir::new("edit-stage-only");
+	dir.write("target.txt", "initial text\n");
+	let pending = Arc::new(PendingStore::new());
+	let snapshots = Arc::new(SnapshotStore::new());
+	let tool = EditTool::with_mode(snapshots, pi_agent::tools::hashline::edit::EditToolOptions::default(), EditMode::Replace)
+		.with_pending(Arc::clone(&pending));
+	let ctx = ctx(&dir);
+
+	let res = tool
+		.execute(&json!({ "path": "target.txt", "old_string": "initial", "new_string": "updated" }), &ctx)
+		.await
+		.expect("stage edit");
+	assert!(!res.is_error, "{}", res.content);
+	assert_eq!(pending.len(), 1);
+	assert_eq!(dir.read("target.txt"), "initial text\n", "file must remain unchanged before apply");
+
+	let applied = pending.resolve(&ctx, "apply").await.expect("apply");
+	assert!(!applied.is_error, "{}", applied.content);
+	assert_eq!(dir.read("target.txt"), "updated text\n");
+}
+
+#[tokio::test]
+async fn reject_discards_staged_operation_without_modifying_workspace() {
+	let dir = TempDir::new("stage-reject");
+	dir.write("foo.txt", "alpha\n");
+	let pending = Arc::new(PendingStore::new());
+	let snapshots = Arc::new(SnapshotStore::new());
+	let tool = EditTool::with_mode(snapshots, pi_agent::tools::hashline::edit::EditToolOptions::default(), EditMode::Replace)
+		.with_pending(Arc::clone(&pending));
+	let ctx = ctx(&dir);
+
+	tool.execute(&json!({ "path": "foo.txt", "old_string": "alpha", "new_string": "beta" }), &ctx)
+		.await
+		.expect("stage");
+	assert_eq!(pending.len(), 1);
+
+	let discarded = pending.reject(&ctx, "no longer needed").await.expect("reject");
+	assert!(!discarded.is_error);
+	assert_eq!(dir.read("foo.txt"), "alpha\n");
+	assert!(pending.is_empty());
+}
+
+#[tokio::test]
+async fn gate_1_stale_aborts_without_modifying_any_file() {
+	let dir = TempDir::new("gate1-stale");
+	let f1 = dir.write("file1.txt", "one\n");
+	let f2 = dir.write("file2.txt", "two\n");
+	let pending = Arc::new(PendingStore::new());
+	let snapshots = Arc::new(SnapshotStore::new());
+	let tool = EditTool::with_mode(snapshots, pi_agent::tools::hashline::edit::EditToolOptions::default(), EditMode::Patch)
+		.with_pending(Arc::clone(&pending));
+	let ctx = ctx(&dir);
+
+	let patch_input = json!({
+		"path": "file1.txt",
+		"edits": [
+			{
+				"path": "file1.txt",
+				"diff": "@@ -1,1 +1,1 @@\n-one\n+ONE\n"
+			},
+			{
+				"path": "file2.txt",
+				"diff": "@@ -1,1 +1,1 @@\n-two\n+TWO\n"
+			}
+		]
+	});
+
+	tool.execute(&patch_input, &ctx).await.expect("stage patch");
+	assert_eq!(pending.len(), 1);
+
+	// Modify file2 externally before apply
+	fs::write(&f2, "concurrent external change\n").expect("external write");
+
+	let stale = pending.resolve(&ctx, "apply").await.expect("resolve");
+	assert!(stale.is_error, "{}", stale.content);
+	assert_eq!(fs::read_to_string(&f1).expect("read"), "one\n", "zero files written on gate 1 failure");
+	assert_eq!(fs::read_to_string(&f2).expect("read"), "concurrent external change\n");
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn parent_symlink_retarget_is_rejected_before_apply() {
+	let dir = TempDir::new("parent-retarget");
+	let real_dir = dir.path.join("real");
+	fs::create_dir_all(&real_dir).expect("real dir");
+	fs::write(real_dir.join("data.txt"), "original\n").expect("write data");
+
+	// Create symlink dir -> real
+	let link_dir = dir.path.join("link");
+	std::os::unix::fs::symlink(&real_dir, &link_dir).expect("symlink dir");
+
+	let pending = Arc::new(PendingStore::new());
+	let snapshots = Arc::new(SnapshotStore::new());
+	let tool = EditTool::with_mode(snapshots, pi_agent::tools::hashline::edit::EditToolOptions::default(), EditMode::Replace)
+		.with_pending(Arc::clone(&pending));
+	let ctx = ctx(&dir);
+
+	tool.execute(&json!({ "path": "link/data.txt", "old_string": "original", "new_string": "replaced" }), &ctx)
+		.await
+		.expect("stage");
+	assert_eq!(pending.len(), 1);
+
+	// Retarget link to another directory (e.g. trap dir)
+	let trap_dir = dir.path.join("trap");
+	fs::create_dir_all(&trap_dir).expect("trap dir");
+	fs::write(trap_dir.join("data.txt"), "original\n").expect("write trap data");
+
+	fs::remove_file(&link_dir).expect("remove link");
+	std::os::unix::fs::symlink(&trap_dir, &link_dir).expect("retarget link");
+
+	let result = pending.resolve(&ctx, "apply").await.expect("resolve");
+	assert!(result.is_error, "retargeted parent symlink must be rejected");
+	assert!(
+		result.content.contains("directory identity changed")
+			|| result.content.contains("parent directory")
+			|| result.content.contains("symlink retarget")
+			|| result.content.contains("dev/ino")
+			|| result.content.contains("identity"),
+		"{}",
+		result.content
+	);
+	assert_eq!(fs::read_to_string(real_dir.join("data.txt")).expect("read"), "original\n");
+	assert_eq!(fs::read_to_string(trap_dir.join("data.txt")).expect("read"), "original\n");
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn inode_change_with_equal_bytes_is_rejected() {
+	let dir = TempDir::new("inode-change");
+	let file_path = dir.write("file.txt", "same content\n");
+	let pending = Arc::new(PendingStore::new());
+	let snapshots = Arc::new(SnapshotStore::new());
+	let tool = EditTool::with_mode(snapshots, pi_agent::tools::hashline::edit::EditToolOptions::default(), EditMode::Replace)
+		.with_pending(Arc::clone(&pending));
+	let ctx = ctx(&dir);
+
+	tool.execute(&json!({ "path": "file.txt", "old_string": "same", "new_string": "changed" }), &ctx)
+		.await
+		.expect("stage");
+	assert_eq!(pending.len(), 1);
+
+	// Replace file with a new file (different inode) having the exact same bytes!
+	fs::remove_file(&file_path).expect("remove file");
+	fs::write(&file_path, "same content\n").expect("new file same bytes");
+
+	let result = pending.resolve(&ctx, "apply").await.expect("resolve");
+	assert!(result.is_error, "dev/ino change must be rejected even when bytes match");
+	assert!(result.content.contains("dev/ino"), "{}", result.content);
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn move_preserves_restrictive_mode_0600() {
+	use std::os::unix::fs::PermissionsExt;
+	let dir = TempDir::new("move-mode");
+	let src = dir.write("src.txt", "secret content\n");
+	fs::set_permissions(&src, fs::Permissions::from_mode(0o600)).expect("chmod");
+
+	let pending = Arc::new(PendingStore::new());
+	let snapshots = Arc::new(SnapshotStore::new());
+	let tool = EditTool::with_mode(snapshots, pi_agent::tools::hashline::edit::EditToolOptions::default(), EditMode::Patch)
+		.with_pending(Arc::clone(&pending));
+	let ctx = ctx(&dir);
+
+	let patch_input = json!({
+		"path": "src.txt",
+		"edits": [
+			{
+				"path": "src.txt",
+				"rename": "dest.txt",
+				"diff": "@@ -1,1 +1,1 @@\n-secret content\n+updated secret\n"
+			}
+		]
+	});
+
+	tool.execute(&patch_input, &ctx).await.expect("stage move");
+	assert_eq!(pending.len(), 1);
+
+	let result = pending.resolve(&ctx, "apply").await.expect("apply move");
+	assert!(!result.is_error, "{}", result.content);
+
+	let dest = dir.path.join("dest.txt");
+	assert!(dest.exists());
+	let meta = fs::metadata(&dest).expect("metadata");
+	assert_eq!(meta.permissions().mode() & 0o777, 0o600, "destination must inherit mode 0600 from source");
+	assert_eq!(fs::read_to_string(&dest).expect("read"), "updated secret\n");
+	assert!(!src.exists(), "source must be unlinked after successful move");
+}
+
+#[tokio::test]
+async fn modified_source_during_move_preserves_source_and_reports_partial() {
+	let dir = TempDir::new("move-partial");
+	let src = dir.write("src.txt", "version 1\n");
+	let pending = Arc::new(PendingStore::new());
+	let snapshots = Arc::new(SnapshotStore::new());
+	let tool = EditTool::with_mode(snapshots, pi_agent::tools::hashline::edit::EditToolOptions::default(), EditMode::Patch)
+		.with_pending(Arc::clone(&pending));
+	let ctx = ctx(&dir);
+
+	let patch_input = json!({
+		"path": "src.txt",
+		"edits": [
+			{
+				"path": "src.txt",
+				"rename": "dest.txt",
+				"diff": "@@ -1,1 +1,1 @@\n-version 1\n+version 2\n"
+			}
+		]
+	});
+
+	tool.execute(&patch_input, &ctx).await.expect("stage move");
+	assert_eq!(pending.len(), 1);
+
+	// Modify source right before apply
+	fs::write(&src, "version 1 externally modified\n").expect("modify source");
+
+	let result = pending.resolve(&ctx, "apply").await.expect("resolve");
+	// Gate 1 detects modified source and aborts with zero files modified
+	assert!(result.is_error, "stale source must be rejected");
+	assert!(!dir.path.join("dest.txt").exists(), "dest must not be created on Gate 1 abort");
+	assert_eq!(fs::read_to_string(&src).expect("read"), "version 1 externally modified\n");
+}
+
+#[tokio::test]
+async fn modified_source_during_delete_is_not_unlinked() {
+	let dir = TempDir::new("delete-stale");
+	let src = dir.write("del.txt", "to be deleted\n");
+	let pending = Arc::new(PendingStore::new());
+	let snapshots = Arc::new(SnapshotStore::new());
+	let tool = EditTool::with_mode(snapshots, pi_agent::tools::hashline::edit::EditToolOptions::default(), EditMode::Patch)
+		.with_pending(Arc::clone(&pending));
+	let ctx = ctx(&dir);
+
+	let patch_input = json!({
+		"path": "del.txt",
+		"edits": [
+			{
+				"path": "del.txt",
+				"op": "delete"
+			}
+		]
+	});
+
+	tool.execute(&patch_input, &ctx).await.expect("stage delete");
+	assert_eq!(pending.len(), 1);
+
+	// Concurrently modify del.txt
+	fs::write(&src, "important data modified concurrently\n").expect("modify del.txt");
+
+	let result = pending.resolve(&ctx, "apply").await.expect("resolve");
+	assert!(result.is_error, "stale delete must be rejected");
+	assert!(src.exists(), "source file must not be unlinked when stale");
+	assert_eq!(fs::read_to_string(&src).expect("read"), "important data modified concurrently\n");
+}
+
+#[tokio::test]
+async fn hardlink_temp_is_cleaned_up_after_successful_publication() {
+	let dir = TempDir::new("temp-cleanup");
+	let pending = Arc::new(PendingStore::new());
+	let tool = WriteTool::with_pending(Arc::clone(&pending));
+	let ctx = ctx(&dir);
+
+	tool.execute(&json!({ "path": "published.txt", "content": "hello world\n" }), &ctx)
+		.await
+		.expect("stage");
+	let result = pending.resolve(&ctx, "apply").await.expect("apply");
+	assert!(!result.is_error, "{}", result.content);
+	assert_eq!(dir.read("published.txt"), "hello world\n");
+
+	// Verify no temporary files remain in dir
+	let entries: Vec<String> = fs::read_dir(&dir.path)
+		.expect("read dir")
+		.map(|e| e.expect("entry").file_name().to_string_lossy().into_owned())
+		.filter(|name| name.contains(".tmp-"))
+		.collect();
+	assert!(entries.is_empty(), "temporary hardlink files must not remain after publish: {entries:?}");
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn move_destination_dir_pin_mismatch_fails_closed() {
+	let dir = TempDir::new("move-dest-retarget");
+	let src = dir.write("src.txt", "data to move\n");
+
+	let real_dest_dir = dir.path.join("real_dest");
+	fs::create_dir_all(&real_dest_dir).expect("real dest dir");
+
+	// Link dest_link -> real_dest
+	let link_dest_dir = dir.path.join("dest_link");
+	std::os::unix::fs::symlink(&real_dest_dir, &link_dest_dir).expect("symlink dest dir");
+
+	let pending = Arc::new(PendingStore::new());
+	let snapshots = Arc::new(SnapshotStore::new());
+	let tool = EditTool::with_mode(snapshots, pi_agent::tools::hashline::edit::EditToolOptions::default(), EditMode::Patch)
+		.with_pending(Arc::clone(&pending));
+	let ctx = ctx(&dir);
+
+	let patch_input = json!({
+		"path": "src.txt",
+		"edits": [
+			{
+				"path": "src.txt",
+				"rename": "dest_link/moved.txt",
+				"diff": "@@ -1,1 +1,1 @@\n-data to move\n+data moved\n"
+			}
+		]
+	});
+
+	tool.execute(&patch_input, &ctx).await.expect("stage move");
+	assert_eq!(pending.len(), 1);
+
+	// Retarget dest_link to trap dir before apply
+	let trap_dir = dir.path.join("trap_dest");
+	fs::create_dir_all(&trap_dir).expect("trap dir");
+	fs::remove_file(&link_dest_dir).expect("remove dest_link");
+	std::os::unix::fs::symlink(&trap_dir, &link_dest_dir).expect("retarget dest link");
+
+	let result = pending.resolve(&ctx, "apply").await.expect("resolve");
+	assert!(result.is_error, "move to retargeted destination directory must fail closed");
+	assert!(result.content.contains("destination") || result.content.contains("parent directory"), "{}", result.content);
+	assert!(src.exists(), "source file must not be modified or unlinked");
+	assert!(!trap_dir.join("moved.txt").exists(), "trap dir must not receive the moved file");
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn update_rejects_concurrent_leaf_replacement_immediately_before_rename() {
+	let dir = TempDir::new("update-leaf-replace");
+	let path = dir.write("target.txt", "v1 content\n");
+
+	let pending = Arc::new(PendingStore::new());
+	let snapshots = Arc::new(SnapshotStore::new());
+	let tool = EditTool::with_mode(snapshots, pi_agent::tools::hashline::edit::EditToolOptions::default(), EditMode::Replace)
+		.with_pending(Arc::clone(&pending));
+	let ctx = ctx(&dir);
+
+	tool.execute(&json!({ "path": "target.txt", "old_string": "v1 content", "new_string": "v2 content" }), &ctx)
+		.await
+		.expect("stage");
+
+	// Replace the leaf file with a new file (different inode) before apply
+	fs::remove_file(&path).expect("unlink leaf");
+	fs::write(&path, "v1 content\n").expect("new leaf with same bytes but new inode");
+
+	let result = pending.resolve(&ctx, "apply").await.expect("resolve");
+	assert!(result.is_error, "replacing leaf file must be detected and rejected");
+	assert!(result.content.contains("dev/ino") || result.content.contains("stale"), "{}", result.content);
+}
+
+#[tokio::test]
+async fn update_rejects_in_place_byte_modification_before_rename() {
+	let dir = TempDir::new("update-inplace-bytes");
+	let path = dir.write("target.txt", "original v1 bytes\n");
+
+	let pending = Arc::new(PendingStore::new());
+	let snapshots = Arc::new(SnapshotStore::new());
+	let tool = EditTool::with_mode(snapshots, pi_agent::tools::hashline::edit::EditToolOptions::default(), EditMode::Replace)
+		.with_pending(Arc::clone(&pending));
+	let ctx = ctx(&dir);
+
+	tool.execute(&json!({ "path": "target.txt", "old_string": "original v1 bytes", "new_string": "v2 content" }), &ctx)
+		.await
+		.expect("stage");
+
+	// Modify the file IN-PLACE without changing inode!
+	{
+		use std::io::Write;
+		let mut f = fs::OpenOptions::new().write(true).open(&path).expect("open target.txt");
+		f.write_all(b"tampered v1 bytes\n").expect("in-place overwrite");
+		f.flush().expect("flush");
+	}
+
+	let result = pending.resolve(&ctx, "apply").await.expect("resolve");
+	assert!(result.is_error, "in-place byte modification before rename must be detected and rejected");
+	assert!(result.content.contains("in-place") || result.content.contains("changed") || result.content.contains("stale"), "{}", result.content);
+	assert_eq!(fs::read_to_string(&path).expect("read"), "tampered v1 bytes\n");
+}
+
+#[tokio::test]
+async fn delete_rejects_in_place_byte_modification_before_unlink() {
+	let dir = TempDir::new("delete-inplace-bytes");
+	let path = dir.write("del.txt", "original delete content\n");
+
+	let pending = Arc::new(PendingStore::new());
+	let snapshots = Arc::new(SnapshotStore::new());
+	let tool = EditTool::with_mode(snapshots, pi_agent::tools::hashline::edit::EditToolOptions::default(), EditMode::Patch)
+		.with_pending(Arc::clone(&pending));
+	let ctx = ctx(&dir);
+
+	let patch_input = json!({
+		"path": "del.txt",
+		"edits": [
+			{
+				"path": "del.txt",
+				"diff": "@@ -1,1 +0,0 @@\n-original delete content\n"
+			}
+		]
+	});
+
+	tool.execute(&patch_input, &ctx).await.expect("stage delete");
+	assert_eq!(pending.len(), 1);
+
+	// In-place byte overwrite
+	{
+		use std::io::Write;
+		let mut f = fs::OpenOptions::new().write(true).open(&path).expect("open del.txt");
+		f.write_all(b"in-place changed content\n").expect("in-place overwrite");
+		f.flush().expect("flush");
+	}
+
+	let result = pending.resolve(&ctx, "apply").await.expect("resolve");
+	assert!(result.is_error, "in-place byte modification before delete must be detected and rejected");
+	assert!(path.exists(), "source file must not be deleted when bytes changed in-place");
+	assert_eq!(fs::read_to_string(&path).expect("read"), "in-place changed content\n");
+}
+
+#[tokio::test]
+async fn move_source_in_place_byte_modification_yields_partial_outcome() {
+	let dir = TempDir::new("move-inplace-bytes");
+	let src = dir.write("src.txt", "data to move\n");
+	let dest = dir.path.join("dest.txt");
+
+	let pending = Arc::new(PendingStore::new());
+	let snapshots = Arc::new(SnapshotStore::new());
+	let tool = EditTool::with_mode(snapshots, pi_agent::tools::hashline::edit::EditToolOptions::default(), EditMode::Patch)
+		.with_pending(Arc::clone(&pending));
+	let ctx = ctx(&dir);
+
+	let patch_input = json!({
+		"path": "src.txt",
+		"edits": [
+			{
+				"path": "src.txt",
+				"rename": "dest.txt",
+				"diff": "@@ -1,1 +1,1 @@\n-data to move\n+data moved\n"
+			}
+		]
+	});
+
+	tool.execute(&patch_input, &ctx).await.expect("stage move");
+	assert_eq!(pending.len(), 1);
+
+	// In-place byte overwrite of source before apply
+	{
+		use std::io::Write;
+		let mut f = fs::OpenOptions::new().write(true).open(&src).expect("open src.txt");
+		f.write_all(b"tampered data\n").expect("in-place overwrite");
+		f.flush().expect("flush");
+	}
+
+	let result = pending.resolve(&ctx, "apply").await.expect("resolve");
+	assert!(result.is_error, "move with tampered source must fail or yield partial outcome");
+	assert!(src.exists(), "source file must not be unlinked when bytes changed in-place");
+	assert_eq!(fs::read_to_string(&src).expect("read"), "tampered data\n");
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn staged_mode_stale_after_chmod_fails_closed() {
+	use std::os::unix::fs::PermissionsExt;
+
+	let dir = TempDir::new("stale-mode");
+	let path = dir.write("sensitive.txt", "v1 content\n");
+
+	// Set mode 0o644 initially
+	fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).expect("set initial mode 0644");
+
+	let pending = Arc::new(PendingStore::new());
+	let snapshots = Arc::new(SnapshotStore::new());
+	let tool = EditTool::with_mode(snapshots, pi_agent::tools::hashline::edit::EditToolOptions::default(), EditMode::Replace)
+		.with_pending(Arc::clone(&pending));
+	let ctx = ctx(&dir);
+
+	tool.execute(&json!({ "path": "sensitive.txt", "old_string": "v1 content", "new_string": "v2 content" }), &ctx)
+		.await
+		.expect("stage");
+
+	// User restricts access to 0o600 before apply
+	fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).expect("chmod 0600");
+
+	let result = pending.resolve(&ctx, "apply").await.expect("resolve");
+	assert!(result.is_error, "stale mode after chmod must fail closed");
+	assert!(result.content.contains("mode changed") || result.content.contains("stale"), "{}", result.content);
+
+	// Verify original file and permissions were strictly preserved
+	assert_eq!(fs::read_to_string(&path).expect("read"), "v1 content\n");
+	let current_mode = fs::metadata(&path).expect("meta").permissions().mode() & 0o777;
+	assert_eq!(current_mode, 0o600, "0600 mode must be preserved, not overwritten with stale 0644");
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn staged_move_source_mode_stale_after_chmod_fails_closed() {
+	use std::os::unix::fs::PermissionsExt;
+
+	let dir = TempDir::new("move-stale-mode");
+	let src = dir.write("src.txt", "data to move\n");
+	let dest = dir.path.join("dest.txt");
+	fs::set_permissions(&src, fs::Permissions::from_mode(0o644)).expect("set 0644");
+
+	let pending = Arc::new(PendingStore::new());
+	let snapshots = Arc::new(SnapshotStore::new());
+	let tool = EditTool::with_mode(snapshots, pi_agent::tools::hashline::edit::EditToolOptions::default(), EditMode::Patch)
+		.with_pending(Arc::clone(&pending));
+	let ctx = ctx(&dir);
+
+	let patch_input = json!({
+		"path": "src.txt",
+		"edits": [
+			{
+				"path": "src.txt",
+				"rename": "dest.txt",
+				"diff": "@@ -1,1 +1,1 @@\n-data to move\n+data moved\n"
+			}
+		]
+	});
+
+	tool.execute(&patch_input, &ctx).await.expect("stage move");
+	assert_eq!(pending.len(), 1);
+
+	// Modify mode to 0600 before apply
+	fs::set_permissions(&src, fs::Permissions::from_mode(0o600)).expect("chmod 0600");
+
+	let result = pending.resolve(&ctx, "apply").await.expect("resolve");
+	assert!(result.is_error, "move with stale mode must fail closed");
+	assert!(result.content.contains("mode changed") || result.content.contains("stale"), "{}", result.content);
+	assert!(src.exists(), "source file must not be deleted");
+	assert!(!dest.exists(), "dest file must not be published when source mode is stale");
+	assert_eq!(fs::metadata(&src).expect("meta").permissions().mode() & 0o777, 0o600);
+}
+
+#[tokio::test]
+async fn gate_one_is_strictly_read_only_and_does_not_create_directories() {
+	let dir = TempDir::new("gate1-readonly");
+	let pending = Arc::new(PendingStore::new());
+	let snapshots = Arc::new(SnapshotStore::new());
+	let tool = WriteTool::with_pending(Arc::clone(&pending));
+	let ctx = ctx(&dir);
+
+	// Stage a write into a nonexistent directory
+	let nonexistent_file = "nonexistent_dir/sub/new_file.txt";
+	tool.execute(&json!({ "path": nonexistent_file, "content": "hello\n" }), &ctx)
+		.await
+		.expect("stage write");
+
+	// Also stage an invalid update that is guaranteed to fail Gate 2
+	let op_fail = pi_agent::tools::staged_ops::PreparedOp::new_update(
+		dir.path.join("nonexistent_base.txt"),
+		"nonexistent_base.txt".to_string(),
+		b"expected".to_vec(),
+		None,
+		b"new".to_vec(),
+		None,
+	);
+	let action = pi_agent::tools::staged_ops::FileOpsAction::new(
+		"write",
+		"failing batch",
+		vec![
+			pi_agent::tools::staged_ops::PreparedOp::new_create(
+				dir.path.join(nonexistent_file),
+				nonexistent_file.to_string(),
+				b"hello\n".to_vec(),
+				None,
+			),
+			op_fail,
+		],
+		Arc::clone(&snapshots),
+	);
+	pending.register(Arc::new(action));
+
+	let result = pending.resolve(&ctx, "apply").await.expect("resolve");
+	assert!(result.is_error, "batch must fail");
+	assert!(result.content.contains("Preview is stale / no longer matches"));
+
+	// Gate 1 must NOT have created the directory!
+	assert!(!dir.path.join("nonexistent_dir").exists(), "Gate 1 must be strictly read-only and not create directories on failure");
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn symlink_delete_unlinks_link_and_preserves_target() {
+	let dir = TempDir::new("symlink-delete-preserves-target");
+	let real_file = dir.write("real_target.txt", "critical target data\n");
+	let link_file = dir.path.join("link_to_target.txt");
+	std::os::unix::fs::symlink(&real_file, &link_file).expect("symlink");
+
+	let pending = Arc::new(PendingStore::new());
+	let snapshots = Arc::new(SnapshotStore::new());
+	let tool = EditTool::with_mode(snapshots, pi_agent::tools::hashline::edit::EditToolOptions::default(), EditMode::Patch)
+		.with_pending(Arc::clone(&pending));
+	let ctx = ctx(&dir);
+
+	let patch_input = json!({
+		"path": "link_to_target.txt",
+		"edits": [
+			{
+				"path": "link_to_target.txt",
+				"diff": "@@ -1,1 +0,0 @@\n-critical target data\n"
+			}
+		]
+	});
+
+	tool.execute(&patch_input, &ctx).await.expect("stage delete");
+	assert_eq!(pending.len(), 1);
+
+	let result = pending.resolve(&ctx, "apply").await.expect("resolve");
+	assert!(!result.is_error, "{}", result.content);
+
+	// The symlink must be unlinked
+	assert!(std::fs::symlink_metadata(&link_file).is_err(), "symlink itself must be unlinked");
+	// The real target file MUST be preserved!
+	assert!(real_file.exists(), "real target file must not be deleted when unlinking symlink");
+	assert_eq!(fs::read_to_string(&real_file).expect("read"), "critical target data\n");
+}
+
+#[tokio::test]
+async fn existing_directory_not_counted_in_created_directories() {
+	let dir = TempDir::new("existing-dir-accounting");
+	let existing = dir.path.join("already_exists");
+	fs::create_dir_all(&existing).expect("create existing dir");
+
+	let pending = Arc::new(PendingStore::new());
+	let tool = WriteTool::with_pending(Arc::clone(&pending));
+	let ctx = ctx(&dir);
+
+	tool.execute(&json!({ "path": "already_exists/new_sub/file.txt", "content": "test\n" }), &ctx)
+		.await
+		.expect("stage write");
+
+	let result = pending.resolve(&ctx, "apply").await.expect("apply");
+	assert!(!result.is_error, "{}", result.content);
+
+	let details = result.details.expect("details");
+	let source = &details["sourceResultDetails"];
+	let created_dirs = source["createdDirectories"].as_array().expect("created dirs array");
+	// already_exists was pre-existing, so it must not be in createdDirectories
+	assert!(created_dirs.iter().all(|d| !d.as_str().unwrap().ends_with("already_exists")));
+	assert!(created_dirs.iter().any(|d| d.as_str().unwrap().contains("new_sub")));
+}
+
+#[tokio::test]
+async fn retry_directory_accounting_tracks_attempt_delta() {
+	let dir = TempDir::new("retry-dir-accounting");
+	let pending = Arc::new(PendingStore::new());
+	let snapshots = Arc::new(SnapshotStore::new());
+	let ctx = ctx(&dir);
+
+	let op1 = pi_agent::tools::staged_ops::PreparedOp::new_create(
+		dir.path.join("brand_new_dir/file1.txt"),
+		"brand_new_dir/file1.txt".to_string(),
+		b"content 1\n".to_vec(),
+		None,
+	);
+	// Op 2 has a filename whose temp sibling exceeds NAME_MAX, so Gate 1 passes
+	// but create_temp_file fails at commit time after op1 created brand_new_dir
+	let blocked_name = format!("{}.txt", "x".repeat(237));
+	let op2_path = dir.path.join(format!("brand_new_dir/{blocked_name}"));
+	let op2 = pi_agent::tools::staged_ops::PreparedOp::new_create(
+		op2_path.clone(),
+		format!("brand_new_dir/{blocked_name}"),
+		b"content 2\n".to_vec(),
+		None,
+	);
+
+	let action = Arc::new(pi_agent::tools::staged_ops::FileOpsAction::new(
+		"write",
+		"two files",
+		vec![op1, op2],
+		Arc::clone(&snapshots),
+	));
+	pending.register(action);
+
+	// First apply attempt: op1 creates brand_new_dir and file1.txt, op2 fails commit
+	let res1 = pending.resolve(&ctx, "apply").await.expect("first apply");
+	assert!(res1.is_error);
+	let details1 = res1.details.expect("details 1");
+	let source1 = &details1["sourceResultDetails"];
+	assert_eq!(source1["partial"], json!(true));
+	let created1 = source1["createdDirectories"].as_array().expect("created dirs");
+	assert!(created1.iter().any(|d| d.as_str().unwrap().contains("brand_new_dir")));
+	let attempt_created1 = source1["attemptCreatedDirectories"].as_array().expect("attempt created");
+	assert!(attempt_created1.iter().any(|d| d.as_str().unwrap().contains("brand_new_dir")));
+
+	// Second apply attempt (retry)
+	let res2 = pending.resolve(&ctx, "apply").await.expect("second apply");
+	assert!(res2.is_error);
+	let details2 = res2.details.expect("details 2");
+	let source2 = &details2["sourceResultDetails"];
+	// On retry, brand_new_dir already existed, so attemptCreatedDirectories must be empty
+	assert_eq!(source2["attemptCreatedDirectories"], json!([]));
+	let created2 = source2["createdDirectories"].as_array().expect("cumulative created dirs");
+	assert!(created2.iter().any(|d| d.as_str().unwrap().contains("brand_new_dir")));
+}
+
+#[tokio::test]
+async fn reject_reports_cumulative_created_directories_without_rollback() {
+	let dir = TempDir::new("reject-dir-reporting");
+	let pending = Arc::new(PendingStore::new());
+	let snapshots = Arc::new(SnapshotStore::new());
+	let ctx = ctx(&dir);
+
+	let op1_path = dir.path.join("partial_created_dir/file1.txt");
+	let op1 = pi_agent::tools::staged_ops::PreparedOp::new_create(
+		op1_path.clone(),
+		"partial_created_dir/file1.txt".to_string(),
+		b"hello\n".to_vec(),
+		None,
+	);
+	// Op 2 fails at commit time after op1 creates partial_created_dir
+	let blocked_name = format!("{}.txt", "x".repeat(237));
+	let op2_path = dir.path.join(format!("partial_created_dir/{blocked_name}"));
+	let op2 = pi_agent::tools::staged_ops::PreparedOp::new_create(
+		op2_path,
+		format!("partial_created_dir/{blocked_name}"),
+		b"content 2\n".to_vec(),
+		None,
+	);
+
+	let action = Arc::new(pi_agent::tools::staged_ops::FileOpsAction::new(
+		"write",
+		"failing batch with dir",
+		vec![op1, op2],
+		Arc::clone(&snapshots),
+	));
+	pending.register(action);
+
+	// First apply: op1 creates partial_created_dir and publishes file1, then op2 fails commit
+	let res_apply = pending.resolve(&ctx, "apply").await.expect("apply");
+	assert!(res_apply.is_error);
+
+	// Now user rejects the remaining pending batch
+	let res_reject = pending.resolve(&ctx, "reject").await.expect("reject");
+	assert!(!res_reject.is_error);
+	assert!(res_reject.content.contains("previously created by an earlier attempt remain in workspace"));
+	assert!(res_reject.content.contains("discard does not roll back directory creation"));
+
+	let details = res_reject.details.expect("details");
+	let source = &details["sourceResultDetails"];
+	assert_eq!(source["action"], json!("discard"));
+	let created_dirs = source["createdDirectories"].as_array().expect("created directories array");
+	assert!(created_dirs.iter().any(|d| d.as_str().unwrap().contains("partial_created_dir")));
+	assert_eq!(source["directoriesRolledBack"], json!(false));
 }

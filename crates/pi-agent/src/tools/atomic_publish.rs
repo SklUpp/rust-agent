@@ -25,7 +25,10 @@ use std::path::Path;
 /// keep the existing file untouched and choose another identity or retry.
 pub fn publish_staged_file(staged: &Path, final_path: &Path) -> Result<bool, String> {
 	match std::fs::hard_link(staged, final_path) {
-		Ok(()) => Ok(true),
+		Ok(()) => {
+			let _ = std::fs::remove_file(staged);
+			Ok(true)
+		},
 		Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => Ok(false),
 		Err(error) => match rename_noreplace(staged, final_path) {
 			Ok(published) => Ok(published),

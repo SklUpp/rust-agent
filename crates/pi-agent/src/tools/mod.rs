@@ -27,6 +27,7 @@ pub mod registry;
 pub mod scheduler;
 pub mod search_query;
 pub mod ssh;
+pub mod staged_ops;
 pub mod task;
 pub mod task_catalog;
 pub mod task_isolation;
@@ -54,6 +55,7 @@ pub use think::ThinkTool;
 pub use todo::TodoTool;
 pub use yield_tool::YieldTool;
 pub use web_search::{SearxngConfig, WebSearchTool};
+pub use staged_ops::{FileOpsAction, OpKind, PreparedOp};
 
 use std::{
 	collections::{BTreeMap, HashMap},
@@ -772,16 +774,16 @@ impl Tool for BashTool {
 static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 /// Guard that removes a temporary file on drop unless disarmed.
-struct TempFileGuard {
+pub(crate) struct TempFileGuard {
 	path: Option<PathBuf>,
 }
 
 impl TempFileGuard {
-	fn new(path: PathBuf) -> Self {
+	pub(crate) fn new(path: PathBuf) -> Self {
 		Self { path: Some(path) }
 	}
 
-	fn disarm(&mut self) {
+	pub(crate) fn disarm(&mut self) {
 		self.path = None;
 	}
 }
@@ -795,9 +797,9 @@ impl Drop for TempFileGuard {
 }
 
 #[derive(Default)]
-struct CommitState {
-	cancelled: bool,
-	committed: bool,
+pub(crate) struct CommitState {
+	pub(crate) cancelled: bool,
+	pub(crate) committed: bool,
 }
 
 /// Drops the write token on future cancellation/drop so detached workers cannot rename.
@@ -865,7 +867,7 @@ fn run_write_commit_gate() {
 	}
 }
 
-async fn resolve_symlink_target(mut path: PathBuf) -> std::io::Result<PathBuf> {
+pub(crate) async fn resolve_symlink_target(mut path: PathBuf) -> std::io::Result<PathBuf> {
 	for _ in 0..32 {
 		match tokio::fs::symlink_metadata(&path).await {
 			Ok(meta) if meta.file_type().is_symlink() => {
@@ -888,7 +890,7 @@ async fn resolve_symlink_target(mut path: PathBuf) -> std::io::Result<PathBuf> {
 	))
 }
 
-fn create_exclusive_temp(
+pub(crate) fn create_exclusive_temp(
 	target: &Path,
 	existing_permissions: &Option<std::fs::Permissions>,
 ) -> std::io::Result<(PathBuf, std::fs::File)> {
@@ -907,7 +909,7 @@ fn create_exclusive_temp(
 			use std::os::unix::fs::PermissionsExt;
 			perms.mode() & 0o777
 		},
-		None => 0o666,
+		None => 0o600,
 	};
 
 	for _ in 0..64 {
@@ -1115,7 +1117,7 @@ async fn write_workspace_file(
 	Ok(())
 }
 
-fn commit_workspace_file(
+pub(crate) fn commit_workspace_file(
 	target: &Path,
 	bytes: &[u8],
 	snapshots: Option<&hashline::SnapshotStore>,
@@ -1217,7 +1219,7 @@ fn commit_workspace_file(
 	Ok(())
 }
 
-fn create_workspace_file(
+pub(crate) fn create_workspace_file(
 	target: &Path,
 	bytes: &[u8],
 	token: &CancellationToken,
@@ -1972,7 +1974,7 @@ pub struct WriteTool {
 impl Default for WriteTool {
 	fn default() -> Self {
 		Self {
-			pending:   None,
+			pending:   Some(Arc::new(pending::PendingStore::new())),
 			router:    None,
 			scope:     Arc::new(UrlScope::default()),
 			acp:       None,
@@ -1992,6 +1994,9 @@ impl WriteTool {
 		Self { pending: Some(pending), ..Self::default() }
 	}
 
+	pub fn pending(&self) -> Option<Arc<pending::PendingStore>> {
+		self.pending.clone()
+	}
 	/// Mount the session snapshot store so conflict resolution can drop tags
 	/// minted from the pre-splice content.
 	#[must_use]
@@ -2062,7 +2067,10 @@ impl WriteTool {
 		if device == pending::RESOLVE_DEVICE
 			&& let Some(guard) = ctx.plan.as_ref()
 		{
-			let declared = store.peek().map(|action| action.targets()).unwrap_or_default();
+			let (declared, source_tool) = store
+				.peek()
+				.map(|action| (action.targets(), action.source_tool().to_string()))
+				.unwrap_or_default();
 			let owned: Vec<String> = declared;
 			let wildcard = [PlanWriteTarget::new("", PlanWriteOp::DeferredApply)];
 			let targets: Vec<PlanWriteTarget<'_>> = if owned.is_empty() {
@@ -2073,7 +2081,8 @@ impl WriteTool {
 					.map(|path| PlanWriteTarget::new(path, PlanWriteOp::DeferredApply))
 					.collect()
 			};
-			if let Some(message) = guard.write_error("ast_edit", &targets) {
+			let check_name = if source_tool.is_empty() { "write" } else { &source_tool };
+			if let Some(message) = guard.write_error(check_name, &targets) {
 				return Err(ToolError::Rejected(message));
 			}
 		}
@@ -2250,6 +2259,50 @@ impl WriteTool {
 		if ctx.cancellation_token.is_cancelled() {
 			return Ok(tool_result(format!("Write to conflict #{} cancelled", entry.id), true));
 		}
+		if let Some(pending_store) = &self.pending {
+			let current_bytes = tokio::fs::read(&entry.absolute_path)
+				.await
+				.map_err(|e| ToolError::ExecutionFailed(format!("read {}: {e}", entry.display_path)))?;
+			let current_meta = tokio::fs::symlink_metadata(&entry.absolute_path).ok();
+			let source_dev_ino = current_meta.as_ref().map(|m| crate::tools::staged_ops::dev_ino(m));
+			let source_mode = current_meta.as_ref().map(|m| crate::tools::staged_ops::file_mode(m));
+			let original_text = String::from_utf8_lossy(&current_bytes).into_owned();
+			let splice = conflict::splice_conflict(&original_text, &entry, &expanded)
+				.map_err(|e| ToolError::Rejected(e.to_string()))?;
+			let new_bytes = splice.text.into_bytes();
+			let op = crate::tools::staged_ops::PreparedOp::new_update(
+				entry.absolute_path.clone(),
+				entry.display_path.clone(),
+				current_bytes,
+				source_dev_ino,
+				new_bytes,
+				source_mode,
+			);
+			let action = crate::tools::staged_ops::FileOpsAction::new(
+				"write",
+				format!("resolve conflict in {}", entry.display_path),
+				vec![op],
+				self.snapshots.clone().unwrap_or_else(|| Arc::new(hashline::SnapshotStore::new())),
+			).with_conflict_ids(vec![entry.id]);
+			let action_id = pending_store.register(Arc::new(action));
+			let range = if entry.block.start_line == entry.block.end_line {
+				format!("line {}", entry.block.start_line)
+			} else {
+				format!("lines {}\u{2013}{}", entry.block.start_line, entry.block.end_line)
+			};
+			let message = format!(
+				"Staged resolution for conflict #{} at {range} in {}. Workspace NOT modified yet.\nWrite to xd://resolve to apply or xd://reject to discard.",
+				entry.id, entry.display_path
+			);
+			let mut res = tool_result(message, false);
+			res.details = Some(serde_json::json!({
+				"staged": true,
+				"actionId": action_id,
+				"conflictId": entry.id,
+				"resolvedPath": entry.absolute_path.display().to_string(),
+			}));
+			return Ok(res);
+		}
 		let splice_entry = entry.clone();
 		let splice = match write_conflict_atomic(
 			&entry.absolute_path,
@@ -2408,6 +2461,93 @@ impl WriteTool {
 		let mut total_resolved = 0usize;
 		let mut total_echo_trimmed = 0usize;
 
+		if let Some(pending_store) = &self.pending {
+			let mut ops = Vec::new();
+			let mut staged_conflict_ids = Vec::new();
+			for (absolute_path, mut entries) in by_file {
+				let sample = entries[0].display_path.clone();
+				entries.sort_by_key(|entry| std::cmp::Reverse(entry.block.start_line));
+				let current_bytes = match tokio::fs::read(&absolute_path).await {
+					Ok(b) => b,
+					Err(e) => {
+						failed.push((sample, entries.len(), format!("read: {e}")));
+						continue;
+					}
+				};
+				let current_meta = tokio::fs::symlink_metadata(&absolute_path).ok();
+				let source_dev_ino = current_meta.as_ref().map(|m| crate::tools::staged_ops::dev_ino(m));
+				let source_mode = current_meta.as_ref().map(|m| crate::tools::staged_ops::file_mode(m));
+				let mut text = String::from_utf8_lossy(&current_bytes).into_owned();
+				let mut file_failed = None;
+				for entry in &entries {
+					let replacement = match &directives {
+						Some(d) => d.get(&entry.id).map(String::as_str).unwrap_or(""),
+						None => content,
+					};
+					match conflict::expand_content_tokens(replacement, entry)
+						.and_then(|expanded| conflict::splice_conflict(&text, entry, &expanded))
+					{
+						Ok(splice) => {
+							text = splice.text;
+						}
+						Err(err) => {
+							file_failed = Some(err);
+							break;
+						}
+					}
+				}
+				if let Some(err) = file_failed {
+					failed.push((sample, entries.len(), err));
+				} else {
+					for entry in &entries {
+						staged_conflict_ids.push(entry.id);
+					}
+					ops.push(crate::tools::staged_ops::PreparedOp::new_update(
+						absolute_path,
+						sample,
+						current_bytes,
+						source_dev_ino,
+						text.into_bytes(),
+						source_mode,
+					));
+				}
+			}
+			if ops.is_empty() {
+				let err_msg = if !failed.is_empty() {
+					let reasons: Vec<String> = failed.iter().map(|(p, count, err)| format!("{p} ({count} conflict(s)): {err}")).collect();
+					format!("No conflicts could be prepared for staging:\n{}", reasons.join("\n"))
+				} else {
+					"No conflicts could be prepared for staging".to_string()
+				};
+				return Err(ToolError::ExecutionFailed(err_msg));
+			}
+			let action = crate::tools::staged_ops::FileOpsAction::new(
+				"write",
+				format!("resolve conflicts in {} file(s)", ops.len()),
+				ops,
+				self.snapshots.clone().unwrap_or_else(|| Arc::new(hashline::SnapshotStore::new())),
+			).with_conflict_ids(staged_conflict_ids);
+			let action_id = pending_store.register(Arc::new(action));
+			let mut message = format!(
+				"Staged resolution for {} conflict file(s). Workspace NOT modified yet.\nWrite to xd://resolve to apply or xd://reject to discard.",
+				action.ops().len()
+			);
+			if !failed.is_empty() {
+				message.push_str(&format!("\n\n{} file(s) could not be staged:", failed.len()));
+				for (path, count, err) in &failed {
+					message.push_str(&format!("\n- {path} ({count} conflict(s)): {err}"));
+				}
+			}
+			let mut res = tool_result(message, false);
+			let mut details_map = serde_json::Map::new();
+			details_map.insert("staged".to_string(), serde_json::json!(true));
+			details_map.insert("actionId".to_string(), serde_json::json!(action_id));
+			if !failed.is_empty() {
+				details_map.insert("failedFiles".to_string(), serde_json::json!(failed));
+			}
+			res.details = Some(serde_json::Value::Object(details_map));
+			return Ok(res);
+		}
 		for (absolute_path, mut entries) in by_file {
 			let sample = entries[0].display_path.clone();
 			let entry_count = entries.len();
@@ -2573,7 +2713,7 @@ impl Tool for WriteTool {
 	}
 
 	fn description(&self) -> &str {
-		"Write content to a file, creating parent directories if necessary"
+		"Stage content to be written to a file. The workspace is not modified until explicitly applied via `write xd://resolve`."
 	}
 
 	fn schema(&self) -> Value {
@@ -2726,26 +2866,130 @@ impl Tool for WriteTool {
 		if ctx.cancellation_token.is_cancelled() {
 			return Ok(tool_result(format!("Write to {} cancelled", target.display()), true));
 		}
-		match write_workspace_file(
-			&target,
-			content.as_bytes(),
-			self.snapshots.clone(),
-			&ctx.cancellation_token,
-		)
-		.await
-		{
-			Ok(()) => Ok(tool_result(
-				format!("Successfully wrote {} bytes to {}", content.len(), target.display()),
-				false,
-			)),
-			Err(WorkspaceWriteError::Cancelled) => {
-				Ok(tool_result(format!("Write to {} cancelled", target.display()), true))
-			},
-			Err(WorkspaceWriteError::Message(message)) => Ok(tool_result(
-				format!("Failed to write {}: {message}", target.display()),
-				true,
-			)),
-		}
+		let real_target = match resolve_symlink_target(target.clone()).await {
+			Ok(resolved) => resolved,
+			Err(err) => {
+				return Ok(tool_result(
+					format!("Failed to resolve symlink {}: {err}", target.display()),
+					true,
+				));
+			}
+		};
+
+		let (kind, base, base_dev_ino, mode) = match tokio::fs::symlink_metadata(&real_target).await {
+			Ok(meta) if meta.is_dir() => {
+				return Ok(tool_result(
+					format!("Failed to write {}: {} is a directory", path, real_target.display()),
+					true,
+				));
+			}
+			Ok(meta) => {
+				if !meta.file_type().is_file() && !meta.file_type().is_symlink() {
+					return Ok(tool_result(
+						format!("Failed to write {}: {} is not a regular file", path, real_target.display()),
+						true,
+					));
+				}
+				let dev_ino_val = staged_ops::dev_ino(&meta);
+				let live_bytes = match tokio::fs::read(&real_target).await {
+					Ok(bytes) => bytes,
+					Err(err) => {
+						return Ok(tool_result(
+							format!("Failed to read {}: {err}", real_target.display()),
+							true,
+						));
+					}
+				};
+				if let Some(store) = &self.snapshots {
+					let key = hashline::canonical_key(&real_target);
+					let retained = store.latest_raw(&key);
+					let Some(retained_bytes) = retained else {
+						return Ok(tool_result(
+							format!(
+								"refusing to overwrite {}: without a retained read snapshot; read the file first",
+								real_target.display()
+							),
+							true,
+						));
+					};
+					if retained_bytes.as_ref() != live_bytes.as_slice() {
+						return Ok(tool_result(
+							format!(
+								"refusing to overwrite {}: it changed since the retained read (raw bytes differ); re-read it first",
+								real_target.display()
+							),
+							true,
+						));
+					}
+				}
+				#[cfg(unix)]
+				let mode = {
+					use std::os::unix::fs::MetadataExt;
+					Some(meta.mode() & 0o7777)
+				};
+				#[cfg(not(unix))]
+				let mode = None;
+
+				(staged_ops::OpKind::Update, Some(live_bytes), Some(dev_ino_val), mode)
+			}
+			Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+				(staged_ops::OpKind::Create, None, None, None)
+			}
+			Err(err) => {
+				return Ok(tool_result(
+					format!("stat {}: {err}", real_target.display()),
+					true,
+				));
+			}
+		};
+
+		let Some(store) = self.pending.as_ref() else {
+			return Err(ToolError::ExecutionFailed("PendingStore is not mounted".to_string()));
+		};
+
+		let op = match kind {
+			staged_ops::OpKind::Create => {
+				staged_ops::PreparedOp::new_create(real_target.clone(), path.to_string(), content.as_bytes().to_vec(), mode)
+			}
+			_ => {
+				staged_ops::PreparedOp::new_update(
+					real_target.clone(),
+					path.to_string(),
+					base.unwrap_or_default(),
+					base_dev_ino,
+					content.as_bytes().to_vec(),
+					mode,
+				)
+			}
+		};
+		let op_verb = match kind {
+			staged_ops::OpKind::Create => "create",
+			staged_ops::OpKind::Update => "overwrite",
+			_ => "write",
+		};
+
+		let action = staged_ops::FileOpsAction::new(
+			"write",
+			format!("{op_verb} {path} ({} bytes)", content.len()),
+			vec![op],
+			self.snapshots.clone().unwrap_or_else(|| Arc::new(hashline::SnapshotStore::new())),
+		);
+
+		let action_id = store.register(Arc::new(action));
+
+		let message = format!(
+			"Staged file operation #{action_id}: {op_verb} {path} ({} bytes). Workspace NOT modified yet.\nWrite to xd://resolve to apply or xd://reject to discard.",
+			content.len()
+		);
+		let mut result = tool_result(message, false);
+		result.details = Some(serde_json::json!({
+			"staged": true,
+			"actionId": action_id,
+			"path": path,
+			"op": op_verb,
+			"bytes": content.len(),
+		}));
+		Ok(result)
 	}
 }
 
@@ -2764,6 +3008,7 @@ pub struct EditTool {
 	/// (CUT registers, no-op guard, store identity) across REPL turns while the
 	/// selector may follow the active model; upstream resolves lazily too.
 	mode: Mutex<edit_variants::EditMode>,
+	pending: Option<Arc<pending::PendingStore>>,
 }
 
 impl EditTool {
@@ -2788,7 +3033,17 @@ impl EditTool {
 			noop_guard: Mutex::new(BTreeMap::new()),
 			options: Mutex::new(options),
 			mode: Mutex::new(mode),
+			pending: Some(Arc::new(pending::PendingStore::new())),
 		}
+	}
+
+	pub fn with_pending(mut self, pending: Arc<pending::PendingStore>) -> Self {
+		self.pending = Some(pending);
+		self
+	}
+
+	pub fn pending(&self) -> Option<Arc<pending::PendingStore>> {
+		self.pending.clone()
 	}
 
 	/// Replace the behavioural knobs for later calls without dropping the
@@ -2822,7 +3077,7 @@ impl Tool for EditTool {
 
 	fn description(&self) -> &str {
 		edit_variants::contract(self.mode()).map_or(
-			"Apply hashline sections to existing files; anchors must carry the 4-hex snapshot tag from the latest read",
+			"Stage hashline sections to existing files (anchored with 4-hex tags). The workspace is not modified until explicitly applied via `write xd://resolve`.",
 			|contract| contract.description,
 		)
 	}
@@ -2873,6 +3128,16 @@ impl Tool for EditTool {
 					return Ok(tool_result(format!("Failed to edit: {message}"), true));
 				},
 			};
+			for section in &mut sections {
+				let file_op = hashline::parser::parse_section_body(&section.diff)
+					.ok()
+					.and_then(|parsed| parsed.file_op);
+				if file_op.is_none() {
+					if let Ok(real) = resolve_symlink_target(section.file_path.clone()).await {
+						section.file_path = real;
+					}
+				}
+			}
 			if let Some(guard) = &guard {
 				let mut ops: Vec<(String, PlanWriteOp, Option<String>)> = Vec::new();
 				for section in &sections {
@@ -2911,7 +3176,7 @@ impl Tool for EditTool {
 				}
 			}
 			return hashline::edit::execute_sections(
-				self.store.as_ref(),
+				&self.store,
 				&self.registers,
 				&self.noop_guard,
 				&options,
@@ -2919,6 +3184,7 @@ impl Tool for EditTool {
 				artifact_root.as_deref(),
 				input,
 				ctx,
+				self.pending.as_deref(),
 			)
 			.await;
 		}
@@ -2952,7 +3218,14 @@ impl Tool for EditTool {
 				return Err(ToolError::Rejected(message));
 			}
 		}
-		edit_variants::execute(mode, args, ctx).await
+		edit_variants::execute(
+			mode,
+			args,
+			ctx,
+			self.pending.as_deref(),
+			Arc::clone(&self.store),
+		)
+		.await
 	}
 }
 
@@ -3938,7 +4211,7 @@ pub fn builtin_tools() -> Vec<Arc<dyn Tool>> {
 			WriteTool::with_pending(Arc::clone(&pending))
 				.with_snapshots(Some(Arc::clone(&snapshots))),
 		),
-		Arc::new(EditTool::new(Arc::clone(&snapshots))),
+		Arc::new(EditTool::new(Arc::clone(&snapshots)).with_pending(Arc::clone(&pending))),
 		Arc::new(GlobTool),
 		Arc::new(GrepTool),
 		Arc::new(AstGrepTool::with_snapshot_sink(sink).with_display_inputs(display)),

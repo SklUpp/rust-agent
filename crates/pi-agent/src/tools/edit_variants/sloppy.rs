@@ -157,7 +157,12 @@ impl Normalized {
 	}
 }
 
-pub async fn execute(args: &Value, ctx: &AgentContext) -> Result<ToolResult, ToolError> {
+pub async fn execute(
+	args: &Value,
+	ctx: &AgentContext,
+	pending: Option<&crate::tools::pending::PendingStore>,
+	snapshots: std::sync::Arc<crate::tools::hashline::SnapshotStore>,
+) -> Result<ToolResult, ToolError> {
 	let input = super::require_str(args, "input")?;
 	let sections = split_sections(&input);
 	if sections.is_empty() {
@@ -188,6 +193,10 @@ pub async fn execute(args: &Value, ctx: &AgentContext) -> Result<ToolResult, Too
 		if display.is_empty() {
 			display = authored;
 		}
+		let absolute = match crate::tools::resolve_symlink_target(absolute.clone()).await {
+			Ok(real) => real,
+			Err(_) => absolute,
+		};
 		let raw = fsops::read_text(&absolute, &display).await?;
 		let (bom, text, ending) = text::normalize_file(&raw);
 		let mut notes = Vec::new();
@@ -207,12 +216,41 @@ pub async fn execute(args: &Value, ctx: &AgentContext) -> Result<ToolResult, Too
 		}
 		prepared.push((absolute, display, raw, bom, ending, text, new_text, notes));
 	}
-	let mut lines = vec!["Success. Updated the following files:".to_string()];
+	let Some(pending_store) = pending else {
+		return Err(ToolError::ExecutionFailed("PendingStore is not mounted".to_string()));
+	};
+
+	let mut seen_paths = std::collections::HashSet::new();
+	let mut ops = Vec::with_capacity(prepared.len());
+	let mut lines = vec!["Staged edits. Workspace NOT modified yet.\nWrite to xd://resolve to apply or xd://reject to discard.\nFiles to update:".to_string()];
 	let mut files = Vec::new();
 	let mut all_warnings = Vec::new();
+
 	for (absolute, display, raw, bom, ending, text, new_text, notes) in prepared {
+		if !seen_paths.insert(absolute.clone()) {
+			return Err(ToolError::ExecutionFailed(format!(
+				"Multiple sloppy sections touch the same file ({display}). Split into separate operations."
+			)));
+		}
 		let final_text = text::denormalize_file(&bom, &new_text, ending);
-		fsops::commit_text(&absolute, &display, &raw, &final_text, &ctx.cancellation_token, None).await?;
+		let meta = std::fs::symlink_metadata(&absolute).ok();
+		let dev_ino = meta.as_ref().map(|m| crate::tools::staged_ops::dev_ino(m));
+		#[cfg(unix)]
+		let mode = {
+			use std::os::unix::fs::MetadataExt;
+			meta.as_ref().map(|m| m.mode() & 0o7777)
+		};
+		#[cfg(not(unix))]
+		let mode = None;
+
+		ops.push(crate::tools::staged_ops::PreparedOp::new_update(
+			absolute,
+			display.clone(),
+			raw.into_bytes(),
+			dev_ino,
+			final_text.into_bytes(),
+			mode,
+		));
 		let diff = text::unified_diff(&display, &text, &new_text);
 		lines.push(format!("M {display}"));
 		if !notes.is_empty() {
@@ -222,8 +260,17 @@ pub async fn execute(args: &Value, ctx: &AgentContext) -> Result<ToolResult, Too
 		}
 		files.push(serde_json::json!({ "path": display, "op": "update", "diff": diff }));
 	}
+
+	let action = crate::tools::staged_ops::FileOpsAction::new(
+		"edit",
+		format!("sloppy edit {} file{}", ops.len(), if ops.len() == 1 { "" } else { "s" }),
+		ops,
+		snapshots,
+	);
+	let action_id = pending_store.register(std::sync::Arc::new(action));
+
 	let content = lines.join("\n");
-	Ok(super::result(content, serde_json::json!({ "files": files, "warnings": all_warnings })))
+	Ok(super::result(content, serde_json::json!({ "staged": true, "actionId": action_id, "files": files, "warnings": all_warnings })))
 }
 
 fn strip_read_selector(path: &str) -> Option<String> {

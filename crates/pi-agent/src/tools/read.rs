@@ -4198,14 +4198,17 @@ mod conflict_read_tests {
 			.expect("base");
 		assert_eq!(side_text(&base.content), vec!["base1"]);
 
-		let write = WriteTool::with_pending(Arc::new(PendingStore::new()));
-		let resolved = write
+		let pending = Arc::new(PendingStore::new());
+		let write = WriteTool::with_pending(Arc::clone(&pending));
+		let staged = write
 			.execute(
 				&json!({ "path": format!("conflict://{id}"), "content": "@theirs" }),
 				&ctx,
 			)
 			.await
-			.expect("resolve");
+			.expect("stage");
+		assert!(!staged.is_error, "{}", staged.content);
+		let resolved = pending.resolve(&ctx, "apply").await.expect("apply");
 		assert!(!resolved.is_error, "{}", resolved.content);
 		assert_eq!(
 			fs::read_to_string(&file).expect("file"),

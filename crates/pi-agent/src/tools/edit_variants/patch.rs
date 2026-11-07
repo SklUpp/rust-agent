@@ -65,7 +65,8 @@ Input is `{ path, edits }`; `path` applies to every entry. Each entry is one of:
 `@@` alone uses context lines; `@@ <anchor>` names a copied line/substring. \
 Copy anchors/context verbatim; a non-unique match is refused. A rename \
 destination MUST NOT exist. Only explicit `delete` entries and `rename` move \
-files.";
+files.\n\
+Edits are staged and applied via `write xd://resolve`.";
 
 pub const APPLY_PATCH_DESCRIPTION: &str = "Edit files: `apply_patch` shell command.\n\n\
 `*** Begin Patch` / `*** End Patch` envelope with file sections:\n\
@@ -73,7 +74,8 @@ pub const APPLY_PATCH_DESCRIPTION: &str = "Edit files: `apply_patch` shell comma
 `*** Delete File: <path>`, or `*** Update File: <path>` with optional \
 `*** Move to: <new path>` then `@@` hunks. Hunk lines start with space, `-`, \
 or `+`. Add refuses an existing file; Move refuses an existing destination. \
-Paths are workspace-relative.";
+Paths are workspace-relative.\n\
+Edits are staged and applied via `write xd://resolve`.";
 
 pub fn schema() -> Value {
 	serde_json::json!({
@@ -178,7 +180,12 @@ pub struct FileChange {
 }
 
 /// `patch` mode entry point.
-pub async fn execute_patch(args: &Value, ctx: &AgentContext) -> Result<ToolResult, ToolError> {
+pub async fn execute_patch(
+	args: &Value,
+	ctx: &AgentContext,
+	pending: Option<&crate::tools::pending::PendingStore>,
+	snapshots: std::sync::Arc<crate::tools::hashline::SnapshotStore>,
+) -> Result<ToolResult, ToolError> {
 	let path = super::require_str(args, "path")?;
 	let edits = args
 		.get("edits")
@@ -206,8 +213,8 @@ pub async fn execute_patch(args: &Value, ctx: &AgentContext) -> Result<ToolResul
 			diff: entry.get("diff").and_then(Value::as_str).unwrap_or("").to_string(),
 		});
 	}
-	let changes = apply_inputs(&inputs, &ctx.cwd, &ctx.cancellation_token, true).await?;
-	Ok(render_changes(changes, "Success. Updated the following files:"))
+	let changes = apply_inputs(&inputs, &ctx.cwd, &ctx.cancellation_token, pending, snapshots).await?;
+	Ok(render_changes(changes, "Staged patch operations. Workspace NOT modified yet.\nWrite to xd://resolve to apply or xd://reject to discard.\nFiles to update:"))
 }
 
 /// Apply a list of file operations in order; not atomic across entries.
@@ -215,39 +222,56 @@ pub async fn apply_inputs(
 	inputs: &[PatchInput],
 	cwd: &Path,
 	token: &tokio_util::sync::CancellationToken,
-	allow_create_overwrite: bool,
+	pending: Option<&crate::tools::pending::PendingStore>,
+	snapshots: std::sync::Arc<crate::tools::hashline::SnapshotStore>,
 ) -> Result<Vec<FileChange>, ToolError> {
+	let Some(pending_store) = pending else {
+		return Err(ToolError::ExecutionFailed("PendingStore is not mounted".to_string()));
+	};
 	let mut changes = Vec::with_capacity(inputs.len());
+	let mut ops = Vec::with_capacity(inputs.len());
+	let mut seen_paths = std::collections::HashSet::new();
+
 	for input in inputs {
-		let change = match apply_one(input, cwd, token, allow_create_overwrite).await {
-			Ok(change) => change,
-			Err(err) => return Err(decorate_partial(err, &changes)),
-		};
+		let (change, op) = prepare_one(input, cwd, token).await?;
+		if !seen_paths.insert(op.path.clone()) {
+			return Err(ToolError::ExecutionFailed(format!(
+				"Multiple patch operations touch the same file ({}). Split into separate operations.",
+				op.display
+			)));
+		}
+		if let Some(dest) = &op.rename_to {
+			if !seen_paths.insert(dest.clone()) {
+				return Err(ToolError::ExecutionFailed(format!(
+					"Patch destination is also modified in this batch ({}). Split into separate operations.",
+					op.rename_to_display.as_deref().unwrap_or("destination")
+				)));
+			}
+		}
 		changes.push(change);
+		ops.push(op);
 	}
-	if changes.is_empty() {
+
+	if ops.is_empty() {
 		return Err(ToolError::ExecutionFailed("No files were modified.".to_string()));
 	}
+
+	let action = crate::tools::staged_ops::FileOpsAction::new(
+		"edit",
+		format!("patch {} file{}", ops.len(), if ops.len() == 1 { "" } else { "s" }),
+		ops,
+		snapshots,
+	);
+	let _ = pending_store.register(std::sync::Arc::new(action));
+
 	Ok(changes)
 }
 
-fn decorate_partial(err: ToolError, landed: &[FileChange]) -> ToolError {
-	if landed.is_empty() {
-		return err;
-	}
-	let paths: Vec<&str> = landed.iter().map(|change| change.path.as_str()).collect();
-	ToolError::ExecutionFailed(format!(
-		"{err}\n\nThe earlier operations already landed for: {}. The remaining operations did not run.",
-		paths.join(", ")
-	))
-}
-
-pub async fn apply_one(
+pub async fn prepare_one(
 	input: &PatchInput,
 	cwd: &Path,
 	token: &tokio_util::sync::CancellationToken,
-	allow_create_overwrite: bool,
-) -> Result<FileChange, ToolError> {
+) -> Result<(FileChange, crate::tools::staged_ops::PreparedOp), ToolError> {
 	let must_exist = input.op != Operation::Create;
 	let (absolute, display) = paths::resolve_edit_path(&input.path, cwd, must_exist, token).await?;
 	let (dest_absolute, dest_display) = match &input.rename {
@@ -273,33 +297,55 @@ pub async fn apply_one(
 			}
 			let normalized = normalize_create_content(&input.diff);
 			let content = if normalized.ends_with('\n') { normalized } else { format!("{normalized}\n") };
-			fsops::create_text(&absolute, &display, &content, token, !allow_create_overwrite).await?;
-			Ok(FileChange {
-				path: display,
-				new_path: None,
-				old_content: None,
-				new_content: Some(content),
-				warnings: Vec::new(),
-				op: Operation::Create,
-			})
+			let op = crate::tools::staged_ops::PreparedOp::new_create(
+				absolute,
+				display.clone(),
+				content.as_bytes().to_vec(),
+				None,
+			);
+			Ok((
+				FileChange {
+					path: display,
+					new_path: None,
+					old_content: None,
+					new_content: Some(content),
+					warnings: Vec::new(),
+					op: Operation::Create,
+				},
+				op,
+			))
 		},
 		Operation::Delete => {
 			let old = fsops::read_text(&absolute, &display).await?;
-			fsops::delete_file(&absolute, &display, token).await?;
-			Ok(FileChange {
-				path: display,
-				new_path: None,
-				old_content: Some(old),
-				new_content: None,
-				warnings: Vec::new(),
-				op: Operation::Delete,
-			})
+			let meta = std::fs::symlink_metadata(&absolute).ok();
+			let dev_ino = meta.as_ref().map(|m| crate::tools::staged_ops::dev_ino(m));
+			let op = crate::tools::staged_ops::PreparedOp::new_delete(
+				absolute,
+				display.clone(),
+				Some(old.as_bytes().to_vec()),
+				dev_ino,
+			);
+			Ok((
+				FileChange {
+					path: display,
+					new_path: None,
+					old_content: Some(old),
+					new_content: None,
+					warnings: Vec::new(),
+					op: Operation::Delete,
+				},
+				op,
+			))
 		},
 		Operation::Update => {
+			let target_absolute = match crate::tools::resolve_symlink_target(absolute.clone()).await {
+				Ok(real) => real,
+				Err(_) => absolute,
+			};
 			if input.diff.is_empty() {
 				return Err(ToolError::ExecutionFailed("Update operation requires diff (hunks)".to_string()));
 			}
-			let raw = fsops::read_text(&absolute, &display).await?;
+			let raw = fsops::read_text(&target_absolute, &display).await?;
 			let (bom, stripped, ending) = text::normalize_file(&raw);
 			let hunks = parse_diff_hunks(&input.diff)?;
 			if hunks.is_empty() {
@@ -308,25 +354,51 @@ pub async fn apply_one(
 			let (new_content, warnings) =
 				apply_hunks_to_content(&stripped, &display, &hunks, DEFAULT_FUZZY_THRESHOLD, true)?;
 			let final_content = text::denormalize_file(&bom, &new_content, ending);
-			match (&dest_absolute, &dest_display) {
-				(Some(dest), Some(dest_display)) => {
-					fsops::move_file(&absolute, &display, dest, dest_display, &raw, &final_content, token).await?;
+			let meta = std::fs::symlink_metadata(&target_absolute).ok();
+			let dev_ino = meta.as_ref().map(|m| crate::tools::staged_ops::dev_ino(m));
+			#[cfg(unix)]
+			let mode = {
+				use std::os::unix::fs::MetadataExt;
+				meta.as_ref().map(|m| m.mode() & 0o7777)
+			};
+			#[cfg(not(unix))]
+			let mode = None;
+
+			let op = match (&dest_absolute, &dest_display) {
+				(Some(dest), Some(dest_d)) => crate::tools::staged_ops::PreparedOp::new_move(
+					target_absolute,
+					display.clone(),
+					dest.clone(),
+					dest_d.clone(),
+					raw.as_bytes().to_vec(),
+					dev_ino,
+					final_content.as_bytes().to_vec(),
+					mode,
+				),
+				_ => crate::tools::staged_ops::PreparedOp::new_update(
+					target_absolute,
+					display.clone(),
+					raw.as_bytes().to_vec(),
+					dev_ino,
+					final_content.as_bytes().to_vec(),
+					mode,
+				),
+			};
+			Ok((
+				FileChange {
+					path: display,
+					new_path: dest_display,
+					old_content: Some(raw),
+					new_content: Some(final_content),
+					warnings,
+					op: Operation::Update,
 				},
-				_ => {
-					fsops::commit_text(&absolute, &display, &raw, &final_content, token, None).await?;
-				},
-			}
-			Ok(FileChange {
-				path: display,
-				new_path: dest_display,
-				old_content: Some(raw),
-				new_content: Some(final_content),
-				warnings,
-				op: Operation::Update,
-			})
+				op,
+			))
 		},
 	}
 }
+
 
 // ── Result shaping ────────────────────────────────────────────────────────
 

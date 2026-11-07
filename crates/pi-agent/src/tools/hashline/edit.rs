@@ -113,7 +113,7 @@ enum Outcome {
 
 /// Tool result on the hashline contract.
 pub async fn execute(
-	store: &SnapshotStore,
+	store: &Arc<SnapshotStore>,
 	registers: &Mutex<BTreeMap<String, Vec<String>>>,
 	noop_guard: &NoopGuard,
 	options: &EditToolOptions,
@@ -135,7 +135,7 @@ pub async fn execute(
 		Ok(sections) => sections,
 		Err(message) => return Ok(tool_result(format!("Failed to edit: {message}"), true)),
 	};
-	execute_sections(store, registers, noop_guard, options, sections, None, input, ctx).await
+	execute_sections(store, registers, noop_guard, options, sections, None, input, ctx, None).await
 }
 
 /// Execute already-parsed sections. `artifact_root` marks sections that live in
@@ -143,7 +143,7 @@ pub async fn execute(
 /// relative helpers instead of path-based filesystem calls.
 #[allow(clippy::too_many_arguments)]
 pub async fn execute_sections(
-	store: &SnapshotStore,
+	store: &Arc<SnapshotStore>,
 	registers: &Mutex<BTreeMap<String, Vec<String>>>,
 	noop_guard: &NoopGuard,
 	options: &EditToolOptions,
@@ -151,6 +151,7 @@ pub async fn execute_sections(
 	artifact_root: Option<&Path>,
 	input: &str,
 	ctx: &AgentContext,
+	pending: Option<&crate::tools::pending::PendingStore>,
 ) -> Result<ToolResult, ToolError> {
 	if sections.is_empty() {
 		return Ok(tool_result("No hashline sections found in input.".to_string(), true));
@@ -218,49 +219,147 @@ pub async fn execute_sections(
 	}
 
 	let total = prepared.len();
-	let mut rendered: Vec<String> = Vec::with_capacity(total);
-	let mut landed: Vec<String> = Vec::new();
-	for (index, entry) in prepared.into_iter().enumerate() {
-		let canonical = entry.canonical.clone();
-		match commit(entry, &ctx.cancellation_token, store, artifact_root).await {
-			Ok(outcome) => {
-				let mut session = registers
-					.lock()
-					.unwrap_or_else(|poison| poison.into_inner());
-				let stored_registers = clipboard::commit_batch(&states[index], &mut session);
-				drop(session);
-				reset_noop(noop_guard, &canonical);
-				let text = render(outcome);
-				landed.push(text.lines().next().unwrap_or_default().to_string());
-				rendered.push(text);
-				if let Err(message) = stored_registers {
-					return Ok(tool_result(
-						failure_report(
-							&format!(
-								"The file update landed, but named register state was not stored: {message}."
+	if artifact_root.is_some() && prepared.iter().all(|e| e.artifact.is_some()) {
+		let mut rendered: Vec<String> = Vec::with_capacity(total);
+		let mut landed: Vec<String> = Vec::new();
+		for (index, entry) in prepared.into_iter().enumerate() {
+			let canonical = entry.canonical.clone();
+			match commit(entry, &ctx.cancellation_token, store, artifact_root).await {
+				Ok(outcome) => {
+					let mut session = registers
+						.lock()
+						.unwrap_or_else(|poison| poison.into_inner());
+					let stored_registers = clipboard::commit_batch(&states[index], &mut session);
+					drop(session);
+					reset_noop(noop_guard, &canonical);
+					let text = render(outcome);
+					landed.push(text.lines().next().unwrap_or_default().to_string());
+					rendered.push(text);
+					if let Err(message) = stored_registers {
+						return Ok(tool_result(
+							failure_report(
+								&format!(
+									"The file update landed, but named register state was not stored: {message}."
+								),
+								&landed,
+								total - index - 1,
 							),
-							&landed,
-							total - index - 1,
-						),
+							true,
+						));
+					}
+				}
+				Err(CommitError::Failed(message)) => {
+					return Ok(tool_result(
+						failure_report(&message, &landed, total - index),
+						true,
+					));
+				}
+				Err(CommitError::Cancelled) => {
+					return Ok(tool_result(
+						failure_report("Edit cancelled", &landed, total - index),
 						true,
 					));
 				}
 			}
-			Err(CommitError::Failed(message)) => {
-				return Ok(tool_result(
-					failure_report(&message, &landed, total - index),
-					true,
-				));
-			}
-			Err(CommitError::Cancelled) => {
-				return Ok(tool_result(
-					failure_report("Edit cancelled", &landed, total - index),
-					true,
-				));
-			}
 		}
+		return Ok(tool_result(rendered.join("\n"), false));
 	}
-	Ok(tool_result(rendered.join("\n"), false))
+
+	let Some(pending_store) = pending else {
+		return Err(ToolError::ExecutionFailed("PendingStore is not mounted".to_string()));
+	};
+
+	let mut ops = Vec::with_capacity(total);
+	let mut rendered_previews = Vec::with_capacity(total);
+
+	for (index, entry) in prepared.into_iter().enumerate() {
+		let mut session = registers.lock().unwrap_or_else(|poison| poison.into_inner());
+		let _ = clipboard::commit_batch(&states[index], &mut session);
+		drop(session);
+		reset_noop(noop_guard, &entry.canonical);
+
+		let source_dev_ino = std::fs::symlink_metadata(&entry.section.file_path)
+			.ok()
+			.map(|m| crate::tools::staged_ops::dev_ino(&m));
+
+		let op = match &entry.file_op {
+			Some(parser::FileOp::Rem) => {
+				let mut desc = format!("Deleted {}", entry.section.path);
+				append_warnings(&mut desc, &entry.warnings);
+				crate::tools::staged_ops::PreparedOp::new_delete(
+					entry.section.file_path,
+					entry.section.path.clone(),
+					Some(entry.source_raw.to_vec()),
+					source_dev_ino,
+				).with_description(desc)
+			}
+			Some(parser::FileOp::Move(dest)) => {
+				let serialized = hash::denormalize_file(&entry.bom, &entry.after, entry.line_ending);
+				let dest_path = entry.move_dest.clone().unwrap_or_else(|| PathBuf::from(dest));
+				let mut desc = format!("Moved {} -> {dest}{}", entry.section.path, first_suffix(entry.first_changed));
+				append_warnings(&mut desc, &entry.warnings);
+				crate::tools::staged_ops::PreparedOp::new_move(
+					entry.section.file_path,
+					entry.section.path.clone(),
+					dest_path,
+					dest.clone(),
+					entry.source_raw.to_vec(),
+					source_dev_ino,
+					serialized.into_bytes(),
+					entry.source_mode,
+				).with_description(desc)
+			}
+			None => {
+				let serialized = hash::denormalize_file(&entry.bom, &entry.after, entry.line_ending);
+				let mut desc = format!("Updated {}{}", entry.section.path, first_suffix(entry.first_changed));
+				append_warnings(&mut desc, &entry.warnings);
+				crate::tools::staged_ops::PreparedOp::new_update(
+					entry.section.file_path,
+					entry.section.path.clone(),
+					entry.source_raw.to_vec(),
+					source_dev_ino,
+					serialized.into_bytes(),
+					entry.source_mode,
+				).with_description(desc)
+			}
+		};
+		let mut diff = match &entry.file_op {
+			Some(parser::FileOp::Rem) => crate::tools::edit_variants::text::unified_diff(&entry.section.path, &entry.normalized, ""),
+			Some(parser::FileOp::Move(dest)) => {
+				format!(
+					"Rename: {} -> {dest}\n{}",
+					entry.section.path,
+					crate::tools::edit_variants::text::unified_diff(&entry.section.path, &entry.normalized, &entry.after)
+				)
+			}
+			None => crate::tools::edit_variants::text::unified_diff(&entry.section.path, &entry.normalized, &entry.after),
+		};
+		append_warnings(&mut diff, &entry.warnings);
+		rendered_previews.push(format!("[{}]\n{diff}", entry.section.path));
+		ops.push(op);
+	}
+
+	let action = crate::tools::staged_ops::FileOpsAction::new(
+		"edit",
+		format!("edit {} file{}", ops.len(), if ops.len() == 1 { "" } else { "s" }),
+		ops,
+		Arc::clone(store),
+	);
+	let action_id = pending_store.register(Arc::new(action));
+
+	let message = format!(
+		"{}\nStaged {} edit operation{}. Workspace NOT modified yet.\nWrite to xd://resolve to apply or xd://reject to discard.",
+		rendered_previews.join("\n"),
+		total,
+		if total == 1 { "" } else { "s" }
+	);
+	let mut res = tool_result(message, false);
+	res.details = Some(serde_json::json!({
+		"staged": true,
+		"actionId": action_id,
+		"operations": total,
+	}));
+	Ok(res)
 }
 
 #[derive(Debug)]

@@ -189,6 +189,14 @@ async fn tool_call_round_trip_feeds_result_back_to_the_model() {
 			}],
 		),
 		Message::assistant_with_tools(
+			"resolving write",
+			vec![ToolCall {
+				id: "call_resolve_write".to_string(),
+				name: "write".to_string(),
+				arguments: json!({"path": "xd://resolve", "content": "apply"}),
+			}],
+		),
+		Message::assistant_with_tools(
 			"editing",
 			vec![ToolCall {
 				id: "call_edit".to_string(),
@@ -196,6 +204,14 @@ async fn tool_call_round_trip_feeds_result_back_to_the_model() {
 				arguments: json!({
 					"input": format!("[note.txt#{edit_tag}]\nPUT 1.=1:\n+world")
 				}),
+			}],
+		),
+		Message::assistant_with_tools(
+			"resolving edit",
+			vec![ToolCall {
+				id: "call_resolve_edit".to_string(),
+				name: "write".to_string(),
+				arguments: json!({"path": "xd://resolve", "content": "apply"}),
 			}],
 		),
 		Message::assistant("done"),
@@ -212,12 +228,16 @@ async fn tool_call_round_trip_feeds_result_back_to_the_model() {
 		.await
 		.expect("dialog");
 
-	assert_eq!(turns.len(), 3);
+	assert_eq!(turns.len(), 5);
 	assert!(!turns[0].is_completed);
 	assert!(!turns[1].is_completed);
-	assert!(turns[2].is_completed);
+	assert!(!turns[2].is_completed);
+	assert!(!turns[3].is_completed);
+	assert!(turns[4].is_completed);
 	assert_eq!(turns[0].tool_results.len(), 1);
 	assert_eq!(turns[1].tool_results.len(), 1);
+	assert_eq!(turns[2].tool_results.len(), 1);
+	assert_eq!(turns[3].tool_results.len(), 1);
 	assert_eq!(
 		std::fs::read_to_string(dir.path.join("note.txt")).expect("read"),
 		"world"
@@ -234,19 +254,25 @@ async fn tool_call_round_trip_feeds_result_back_to_the_model() {
 			Role::Assistant,
 			Role::Tool,
 			Role::Assistant,
+			Role::Tool,
+			Role::Assistant,
+			Role::Tool,
+			Role::Assistant,
 		]
 	);
 	let tools = tool_messages(&state);
-	assert!(tools[0].content.contains("Successfully wrote"));
-	// The edit result carries the updated path plus the new snapshot header the
+	assert!(tools[0].content.contains("Staged"));
+	assert!(tools[1].content.contains("Applied"));
+	assert!(tools[2].content.contains("Staged"));
+	// The resolved edit result carries the updated path plus the new snapshot header the
 	// model needs for its next anchored edit.
-	assert!(tools[1].content.starts_with("Updated note.txt"), "{}", tools[1].content);
-	assert!(tools[1].content.contains("[note.txt#"), "{}", tools[1].content);
+	assert!(tools[3].content.contains("Updated note.txt"), "{}", tools[3].content);
+	assert!(tools[3].content.contains("[note.txt#"), "{}", tools[3].content);
 	assert_eq!(std::fs::read_to_string(dir.path.join("note.txt")).expect("file"), "world");
 	assert_no_orphan_tool_calls(&state);
 
 	// Each later provider call saw the previous tool answers in history.
-	assert_eq!(state.total_turns, 3);
+	assert_eq!(state.total_turns, 5);
 	assert!(
 		state
 			.messages
@@ -262,7 +288,6 @@ async fn tool_call_round_trip_feeds_result_back_to_the_model() {
 				&& message.tool_call_id.as_deref() == Some("call_edit"))
 	);
 }
-
 #[tokio::test]
 async fn provider_error_surfaces_without_polluting_history() {
 	let dir = TempDir::new("provider-error");
@@ -476,7 +501,8 @@ async fn edit_replaces_an_anchored_line_and_deletes_a_bodyless_span() {
 
 	let store = Arc::new(pi_agent::tools::hashline::SnapshotStore::new());
 	let tag = record_edit_snapshot(&store, &path);
-	let result = EditTool::new(store)
+	let tool = EditTool::new(store);
+	let result = tool
 		.execute(
 			&json!({ "input": format!("[note.txt#{tag}]\nPUT 1.=1:\n+one thread two") }),
 			&ctx,
@@ -485,16 +511,20 @@ async fn edit_replaces_an_anchored_line_and_deletes_a_bodyless_span() {
 		.expect("edit");
 
 	assert!(!result.is_error, "{}", result.content);
+	tool.pending().unwrap().resolve(&ctx, "apply").await.expect("apply");
 	assert_eq!(std::fs::read_to_string(&path).expect("read"), "one thread two\n");
 
 	let store = Arc::new(pi_agent::tools::hashline::SnapshotStore::new());
 	let tag = record_edit_snapshot(&store, &path);
 	// Upstream hashline reads a body-less `PUT A.=B:` as a ranged delete.
-	let delete = EditTool::new(store)
+	let tool = EditTool::new(store);
+	// Upstream hashline reads a body-less `PUT A.=B:` as a ranged delete.
+	let delete = tool
 		.execute(&json!({ "input": format!("[note.txt#{tag}]\nPUT 1.=1:\n") }), &ctx)
 		.await
 		.expect("edit");
 	assert!(!delete.is_error, "{}", delete.content);
+	tool.pending().unwrap().resolve(&ctx, "apply").await.expect("apply");
 	assert_eq!(std::fs::read_to_string(&path).expect("read"), "");
 }
 
@@ -530,7 +560,8 @@ async fn edit_replaces_a_multi_line_span() {
 
 	let store = Arc::new(pi_agent::tools::hashline::SnapshotStore::new());
 	let tag = record_edit_snapshot(&store, &path);
-	let result = EditTool::new(store)
+	let tool = EditTool::new(store);
+	let result = tool
 		.execute(
 			&json!({ "input": format!("[note.txt#{tag}]\nPUT 2.=3:\n+X\n+Y") }),
 			&ctx,
@@ -539,6 +570,8 @@ async fn edit_replaces_a_multi_line_span() {
 		.expect("edit");
 
 	assert!(!result.is_error, "{}", result.content);
+	let res = tool.pending().unwrap().resolve(&ctx, "apply").await.expect("apply");
+	assert!(!res.is_error, "{}", res.content);
 	assert_eq!(std::fs::read_to_string(&path).expect("read"), "dup dup dup\nX\nY\n");
 }
 
@@ -782,7 +815,8 @@ async fn write_follows_dangling_symlink_preserving_symlink() {
 	assert!(!target_file.exists());
 
 	let ctx = pi_agent::AgentContext::new(dir.path.clone());
-	let result = WriteTool::default()
+	let tool = WriteTool::default();
+	let result = tool
 		.execute(
 			&json!({
 				"path": "dangling_link.txt",
@@ -794,6 +828,7 @@ async fn write_follows_dangling_symlink_preserving_symlink() {
 		.expect("write");
 
 	assert!(!result.is_error);
+	tool.pending().unwrap().resolve(&ctx, "apply").await.expect("apply");
 	assert!(target_file.exists());
 	assert_eq!(
 		std::fs::read_to_string(&target_file).expect("read target"),
@@ -854,7 +889,9 @@ async fn edit_preserves_symlink_structure_and_permissions() {
 	let ctx = pi_agent::AgentContext::new(dir.path.clone());
 	let store = Arc::new(pi_agent::tools::hashline::SnapshotStore::new());
 	let tag = record_edit_snapshot(&store, &link_file);
-	let result = EditTool::new(store)
+	let pending = Arc::new(pi_agent::tools::PendingStore::new());
+	let tool = EditTool::new(store).with_pending(Arc::clone(&pending));
+	let result = tool
 		.execute(
 			&json!({ "input": format!("[link_script.sh#{tag}]\nPUT 2.=2:\n+echo updated") }),
 			&ctx,
@@ -863,6 +900,8 @@ async fn edit_preserves_symlink_structure_and_permissions() {
 		.expect("edit");
 
 	assert!(!result.is_error, "{}", result.content);
+	let res = pending.resolve(&ctx, "apply").await.expect("apply");
+	assert!(!res.is_error, "{}", res.content);
 	assert_eq!(
 		std::fs::read_to_string(&real_file).expect("read real"),
 		"#!/bin/sh\necho updated\n"
@@ -888,8 +927,9 @@ async fn write_preserves_restrictive_mode_on_existing_file() {
 	let ctx = pi_agent::AgentContext::new(dir.path.clone());
 	let store = Arc::new(pi_agent::tools::hashline::SnapshotStore::new());
 	record_edit_snapshot(&store, &target);
-	let result = WriteTool::default()
-		.with_snapshots(Some(store))
+	let tool = WriteTool::default()
+		.with_snapshots(Some(store));
+	let result = tool
 		.execute(
 			&json!({
 				"path": "secret.key",
@@ -901,6 +941,7 @@ async fn write_preserves_restrictive_mode_on_existing_file() {
 		.expect("write");
 
 	assert!(!result.is_error);
+	tool.pending().unwrap().resolve(&ctx, "apply").await.expect("apply");
 	assert_eq!(
 		std::fs::read_to_string(&target).expect("read secret"),
 		"new secret content\n"
@@ -2192,6 +2233,13 @@ async fn child_registry_gets_fresh_store_registers_and_seen_lines() {
 		.await
 		.expect("cut");
 	assert!(!cut.is_error, "{}", cut.content);
+	let resolve_cut = parent
+		.get("write")
+		.expect("parent write")
+		.execute(&json!({ "path": "xd://resolve", "content": "apply cut" }), &ctx)
+		.await
+		.expect("resolve cut");
+	assert!(!resolve_cut.is_error, "{}", resolve_cut.content);
 	let cut_content = "l1\nl3\nl4\nl5\nl6\nl7\nl8\nl9\nl10\n";
 	assert_eq!(std::fs::read_to_string(&path).expect("read"), cut_content);
 
@@ -2247,6 +2295,13 @@ async fn child_registry_gets_fresh_store_registers_and_seen_lines() {
 		.await
 		.expect("edit");
 	assert!(!landed.is_error, "{}", landed.content);
+	let resolve_landed = fresh
+		.get("write")
+		.expect("fresh write")
+		.execute(&json!({ "path": "xd://resolve", "content": "apply landed" }), &ctx)
+		.await
+		.expect("resolve landed");
+	assert!(!resolve_landed.is_error, "{}", resolve_landed.content);
 	assert_eq!(
 		std::fs::read_to_string(&path).expect("read"),
 		"l1\nl3\nl4\nl5\nl6\nl7\nl8\ndelta\nl10\n"
@@ -3279,7 +3334,7 @@ async fn plan_required_choice_executes_any_tool_then_clears_after_real_write() {
 	let (server_url, mut requests) = spawn_scripted_chat_server(vec![
 		// Text-only turn: the generic gate escalates the next request.
 		json!({ "role": "assistant", "content": "thinking" }),
-		// Any tool satisfies plan progress; this write must actually run.
+		// Any tool satisfies plan progress; this write must stage.
 		json!({
 			"role": "assistant",
 			"content": "",
@@ -3289,14 +3344,25 @@ async fn plan_required_choice_executes_any_tool_then_clears_after_real_write() {
 				"function": { "name": "write", "arguments": "{\"path\":\"pending.txt\",\"content\":\"ok\"}" }
 			}]
 		}),
+		// Model resolves staged write to land changes in the workspace.
+		json!({
+			"role": "assistant",
+			"content": "",
+			"tool_calls": [{
+				"id": "plan_resolve",
+				"type": "function",
+				"function": { "name": "write", "arguments": "{\"path\":\"xd://resolve\",\"content\":\"apply\"}" }
+			}]
+		}),
 		json!({ "role": "assistant", "content": "done" }),
 	])
 	.await;
 	let provider = OpenAiCompatibleProvider::new(server_url, "fake-key", "gpt-4o")
 		.expect("provider build");
 	let mut registry = ToolRegistry::new();
+	let pending_store = Arc::new(pi_agent::tools::PendingStore::new());
 	registry.register(Arc::new(pi_agent::AskTool::new()));
-	registry.register(Arc::new(WriteTool::new()));
+	registry.register(Arc::new(WriteTool::with_pending(Arc::clone(&pending_store))));
 	registry.set_policy(Arc::new(StatPlanPolicy { pending: pending.clone() }));
 
 	let agent = AgentLoop::new(config(&dir.path, 8), Arc::new(provider), registry);
@@ -3306,10 +3372,12 @@ async fn plan_required_choice_executes_any_tool_then_clears_after_real_write() {
 	let first = requests.recv().await.expect("first request");
 	let second = requests.recv().await.expect("escalated request");
 	let third = requests.recv().await.expect("third request");
-	assert!(requests.try_recv().is_err(), "dialog must terminate without a fourth request");
+	let fourth = requests.recv().await.expect("fourth request");
+	assert!(requests.try_recv().is_err(), "dialog must terminate without a fifth request");
 	assert!(first.get("tool_choice").is_none(), "reminder request stays auto: {first}");
 	assert_eq!(second["tool_choice"], json!("required"), "escalation must require any tool");
 	assert!(third.get("tool_choice").is_none(), "the force must not stick: {third}");
+	assert!(fourth.get("tool_choice").is_none(), "the force must not stick: {fourth}");
 	assert_eq!(std::fs::read_to_string(&pending).expect("write executed"), "ok");
 	assert!(
 		tool_messages(&state).iter().any(|message| !message.is_error),

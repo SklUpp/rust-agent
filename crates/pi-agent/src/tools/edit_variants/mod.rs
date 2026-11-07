@@ -84,15 +84,21 @@ pub fn wire_name(mode: EditMode) -> &'static str {
 
 /// Execute a non-hashline mode. `Hashline` returns an argument error because
 /// the parent dispatches it to the native engine.
-pub async fn execute(mode: EditMode, args: &Value, ctx: &AgentContext) -> Result<ToolResult, ToolError> {
+pub async fn execute(
+	mode: EditMode,
+	args: &Value,
+	ctx: &AgentContext,
+	pending: Option<&crate::tools::pending::PendingStore>,
+	snapshots: std::sync::Arc<crate::tools::hashline::SnapshotStore>,
+) -> Result<ToolResult, ToolError> {
 	match mode {
 		EditMode::Hashline => Err(ToolError::InvalidArguments(
 			"hashline edits are handled by the native hashline engine".to_string(),
 		)),
-		EditMode::Replace => replace::execute(args, ctx).await,
-		EditMode::Patch => patch::execute_patch(args, ctx).await,
-		EditMode::ApplyPatch => apply_patch::execute(args, ctx).await,
-		EditMode::Sloppy => sloppy::execute(args, ctx).await,
+		EditMode::Replace => replace::execute(args, ctx, pending, snapshots).await,
+		EditMode::Patch => patch::execute_patch(args, ctx, pending, snapshots).await,
+		EditMode::ApplyPatch => apply_patch::execute(args, ctx, pending, snapshots).await,
+		EditMode::Sloppy => sloppy::execute(args, ctx, pending, snapshots).await,
 	}
 }
 

@@ -7,7 +7,10 @@ use std::{
 	collections::{BTreeMap, BTreeSet},
 	fs,
 	path::{Path, PathBuf},
-	sync::atomic::{AtomicUsize, Ordering},
+	sync::{
+		Arc,
+		atomic::{AtomicUsize, Ordering},
+	},
 };
 
 use pi_agent::{
@@ -225,12 +228,23 @@ async fn upstream_corpus_trees_match_after_apply() {
 
 		let patch = fs::read_to_string(&patch_path)
 			.unwrap_or_else(|err| panic!("case {case}: read {}: {err}", patch_path.display()));
+		let pending = Arc::new(pi_agent::tools::pending::PendingStore::new());
+		let snapshots = Arc::new(pi_agent::tools::hashline::SnapshotStore::new());
 		// Upstream swallows refusal errors; mutating cases must not error.
 		let apply_error = match parse_apply_patch(&patch) {
-			Ok(hunks) => apply_inputs(&hunks, temp.path(), &token, false)
-				.await
-				.err()
-				.map(|err| err.to_string()),
+			Ok(hunks) => {
+				match apply_inputs(&hunks, temp.path(), &token, Some(&pending), Arc::clone(&snapshots)).await {
+					Ok(_) => {
+						let ctx = pi_agent::AgentContext::new(temp.path().to_path_buf());
+						match pending.resolve(&ctx, "apply").await {
+							Ok(res) if res.is_error => Some(res.content),
+							Ok(_) => None,
+							Err(err) => Some(err.to_string()),
+						}
+					}
+					Err(err) => Some(err.to_string()),
+				}
+			}
 			Err(err) => Some(err.to_string()),
 		};
 		let actual = snapshot(temp.path()).unwrap_or_else(|err| panic!("case {case}: {err}"));

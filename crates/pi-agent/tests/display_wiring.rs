@@ -16,6 +16,7 @@ use pi_agent::{
 			normalize_edit_mode,
 		},
 		hashline::{SnapshotStore, edit::EditToolOptions},
+		pending::PendingStore,
 		read::FileDisplayInputs,
 	},
 };
@@ -76,11 +77,15 @@ impl Tool for AliasTool {
 async fn apply_patch_is_advertised_and_routed_through_the_registry() {
 	let dir = temp_dir("wire");
 	let mut registry = ToolRegistry::new();
-	let edit = Arc::new(EditTool::with_mode(
-		Arc::new(SnapshotStore::new()),
-		EditToolOptions::default(),
-		EditMode::ApplyPatch,
-	));
+	let pending = Arc::new(PendingStore::new());
+	let edit = Arc::new(
+		EditTool::with_mode(
+			Arc::new(SnapshotStore::new()),
+			EditToolOptions::default(),
+			EditMode::ApplyPatch,
+		)
+		.with_pending(Arc::clone(&pending)),
+	);
 	registry.register(edit);
 
 	let schemas = registry.schemas();
@@ -97,6 +102,7 @@ async fn apply_patch_is_advertised_and_routed_through_the_registry() {
 		.await
 		.expect("dispatch through alias executes apply_patch");
 	assert!(!result.is_error, "{}", result.content);
+	pending.resolve(&ctx, "apply").await.expect("apply");
 	assert_eq!(
 		std::fs::read_to_string(dir.join("added.txt")).expect("created file"),
 		"hello\n"

@@ -20,7 +20,8 @@ pub const DESCRIPTION: &str = "Single file string replacement; fuzzy whitespace 
 - `path` is required; `old_string` must be non-empty and uniquely identify the change.\n\
 - A non-unique `old_string` is refused unless `replace_all: true`.\n\
 - Naming a string across a file: `replace_all: true`.\n\
-- Do not use this tool to create files; use `write`.";
+- Do not use this tool to create files; use `write`.\n\
+- Edits are staged and applied via `write xd://resolve`.";
 
 const MAX_RECORDED_MATCHES: usize = 5;
 const OCCURRENCE_PREVIEW_CONTEXT: usize = 5;
@@ -42,7 +43,12 @@ pub fn schema() -> Value {
 	})
 }
 
-pub async fn execute(args: &Value, ctx: &AgentContext) -> Result<ToolResult, ToolError> {
+pub async fn execute(
+	args: &Value,
+	ctx: &AgentContext,
+	pending: Option<&crate::tools::pending::PendingStore>,
+	snapshots: std::sync::Arc<crate::tools::hashline::SnapshotStore>,
+) -> Result<ToolResult, ToolError> {
 	let path = super::require_str(args, "path")?;
 	let old_string = super::require_str(args, "old_string")?;
 	let new_string = super::require_str(args, "new_string")?;
@@ -50,7 +56,11 @@ pub async fn execute(args: &Value, ctx: &AgentContext) -> Result<ToolResult, Too
 	if old_string.is_empty() {
 		return Err(ToolError::InvalidArguments("old_string must not be empty.".to_string()));
 	}
-	let (absolute, display) = paths::resolve_edit_path(&path, &ctx.cwd, true, &ctx.cancellation_token).await?;
+	let (authored_absolute, display) = paths::resolve_edit_path(&path, &ctx.cwd, true, &ctx.cancellation_token).await?;
+	let absolute = match crate::tools::resolve_symlink_target(authored_absolute.clone()).await {
+		Ok(real) => real,
+		Err(_) => authored_absolute,
+	};
 	let raw = fsops::read_text(&absolute, &display).await?;
 	let (bom, text, ending) = text::normalize_file(&raw);
 	let normalized_old = text::to_lf(&old_string);
@@ -67,10 +77,40 @@ pub async fn execute(args: &Value, ctx: &AgentContext) -> Result<ToolResult, Too
 		)));
 	}
 	let final_text = text::denormalize_file(&bom, &replaced, ending);
-	fsops::commit_text(&absolute, &display, &raw, &final_text, &ctx.cancellation_token, None).await?;
+	let Some(pending_store) = pending else {
+		return Err(ToolError::ExecutionFailed("PendingStore is not mounted".to_string()));
+	};
+	let source_meta = std::fs::symlink_metadata(&absolute).ok();
+	let source_dev_ino = source_meta.as_ref().map(|m| crate::tools::staged_ops::dev_ino(m));
+	#[cfg(unix)]
+	let mode = {
+		use std::os::unix::fs::MetadataExt;
+		source_meta.as_ref().map(|m| m.mode() & 0o7777)
+	};
+	#[cfg(not(unix))]
+	let mode = None;
+
+	let op = crate::tools::staged_ops::PreparedOp::new_update(
+		absolute,
+		display.clone(),
+		raw.into_bytes(),
+		source_dev_ino,
+		final_text.into_bytes(),
+		mode,
+	);
+	let action = crate::tools::staged_ops::FileOpsAction::new(
+		"edit",
+		format!("replace in {display}"),
+		vec![op],
+		snapshots,
+	);
+	let action_id = pending_store.register(std::sync::Arc::new(action));
+
 	let diff = text::unified_diff(&display, &text, &replaced);
 	let first = text::first_changed_line(&text, &replaced);
-	let mut body = format!("[{display}]\n{diff}");
+	let mut body = format!(
+		"[{display}]\n{diff}\nStaged 1 replacement. Workspace NOT modified yet.\nWrite to xd://resolve to apply or xd://reject to discard."
+	);
 	if !warnings.is_empty() {
 		body.push_str("\n\nWarnings:\n");
 		body.push_str(&warnings.join("\n"));
@@ -78,6 +118,8 @@ pub async fn execute(args: &Value, ctx: &AgentContext) -> Result<ToolResult, Too
 	Ok(super::result(
 		body,
 		serde_json::json!({
+			"staged": true,
+			"actionId": action_id,
 			"path": display,
 			"op": "update",
 			"diff": diff,

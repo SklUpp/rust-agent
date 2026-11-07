@@ -114,10 +114,18 @@ async fn run_edit_with_options(
 	options: pi_agent::tools::hashline::edit::EditToolOptions,
 ) -> ToolResult {
 	let ctx = AgentContext::new(cwd.to_path_buf());
-	EditTool::with_options(store.clone(), options)
+	let pending = Arc::new(pi_agent::tools::PendingStore::new());
+	let tool = EditTool::with_options(store.clone(), options)
+		.with_pending(Arc::clone(&pending));
+	let result = tool
 		.execute(&json!({ "input": input }), &ctx)
 		.await
-		.expect("edit tool")
+		.expect("edit tool");
+	if !result.is_error {
+		let applied = pending.resolve(&ctx, "apply").await.expect("apply edit");
+		return applied;
+	}
+	result
 }
 
 fn assert_failed(result: &ToolResult, needle: &str) {
@@ -773,12 +781,12 @@ async fn later_commit_failure_reports_landed_sections() {
 	let b = dir.write("b.txt", "B\n");
 	let tag_a = record(&store, &a, &[1]);
 	let tag_b = record(&store, &b, &[1]);
-	std::fs::create_dir(dir.path.join("d")).unwrap();
-
-	// The second section's move destination is a directory: prepare accepts it,
-	// the write fails, and the first section must still be reported as written.
+	let long_name = format!("{}.txt", "x".repeat(237));
+	// The second section's move destination passes Gate 1, but its temp sibling
+	// exceeds NAME_MAX at commit: section 1 lands, section 2 fails commit, and
+	// landed sections are reported.
 	let input = format!(
-		"[a.txt#{tag_a}]\nPUT 1.=1:\n+A2\n[b.txt#{tag_b}]\nMV d\n"
+		"[a.txt#{tag_a}]\nPUT 1.=1:\n+A2\n[b.txt#{tag_b}]\nMV \"{long_name}\"\n"
 	);
 	let result = run_edit(&dir.path, &store, &input).await;
 	assert!(result.is_error, "{}", result.content);
@@ -828,6 +836,7 @@ async fn named_registers_do_not_leak_across_tool_instances() {
 		.await
 		.expect("cut");
 	assert!(!cut.is_error, "{}", cut.content);
+	session_a.pending().unwrap().resolve(&ctx, "apply").await.expect("apply cut");
 	assert_eq!(dir.read("shared.txt"), "keep\n");
 
 	// Session B shares the snapshot store but must not see A's registers.
@@ -846,6 +855,7 @@ async fn named_registers_do_not_leak_across_tool_instances() {
 		.await
 		.expect("paste a");
 	assert!(!paste.is_error, "{}", paste.content);
+	session_a.pending().unwrap().resolve(&ctx, "apply").await.expect("apply paste");
 	assert_eq!(dir.read("shared.txt"), "keep\ntake\n");
 }
 
@@ -885,6 +895,7 @@ async fn named_registers_persist_across_calls_on_one_tool_instance() {
 		.await
 		.expect("cut");
 	assert!(!cut.is_error, "{}", cut.content);
+	tool.pending().unwrap().resolve(&ctx, "apply").await.expect("apply cut");
 	assert_eq!(dir.read("registers.txt"), "keep\n");
 
 	let tag = record(&store, &path, &[1]);
@@ -894,5 +905,6 @@ async fn named_registers_persist_across_calls_on_one_tool_instance() {
 		.await
 		.expect("paste");
 	assert!(!paste.is_error, "{}", paste.content);
+	tool.pending().unwrap().resolve(&ctx, "apply").await.expect("apply paste");
 	assert_eq!(dir.read("registers.txt"), "keep\ntake\n");
 }

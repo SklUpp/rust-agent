@@ -1094,11 +1094,14 @@ impl Supervisor {
 		if has_edit_tool {
 			let options = *self.edit_options.lock().unwrap();
 			registry.remove("edit");
-			registry.register(Arc::new(EditTool::with_mode(
-				Arc::clone(&snapshots),
-				options,
-				resolved.edit_tool,
-			)));
+			registry.register(Arc::new(
+				EditTool::with_mode(
+					Arc::clone(&snapshots),
+					options,
+					resolved.edit_tool,
+				)
+				.with_pending(Arc::clone(&pending)),
+			));
 		}
 		if registry.get("ast_edit").is_some() {
 			registry.remove("ast_edit");

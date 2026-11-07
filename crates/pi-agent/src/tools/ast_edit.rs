@@ -42,9 +42,8 @@ use super::{
 	},
 	format_path_relative_to_cwd,
 	hashline::{SnapshotStore, canonical_key, format_header},
-	pending::{PendingAction, PendingStore, REJECT_DEVICE_PATH, RESOLVE_DEVICE_PATH},
+	pending::{PendingStore, REJECT_DEVICE_PATH, RESOLVE_DEVICE_PATH},
 	read::{FileDisplayInputs, normalize_snapshot_text},
-	write_atomic,
 };
 use crate::{
 	state::{AgentContext, ToolResult},
@@ -331,21 +330,48 @@ impl Tool for AstEditTool {
 			computed.files_touched,
 			plural(computed.files_touched),
 		);
-		self.pending.register(Arc::new(AstEditPending {
+		let mut ops = Vec::new();
+		for file in &computed.prepared {
+			if let Some(output) = &file.output {
+				let target_path = std::fs::canonicalize(&file.absolute).unwrap_or_else(|_| file.absolute.clone());
+				let meta = std::fs::metadata(&target_path).ok();
+				let dev_ino = meta.as_ref().map(|m| crate::tools::staged_ops::dev_ino(m));
+				#[cfg(unix)]
+				let mode = {
+					use std::os::unix::fs::MetadataExt;
+					meta.as_ref().map(|m| m.mode() & 0o7777)
+				};
+				#[cfg(not(unix))]
+				let mode = None;
+
+				ops.push(crate::tools::staged_ops::PreparedOp::new_update(
+					target_path,
+					file.display.clone(),
+					file.original.clone(),
+					dev_ino,
+					output.clone(),
+					mode,
+				));
+			}
+		}
+		let extra = serde_json::json!({
+			"totalReplacements": computed.total_replacements,
+			"filesTouched": computed.files_touched,
+			"filesSearched": computed.files_searched,
+			"limitReached": computed.limit_reached,
+			"parseErrors": parse_errors.clone(),
+			"parseErrorsTotal": parse_errors_total,
+			"scopePath": scope_path,
+			"fileChanges": computed.file_changes,
+		});
+		let action = crate::tools::staged_ops::FileOpsAction::new(
+			"ast_edit",
 			label,
-			prepared: computed.prepared,
-			file_changes: computed.file_changes,
-			total_replacements: computed.total_replacements,
-			files_touched: computed.files_touched,
-			files_searched: computed.files_searched,
-			limit_reached: computed.limit_reached,
-			parse_errors: parse_errors.clone(),
-			parse_errors_total,
-			scope_path,
-			hash_lines: self.hash_lines(),
-			snapshots: Arc::clone(&self.snapshots),
-			attempts: Mutex::new(AttemptWrites::default()),
-		}));
+			ops,
+			Arc::clone(&self.snapshots),
+		)
+		.with_extra_details(extra);
+		self.pending.register(Arc::new(action));
 
 		let mut lines = vec![preview_pending_notice(), String::new()];
 		lines.extend(output);
@@ -867,313 +893,6 @@ fn parse_error_lines(errors: &[String], total: usize) -> Vec<String> {
 	lines
 }
 
-/// Files already rewritten by earlier attempts of this staged action. The
-/// byte gate cannot tell its own prior writes from external edits, so a stale
-/// retry reports the previous write set instead of claiming zero writes.
-#[derive(Clone, Default)]
-struct AttemptWrites {
-	written:     Vec<String>,
-	invalidated: Vec<String>,
-}
-
-/// Staged apply action. The preview's exact bytes are the stale gate; the
-/// prepared outputs are never recomputed from live content.
-struct AstEditPending {
-	label:              String,
-	prepared:           Vec<PreparedFile>,
-	file_changes:       Vec<(String, u32)>,
-	total_replacements: usize,
-	files_touched:      usize,
-	files_searched:     usize,
-	limit_reached:      bool,
-	parse_errors:       Vec<String>,
-	parse_errors_total: usize,
-	scope_path:         String,
-	hash_lines:         bool,
-	snapshots:          Arc<SnapshotStore>,
-	attempts:           Mutex<AttemptWrites>,
-}
-
-#[async_trait]
-impl PendingAction for AstEditPending {
-	fn label(&self) -> &str {
-		&self.label
-	}
-
-	fn source_tool(&self) -> &str {
-		"ast_edit"
-	}
-
-	fn tier(&self) -> Option<crate::tools::pending::ActionTier> {
-		Some(crate::tools::pending::ActionTier::Write)
-	}
-
-	async fn apply(&self, ctx: &AgentContext, _reason: &str) -> Result<ToolResult, ToolError> {
-		if ctx.cancellation_token.is_cancelled() {
-			return Err(ToolError::Aborted("AST edit cancelled".to_string()));
-		}
-
-		// Gate 1: every affected file must still hold the exact bytes this
-		// preview read. No write starts until this pass succeeds.
-		let mut gate_failures = Vec::new();
-		for file in &self.prepared {
-			if ctx.cancellation_token.is_cancelled() {
-				return Err(ToolError::Aborted("AST edit cancelled".to_string()));
-			}
-			match tokio::fs::read(&file.absolute).await {
-				Ok(bytes) if bytes == file.original => {},
-				Ok(_) => gate_failures.push(format!("{}: content changed since preview", file.display)),
-				Err(error) => gate_failures.push(format!("{}: {error}", file.display)),
-			}
-		}
-		if !gate_failures.is_empty() {
-			let prior = self
-				.attempts
-				.lock()
-				.unwrap_or_else(|poison| poison.into_inner())
-				.clone();
-			let mut message = format!(
-				"Preview is stale / no longer matches; this attempt applied nothing. Preview \
-				 expected {} replacement{} in {} file{}.\n{}",
-				self.total_replacements,
-				plural(self.total_replacements),
-				self.files_touched,
-				plural(self.files_touched),
-				gate_failures.join("\n"),
-			);
-			if !prior.written.is_empty() {
-				message.push_str("\nPreviously written by this staged action: ");
-				message.push_str(&prior.written.join(", "));
-			}
-			if !prior.invalidated.is_empty() {
-				message.push_str("\nPrevious snapshot invalidations: ");
-				message.push_str(&prior.invalidated.join(", "));
-			}
-			let mut result = tool_result(message, true);
-			let mut details = self.details(false);
-			details["stale"] = json!(true);
-			details["partial"] = json!(!prior.written.is_empty());
-			details["gateFailures"] = json!(gate_failures);
-			details["writtenFiles"] = json!(prior.written);
-			details["snapshotInvalidations"] = json!(prior.invalidated);
-			details["attemptWrittenFiles"] = json!([]);
-			result.details = Some(details);
-			return Ok(result);
-		}
-
-		let mut written: Vec<String> = Vec::new();
-		let mut invalidated: Vec<String> = Vec::new();
-		let mut fresh_tags: Vec<String> = Vec::new();
-		let prepared_writes = self.prepared.iter().filter(|file| file.output.is_some()).count();
-
-		for file in &self.prepared {
-			let Some(output) = &file.output else {
-				continue;
-			};
-			if ctx.cancellation_token.is_cancelled() {
-				return Ok(self.partial_result(
-					format!(
-						"Cancelled after writing {} of {prepared_writes} files; remaining files were not modified.",
-						written.len()
-					),
-					&written,
-					&invalidated,
-					&fresh_tags,
-					!written.is_empty(),
-					false,
-					None,
-				));
-			}
-			// Gate 2: narrow the window between gate 1 and this write. This is
-			// a recheck, not a lock; a writer racing after it can still lose.
-			match tokio::fs::read(&file.absolute).await {
-				Ok(bytes) if bytes == file.original => {},
-				Ok(_) => {
-					return Ok(self.partial_result(
-						format!(
-							"Preview is stale / no longer matches at {} after {} of {prepared_writes} files were written. Remaining files were not modified.",
-							file.display,
-							written.len()
-						),
-						&written,
-						&invalidated,
-						&fresh_tags,
-						!written.is_empty(),
-						true,
-						Some(file.display.clone()),
-					));
-				},
-				Err(error) => {
-					return Ok(self.partial_result(
-						format!(
-							"Cannot re-read {} before writing: {error}. {} of {prepared_writes} files were written.",
-							file.display,
-							written.len()
-						),
-						&written,
-						&invalidated,
-						&fresh_tags,
-						!written.is_empty(),
-						false,
-						Some(file.display.clone()),
-					));
-				},
-			}
-			if ctx.cancellation_token.is_cancelled() {
-				return Ok(self.partial_result(
-					format!(
-						"Cancelled after writing {} of {prepared_writes} files; remaining files were not modified.",
-						written.len()
-					),
-					&written,
-					&invalidated,
-					&fresh_tags,
-					!written.is_empty(),
-					false,
-					None,
-				));
-			}
-
-			match write_atomic(&file.absolute, output, &ctx.cancellation_token).await {
-				Ok(()) => {
-					written.push(file.display.clone());
-					let key = canonical_key(&file.absolute);
-					self.snapshots.invalidate(&key);
-					invalidated.push(file.display.clone());
-					{
-						let mut attempts = self
-							.attempts
-							.lock()
-							.unwrap_or_else(|poison| poison.into_inner());
-						attempts.written.push(file.display.clone());
-						attempts.invalidated.push(file.display.clone());
-					}
-					// Re-record either way (a later `edit` validates against the
-					// post-apply bytes), but only hashline output shows the headers,
-					// matching upstream's `useHashLines` gate.
-					let text = normalize_snapshot_text(output);
-					let tag = self.snapshots.record_with_raw(&key, output, &text, None);
-					if self.hash_lines {
-						fresh_tags.extend(tag.map(|tag| format_header(&file.display, &tag)));
-					}
-				},
-				Err(error)
-					if error.kind() == std::io::ErrorKind::Interrupted
-						|| ctx.cancellation_token.is_cancelled() =>
-				{
-					return Ok(self.partial_result(
-						format!(
-							"Cancelled after writing {} of {prepared_writes} files; remaining files were not modified.",
-							written.len()
-						),
-						&written,
-						&invalidated,
-						&fresh_tags,
-						!written.is_empty(),
-						false,
-						Some(file.display.clone()),
-					));
-				},
-				Err(error) => {
-					return Ok(self.partial_result(
-						format!(
-							"Failed to write {}: {error}. {} of {prepared_writes} files were written; remaining files were not modified.",
-							file.display,
-							written.len()
-						),
-						&written,
-						&invalidated,
-						&fresh_tags,
-						!written.is_empty(),
-						false,
-						Some(file.display.clone()),
-					));
-				},
-			}
-		}
-
-		let mut text = format!(
-			"Applied {} replacement{} in {} file{}.",
-			self.total_replacements,
-			plural(self.total_replacements),
-			self.files_touched,
-			plural(self.files_touched),
-		);
-		if !fresh_tags.is_empty() {
-			text.push('\n');
-			text.push_str(&fresh_tags.join("\n"));
-		}
-		let mut details = self.details(true);
-		details["writtenFiles"] = json!(written);
-		details["snapshotInvalidations"] = json!(invalidated);
-		details["freshTagLines"] = json!(fresh_tags);
-		let mut result = tool_result(text, false);
-		result.details = Some(details);
-		Ok(result)
-	}
-}
-
-impl AstEditPending {
-	fn details(&self, applied: bool) -> Value {
-		let mut details = json!({
-			"totalReplacements": self.total_replacements,
-			"filesTouched": self.files_touched,
-			"filesSearched": self.files_searched,
-			"applied": applied,
-			"limitReached": self.limit_reached,
-			"scopePath": self.scope_path,
-			"files": self.file_changes.iter().map(|(path, _)| path).collect::<Vec<_>>(),
-			"fileReplacements": self
-				.file_changes
-				.iter()
-				.map(|(path, count)| json!({ "path": path, "count": count }))
-				.collect::<Vec<_>>(),
-		});
-		if !self.parse_errors.is_empty() {
-			details["parseErrors"] = json!(self.parse_errors);
-			details["parseErrorsTotal"] = json!(self.parse_errors_total);
-		}
-		details
-	}
-
-	#[allow(clippy::too_many_arguments)]
-	fn partial_result(
-		&self,
-		message: String,
-		written: &[String],
-		invalidated: &[String],
-		fresh_tags: &[String],
-		partial: bool,
-		stale: bool,
-		failed_file: Option<String>,
-	) -> ToolResult {
-		let mut text = message;
-		if !written.is_empty() {
-			text.push_str("\nWritten: ");
-			text.push_str(&written.join(", "));
-		}
-		if !invalidated.is_empty() {
-			text.push_str("\nSnapshot invalidations: ");
-			text.push_str(&invalidated.join(", "));
-		}
-		if !fresh_tags.is_empty() {
-			text.push('\n');
-			text.push_str(&fresh_tags.join("\n"));
-		}
-		let mut details = self.details(false);
-		details["partial"] = json!(partial);
-		details["stale"] = json!(stale);
-		details["writtenFiles"] = json!(written);
-		details["snapshotInvalidations"] = json!(invalidated);
-		details["freshTagLines"] = json!(fresh_tags);
-		if let Some(failed_file) = failed_file {
-			details["failedFile"] = json!(failed_file);
-		}
-		let mut result = tool_result(text, true);
-		result.details = Some(details);
-		result
-	}
-}
 
 #[cfg(test)]
 mod tests {
@@ -1292,6 +1011,7 @@ mod tests {
 			.await
 			.expect("edit executes");
 		assert!(!applied.is_error, "{}", applied.content);
+		edit.pending().unwrap().resolve(&ctx, "apply").await.expect("apply");
 		assert_eq!(fs::read_to_string(&file).expect("read"), "const a = baz(1);\n");
 	}
 
@@ -1528,7 +1248,7 @@ mod tests {
 		let partial = pending.resolve(&ctx, "apply").await.expect("partial");
 		fs::set_permissions(&blocked, fs::Permissions::from_mode(0o700)).expect("restore chmod");
 		assert!(partial.is_error, "{}", partial.content);
-		assert!(partial.content.contains("Failed to write"), "{}", partial.content);
+		assert!(partial.content.contains("Failed to write") || partial.content.contains("Failed to create temp file"), "{}", partial.content);
 		let partial_source = partial.details.as_ref().expect("details");
 		let partial_details = &partial_source["sourceResultDetails"];
 		assert_eq!(partial_details["partial"], json!(true));

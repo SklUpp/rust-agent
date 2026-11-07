@@ -302,8 +302,8 @@ impl LspSlot {
 impl RunnerSession {
 	fn new(options: EditToolOptions) -> Self {
 		let snapshots = Arc::new(SnapshotStore::new());
-		let edit = Arc::new(EditTool::with_options(snapshots.clone(), options));
 		let pending = Arc::new(PendingStore::new());
+		let edit = Arc::new(EditTool::with_options(snapshots.clone(), options).with_pending(Arc::clone(&pending)));
 		Self {
 			snapshots,
 			conflicts: Arc::new(pi_agent::tools::ConflictHistory::new()),
@@ -5147,7 +5147,7 @@ fn build_registry_with_display(
 					snapshots.clone(),
 					edit_options,
 					resolved.edit_tool,
-				)),
+				).with_pending(Arc::clone(&pending))),
 			},
 			"bash" => Arc::new(BashTool::new().with_acp_bridge(acp_bridge.clone())),
 			"todo" => Arc::new(TodoTool::restored(todo_phases.clone(), session_persisted)),

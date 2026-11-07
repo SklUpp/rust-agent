@@ -37,7 +37,12 @@ pub fn schema() -> Value {
 	})
 }
 
-pub async fn execute(args: &Value, ctx: &AgentContext) -> Result<ToolResult, ToolError> {
+pub async fn execute(
+	args: &Value,
+	ctx: &AgentContext,
+	pending: Option<&crate::tools::pending::PendingStore>,
+	snapshots: std::sync::Arc<crate::tools::hashline::SnapshotStore>,
+) -> Result<ToolResult, ToolError> {
 	let input = super::require_str(args, "input")?;
 	let hunks = parse_apply_patch(&input)?;
 	if hunks.is_empty() {
@@ -50,8 +55,8 @@ pub async fn execute(args: &Value, ctx: &AgentContext) -> Result<ToolResult, Too
 			paths::ensure_no_internal_scheme(rename)?;
 		}
 	}
-	let changes = super::patch::apply_inputs(&hunks, &ctx.cwd, &ctx.cancellation_token, false).await?;
-	Ok(super::patch::render_changes(changes, "Success. Updated the following files:"))
+	let changes = super::patch::apply_inputs(&hunks, &ctx.cwd, &ctx.cancellation_token, pending, snapshots).await?;
+	Ok(super::patch::render_changes(changes, "Staged patch operations. Workspace NOT modified yet.\nWrite to xd://resolve to apply or xd://reject to discard.\nFiles to update:"))
 }
 
 /// Parse a complete envelope; `*** Begin/End Patch` are required.
