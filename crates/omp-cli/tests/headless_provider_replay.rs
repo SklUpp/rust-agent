@@ -441,8 +441,12 @@ fn store_session(
 		parent_session: None,
 	});
 	assert!(store.enabled(), "durable session must open");
+	// `messages.id` is unique across the whole store, so the ids must be scoped
+	// to the session: the control twin stores the same turn shape.
+	let user_id = format!("{id}-user");
+	let assistant_id = format!("{id}-assistant");
 	let user = MessageEntry::new(
-		"msg-u",
+		user_id.clone(),
 		None,
 		"2026-11-02T00:00:01.000Z",
 		SessionMessage::user(MessageContent::Text("prior turn".to_string()), 1000),
@@ -459,8 +463,8 @@ fn store_session(
 	let call: ContentPart =
 		serde_json::from_value(call).expect("a toolCall part parses with or without a name");
 	let assistant = MessageEntry::new(
-		"msg-a",
-		Some("msg-u".to_string()),
+		assistant_id,
+		Some(user_id),
 		"2026-11-02T00:00:02.000Z",
 		SessionMessage::assistant(
 			MessageContent::Parts(vec![call]),
