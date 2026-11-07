@@ -420,17 +420,22 @@ data: [DONE]
 	fs::remove_dir_all(base).ok();
 }
 
-/// Store one durable (SQLite-authority) turn whose assistant block cannot be
-/// replayed: a `toolCall` part without its tool name. Returns the path the
-/// headless CLI resolves for that id.
-fn store_corrupt_session(sessions: &Path, cwd: &Path) -> PathBuf {
+/// Store one durable (SQLite-authority) turn whose assistant block carries
+/// `tool_name`; `None` omits it, so the stored context cannot be replayed.
+/// Returns the path the headless CLI resolves for `id`.
+fn store_session(
+	sessions: &Path,
+	cwd: &Path,
+	id: &str,
+	tool_name: Option<&str>,
+) -> PathBuf {
 	let mut store = SessionStore::open(&SessionOptions {
 		enabled: true,
 		cwd: cwd.to_path_buf(),
 		model: None,
 		provider: None,
 		dir: Some(sessions.to_path_buf()),
-		id: Some("broken-context".to_string()),
+		id: Some(id.to_string()),
 		continue_latest: false,
 		no_title: true,
 		parent_session: None,
@@ -442,13 +447,17 @@ fn store_corrupt_session(sessions: &Path, cwd: &Path) -> PathBuf {
 		"2026-11-02T00:00:01.000Z",
 		SessionMessage::user(MessageContent::Text("prior turn".to_string()), 1000),
 	);
-	// Parses as a valid entry, but the tool name is absent.
-	let call: ContentPart = serde_json::from_value(serde_json::json!({
+	// Parses as a valid entry with or without the tool name.
+	let mut call = serde_json::json!({
 		"type": "toolCall",
 		"id": "call-1",
 		"arguments": { "path": "note.txt" },
-	}))
-	.expect("a toolCall part without a name still parses");
+	});
+	if let Some(tool_name) = tool_name {
+		call["name"] = serde_json::json!(tool_name);
+	}
+	let call: ContentPart =
+		serde_json::from_value(call).expect("a toolCall part parses with or without a name");
 	let assistant = MessageEntry::new(
 		"msg-a",
 		Some("msg-u".to_string()),
@@ -465,15 +474,16 @@ fn store_corrupt_session(sessions: &Path, cwd: &Path) -> PathBuf {
 	);
 	store
 		.append_messages_compat(&[user, assistant])
-		.expect("store the malformed context");
-	// The fixture is only meaningful while the stored context is unreplayable.
+		.expect("store the fixture context");
+	// The fixture is meaningful only while replayability matches the name.
 	let branch: Vec<MessageEntry> = store.branch_messages().into_iter().cloned().collect();
-	assert!(
-		omp_cli::runtime::history_messages_from_entries(&branch).is_err(),
-		"fixture must store a block the replay cannot rebuild"
+	assert_eq!(
+		omp_cli::runtime::history_messages_from_entries(&branch).is_ok(),
+		tool_name.is_some(),
+		"fixture replayability must follow the stored tool call"
 	);
 	drop(store);
-	session_file(sessions, "broken-context")
+	session_file(sessions, id)
 }
 
 #[test]
@@ -484,23 +494,81 @@ fn corrupt_stored_context_fails_before_any_provider_request() {
 
 	// A `toolCall` block without its name parses as a valid entry but cannot be
 	// rebuilt losslessly, so resuming must stop instead of replaying the turn.
-	let session = store_corrupt_session(&sessions, &cwd);
+	let session = store_session(&sessions, &cwd, "broken-context", None);
+	// Positive control: the identical fixture with a stored tool name replays.
+	let control_session = store_session(&sessions, &cwd, "sound-context", Some("read"));
+	let before = entries(&session);
 
-	let output = run(
-		omp(&agent_dir, &cwd, &sessions)
-			.args(["--resume", "broken-context", "-p", "CORRUPT-PROMPT-5e"]),
-	);
-	assert!(
-		!output.status.success(),
-		"a corrupt stored conversation must fail the turn: {}",
-		String::from_utf8_lossy(&output.stderr)
-	);
+	// Every attempt fails closed, and retries never journal a partial turn.
+	for attempt in 0..2 {
+		let output = run(
+			omp(&agent_dir, &cwd, &sessions)
+				.args(["--resume", "broken-context", "-p", "CORRUPT-PROMPT-5e"]),
+		);
+		assert!(
+			!output.status.success(),
+			"corrupt resume attempt {attempt} must fail the turn: {}",
+			String::from_utf8_lossy(&output.stderr)
+		);
+		assert_eq!(entries(&session), before, "attempt {attempt} must not journal");
+	}
 	assert_eq!(server.request_count(), 0, "the provider must never be called with degraded context");
+
+	// Backwards compatibility: an older log without this turn's prompt.
 	assert!(
-		!entries(&session)
+		before.iter().any(|entry| entry.to_string().contains("prior turn")),
+		"the stored context must be readable: {before:?}"
+	);
+	assert!(
+		!before
 			.iter()
 			.any(|entry| entry.to_string().contains("CORRUPT-PROMPT-5e")),
 		"the request must be built before the journal gains this turn's prompt"
+	);
+
+	// Fork copies the branch into a new session and continues it, so it must
+	// refuse before creating the target row instead of storing a bad copy.
+	let rows_before_fork = omp_cli::durable_session::list_session_summaries(&sessions)
+		.expect("list durable sessions")
+		.len();
+	let fork = run(
+		omp(&agent_dir, &cwd, &sessions)
+			.args(["--fork", "broken-context", "-p", "FORK-PROMPT-5e"]),
+	);
+	assert!(
+		!fork.status.success(),
+		"a fork of a corrupt source must fail: {}",
+		String::from_utf8_lossy(&fork.stderr)
+	);
+	assert_eq!(
+		omp_cli::durable_session::list_session_summaries(&sessions)
+			.expect("list durable sessions")
+			.len(),
+		rows_before_fork,
+		"a refused fork must not create a target session row"
+	);
+	assert_eq!(entries(&session), before, "a refused fork must leave the source intact");
+
+	// Causal control: only the replayable twin reaches the provider.
+	let control = run(
+		omp(&agent_dir, &cwd, &sessions)
+			.args(["--resume", "sound-context", "-p", "CONTROL-PROMPT-5e"]),
+	);
+	assert!(
+		control.status.success(),
+		"the replayable twin must run: {}",
+		String::from_utf8_lossy(&control.stderr)
+	);
+	assert_eq!(
+		server.request_count(),
+		1,
+		"only the control session may reach the provider"
+	);
+	assert!(
+		entries(&control_session)
+			.iter()
+			.any(|entry| entry.to_string().contains("CONTROL-PROMPT-5e")),
+		"the control turn must be journaled"
 	);
 
 	server.stop();

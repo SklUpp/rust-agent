@@ -4599,6 +4599,14 @@ pub fn fork_session(
 			.unwrap_or("cannot open source session")
 			.to_string());
 	}
+	// Fork copies this branch into a new session and continues it. Opening is a
+	// read (a corrupt branch stays readable), so the replay check must happen
+	// here, before the target row exists: otherwise a fork would persist an
+	// unreplayable copy and only the next turn would fail.
+	let branch_replay: Vec<MessageEntry> =
+		source.branch_messages().into_iter().cloned().collect();
+	crate::runtime::history_messages_from_entries(&branch_replay)
+		.map_err(|error| format!("cannot fork session {}: {error}", source.id()))?;
 	let original_id = source.id().to_string();
 	let mut header = source
 		.header()

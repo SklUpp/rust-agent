@@ -157,7 +157,11 @@ pub struct DurableSession {
 	/// On resume, digests and ids of the stored (or projected) messages. The
 	/// first live write aligns the incoming history against them before
 	/// appending new messages.
-	resume_seed: Arc<Mutex<Option<Vec<(u64, Option<String>)>>>>,
+	///
+	/// A branch that cannot be projected is still stored as an error, not
+	/// raised here: opening is a read and must stay available, while the first
+	/// write boundary (before any provider request) fails the turn.
+	resume_seed: Arc<Mutex<Option<StoreResult<Vec<(u64, Option<String>)>>>>>,
 	written_tool_ids: Arc<Mutex<HashMap<String, VecDeque<String>>>>,
 	/// Selected compacted projection, mirrored in the session payload.
 	projection: Arc<Mutex<Option<StoredProjection>>>,
@@ -286,7 +290,7 @@ impl DurableSession {
 							&branch_messages,
 							projection.as_ref(),
 							&messages,
-						)?))),
+						)))),
 						tracked: Arc::new(Mutex::new(Vec::new())),
 						tracked_ids: Arc::new(Mutex::new(Vec::new())),
 					},
@@ -372,7 +376,7 @@ impl DurableSession {
 				&branch_messages,
 				projection.as_ref(),
 				&messages,
-			)?);
+			));
 		}
 		Ok(LoadedSession {
 			header,
@@ -511,9 +515,24 @@ impl DurableSession {
 	) -> Result<usize, DurableError> {
 		let previous = {
 			let mut tracked = lock(&self.tracked);
-			if tracked.is_empty()
-				&& let Some(seed) = lock(&self.resume_seed).take()
-			{
+			let seed = if tracked.is_empty() {
+				lock(&self.resume_seed).take()
+			} else {
+				None
+			};
+			if let Some(seed) = seed {
+				// A stored branch that cannot be projected fails here, before the
+				// provider request, while the session itself stays readable. The
+				// error is put back so a retried turn cannot mistake the corrupt
+				// branch for a brand-new conversation and duplicate its rows.
+				let seed = match seed {
+					Ok(seed) => seed,
+					Err(error) => {
+						let message = error.to_string();
+						*lock(&self.resume_seed) = Some(Err(error));
+						return Err(DurableError::new(message));
+					},
+				};
 				// Resume: the stored projected view is a prefix of the incoming
 				// persisted-role messages. Align it by stable revision, not by
 				// assuming the caller's history length.
@@ -1818,6 +1837,67 @@ mod tests {
 			messages.iter().all(|message| message.role != Role::System),
 			"revive inserts the real contract prompt, not a stale System from the transcript"
 		);
+		let _ = std::fs::remove_dir_all(dir);
+	}
+
+	#[tokio::test]
+	async fn corrupt_resume_seed_stays_readable_and_fails_every_write() {
+		let (dir, path) = temp_db("corrupt-seed");
+		let session =
+			DurableSession::create(&path, header("corrupt", None)).expect("create session");
+		let user = MessageEntry::new(
+			"msg-u",
+			None,
+			"2026-11-02T00:00:01.000Z",
+			SessionMessage::user(MessageContent::Text("prior turn".to_string()), 1000),
+		);
+		// Parses as a valid entry, but the tool name is absent.
+		let call: SessionPart = serde_json::from_value(serde_json::json!({
+			"type": "toolCall",
+			"id": "call-1",
+			"arguments": { "path": "note.txt" },
+		}))
+		.expect("toolCall without a name still parses");
+		let assistant = MessageEntry::new(
+			"msg-a",
+			Some("msg-u".to_string()),
+			"2026-11-02T00:00:02.000Z",
+			SessionMessage::assistant(
+				MessageContent::Parts(vec![call]),
+				"openai-completions",
+				"mock",
+				"mock-model",
+				None,
+				"toolUse",
+				2000,
+			),
+		);
+		session
+			.append_message_entries(&[user, assistant])
+			.expect("store the malformed context");
+		drop(session);
+
+		// Opening is a read: the corrupt branch stays available while the seed
+		// carries its projection error.
+		let reopened = DurableSession::open(&path, "corrupt", header("corrupt", None))
+			.expect("a corrupt branch must stay readable");
+		let before = reopened.load().expect("read").branch_messages.len();
+		assert_eq!(before, 2, "both stored rows must load");
+		for attempt in 0..2 {
+			let error = reopened
+				.persist_messages(&[Message::user("retry prompt")])
+				.await
+				.expect_err("every resume write must fail closed");
+			assert!(
+				error.to_string().contains("msg-a"),
+				"attempt {attempt} must name the unreplayable revision: {error}"
+			);
+			assert_eq!(
+				reopened.load().expect("read").branch_messages.len(),
+				before,
+				"attempt {attempt} must not append or duplicate rows"
+			);
+		}
 		let _ = std::fs::remove_dir_all(dir);
 	}
 }
