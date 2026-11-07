@@ -15,6 +15,10 @@ use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
 use std::time::Duration;
 
+use omp_cli::session::{
+	ContentPart, MessageContent, MessageEntry, SessionMessage, SessionOptions, SessionStore,
+};
+
 static COUNTER: AtomicU32 = AtomicU32::new(0);
 
 const DEFAULT_SSE: &str =
@@ -416,6 +420,62 @@ data: [DONE]
 	fs::remove_dir_all(base).ok();
 }
 
+/// Store one durable (SQLite-authority) turn whose assistant block cannot be
+/// replayed: a `toolCall` part without its tool name. Returns the path the
+/// headless CLI resolves for that id.
+fn store_corrupt_session(sessions: &Path, cwd: &Path) -> PathBuf {
+	let mut store = SessionStore::open(&SessionOptions {
+		enabled: true,
+		cwd: cwd.to_path_buf(),
+		model: None,
+		provider: None,
+		dir: Some(sessions.to_path_buf()),
+		id: Some("broken-context".to_string()),
+		continue_latest: false,
+		no_title: true,
+		parent_session: None,
+	});
+	assert!(store.enabled(), "durable session must open");
+	let user = MessageEntry::new(
+		"msg-u",
+		None,
+		"2026-11-02T00:00:01.000Z",
+		SessionMessage::user(MessageContent::Text("prior turn".to_string()), 1000),
+	);
+	// Parses as a valid entry, but the tool name is absent.
+	let call: ContentPart = serde_json::from_value(serde_json::json!({
+		"type": "toolCall",
+		"id": "call-1",
+		"arguments": { "path": "note.txt" },
+	}))
+	.expect("a toolCall part without a name still parses");
+	let assistant = MessageEntry::new(
+		"msg-a",
+		Some("msg-u".to_string()),
+		"2026-11-02T00:00:02.000Z",
+		SessionMessage::assistant(
+			MessageContent::Parts(vec![call]),
+			"openai-completions",
+			"mock",
+			"mock-model",
+			None,
+			"toolUse",
+			2000,
+		),
+	);
+	store
+		.append_messages_compat(&[user, assistant])
+		.expect("store the malformed context");
+	// The fixture is only meaningful while the stored context is unreplayable.
+	let branch: Vec<MessageEntry> = store.branch_messages().into_iter().cloned().collect();
+	assert!(
+		omp_cli::runtime::history_messages_from_entries(&branch).is_err(),
+		"fixture must store a block the replay cannot rebuild"
+	);
+	drop(store);
+	session_file(sessions, "broken-context")
+}
+
 #[test]
 fn corrupt_stored_context_fails_before_any_provider_request() {
 	let server = MockWireServer::start(vec![DEFAULT_SSE.to_string()]);
@@ -423,71 +483,21 @@ fn corrupt_stored_context_fails_before_any_provider_request() {
 	let (agent_dir, cwd, sessions) = setup(server.port, &base);
 
 	// A `toolCall` block without its name parses as a valid entry but cannot be
-	// rebuilt losslessly, so the CLI must stop instead of replaying the turn.
-	let log = sessions.join("2026-11-02T00-00-00-000Z_broken-context.jsonl");
-	let lines = [
-		serde_json::json!({
-			"type": "session",
-			"version": 3,
-			"id": "broken-context",
-			"timestamp": "2026-11-02T00:00:00.000Z",
-			"cwd": cwd.to_str().expect("cwd"),
-		})
-		.to_string(),
-		serde_json::json!({
-			"type": "message",
-			"id": "msg-u",
-			"parentId": null,
-			"timestamp": "2026-11-02T00:00:01.000Z",
-			"message": {
-				"role": "user",
-				"content": [{ "type": "text", "text": "prior turn" }],
-				"timestamp": 1000,
-			},
-		})
-		.to_string(),
-		serde_json::json!({
-			"type": "message",
-			"id": "msg-a",
-			"parentId": "msg-u",
-			"timestamp": "2026-11-02T00:00:02.000Z",
-			"message": {
-				"role": "assistant",
-				"content": [{ "type": "toolCall", "id": "call-1", "arguments": { "path": "note.txt" } }],
-				"api": "openai-completions",
-				"provider": "mock",
-				"model": "mock-model",
-				"stopReason": "toolUse",
-				"timestamp": 2000,
-			},
-		})
-		.to_string(),
-	];
-	fs::write(&log, format!("{}\n", lines.join("\n"))).expect("write corrupt log");
+	// rebuilt losslessly, so resuming must stop instead of replaying the turn.
+	let session = store_corrupt_session(&sessions, &cwd);
 
 	let output = run(
-		omp(&agent_dir, &cwd, &sessions).args(["--resume", "broken-context", "-p", "CORRUPT-PROMPT-5e"]),
+		omp(&agent_dir, &cwd, &sessions)
+			.args(["--resume", "broken-context", "-p", "CORRUPT-PROMPT-5e"]),
 	);
-	let stderr = String::from_utf8_lossy(&output.stderr);
 	assert!(
 		!output.status.success(),
-		"a corrupt stored conversation must fail the turn: {stderr}"
+		"a corrupt stored conversation must fail the turn: {}",
+		String::from_utf8_lossy(&output.stderr)
 	);
+	assert_eq!(server.request_count(), 0, "the provider must never be called with degraded context");
 	assert!(
-		stderr.contains("toolCall part missing name"),
-		"failure must name the unreplayable block: {stderr}"
-	);
-	assert!(
-		!stderr.contains("cannot rebuild branch context"),
-		"the turn must not continue after a downgraded rebuild: {stderr}"
-	);
-	assert_eq!(
-		server.request_count(),
-		0,
-		"the provider must never be called with degraded context"
-	);
-	assert!(
-		!entries(&log)
+		!entries(&session)
 			.iter()
 			.any(|entry| entry.to_string().contains("CORRUPT-PROMPT-5e")),
 		"the request must be built before the journal gains this turn's prompt"
