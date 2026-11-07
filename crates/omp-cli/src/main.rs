@@ -2431,6 +2431,7 @@ impl Session<'_> {
 			catalog: Arc::clone(&self.catalog),
 			approvals: self.approvals.clone(),
 			max_time: self.max_time,
+			turn_started: std::time::Instant::now(),
 			max_turns: self.max_turns,
 			tools_enabled: self.tools_enabled,
 			cancellation_token: None,
@@ -2676,6 +2677,8 @@ impl Session<'_> {
 		request.turn_ack = Some(Arc::clone(&turn_ack));
 		let _turn_ack_guard = TurnAckGuard(Arc::clone(&turn_ack));
 		let started = std::time::Instant::now();
+		// The runtime timer and this CLI's stream deadline share one start.
+		request.turn_started = started;
 		let mut builder = if !turn_parts.is_empty() {
 			TurnBuilder::new_with_parts(full_prompt, turn_parts)
 		} else {
@@ -3499,6 +3502,15 @@ impl Session<'_> {
 						}
 					}
 				}
+			}
+			// A failed turn can still journal accepted steering (the loop writes
+			// it before surfacing the interrupt) without a `TurnEnd` boundary.
+			// Rebuild the host view here so the next prompt is built from the
+			// durable branch instead of this turn's stale mirror.
+			if self.store.durable_boundary().is_some()
+				&& let Err(err) = self.store.reload_from_durable()
+			{
+				eprintln!("warning: cannot reload durable session: {err}");
 			}
 		}
 		drop(handle_event);

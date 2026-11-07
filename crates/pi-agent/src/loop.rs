@@ -56,9 +56,18 @@ pub const INTERRUPTED_TOOL_RESULT: &str = "[Tool execution interrupted by user]"
 /// through it. `Err` names why a payload was rejected, so callers decide the
 /// fallout: the loop fails the result closed, wire-only views drop the images.
 pub fn tool_image_parts_of(result: &ToolResult) -> Result<Vec<ContentPart>, String> {
-	let Some(images) = result
-		.details
-		.as_ref()
+	image_parts_from_details(result.details.as_ref())
+}
+
+/// Validate a `details.images` payload into content parts.
+///
+/// Single source of truth for the policy shared by the live provider request,
+/// the `tool_execution_end` frame, the RPC child turn, and durable replay of
+/// rows whose images were archived under `details` rather than content parts.
+pub fn image_parts_from_details(
+	details: Option<&serde_json::Value>,
+) -> Result<Vec<ContentPart>, String> {
+	let Some(images) = details
 		.and_then(|details| details.get("images"))
 		.and_then(serde_json::Value::as_array)
 	else {
@@ -329,6 +338,11 @@ pub enum AgentError {
 	MaxTurnsExceeded(usize),
 	#[error("Execution interrupted by steering")]
 	Interrupted,
+	/// Interruption whose supervisor already named the cause (for example the
+	/// `--max-time` deadline). The reason travels with the error so a caller
+	/// never has to re-derive it from a second clock.
+	#[error("{0}")]
+	InterruptedReason(String),
 	#[error("Model provider error: {0}")]
 	Provider(#[from] ProviderError),
 	#[error("Durable session write failed: {0}")]
@@ -341,6 +355,10 @@ pub enum AgentError {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SteeringEvent {
 	Interrupt,
+	/// An interrupt whose reason the supervisor already knows (for example the
+	/// `--max-time` deadline). The loop records it as the aborted turn's
+	/// `errorMessage` instead of the generic user-interrupt label.
+	InterruptWithReason(String),
 	/// Exact user parts (text and images) injected as one user message, so a
 	/// steering image survives instead of being flattened to text.
 	InjectMessage(Vec<ContentPart>),
@@ -351,12 +369,22 @@ pub enum SteeringEvent {
 struct Steering {
 	injections: Vec<Vec<ContentPart>>,
 	interrupted: bool,
+	/// Supervisor-supplied reason for the interrupt (for example the
+	/// `--max-time` deadline). A later interrupt never replaces an earlier
+	/// reason, so the first terminal cause wins.
+	reason: Option<String>,
 }
 
 impl Steering {
 	fn absorb(&mut self, event: SteeringEvent) {
 		match event {
 			SteeringEvent::Interrupt => self.interrupted = true,
+			SteeringEvent::InterruptWithReason(reason) => {
+				self.interrupted = true;
+				if self.reason.is_none() {
+					self.reason = Some(reason);
+				}
+			},
 			SteeringEvent::InjectMessage(message) => self.injections.push(message),
 		}
 	}
@@ -376,6 +404,9 @@ struct BatchOutcome {
 	results: Vec<ToolResult>,
 	injections: Vec<Vec<ContentPart>>,
 	interrupted: bool,
+	/// Supervisor-supplied interrupt reason, so the synthetic results of a
+	/// cancelled batch record the real cause instead of the user label.
+	interrupt_reason: Option<String>,
 }
 
 /// Upstream `MAX_SOFT_TOOL_ESCALATIONS`: abort instead of forcing forever.
@@ -673,6 +704,45 @@ async fn pair_skipped_tool_calls(
 		results.push(result);
 	}
 	results
+}
+
+/// A provider request that produced no accepted turn. An interrupt carries the
+/// partial message and the supervisor's reason so the caller can journal the
+/// aborted turn and surface the exact cause; every other failure stays opaque
+/// except for the partial response worth publishing.
+enum NextAssistantError {
+	Interrupted { message: Message, reason: Option<String> },
+	Failed { error: AgentError, terminal: Option<(Message, TurnStatus)> },
+}
+
+impl NextAssistantError {
+	fn interrupted(message: Message, reason: Option<String>) -> Self {
+		Self::Interrupted { message, reason }
+	}
+}
+
+impl From<ProviderError> for NextAssistantError {
+	fn from(error: ProviderError) -> Self {
+		Self::Failed { error: AgentError::Provider(error), terminal: None }
+	}
+}
+
+/// Build the abort error for a suppressed turn: a supervisor reason stays
+/// attached; a bare interrupt keeps the historical unit variant.
+fn interrupt_error(reason: Option<String>) -> AgentError {
+	match reason {
+		Some(reason) => AgentError::InterruptedReason(reason),
+		None => AgentError::Interrupted,
+	}
+}
+
+/// Stamp an interrupted assistant message with its terminal reason. A reason
+/// supplied by the supervisor (for example the `--max-time` deadline) is
+/// recorded verbatim; a bare interrupt is a user interrupt.
+fn interrupted_message(mut message: Message, reason: Option<String>) -> Message {
+	message.stop_reason = Some(StopReason::Aborted);
+	message.error_message = Some(reason.unwrap_or_else(|| "Interrupted by user".to_string()));
+	message
 }
 
 /// C4-specific pre-dispatch gate for one assistant response.
@@ -1159,8 +1229,12 @@ impl AgentLoop {
 					state.messages.push(Message::user_with_parts(parts));
 				}
 				if steering.interrupted {
+					// Accepted sends were already receipted: make the injected
+					// rows durable before the dialog unwinds, so a host reload
+					// does not lose what the supervisor accepted.
 					cancellation_token.cancel();
-					return Err(AgentError::Interrupted);
+					self.persist_conversation(&state.messages).await?;
+					return Err(interrupt_error(steering.reason));
 				}
 			}
 			// Results that settled while the previous assistant turn ran land
@@ -1267,13 +1341,73 @@ impl AgentLoop {
 				.await
 			{
 				Ok(assistant) => assistant,
-				Err(error) => {
+				Err(NextAssistantError::Interrupted { message: partial, reason }) => {
+					// `next_assistant` stamped the abort reason; journal the turn
+					// and its accepted injections before any terminal event, so
+					// the host's reload on `TurnEnd` sees exactly what is durable.
+					// A partial turn carries no tool calls (they never resolved),
+					// so no synthetic result can pair.
+					state.messages.push(partial.clone());
+					self.persist_conversation(&state.messages).await?;
+					for parts in &pending_injections {
+						state.messages.push(Message::user_with_parts(parts.clone()));
+					}
+					self.persist_conversation(&state.messages).await?;
+					if let Some(sink) = events.as_ref() {
+						let _ = sink
+							.send(AgentEvent::MessageEnd {
+								message: partial.clone(),
+								status: TurnStatus::Aborted,
+							})
+							.await;
+					}
+					for parts in &pending_injections {
+						announce_user_steer(&events, parts).await;
+					}
+					if let Some(sink) = events.as_ref() {
+						let _ = sink
+							.send(AgentEvent::TurnEnd {
+								message: partial,
+								tool_results: Vec::new(),
+								status: TurnStatus::Aborted,
+							})
+							.await;
+					}
+					return Err(interrupt_error(reason));
+				},
+				Err(NextAssistantError::Failed { error, terminal }) => {
 					// The hub receipted these sends as `injected`; a turn that dies
-					// mid-request must still hand them to the caller's state instead
-					// of dropping them with this frame.
-					for parts in pending_injections {
-						announce_user_steer(&events, &parts).await;
-						state.messages.push(Message::user_with_parts(parts));
+					// mid-request must still journal them before it surfaces, or a
+					// host reload loses accepted steering.
+					for parts in &pending_injections {
+						state.messages.push(Message::user_with_parts(parts.clone()));
+					}
+					self.persist_conversation(&state.messages).await?;
+					if let Some((partial, status)) = terminal {
+						if let Some(sink) = events.as_ref() {
+							let _ = sink
+								.send(AgentEvent::MessageEnd {
+									message: partial.clone(),
+									status: status.clone(),
+								})
+								.await;
+						}
+						for parts in &pending_injections {
+							announce_user_steer(&events, parts).await;
+						}
+						if let Some(sink) = events.as_ref() {
+							let _ = sink
+								.send(AgentEvent::TurnEnd {
+									message: partial,
+									tool_results: Vec::new(),
+									status,
+								})
+								.await;
+						}
+					} else {
+						for parts in &pending_injections {
+							announce_user_steer(&events, parts).await;
+						}
 					}
 					return Err(error);
 				},
@@ -1727,6 +1861,17 @@ impl AgentLoop {
 			let injection_count = pending_injections.len() + outcome.injections.len();
 			let ack_rx =
 				self.begin_turn_ack(turn_start, state.messages.len() + injection_count);
+			// Injected messages land after the tool responses and after the turn
+			// tail is journaled, so the history stays valid and the accepted user
+			// chains behind the messages it interrupted.
+			for parts in pending_injections.into_iter().chain(outcome.injections) {
+				announce_user_steer(&events, &parts).await;
+				state.messages.push(Message::user_with_parts(parts));
+			}
+			// Accepted steering is a user message; make it durable before the
+			// owner is acked and before `TurnEnd` publishes, so a host reload at
+			// that boundary sees the injected rows.
+			self.persist_conversation(&state.messages).await?;
 			if let Some(events_sink) = events.as_ref() {
 				let _ = events_sink
 					.send(AgentEvent::TurnEnd {
@@ -1736,16 +1881,6 @@ impl AgentLoop {
 					})
 					.await;
 			}
-			// Injected messages land after the tool responses and after the turn
-			// tail is journaled, so the history stays valid and the accepted user
-			// chains behind the messages it interrupted.
-			for parts in pending_injections.into_iter().chain(outcome.injections) {
-				announce_user_steer(&events, &parts).await;
-				state.messages.push(Message::user_with_parts(parts));
-			}
-			// Accepted steering is a user message; make it durable before the
-			// owner is acked and before any next provider request.
-			self.persist_conversation(&state.messages).await?;
 			let decision = self.await_turn_ack(ack_rx, &cancellation_token).await;
 			let TurnAckDecision {
 				rewrite,
@@ -1799,7 +1934,7 @@ impl AgentLoop {
 
 			if cancelled {
 				cancellation_token.cancel();
-				return Err(AgentError::Interrupted);
+				return Err(interrupt_error(outcome.interrupt_reason));
 			}
 
 			if should_terminate {
@@ -1827,8 +1962,12 @@ impl AgentLoop {
 		let execute = self.scheduler.execute_batch(calls, ctx);
 		tokio::pin!(execute);
 
-		let mut outcome =
-			BatchOutcome { results: Vec::new(), injections: Vec::new(), interrupted: false };
+		let mut outcome = BatchOutcome {
+			results: Vec::new(),
+			injections: Vec::new(),
+			interrupted: false,
+			interrupt_reason: None,
+		};
 		let mut finished = false;
 		let mut rx_open = steering_rx.is_some();
 
@@ -1843,6 +1982,10 @@ impl AgentLoop {
 						event = rx.recv() => match event {
 							Some(SteeringEvent::InjectMessage(message)) => outcome.injections.push(message),
 							Some(SteeringEvent::Interrupt) => outcome.interrupted = true,
+							Some(SteeringEvent::InterruptWithReason(reason)) => {
+								outcome.interrupted = true;
+								outcome.interrupt_reason.get_or_insert(reason);
+							},
 							None => rx_open = false,
 						},
 					}
@@ -1862,6 +2005,10 @@ impl AgentLoop {
 		}
 
 		let mut ordered = Vec::with_capacity(calls.len());
+		// A cancelled batch never produced these results; the synthetic row is
+		// the durable record of the cancellation, so it carries the supervisor's
+		// reason (`max time exceeded`) instead of the generic user label.
+		let interrupt_text = outcome.interrupt_reason.as_deref().unwrap_or(INTERRUPTED_TOOL_RESULT);
 		for call in calls {
 			match outcome
 				.results
@@ -1871,7 +2018,7 @@ impl AgentLoop {
 				Some(result) => ordered.push(result.clone()),
 				None => ordered.push(ToolResult {
 					tool_call_id: call.id.clone(),
-					content: INTERRUPTED_TOOL_RESULT.to_string(),
+					content: interrupt_text.to_string(),
 					is_error: true,
 					terminate: false,
 					details: None,
@@ -1916,9 +2063,9 @@ impl AgentLoop {
 		cancellation_token: &CancellationToken,
 		mut steering_rx: Option<&mut mpsc::Receiver<SteeringEvent>>,
 		injections: &mut Vec<Vec<ContentPart>>,
-	) -> Result<Message, AgentError> {
+	) -> Result<Message, NextAssistantError> {
 		if cancellation_token.is_cancelled() {
-			return Err(AgentError::Interrupted);
+			return Err(NextAssistantError::interrupted(interrupted_message(Message::assistant(""), None), None));
 		}
 		let Some(events) = events else {
 			let complete_fut = provider.complete(messages, schemas, tool_choice);
@@ -1927,18 +2074,25 @@ impl AgentLoop {
 				match steering_rx.as_deref_mut() {
 					Some(rx) => {
 						tokio::select! {
-							_ = cancellation_token.cancelled() => return Err(AgentError::Interrupted),
+							_ = cancellation_token.cancelled() => return Err(NextAssistantError::interrupted(interrupted_message(Message::assistant(""), None), None)),
 							event = rx.recv() => match event {
-								Some(SteeringEvent::Interrupt) => {
+								Some(event @ (SteeringEvent::Interrupt | SteeringEvent::InterruptWithReason(_))) => {
 									cancellation_token.cancel();
-									return Err(AgentError::Interrupted);
+									let reason = match event {
+										SteeringEvent::InterruptWithReason(reason) => Some(reason),
+										_ => None,
+									};
+									return Err(NextAssistantError::interrupted(
+										interrupted_message(Message::assistant(""), reason.clone()),
+										reason,
+									));
 								}
 								Some(SteeringEvent::InjectMessage(msg)) => {
 									injections.push(msg);
 								}
 								None => {
 									tokio::select! {
-										_ = cancellation_token.cancelled() => return Err(AgentError::Interrupted),
+										_ = cancellation_token.cancelled() => return Err(NextAssistantError::interrupted(interrupted_message(Message::assistant(""), None), None)),
 										res = &mut complete_fut => return Ok(Self::with_source(provider, res?)),
 									}
 								}
@@ -1948,7 +2102,7 @@ impl AgentLoop {
 					}
 					None => {
 						tokio::select! {
-							_ = cancellation_token.cancelled() => return Err(AgentError::Interrupted),
+							_ = cancellation_token.cancelled() => return Err(NextAssistantError::interrupted(interrupted_message(Message::assistant(""), None), None)),
 							res = &mut complete_fut => return Ok(Self::with_source(provider, res?)),
 						}
 					}
@@ -1963,33 +2117,25 @@ impl AgentLoop {
 				Some(rx) => {
 					tokio::select! {
 						_ = cancellation_token.cancelled() => {
-							let partial = Message::assistant("");
-							let _ = events.send(AgentEvent::MessageEnd { message: partial.clone(), status: TurnStatus::Aborted }).await;
-							let _ = events.send(AgentEvent::TurnEnd {
-								message: partial,
-								tool_results: Vec::new(),
-								status: TurnStatus::Aborted,
-							}).await;
-							return Err(AgentError::Interrupted);
+							let partial = interrupted_message(Message::assistant(""), None);
+							return Err(NextAssistantError::interrupted(partial, None));
 						},
 						event = rx.recv() => match event {
-							Some(SteeringEvent::Interrupt) => {
+							Some(event @ (SteeringEvent::Interrupt | SteeringEvent::InterruptWithReason(_))) => {
 								cancellation_token.cancel();
-								let partial = Message::assistant("");
-								let _ = events.send(AgentEvent::MessageEnd { message: partial.clone(), status: TurnStatus::Aborted }).await;
-								let _ = events.send(AgentEvent::TurnEnd {
-									message: partial,
-									tool_results: Vec::new(),
-									status: TurnStatus::Aborted,
-								}).await;
-								return Err(AgentError::Interrupted);
+								let reason = match event {
+									SteeringEvent::InterruptWithReason(reason) => Some(reason),
+									_ => None,
+								};
+								let partial = interrupted_message(Message::assistant(""), reason.clone());
+								return Err(NextAssistantError::interrupted(partial, reason));
 							}
 							Some(SteeringEvent::InjectMessage(msg)) => {
 								injections.push(msg);
 							}
 							None => {
 								tokio::select! {
-									_ = cancellation_token.cancelled() => return Err(AgentError::Interrupted),
+									_ = cancellation_token.cancelled() => return Err(NextAssistantError::interrupted(interrupted_message(Message::assistant(""), None), None)),
 									res = &mut stream_fut => break res?,
 								}
 							}
@@ -2000,14 +2146,8 @@ impl AgentLoop {
 				None => {
 					tokio::select! {
 						_ = cancellation_token.cancelled() => {
-							let partial = Message::assistant("");
-							let _ = events.send(AgentEvent::MessageEnd { message: partial.clone(), status: TurnStatus::Aborted }).await;
-							let _ = events.send(AgentEvent::TurnEnd {
-								message: partial,
-								tool_results: Vec::new(),
-								status: TurnStatus::Aborted,
-							}).await;
-							return Err(AgentError::Interrupted);
+							let partial = interrupted_message(Message::assistant(""), None);
+							return Err(NextAssistantError::interrupted(partial, None));
 						},
 						res = &mut stream_fut => break res?,
 					}
@@ -2024,26 +2164,21 @@ impl AgentLoop {
 				Some(rx) if rx_open => {
 					tokio::select! {
 						_ = cancellation_token.cancelled() => {
-							let partial = Self::with_source(provider, assembler.finish_partial());
-							let _ = events.send(AgentEvent::MessageEnd { message: partial.clone(), status: TurnStatus::Aborted }).await;
-							let _ = events.send(AgentEvent::TurnEnd {
-								message: partial,
-								tool_results: Vec::new(),
-								status: TurnStatus::Aborted,
-							}).await;
-							return Err(AgentError::Interrupted);
+							let partial = interrupted_message(Self::with_source(provider, assembler.finish_partial()), None);
+							return Err(NextAssistantError::interrupted(partial, None));
 						},
 						event = rx.recv() => match event {
-							Some(SteeringEvent::Interrupt) => {
+							Some(event @ (SteeringEvent::Interrupt | SteeringEvent::InterruptWithReason(_))) => {
 								cancellation_token.cancel();
-								let partial = Self::with_source(provider, assembler.finish_partial());
-								let _ = events.send(AgentEvent::MessageEnd { message: partial.clone(), status: TurnStatus::Aborted }).await;
-								let _ = events.send(AgentEvent::TurnEnd {
-									message: partial,
-									tool_results: Vec::new(),
-									status: TurnStatus::Aborted,
-								}).await;
-								return Err(AgentError::Interrupted);
+								let reason = match event {
+									SteeringEvent::InterruptWithReason(reason) => Some(reason),
+									_ => None,
+								};
+								let partial = interrupted_message(
+									Self::with_source(provider, assembler.finish_partial()),
+									reason.clone(),
+								);
+								return Err(NextAssistantError::interrupted(partial, reason));
 							}
 							Some(SteeringEvent::InjectMessage(msg)) => {
 								injections.push(msg);
@@ -2060,14 +2195,8 @@ impl AgentLoop {
 				_ => {
 					tokio::select! {
 						_ = cancellation_token.cancelled() => {
-							let partial = Self::with_source(provider, assembler.finish_partial());
-							let _ = events.send(AgentEvent::MessageEnd { message: partial.clone(), status: TurnStatus::Aborted }).await;
-							let _ = events.send(AgentEvent::TurnEnd {
-								message: partial,
-								tool_results: Vec::new(),
-								status: TurnStatus::Aborted,
-							}).await;
-							return Err(AgentError::Interrupted);
+							let partial = interrupted_message(Self::with_source(provider, assembler.finish_partial()), None);
+							return Err(NextAssistantError::interrupted(partial, None));
 						},
 						chunk = stream.next() => chunk,
 					}
@@ -2081,13 +2210,11 @@ impl AgentLoop {
 				Ok(c) => c,
 				Err(err) => {
 					let partial = Self::with_source(provider, assembler.finish_partial());
-					let _ = events.send(AgentEvent::MessageEnd { message: partial.clone(), status: TurnStatus::Error(err.to_string()) }).await;
-					let _ = events.send(AgentEvent::TurnEnd {
-						message: partial,
-						tool_results: Vec::new(),
-						status: TurnStatus::Error(err.to_string()),
-					}).await;
-					return Err(err.into());
+					let status = TurnStatus::Error(err.to_string());
+					return Err(NextAssistantError::Failed {
+						error: err.into(),
+						terminal: Some((partial, status)),
+					});
 				}
 			};
 			// TS `openai-completions.ts:1160-1192` handles a chunk's reasoning
@@ -2110,13 +2237,11 @@ impl AgentLoop {
 			done = chunk.is_done;
 			if let Err(err) = assembler.push(&chunk) {
 				let partial = Self::with_source(provider, assembler.finish_partial());
-				let _ = events.send(AgentEvent::MessageEnd { message: partial.clone(), status: TurnStatus::Error(err.to_string()) }).await;
-				let _ = events.send(AgentEvent::TurnEnd {
-					message: partial,
-					tool_results: Vec::new(),
-					status: TurnStatus::Error(err.to_string()),
-				}).await;
-				return Err(err.into());
+				let status = TurnStatus::Error(err.to_string());
+				return Err(NextAssistantError::Failed {
+					error: err.into(),
+					terminal: Some((partial, status)),
+				});
 			}
 			if done {
 				break;
@@ -2126,25 +2251,21 @@ impl AgentLoop {
 		if !done {
 			let partial = Self::with_source(provider, assembler.finish_partial());
 			let err_msg = "stream ended before completion".to_string();
-			let _ = events.send(AgentEvent::MessageEnd { message: partial.clone(), status: TurnStatus::Error(err_msg.clone()) }).await;
-			let _ = events.send(AgentEvent::TurnEnd {
-				message: partial,
-				tool_results: Vec::new(),
-				status: TurnStatus::Error(err_msg.clone()),
-			}).await;
-			return Err(ProviderError::Protocol(err_msg).into());
+			let status = TurnStatus::Error(err_msg.clone());
+			return Err(NextAssistantError::Failed {
+				error: ProviderError::Protocol(err_msg).into(),
+				terminal: Some((partial, status)),
+			});
 		}
 		let partial = Self::with_source(provider, assembler.finish_partial());
 		let message = match assembler.finish() {
 			Ok(message) => Self::with_source(provider, message),
 			Err(err) => {
-				let _ = events.send(AgentEvent::MessageEnd { message: partial.clone(), status: TurnStatus::Error(err.to_string()) }).await;
-				let _ = events.send(AgentEvent::TurnEnd {
-					message: partial,
-					tool_results: Vec::new(),
-					status: TurnStatus::Error(err.to_string()),
-				}).await;
-				return Err(err.into());
+				let status = TurnStatus::Error(err.to_string());
+				return Err(NextAssistantError::Failed {
+					error: err.into(),
+					terminal: Some((partial, status)),
+				});
 			}
 		};
 		Ok(message)
@@ -2416,5 +2537,18 @@ mod steering_parts_tests {
 		let message = Message::user_with_parts(injected);
 		assert_eq!(message.parts, parts);
 		assert!(message.has_image(), "steering image must survive into the chat");
+	}
+
+	/// A reason that arrives through `absorb` is the source of the aborted
+	/// turn's label and the surfaced error; a later interrupt must not replace
+	/// the first terminal cause.
+	#[test]
+	fn absorb_keeps_the_first_interrupt_reason() {
+		let mut steering = Steering::default();
+		steering.absorb(SteeringEvent::Interrupt);
+		steering.absorb(SteeringEvent::InterruptWithReason("max time exceeded".to_string()));
+		steering.absorb(SteeringEvent::InterruptWithReason("late duplicate".to_string()));
+		assert!(steering.interrupted);
+		assert_eq!(steering.reason.as_deref(), Some("max time exceeded"));
 	}
 }

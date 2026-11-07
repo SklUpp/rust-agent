@@ -286,7 +286,7 @@ impl DurableSession {
 							&branch_messages,
 							projection.as_ref(),
 							&messages,
-						)))),
+						)?))),
 						tracked: Arc::new(Mutex::new(Vec::new())),
 						tracked_ids: Arc::new(Mutex::new(Vec::new())),
 					},
@@ -372,7 +372,7 @@ impl DurableSession {
 				&branch_messages,
 				projection.as_ref(),
 				&messages,
-			));
+			)?);
 		}
 		Ok(LoadedSession {
 			header,
@@ -461,9 +461,15 @@ impl DurableSession {
 		})
 	}
 
-	fn align_ids(&self, messages: &[Message], branch: &[MessageEntry]) -> Vec<Option<String>> {
-		let persisted: Vec<&MessageEntry> = branch
-			.iter()
+	fn align_ids(
+		&self,
+		messages: &[Message],
+		branch: &[MessageEntry],
+	) -> StoreResult<Vec<Option<String>>> {
+		// Terminal aborted/error turns are archive-only: align against the same
+		// replay projection the resumed conversation will contain.
+		let persisted: Vec<&MessageEntry> = crate::session::replayable_message_entries(branch)
+			.into_iter()
 			.filter(|entry| {
 				matches!(entry.message.role.as_str(), "user" | "assistant" | "toolResult")
 			})
@@ -471,20 +477,85 @@ impl DurableSession {
 		let mut ids = Vec::with_capacity(messages.len());
 		let mut seen = 0usize;
 		for message in messages {
-			if self.to_session_message(message).is_none() {
+			if Self::project_message(message).is_none() {
 				ids.push(None);
 				continue;
 			}
 			let digest = self.incoming_digest(message);
-			match persisted.get(seen) {
-				Some(entry) if session_digest(&entry.message) == digest => {
-					ids.push(Some(entry.id.clone()));
+			let revision = persisted
+				.get(seen)
+				.map(|entry| projected_digest(*entry))
+				.transpose()?;
+			match revision {
+				Some(revision) if revision == digest => {
+					ids.push(Some(persisted[seen].id.clone()));
 					seen += 1;
 				},
 				_ => ids.push(None),
 			}
 		}
-		ids
+		Ok(ids)
+	}
+
+	/// Index just past the incoming messages already persisted on the active
+	/// branch.
+	///
+	/// A terminal aborted/error turn stays archived but is dropped from every
+	/// replayed conversation, so the next turn legitimately starts from a
+	/// shorter history. On a prefix mismatch, re-align against the stored
+	/// branch's replay projection before declaring a real divergence.
+	async fn align_start(
+		&self,
+		messages: &[Message],
+		digests: &[u64],
+	) -> Result<usize, DurableError> {
+		let previous = {
+			let mut tracked = lock(&self.tracked);
+			if tracked.is_empty()
+				&& let Some(seed) = lock(&self.resume_seed).take()
+			{
+				// Resume: the stored projected view is a prefix of the incoming
+				// persisted-role messages. Align it by stable revision, not by
+				// assuming the caller's history length.
+				let Some((boundary, matched)) = align_seed(messages, digests, &seed) else {
+					return Err(DurableError::new(
+						"resume history does not match the durable branch revision",
+					));
+				};
+				*tracked = digests[..boundary].to_vec();
+				*lock(&self.tracked_ids) = matched[..boundary].to_vec();
+			}
+			let start = tracked.len();
+			if messages.len() >= start && tracked.as_slice() == &digests[..start] {
+				return Ok(start);
+			}
+			start
+		};
+		// Rebuild the seed from the stored branch and require the exact same
+		// replay projection the incoming view carries.
+		let session_id = self.session_id.clone();
+		let (branch_id, leaf, _, all_messages, branch_messages, _, projection) = self
+			.writer
+			.call_async(move |store| load_parts(store, &session_id))
+			.await
+			.map_err(|error| DurableError::new(error.to_string()))?;
+		{
+			let mut cursor = lock(&self.cursor);
+			cursor.branch = branch_id;
+			cursor.leaf = leaf;
+		}
+		let seed = seed_entries(&branch_messages, projection.as_ref(), &all_messages)
+			.map_err(|error| DurableError::new(error.to_string()))?;
+		let Some((boundary, matched)) = align_seed(messages, digests, &seed) else {
+			return Err(DurableError::new(if messages.len() < previous {
+				"conversation shrank without a compaction mapping"
+			} else {
+				"conversation diverged from the durable branch; resync required"
+			}));
+		};
+		*lock(&self.tracked) = digests[..boundary].to_vec();
+		*lock(&self.tracked_ids) = matched[..boundary].to_vec();
+		Ok(boundary)
 	}
 
 	async fn set_projection(&self, projection: Option<StoredProjection>) -> Result<(), DurableError> {
@@ -596,7 +667,7 @@ impl DurableSession {
 	}
 
 	fn incoming_digest(&self, message: &Message) -> u64 {
-		match self.to_session_message(message) {
+		match Self::project_message(message) {
 			Some(session) => session_digest(&session),
 			// System/developer context is runtime-only but still occupies an
 			// index in the compaction report; give it a stable revision too.
@@ -607,7 +678,7 @@ impl DurableSession {
 		}
 	}
 
-	fn to_session_message(&self, message: &Message) -> Option<SessionMessage> {
+	fn project_message(message: &Message) -> Option<SessionMessage> {
 		// Host-injected hidden guidance (goal continuation) is runtime-only and
 		// never a user turn in the durable journal.
 		if message.custom_type.is_some() {
@@ -623,13 +694,30 @@ impl DurableSession {
 		};
 		let now = SystemTime::now();
 		let timestamp_ms = now.duration_since(UNIX_EPOCH).unwrap_or_default().as_millis() as u64;
+		// Image parts are replay-visible content: the resume seed and the live
+		// history must project them identically, or a forked/imported session
+		// can never align its first write with the stored branch.
 		let mut parts: Vec<SessionPart> = message
 			.parts
 			.iter()
-			.filter_map(SessionPart::from_agent_part)
+			.filter_map(|part| match part {
+				pi_agent::state::ContentPart::Image { data, mime_type } => {
+					Some(SessionPart::image(data.clone(), mime_type.clone()))
+				},
+				part => SessionPart::from_agent_part(part),
+			})
 			.collect();
-		let preserve_plain_text = role == "toolResult";
-		if parts.is_empty() && !message.content.is_empty() && !preserve_plain_text {
+		// A tool result may carry its answer text in `content` alongside image
+		// parts; keep both or replay silently loses the text. Plain text results
+		// stay a string (no synthetic part), matching the TS storage shape.
+		if role == "toolResult" {
+			if !parts.is_empty()
+				&& !message.content.is_empty()
+				&& !parts.iter().any(|part| part.kind == "text")
+			{
+				parts.insert(0, SessionPart::text(message.content.clone()));
+			}
+		} else if parts.is_empty() && !message.content.is_empty() {
 			parts.push(SessionPart::text(message.content.clone()));
 		}
 		if role == "assistant"
@@ -687,7 +775,7 @@ impl DurableSession {
 	}
 
 	fn to_message_entry(&self, message: &Message, leaf: Option<String>) -> Option<MessageEntry> {
-		let session_message = self.to_session_message(message)?;
+		let session_message = Self::project_message(message)?;
 		let now = SystemTime::now();
 		Some(MessageEntry::new(
 			format!("msg-{}", output::session_id()),
@@ -704,16 +792,41 @@ impl DurableSession {
 		leaf: Option<String>,
 	) -> MessageEntry {
 		let now = SystemTime::now();
-		let timestamp_ms = now.duration_since(UNIX_EPOCH).unwrap_or_default().as_millis() as u64;
-		let mut message = SessionMessage::tool_result(
-			call.id.clone(),
-			call.name.clone(),
-			MessageContent::Text(result.content.clone()),
-			result.is_error,
-			timestamp_ms,
-		);
-		if let Some(details) = &result.details {
-			message.extra.insert("details".to_string(), details.clone());
+		// Mirror the loop's tool-message projection exactly: the same image
+		// validation and the same text-then-image part order. Write the row and
+		// replay must agree, or a multimodal result would lose its images (and a
+		// later turn would see a different revision than the live loop tracked).
+		let mut details = result.details.clone();
+		let (content, is_error, parts) = match pi_agent::tool_image_parts_of(result) {
+			Ok(parts) => (result.content.clone(), result.is_error, parts),
+			Err(error) => {
+				// Rejected images must not be archived, or replay would reject
+				// them a second time and duplicate the error note.
+				if let Some(details) = details.as_mut().and_then(Value::as_object_mut) {
+					details.remove("images");
+				}
+				(
+					format!("{}\n\n[image payload rejected: {error}]", result.content),
+					true,
+					Vec::new(),
+				)
+			},
+		};
+		let message = if parts.is_empty() {
+			Message::tool_with_status(call.id.clone(), call.name.clone(), &content, is_error)
+		} else {
+			Message::tool_with_status_and_parts(
+				call.id.clone(),
+				call.name.clone(),
+				&content,
+				parts,
+				is_error,
+			)
+		};
+		let mut message = Self::project_message(&message)
+			.expect("tool result messages always have a durable projection");
+		if let Some(details) = details {
+			message.extra.insert("details".to_string(), details);
 		}
 		MessageEntry::new(
 			format!("msg-{}", output::session_id()),
@@ -731,55 +844,7 @@ impl DurableBoundary for DurableSession {
 			.iter()
 			.map(|message| self.incoming_digest(message))
 			.collect();
-		let start = {
-			let mut tracked = lock(&self.tracked);
-			if tracked.is_empty()
-				&& let Some(seed) = lock(&self.resume_seed).take()
-			{
-				// Resume: the stored projected view is a prefix of the incoming
-				// persisted-role messages. Align it by stable revision, not by
-				// assuming the caller's history length.
-				let mut matched: Vec<Option<String>> = vec![None; messages.len()];
-				let mut seen = 0usize;
-				let mut boundary = seed.is_empty().then_some(0);
-				for (index, message) in messages.iter().enumerate() {
-					if self.to_session_message(message).is_none() {
-						continue;
-					}
-					let Some((revision, id)) = seed.get(seen) else {
-						break;
-					};
-					if digests[index] != *revision {
-						break;
-					}
-					matched[index] = id.clone();
-					seen += 1;
-					if seen == seed.len() {
-						boundary = Some(index + 1);
-						break;
-					}
-				}
-				let Some(boundary) = boundary else {
-					return Err(DurableError::new(
-						"resume history does not match the durable branch revision",
-					));
-				};
-				*tracked = digests[..boundary].to_vec();
-				*lock(&self.tracked_ids) = matched[..boundary].to_vec();
-			}
-			let start = tracked.len();
-			if messages.len() < start {
-				return Err(DurableError::new(
-					"conversation shrank without a compaction mapping",
-				));
-			}
-			if tracked.as_slice() != &digests[..start] {
-				return Err(DurableError::new(
-					"conversation diverged from the durable branch; resync required",
-				));
-			}
-			start
-		};
+		let start = self.align_start(messages, &digests).await?;
 		if start >= messages.len() {
 			return Ok(());
 		}
@@ -958,7 +1023,9 @@ impl DurableBoundary for DurableSession {
 		// Existing tool rows are part of the seed prefix, not pending outcomes.
 		lock(&self.written_tools).clear();
 		lock(&self.written_tool_ids).clear();
-		let ids = self.align_ids(messages, &branch_messages);
+		let ids = self
+			.align_ids(messages, &branch_messages)
+			.map_err(|error| DurableError::new(error.to_string()))?;
 		*lock(&self.tracked) = messages
 			.iter()
 			.map(|message| self.incoming_digest(message))
@@ -1424,7 +1491,7 @@ fn seed_entries(
 	branch: &[MessageEntry],
 	projection: Option<&StoredProjection>,
 	all: &[MessageEntry],
-) -> Vec<(u64, Option<String>)> {
+) -> StoreResult<Vec<(u64, Option<String>)>> {
 	let source: Vec<MessageEntry> = match projection {
 		Some(projection) => {
 			let by_id: HashMap<&str, &MessageEntry> =
@@ -1487,8 +1554,68 @@ fn seed_entries(
 		.filter(|entry| {
 			matches!(entry.message.role.as_str(), "user" | "assistant" | "toolResult")
 		})
-		.map(|entry| (session_digest(&entry.message), Some(entry.id.clone())))
+		.map(|entry| projected_digest(entry).map(|digest| (digest, Some(entry.id.clone()))))
 		.collect()
+}
+
+/// Revision of a stored row as the live loop will see it after replay.
+///
+/// Storage writers are not byte-compatible: TS/imported logs keep plain text
+/// as a string, while this writer projects text-only turns as one text part.
+/// The seed must therefore hash the provider-visible projection, not the raw
+/// stored payload, or the same turn can never align on the next write. A row
+/// that cannot be projected is corrupt, never silently hashed raw.
+fn projected_digest(entry: &MessageEntry) -> StoreResult<u64> {
+	let mut messages = crate::runtime::history_messages_from_entries(std::slice::from_ref(entry))
+		.map_err(|error| {
+			StoreError::Corrupt(format!("cannot project stored revision {}: {error}", entry.id))
+		})?;
+	let message = messages.pop().ok_or_else(|| {
+		StoreError::Corrupt(format!(
+			"stored revision {} has no replayable projection",
+			entry.id
+		))
+	})?;
+	let projected = DurableSession::project_message(&message).ok_or_else(|| {
+		StoreError::Corrupt(format!(
+			"stored revision {} is runtime-only and cannot seed a conversation",
+			entry.id
+		))
+	})?;
+	Ok(session_digest(&projected))
+}
+
+/// Match an incoming conversation view against the stored replay seed.
+///
+/// Runtime-only messages occupy no durable row, so they are skipped. Returns
+/// the boundary just past the last matched stored row plus the durable ids of
+/// every matched message, or `None` when the incoming view diverges.
+fn align_seed(
+	messages: &[Message],
+	digests: &[u64],
+	seed: &[(u64, Option<String>)],
+) -> Option<(usize, Vec<Option<String>>)> {
+	let mut matched: Vec<Option<String>> = vec![None; messages.len()];
+	let mut seen = 0usize;
+	let mut boundary = seed.is_empty().then_some(0);
+	for (index, message) in messages.iter().enumerate() {
+		if DurableSession::project_message(message).is_none() {
+			continue;
+		}
+		let Some((revision, id)) = seed.get(seen) else {
+			break;
+		};
+		if digests[index] != *revision {
+			break;
+		}
+		matched[index] = id.clone();
+		seen += 1;
+		if seen == seed.len() {
+			boundary = Some(index + 1);
+			break;
+		}
+	}
+	boundary.map(|boundary| (boundary, matched))
 }
 
 fn root_branch_id(session_id: &str) -> String {
@@ -1742,6 +1869,7 @@ mod projection_tests {
 		let branch = vec![user("u1"), assistant];
 		let all = vec![user("u1"), branch[1].clone(), sibling];
 		let ids: Vec<String> = seed_entries(&branch, None, &all)
+			.expect("seed")
 			.into_iter()
 			.filter_map(|(_, id)| id)
 			.collect();
@@ -1763,6 +1891,7 @@ mod projection_tests {
 		}));
 		let branch = vec![user("u1"), failed];
 		let ids: Vec<String> = seed_entries(&branch, None, &branch)
+			.expect("seed")
 			.into_iter()
 			.filter_map(|(_, id)| id)
 			.collect();

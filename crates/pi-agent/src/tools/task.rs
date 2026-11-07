@@ -1217,7 +1217,7 @@ impl TaskTool {
 				result_key: None,
 				}
 			},
-			Err(AgentError::Interrupted) => {
+			Err(AgentError::Interrupted | AgentError::InterruptedReason(_)) => {
 				artifact_body = Some(salvage.cancelled_output());
 				terminal_mark = Some(TerminalMark::Aborted("aborted by parent".to_string()));
 				SingleResult {
@@ -2642,7 +2642,7 @@ fn settle_background_result(
 			supervisor.enqueue_delivery(&id, envelope);
 			adopt_keep_alive_child(&supervisor, &id, isolation.is_some(), &mut live);
 		},
-		Err(AgentError::Interrupted) => {
+		Err(AgentError::Interrupted | AgentError::InterruptedReason(_)) => {
 			// The loop discarded its turns on cancellation, but every request it
 			// completed was charged: `observed` carries exactly those counters,
 			// and stays `None` when nothing completed (unknown, never zero).

@@ -2077,13 +2077,15 @@ impl RpcSession {
 			request.cancellation_token = Some(token.clone());
 			let turn_ack = TurnAck::new();
 			request.turn_ack = Some(Arc::clone(&turn_ack));
+			let started = Instant::now();
+			request.turn_started = started;
 			let prepared = PreparedTurn {
 				token,
 				turn_ack,
 				builder: TurnBuilder::new(String::new()),
 				parent_id: self.store.leaf_id().map(str::to_string),
 				in_memory_before: self.in_memory_messages.as_ref().map_or(0, Vec::len),
-				started: Instant::now(),
+				started,
 				model_fallback: self.model.clone(),
 				provider_fallback: self.provider.clone(),
 				tool_names: std::collections::HashMap::new(),
@@ -2152,6 +2154,8 @@ impl RpcSession {
 		let turn_ack = TurnAck::new();
 		request.turn_ack = Some(Arc::clone(&turn_ack));
 
+		let started = Instant::now();
+		request.turn_started = started;
 		let prepared = PreparedTurn {
 			token,
 			turn_ack,
@@ -2162,7 +2166,7 @@ impl RpcSession {
 			},
 			parent_id: Some(user_id),
 			in_memory_before,
-			started: Instant::now(),
+			started,
 			model_fallback: self.model.clone(),
 			provider_fallback: self.provider.clone(),
 			tool_names: std::collections::HashMap::new(),
@@ -2268,6 +2272,7 @@ impl RpcSession {
 			catalog: Arc::clone(&self.catalog),
 			approvals: self.approvals.clone(),
 			max_time: self.max_time,
+			turn_started: std::time::Instant::now(),
 			max_turns: self.max_turns,
 			tools_enabled: self.tools_enabled,
 			cancellation_token: None,
@@ -3857,6 +3862,115 @@ mod tests {
 		let input = TurnInput { text: text.to_string(), images: Vec::new(), continuation: false };
 		let (_, prepared) = session.prepare_turn(&input).expect("prepare turn");
 		prepared
+	}
+
+	/// A failed turn can journal accepted steering (the loop writes it before
+	/// surfacing the interrupt) without a `TurnEnd`. The RPC error path must
+	/// reload the durable view, or the next prompt is built from a stale mirror
+	/// and diverges from the branch.
+	#[tokio::test]
+	async fn error_turn_reload_exposes_journaled_steering_to_the_next_request() {
+		use pi_agent::DurableBoundary as _;
+
+		let sink: Arc<dyn FrameSink> = Arc::new(NullSink);
+		let cwd = std::env::temp_dir();
+		let dir = cwd.join(format!(
+			"omp-rpc-reload-{}-{}",
+			std::process::id(),
+			std::time::SystemTime::now()
+				.duration_since(std::time::UNIX_EPOCH)
+				.unwrap_or_default()
+				.as_nanos()
+		));
+		std::fs::create_dir_all(&dir).expect("session dir");
+		let mut config = Config::default();
+		config.checkpoint.enabled = Some(true);
+		let mut session = RpcSession::open(
+			RpcLaunch {
+				runner:           Arc::new(NoopRunner),
+				config,
+				cwd:              cwd.clone(),
+				prompts:          Prompts::default(),
+				skill_snapshot:   SkillSnapshot::new(),
+				skill_options:    LoadOptions::new(cwd.clone()),
+				catalog:          Arc::new(Catalog::default()),
+				agent_db:         cwd.join("agent.db"),
+				approval_mode:    ApprovalMode::Yolo,
+				allow:            Vec::new(),
+				model:            Some("local/mock-model".to_string()),
+				provider:         Some("local".to_string()),
+				api_key:          Some("sk-test".to_string()),
+				thinking:         None,
+				restore_model:    false,
+				prewalk:          None,
+				plan_yolo:        None,
+				max_time:         None,
+				max_turns:        8,
+				tools_enabled:    true,
+				prompt_cache_key: None,
+				prompt_cache_key_inherited: false,
+				service_tier_explicit: false,
+				provider_session_id: None,
+				store_options:    SessionOptions {
+					enabled: true,
+					cwd: cwd.clone(),
+					model: None,
+					provider: None,
+					dir: Some(dir.clone()),
+					id: Some("rpc-reload".to_string()),
+					continue_latest: false,
+					parent_session: None,
+					no_title: true,
+				},
+				steer: None,
+			},
+			Approvals::new(ApprovalMode::Yolo, Vec::new()),
+			Arc::new(HostToolBridge::new(Arc::clone(&sink))),
+			Arc::new(HostUriBridge::new(Arc::clone(&sink))),
+			Arc::new(InternalUrlRouter::new()),
+			Arc::new(NoopObserver),
+			Arc::new(NoopResolver),
+		)
+		.expect("durable RPC session");
+
+		let mut prepared = start_turn(&mut session, "first");
+		// What the loop boundary journals before the failed turn surfaces.
+		session
+			.store
+			.durable_boundary()
+			.expect("live durable boundary")
+			.persist_messages(&[
+				pi_agent::Message::user("first"),
+				pi_agent::Message::user("steer note"),
+			])
+			.await
+			.expect("journal the accepted steering");
+		session.finish_turn(
+			&mut prepared,
+			&TurnOutcome { error: Some("provider failed".to_string()), aborted: false },
+		);
+
+		let request = session
+			.request("second".to_string(), Vec::new(), false)
+			.expect("next request");
+		let history = request.history_messages.expect("durable context");
+		assert!(
+			history.iter().any(|message| {
+				message.role == pi_agent::Role::User && message.content.contains("steer note")
+			}),
+			"the error path must reload journaled steering before the next request"
+		);
+		assert_eq!(
+			history
+				.iter()
+				.filter(|message| {
+					message.role == pi_agent::Role::User && message.content == "first"
+				})
+				.count(),
+			1,
+			"the prompt is replayed exactly once"
+		);
+		std::fs::remove_dir_all(dir).ok();
 	}
 
 	fn tool_start(id: &str, tool: &str) -> AgentEvent {

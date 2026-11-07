@@ -96,6 +96,7 @@ fn wire_request(catalog: Catalog, provider: &str, model: &str, api_key: Option<&
 		catalog: Arc::new(catalog),
 		approvals: Approvals::new(ApprovalMode::Yolo, Vec::new()),
 		max_time: Some(Duration::from_secs(30)),
+		turn_started: std::time::Instant::now(),
 		max_turns: 4,
 		tools_enabled: true,
 		cancellation_token: None,

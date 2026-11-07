@@ -119,6 +119,7 @@ fn request(catalog: Catalog, tiers: &[(&str, &str)]) -> RunRequest {
 		catalog: Arc::new(catalog),
 		approvals: Approvals::new(ApprovalMode::Yolo, Vec::new()),
 		max_time: Some(Duration::from_secs(30)),
+		turn_started: std::time::Instant::now(),
 		max_turns: 1,
 		tools_enabled: false,
 		cancellation_token: None,

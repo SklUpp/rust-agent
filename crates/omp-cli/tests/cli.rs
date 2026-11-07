@@ -445,6 +445,7 @@ fn fake_request(prompt: &str) -> RunRequest {
 		catalog: Arc::new(Catalog::default()),
 		approvals: Approvals::default(),
 		max_time: None,
+		turn_started: std::time::Instant::now(),
 		max_turns: 1,
 		tools_enabled: false,
 		cancellation_token: None,

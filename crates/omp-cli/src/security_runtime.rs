@@ -269,6 +269,7 @@ impl SecurityRunSession {
 			catalog: Arc::clone(&self.catalog),
 			approvals: self.approvals.clone(),
 			max_time: None,
+			turn_started: std::time::Instant::now(),
 			max_turns: 120,
 			tools_enabled: true,
 			cancellation_token: Some(self.request.cancel.clone()),

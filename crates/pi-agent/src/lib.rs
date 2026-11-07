@@ -30,7 +30,7 @@ pub use durable::{
 pub use loop_module::{
 	AgentError, AgentEvent, AgentLoop, AssistantGuard, InMemoryRewind, SteeringEvent, TurnAck,
 	TurnAckDecision, TurnAckRequest, TurnRewrite, TurnToolSelection, INTERRUPTED_TOOL_RESULT,
-	repair_tool_batch_boundary, tool_batch_end, tool_image_parts_of,
+	repair_tool_batch_boundary, tool_batch_end, image_parts_from_details, tool_image_parts_of,
 };
 pub use tokio_util::sync::CancellationToken;
 pub use provider::{

@@ -2383,7 +2383,7 @@ async fn interrupt_stalled_provider_stream_setup() {
 		.expect("dialog hung instead of interrupting stalled stream setup")
 		.unwrap();
 
-	assert!(matches!(res, Err(AgentError::Interrupted)));
+	assert!(matches!(res, Err(AgentError::Interrupted | AgentError::InterruptedReason(_))));
 }
 
 #[tokio::test]
@@ -2458,7 +2458,7 @@ async fn interrupt_pending_provider_stream() {
 		.expect("dialog hung instead of interrupting pending stream")
 		.unwrap();
 
-	assert!(matches!(res, Err(AgentError::Interrupted)));
+	assert!(matches!(res, Err(AgentError::Interrupted | AgentError::InterruptedReason(_))));
 }
 
 #[tokio::test]
@@ -2522,7 +2522,7 @@ async fn interrupt_two_tool_batch_without_orphan() {
 	}
 
 	let (res, state) = dialog_task.await.unwrap();
-	assert!(matches!(res, Err(AgentError::Interrupted)));
+	assert!(matches!(res, Err(AgentError::Interrupted | AgentError::InterruptedReason(_))));
 	while let Ok(event) = events_rx.try_recv() {
 		events.push(event);
 	}
@@ -2680,7 +2680,7 @@ async fn mid_stream_abort_discards_incomplete_tool_calls() {
 	}
 
 	let res = dialog_task.await.unwrap();
-	assert!(matches!(res, Err(AgentError::Interrupted)));
+	assert!(matches!(res, Err(AgentError::Interrupted | AgentError::InterruptedReason(_))));
 
 	// Verify MessageEnd has tool_calls discarded
 	let msg_end = events
@@ -2756,7 +2756,7 @@ async fn batch_abort_paired_results_in_provider_context() {
 	}
 
 	let (res, state) = dialog_task.await.unwrap();
-	assert!(matches!(res, Err(AgentError::Interrupted)));
+	assert!(matches!(res, Err(AgentError::Interrupted | AgentError::InterruptedReason(_))));
 
 	// TurnEnd has Aborted status and 2 paired results
 	let turn_end = events

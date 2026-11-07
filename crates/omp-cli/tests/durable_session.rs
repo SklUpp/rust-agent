@@ -10,13 +10,14 @@ use std::{
 		Arc, Mutex,
 		atomic::{AtomicUsize, Ordering},
 	},
+	time::Duration,
 };
 
 use async_trait::async_trait;
 use pi_agent::{
-	AgentConfig, AgentError, AgentLoop, AgentState, ChunkStream, DurableBoundary, DurableError,
-	Message, ModelProvider, ProviderError, StopReason, Tool, ToolCall, ToolChoice, ToolRegistry,
-	ToolResult,
+	AgentConfig, AgentError, AgentLoop, AgentState, ChunkStream, ContentPart, DurableBoundary,
+	DurableError, Message, ModelProvider, ProviderError, Role, SteeringEvent, StopReason, Tool,
+	ToolCall, ToolChoice, ToolRegistry, ToolResult,
 };
 use serde_json::json;
 
@@ -506,4 +507,517 @@ fn replay_keeps_plain_text_tool_result_shape() {
 	assert_eq!(replayed.len(), 1);
 	assert!(replayed[0].parts.is_empty(), "plain text stays a text content");
 	assert_eq!(replayed[0].content, "ok");
+}
+
+/// Older durable/TS rows can archive tool images under `details.images`
+/// instead of content parts; replay must restore them, never only the text.
+#[test]
+fn replay_restores_tool_images_archived_in_details() {
+	let entry: omp_cli::session::MessageEntry = serde_json::from_value(serde_json::json!({
+		"type": "message",
+		"id": "t2",
+		"timestamp": "2026-01-01T00:00:00.000Z",
+		"message": {
+			"role": "toolResult",
+			"toolCallId": "c2",
+			"toolName": "read",
+			"content": "file content",
+			"isError": false,
+			"timestamp": 1,
+			"details": {"images": [{"data": "aGVsbG8=", "mimeType": "image/png"}]}
+		}
+	}))
+	.expect("legacy tool result fixture");
+	let replayed = omp_cli::runtime::history_messages_from_entries(std::slice::from_ref(&entry))
+		.expect("replay");
+	assert_eq!(replayed.len(), 1);
+	assert_eq!(replayed[0].content, "file content");
+	assert!(
+		replayed[0]
+			.parts
+			.iter()
+			.any(|part| matches!(part, ContentPart::Image { .. })),
+		"images archived under details must be replayed"
+	);
+
+	// The provider builds tool text from parts whenever any part exists, so the
+	// replayed text must be visible on the wire next to the image attachment.
+	use pi_agent::provider::{OpenAiContent, OpenAiContentPart, to_openai_messages};
+	let wire = to_openai_messages(&replayed).expect("openai wire");
+	let tool = wire
+		.iter()
+		.find(|message| message.role == "tool")
+		.expect("tool wire message");
+	assert!(
+		matches!(&tool.content, Some(OpenAiContent::Text(text)) if text.as_str() == "file content"),
+		"the tool answer text must reach the model, got {:?}",
+		tool.content
+	);
+	assert!(
+		wire.iter().any(|message| message.role == "user"
+			&& matches!(&message.content, Some(OpenAiContent::Parts(parts))
+				if parts.iter().any(|part| matches!(part, OpenAiContentPart::ImageUrl { .. })))),
+		"the replayed image must be attached to the request"
+	);
+}
+
+/// Tool outcomes are written before the loop builds the provider message, so
+/// the outcome row must itself carry the text and image parts; otherwise the
+/// live tracked revision and the next replay would disagree.
+#[tokio::test]
+async fn tool_outcome_archives_multimodal_content() {
+	let dir = temp_dir("tool-outcome-images");
+	let db = dir.join("sessions.db");
+	let session = DurableSession::create(db, header("s14", &dir)).expect("create");
+	let call = ToolCall {
+		id: "c1".to_string(),
+		name: "read".to_string(),
+		arguments: json!({}),
+	};
+	let execution = session.begin_execution(&call).await.expect("intent");
+	let result = ToolResult {
+		tool_call_id: "c1".to_string(),
+		content: "file content".to_string(),
+		is_error: false,
+		terminate: false,
+		details: Some(json!({
+			"images": [{"data": "aGVsbG8=", "mimeType": "image/png"}]
+		})),
+	};
+	session
+		.finish_execution(&execution, &call, &result)
+		.await
+		.expect("outcome");
+	let loaded = session.load().expect("load");
+	let entry = loaded
+		.messages
+		.iter()
+		.find(|entry| entry.message.role == "toolResult")
+		.expect("tool result row");
+	assert_eq!(entry.message.content.text(), "file content");
+	let parts = entry.message.content.parts();
+	assert!(
+		parts
+			.iter()
+			.any(|part| part.kind == "text" && part.text.as_deref() == Some("file content")),
+		"text must be stored beside the image"
+	);
+	assert!(parts.iter().any(|part| part.kind == "image"), "image must be stored");
+	let replayed =
+		omp_cli::runtime::history_messages_from_entries(&loaded.branch_messages).expect("replay");
+	assert!(
+		replayed[0]
+			.parts
+			.iter()
+			.any(|part| matches!(part, ContentPart::Image { .. })),
+		"replay restores the multimodal tool result"
+	);
+	std::fs::remove_dir_all(dir).ok();
+}
+
+/// A terminal aborted turn stays archived but is absent from every replayed
+/// view. The next REPL turn starts from that shorter history and must realign
+/// instead of being rejected as divergence.
+#[tokio::test]
+async fn aborted_turn_does_not_block_the_next_turn() {
+	let dir = temp_dir("aborted-next-turn");
+	let db = dir.join("sessions.db");
+	let session = DurableSession::create(db, header("s10", &dir)).expect("create");
+	let mut aborted = Message::assistant("partial");
+	aborted.stop_reason = Some(StopReason::Aborted);
+	aborted.error_message = Some("Interrupted by user".to_string());
+	session
+		.persist_messages(&[Message::user("q"), aborted])
+		.await
+		.expect("persist aborted turn");
+
+	// The next turn replays only the prompt, then appends its own user message.
+	session
+		.persist_messages(&[Message::user("q"), Message::user("next")])
+		.await
+		.expect("an aborted turn must not block the next turn");
+
+	let loaded = session.load().expect("load");
+	assert!(
+		loaded.messages.iter().any(|entry| {
+			entry.message.role == "assistant"
+				&& entry.message.stop_reason.as_deref() == Some("aborted")
+		}),
+		"archive must retain the aborted turn"
+	);
+	assert_eq!(
+		loaded
+			.messages
+			.iter()
+			.filter(|entry| entry.message.role == "user")
+			.count(),
+		2,
+		"both user turns are persisted"
+	);
+	std::fs::remove_dir_all(dir).ok();
+}
+
+/// A tool result can carry its answer text outside `parts` next to image
+/// blocks; the persisted projection must keep both and replay to the same
+/// revision.
+#[tokio::test]
+async fn tool_result_image_keeps_its_text_across_replay() {
+	let dir = temp_dir("tool-image-text");
+	let db = dir.join("sessions.db");
+	let session = DurableSession::create(db, header("s11", &dir)).expect("create");
+	let result = Message::tool_with_status_and_parts(
+		"call_1",
+		"read",
+		"file content",
+		vec![ContentPart::Image {
+			data: "aGVsbG8=".to_string(),
+			mime_type: "image/png".to_string(),
+		}],
+		false,
+	);
+	session
+		.persist_messages(&[Message::user("read it"), result])
+		.await
+		.expect("persist tool result");
+	let loaded = session.load().expect("load");
+	let entry = loaded
+		.messages
+		.iter()
+		.find(|entry| entry.message.role == "toolResult")
+		.expect("tool result row");
+	assert_eq!(entry.message.content.text(), "file content", "text must survive");
+	let parts = entry.message.content.parts();
+	assert!(
+		parts
+			.iter()
+			.any(|part| part.kind == "text" && part.text.as_deref() == Some("file content")),
+		"the text part must be stored beside the image"
+	);
+	assert!(parts.iter().any(|part| part.kind == "image"), "the image must survive");
+
+	// The replay projection (the next turn's history) must hash to the stored
+	// revision, so appending after it aligns instead of diverging.
+	let mut next = omp_cli::runtime::history_messages_from_entries(&loaded.branch_messages)
+		.expect("replay stored branch");
+	next.push(Message::user("next"));
+	session
+		.persist_messages(&next)
+		.await
+		.expect("replayed history must align with the stored revision");
+	std::fs::remove_dir_all(dir).ok();
+}
+
+/// A supervisor that streams nothing and never answers; an interrupt must
+/// still journal the aborted turn with the exact reason.
+struct HangingProvider {
+	started: Arc<tokio::sync::Notify>,
+}
+
+#[async_trait]
+impl ModelProvider for HangingProvider {
+	async fn complete(
+		&self,
+		_messages: &[Message],
+		_tools: &[serde_json::Value],
+		_tool_choice: &ToolChoice,
+	) -> Result<Message, ProviderError> {
+		self.started.notify_one();
+		tokio::time::sleep(Duration::from_secs(3_600)).await;
+		Err(ProviderError::Protocol("unreachable".to_string()))
+	}
+
+	async fn stream(
+		&self,
+		_messages: &[Message],
+		_tools: &[serde_json::Value],
+		_tool_choice: &ToolChoice,
+	) -> Result<ChunkStream, ProviderError> {
+		Err(ProviderError::Protocol("hanging provider has no stream".to_string()))
+	}
+}
+
+/// Stalls the first request (so a steering interrupt can land mid-flight) and
+/// answers every later one, recording exactly what each request saw.
+struct HangThenAnswer {
+	started: Arc<tokio::sync::Notify>,
+	calls: AtomicUsize,
+	seen: Mutex<Vec<Vec<Message>>>,
+}
+
+#[async_trait]
+impl ModelProvider for HangThenAnswer {
+	async fn complete(
+		&self,
+		messages: &[Message],
+		_tools: &[serde_json::Value],
+		_tool_choice: &ToolChoice,
+	) -> Result<Message, ProviderError> {
+		let call = self.calls.fetch_add(1, Ordering::SeqCst);
+		self.seen.lock().unwrap().push(messages.to_vec());
+		if call == 0 {
+			self.started.notify_one();
+			tokio::time::sleep(Duration::from_secs(3_600)).await;
+		}
+		Ok(Message::assistant("second".to_string()))
+	}
+
+	async fn stream(
+		&self,
+		_messages: &[Message],
+		_tools: &[serde_json::Value],
+		_tool_choice: &ToolChoice,
+	) -> Result<ChunkStream, ProviderError> {
+		Err(ProviderError::Protocol("scripted provider has no stream".to_string()))
+	}
+}
+
+/// Records every provider request and always answers, so a test can assert the
+/// exact history the model saw after a host reload.
+struct RecordingProvider {
+	seen: Mutex<Vec<Vec<Message>>>,
+}
+
+#[async_trait]
+impl ModelProvider for RecordingProvider {
+	async fn complete(
+		&self,
+		messages: &[Message],
+		_tools: &[serde_json::Value],
+		_tool_choice: &ToolChoice,
+	) -> Result<Message, ProviderError> {
+		self.seen.lock().unwrap().push(messages.to_vec());
+		Ok(Message::assistant("answered".to_string()))
+	}
+
+	async fn stream(
+		&self,
+		_messages: &[Message],
+		_tools: &[serde_json::Value],
+		_tool_choice: &ToolChoice,
+	) -> Result<ChunkStream, ProviderError> {
+		Err(ProviderError::Protocol("recording provider has no stream".to_string()))
+	}
+}
+
+/// The `--max-time` deadline reaches the loop as a reasoned interrupt; the
+/// durable aborted turn must record that reason, not the user-interrupt label.
+#[tokio::test]
+async fn timeout_interrupt_records_its_own_reason() {
+	let (session, dir) = run_interrupted_stall(
+		"timeout-reason",
+		"s12",
+		SteeringEvent::InterruptWithReason(omp_cli::deadline::TIMEOUT_MESSAGE.to_string()),
+	)
+	.await;
+	let loaded = session.load().expect("load");
+	let aborted = loaded
+		.messages
+		.iter()
+		.find(|entry| entry.message.role == "assistant")
+		.expect("aborted assistant row");
+	assert_eq!(aborted.message.stop_reason.as_deref(), Some("aborted"));
+	assert_eq!(
+		aborted.message.error_message.as_deref(),
+		Some(omp_cli::deadline::TIMEOUT_MESSAGE),
+		"the deadline reason must not be rewritten as a user interrupt"
+	);
+	std::fs::remove_dir_all(dir).ok();
+}
+
+/// A bare interrupt stays a user interrupt even though it takes the same
+/// journaling path as the reasoned deadline interrupt.
+#[tokio::test]
+async fn user_interrupt_keeps_the_user_label() {
+	let (session, dir) = run_interrupted_stall("user-interrupt-label", "s13", SteeringEvent::Interrupt).await;
+	let loaded = session.load().expect("load");
+	let aborted = loaded
+		.messages
+		.iter()
+		.find(|entry| entry.message.role == "assistant")
+		.expect("aborted assistant row");
+	assert_eq!(aborted.message.stop_reason.as_deref(), Some("aborted"));
+	assert_eq!(
+		aborted.message.error_message.as_deref(),
+		Some("Interrupted by user")
+	);
+	std::fs::remove_dir_all(dir).ok();
+}
+
+/// An interrupt that lands during a provider request must journal the accepted
+/// steering *and* the aborted turn before the dialog unwinds, and the next turn
+/// on the same store must start from that exact history.
+#[tokio::test]
+async fn interrupt_journals_injections_before_the_next_turn() {
+	let dir = temp_dir("interrupt-injection");
+	let db = dir.join("sessions.db");
+	let session = Arc::new(DurableSession::create(db, header("s14", &dir)).expect("create"));
+	let started = Arc::new(tokio::sync::Notify::new());
+	let provider = Arc::new(HangThenAnswer {
+		started: Arc::clone(&started),
+		calls: AtomicUsize::new(0),
+		seen: Mutex::new(Vec::new()),
+	});
+	let provider_dyn: Arc<dyn ModelProvider> = Arc::clone(&provider);
+	let agent = AgentLoop::new(config(&dir), provider_dyn, ToolRegistry::new())
+		.with_durable(Some(Arc::clone(&session) as Arc<dyn DurableBoundary>));
+	let mut state = AgentState::default();
+	let (tx, rx) = tokio::sync::mpsc::channel(4);
+	{
+		let first = agent.run_dialog("first", &mut state, Some(rx));
+		tokio::pin!(first);
+		tokio::select! {
+			_ = started.notified() => {},
+			res = &mut first => panic!("dialog ended before the provider request started: {res:?}"),
+		}
+		tx.send(SteeringEvent::InjectMessage(vec![ContentPart::text("please also note")]))
+			.await
+			.expect("accept injection");
+		tx
+			.send(SteeringEvent::InterruptWithReason(
+				omp_cli::deadline::TIMEOUT_MESSAGE.to_string(),
+			))
+			.await
+			.expect("accept interrupt");
+		let result = tokio::time::timeout(Duration::from_secs(5), &mut first)
+			.await
+			.expect("the interrupt must stop the dialog")
+			.expect("join dialog");
+		assert!(matches!(result, Err(AgentError::InterruptedReason(_))));
+	}
+	// Rows the host would reload on the abort boundary are already durable.
+	let after_abort = session.load().expect("load after abort");
+	assert!(
+		after_abort
+			.messages
+			.iter()
+			.any(|entry| entry.message.role == "user"
+				&& entry.message.content.contains("please also note")),
+		"the accepted steering must be durable before the interrupt surfaces"
+	);
+
+	let turns = agent
+		.run_dialog("second", &mut state, None)
+		.await
+		.expect("the next turn proceeds on the same history");
+	assert!(!turns.is_empty());
+	{
+		let seen = provider.seen.lock().unwrap();
+		assert_eq!(seen.len(), 2, "the second request must carry the same history");
+		assert!(
+			seen[1]
+				.iter()
+				.any(|message| message.role == Role::User
+					&& message.content.contains("please also note")),
+			"the injected user message must precede the next request"
+		);
+	}
+	let loaded = session.load().expect("load after the next turn");
+	assert_eq!(
+		loaded
+			.messages
+			.iter()
+			.filter(|entry| entry.message.role == "assistant")
+			.count(),
+		2,
+		"both assistant turns stay in the durable log"
+	);
+	std::fs::remove_dir_all(dir).ok();
+}
+
+/// A drain-boundary interrupt persists the accepted steering and returns
+/// without any TurnEnd. The host rebuilds its next request from the durable
+/// branch (that is what the CLI's error-path reload does); that request must
+/// align with the seed and carry the injected user message.
+#[tokio::test]
+async fn drain_interrupt_survives_a_host_reload() {
+	let dir = temp_dir("drain-reload");
+	let db = dir.join("sessions.db");
+	let session = Arc::new(DurableSession::create(db.clone(), header("s15", &dir)).expect("create"));
+	let provider = Arc::new(RecordingProvider { seen: Mutex::new(Vec::new()) });
+	let provider_dyn: Arc<dyn ModelProvider> = Arc::clone(&provider);
+	let agent = AgentLoop::new(config(&dir), provider_dyn, ToolRegistry::new())
+		.with_durable(Some(Arc::clone(&session) as Arc<dyn DurableBoundary>));
+	let mut state = AgentState::default();
+	let (tx, rx) = tokio::sync::mpsc::channel(4);
+	tx.send(SteeringEvent::InjectMessage(vec![ContentPart::text("steer note")]))
+		.await
+		.expect("queue injection");
+	tx
+		.send(SteeringEvent::InterruptWithReason(
+			omp_cli::deadline::TIMEOUT_MESSAGE.to_string(),
+		))
+		.await
+		.expect("queue interrupt");
+	let result = agent.run_dialog("first", &mut state, Some(rx)).await;
+	assert!(matches!(result, Err(AgentError::InterruptedReason(_))));
+	assert!(
+		provider.seen.lock().unwrap().is_empty(),
+		"the drain aborts before any provider request"
+	);
+	drop(agent);
+	drop(session);
+
+	// The host's error path reloads and the next prompt replays the branch.
+	let reopened = DurableSession::open(db, "s15", header("s15", &dir))
+		.expect("reopen")
+		.0;
+	let loaded = reopened.load().expect("load persisted branch");
+	let history = omp_cli::runtime::history_messages_from_entries(&loaded.messages)
+		.expect("replay the reloaded branch");
+	assert!(
+		history
+			.iter()
+			.any(|message| message.role == Role::User && message.content.contains("steer note")),
+		"the host reload must see the accepted steering row"
+	);
+	let provider_dyn: Arc<dyn ModelProvider> = Arc::clone(&provider);
+	let agent = AgentLoop::new(config(&dir), provider_dyn, ToolRegistry::new())
+		.with_durable(Some(Arc::new(reopened) as Arc<dyn DurableBoundary>));
+	let mut state = AgentState { messages: history, total_turns: 0 };
+	let turns = agent
+		.run_dialog("second", &mut state, None)
+		.await
+		.expect("the next turn must align with the durable branch");
+	assert!(!turns.is_empty());
+	{
+		let seen = provider.seen.lock().unwrap();
+		assert_eq!(seen.len(), 1, "exactly one provider request after the reload");
+		assert!(
+			seen[0]
+				.iter()
+				.any(|message| message.role == Role::User
+					&& message.content.contains("steer note")),
+			"the injected message must be in the next provider request"
+		);
+	}
+	std::fs::remove_dir_all(dir).ok();
+}
+
+/// Start a dialog against a provider that never answers, interrupt it, and
+/// return the store the loop journaled into.
+async fn run_interrupted_stall(
+	label: &str,
+	id: &str,
+	interrupt: SteeringEvent,
+) -> (Arc<DurableSession>, PathBuf) {
+	let dir = temp_dir(label);
+	let db = dir.join("sessions.db");
+	let session = Arc::new(DurableSession::create(db, header(id, &dir)).expect("create"));
+	let started = Arc::new(tokio::sync::Notify::new());
+	let provider = HangingProvider { started: Arc::clone(&started) };
+	let agent = AgentLoop::new(config(&dir), Arc::new(provider), ToolRegistry::new())
+		.with_durable(Some(Arc::clone(&session) as Arc<dyn DurableBoundary>));
+	let mut state = AgentState::default();
+	let (tx, rx) = tokio::sync::mpsc::channel(4);
+	let run = tokio::spawn(async move { agent.run_dialog("stall", &mut state, Some(rx)).await });
+	tokio::time::timeout(Duration::from_secs(5), started.notified())
+		.await
+		.expect("provider request must start");
+	tx.send(interrupt).await.expect("send interrupt");
+	let result = tokio::time::timeout(Duration::from_secs(5), run)
+		.await
+		.expect("the interrupt must stop the dialog")
+		.expect("join dialog");
+	assert!(matches!(result, Err(AgentError::Interrupted | AgentError::InterruptedReason(_))));
+	(session, dir)
 }

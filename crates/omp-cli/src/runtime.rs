@@ -61,6 +61,18 @@ pub const DEFAULT_MAX_TURNS: usize = 32;
 /// Context window assumed when the catalog declares none (matches `pi-agent`).
 pub const DEFAULT_CONTEXT_LIMIT: usize = 32_768;
 
+/// Single `--max-time` predicate: the timer flag, the cancellation watcher,
+/// the stream drop, and the dialog result all classify from the same turn
+/// start, so the CLI deadline and the runtime timer can never disagree.
+fn deadline_expired(
+	timed_out: &AtomicBool,
+	max_time: Option<std::time::Duration>,
+	start: std::time::Instant,
+) -> bool {
+	timed_out.load(Ordering::SeqCst)
+		|| max_time.is_some_and(|budget| start.elapsed() >= budget)
+}
+
 /// Builtin tools: name and whether the tool only reads.
 ///
 /// The registry lists every selected tool; approval is not a visibility filter.
@@ -1536,6 +1548,8 @@ impl AgentRunner for PiAgentRunner {
 			None => pi_agent::CancellationToken::new(),
 		};
 		let timed_out = Arc::new(AtomicBool::new(false));
+		let deadline_start = request.turn_started;
+		let max_time = request.max_time;
 
 		let (discovery_steering_tx, mut discovery_steering_rx) = tokio::sync::mpsc::channel(4);
 		let discovery_sig_reg = self.dispatcher.register(discovery_steering_tx);
@@ -1548,9 +1562,12 @@ impl AgentRunner for PiAgentRunner {
 
 		let timeout_cancel = cancellation_token.clone();
 		let timed_out_clone = Arc::clone(&timed_out);
-		let mut timer_guard = TimerGuard(request.max_time.map(|budget| {
+		let mut timer_guard = TimerGuard(max_time.map(|budget| {
+			// The budget covers the whole turn, including any work that ran
+			// before this stream was created.
+			let remaining = budget.saturating_sub(deadline_start.elapsed());
 			self.runtime.spawn(async move {
-				tokio::time::sleep(budget).await;
+				tokio::time::sleep(remaining).await;
 				timed_out_clone.store(true, Ordering::SeqCst);
 				timeout_cancel.cancel();
 			})
@@ -1604,7 +1621,7 @@ impl AgentRunner for PiAgentRunner {
 		if cancellation_token.is_cancelled() {
 			self.runtime
 				.block_on(close_mcp_sessions(mcp_spawn.connections.iter().cloned()));
-			if timed_out.load(Ordering::SeqCst) {
+			if deadline_expired(&timed_out, max_time, deadline_start) {
 				return Err(Error::new("execution timed out during MCP discovery"));
 			}
 			return Err(Error::new("MCP discovery interrupted"));
@@ -2285,9 +2302,15 @@ impl AgentRunner for PiAgentRunner {
 
 		let cancel_watcher_token = cancellation_token.clone();
 		let steering_tx_cancel = steering_tx.clone();
+		let timed_out_watcher = Arc::clone(&timed_out);
 		let cancel_watcher = self.runtime.spawn(async move {
 			cancel_watcher_token.cancelled().await;
-			let _ = steering_tx_cancel.send(SteeringEvent::Interrupt).await;
+			let event = if deadline_expired(&timed_out_watcher, max_time, deadline_start) {
+				SteeringEvent::InterruptWithReason(crate::deadline::TIMEOUT_MESSAGE.to_string())
+			} else {
+				SteeringEvent::Interrupt
+			};
+			let _ = steering_tx_cancel.send(event).await;
 		});
 
 		let signal_reg = self.dispatcher.register_dialog(steering_tx.clone());
@@ -2305,6 +2328,9 @@ impl AgentRunner for PiAgentRunner {
 		let event_tx_clone = event_tx.clone();
 		let cancel_on_err = cancellation_token.clone();
 		let steering_tx_err = steering_tx.clone();
+		// The event task outlives this scope; the stream handle keeps its own
+		// reference for the drop classification.
+		let timed_out_events = Arc::clone(&timed_out);
 		let advisor_sync = request.config.advisor.sync_backlog();
 		let advisor_events = advisor.clone();
 		self.runtime.spawn(async move {
@@ -2582,18 +2608,19 @@ impl AgentRunner for PiAgentRunner {
 						.await;
 					completed_clone.store(true, Ordering::SeqCst);
 				},
-				Err(AgentError::Interrupted) => {
+				Err(err @ (AgentError::Interrupted | AgentError::InterruptedReason(_))) => {
 					if let Some(goal) = &goal_runtime {
 						goal.on_task_aborted(crate::goal::GoalAbortReason::Interrupted);
 					}
 					completed_clone.store(true, Ordering::SeqCst);
-					if timed_out.load(Ordering::SeqCst) {
-						let _ = event_tx_clone
-							.send(Err(Error::new(crate::deadline::TIMEOUT_MESSAGE)))
-							.await;
-					} else {
-						let _ = event_tx_clone.send(Err(Error::new("interrupted"))).await;
-					}
+					let surfaced = match &err {
+						AgentError::InterruptedReason(reason) => reason.clone(),
+						_ if deadline_expired(&timed_out_events, max_time, deadline_start) => {
+							crate::deadline::TIMEOUT_MESSAGE.to_string()
+						},
+						_ => "interrupted".to_string(),
+					};
+					let _ = event_tx_clone.send(Err(Error::new(surfaced))).await;
 				},
 				Err(err) => {
 					completed_clone.store(true, Ordering::SeqCst);
@@ -2619,6 +2646,9 @@ impl AgentRunner for PiAgentRunner {
 			cancel_watcher,
 			dialog_abort,
 			timer_handle: timer_guard.disarm(),
+			timed_out: Arc::clone(&timed_out),
+			max_time,
+			deadline_start,
 			_signal_reg: signal_reg,
 			runtime_handle,
 		});
@@ -2699,6 +2729,11 @@ struct StreamHandles {
 	cancel_watcher:     tokio::task::JoinHandle<()>,
 	dialog_abort:       tokio::task::AbortHandle,
 	timer_handle:       Option<tokio::task::JoinHandle<()>>,
+	/// Set by the `--max-time` timer; a drop-driven interrupt then carries the
+	/// deadline reason instead of being labelled a user interrupt.
+	timed_out:          Arc<AtomicBool>,
+	max_time:           Option<std::time::Duration>,
+	deadline_start:     std::time::Instant,
 	_signal_reg:        TurnSignalRegistration,
 	runtime_handle:     tokio::runtime::Handle,
 }
@@ -2706,7 +2741,12 @@ struct StreamHandles {
 impl Drop for StreamHandles {
 	fn drop(&mut self) {
 		self.stream_cancel.cancel();
-		let _ = self.steering_tx.try_send(SteeringEvent::Interrupt);
+		let event = if deadline_expired(&self.timed_out, self.max_time, self.deadline_start) {
+			SteeringEvent::InterruptWithReason(crate::deadline::TIMEOUT_MESSAGE.to_string())
+		} else {
+			SteeringEvent::Interrupt
+		};
+		let _ = self.steering_tx.try_send(event);
 		let dialog_abort = self.dialog_abort.clone();
 		self.runtime_handle.spawn(async move {
 			tokio::time::sleep(std::time::Duration::from_millis(500)).await;
@@ -6650,23 +6690,53 @@ pub fn history_messages_from_entries(
 				// Preserve the stored text shape: a plain-text result must not
 				// become a Parts([Text]) message on replay, or the durable seed
 				// revision (which projects the stored shape) will diverge.
-				let parts = match &source.content {
-					crate::session::MessageContent::Parts(parts) => parts.clone(),
+				let mut content = source.content.text();
+				let mut is_error = source.is_error.unwrap_or(false);
+				let mut parts = match &source.content {
+					crate::session::MessageContent::Parts(parts) => {
+						convert_content_parts(parts, "tool result history")?
+					},
 					_ => Vec::new(),
 				};
-				let content = source.content.text();
+				// Durable rows may archive image blocks under `details.images`
+				// instead of content parts; replay them with the same validation
+				// policy the live loop applies to tool results.
+				if !parts
+					.iter()
+					.any(|part| matches!(part, pi_agent::ContentPart::Image { .. }))
+					&& let Some(details) = source.extra.get("details")
+				{
+					match pi_agent::image_parts_from_details(Some(details)) {
+						Ok(images) => parts.extend(images),
+						Err(error) => {
+							// The images are dropped, so the text shape carries the
+							// rejection to the model; keeping parts would let the
+							// provider wire use only the part text and hide it.
+							is_error = true;
+							content = format!("{content}\n\n[image payload rejected: {error}]");
+							parts.clear();
+						},
+					}
+				}
+				// The provider wire builds a tool result's text from its parts
+				// whenever any part exists (`to_openai_messages`), so a legacy row
+				// whose text lives only in `content` must gain a text part; losing
+				// it would replay the answer as only "(see attached image)".
+				if !parts.is_empty()
+					&& !content.is_empty()
+					&& !parts
+						.iter()
+						.any(|part| matches!(part, pi_agent::ContentPart::Text { .. }))
+				{
+					parts.insert(0, pi_agent::ContentPart::text(content.clone()));
+				}
 				let name = source.tool_name.as_deref().unwrap_or("tool");
 				let id = source.tool_call_id.clone().unwrap_or_default();
-				let is_error = source.is_error.unwrap_or(false);
 				let message = if parts.is_empty() {
 					pi_agent::Message::tool_with_status(id, name, content, is_error)
 				} else {
 					pi_agent::Message::tool_with_status_and_parts(
-						id,
-						name,
-						content,
-						convert_content_parts(&parts, "tool result history")?,
-						is_error,
+						id, name, content, parts, is_error,
 					)
 				};
 				messages.push(message);
@@ -7121,6 +7191,7 @@ mod tests {
 			catalog: Arc::new(catalog()),
 			approvals,
 			max_time: None,
+			turn_started: std::time::Instant::now(),
 			tools_enabled: true,
 			max_turns: 5,
 			history: Vec::new(),
@@ -8418,6 +8489,55 @@ mod tests {
 
 		let err = stream.next().expect("error event").err().expect("is error");
 		assert!(err.to_string().contains(crate::deadline::TIMEOUT_MESSAGE));
+	}
+
+	#[test]
+	fn deadline_is_measured_from_the_turn_start() {
+		let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+		let addr = listener.local_addr().unwrap();
+		std::thread::spawn(move || {
+			if let Ok((mut socket, _)) = listener.accept() {
+				let mut buf = [0u8; 1024];
+				let _ = std::io::Read::read(&mut socket, &mut buf);
+			}
+			std::thread::sleep(std::time::Duration::from_secs(5));
+		});
+
+		let mut req = request(yolo());
+		req.config.providers.insert("local".to_string(), ProviderConfig {
+			base_url: Some(format!("http://{addr}/v1")),
+			api_key: Some("sk-test".to_string()),
+			..ProviderConfig::default()
+		});
+		// A turn whose budget was spent before the stream existed: the timer
+		// must derive the remaining time from `turn_started`, not from `now()`.
+		req.tools_enabled = false;
+		req.max_time = Some(std::time::Duration::from_secs(30));
+		req.turn_started = std::time::Instant::now() - std::time::Duration::from_secs(60);
+
+		let runner = PiAgentRunner::new().expect("runner");
+		let started = std::time::Instant::now();
+		let mut surfaced = None;
+		match runner.run(&req) {
+			Err(err) => surfaced = Some(err.to_string()),
+			Ok(stream) => {
+				for event in stream {
+					if let Err(err) = event {
+						surfaced = Some(err.to_string());
+						break;
+					}
+				}
+			},
+		}
+		assert!(
+			started.elapsed() < std::time::Duration::from_secs(10),
+			"an already-spent --max-time budget must fire immediately"
+		);
+		let message = surfaced.unwrap_or_default();
+		assert!(
+			message.contains(crate::deadline::TIMEOUT_MESSAGE) || message.contains("timed out"),
+			"the deadline must surface as a timeout, got {message:?}"
+		);
 	}
 
 	#[test]

@@ -163,6 +163,7 @@ fn make_run_request(
 		catalog: Arc::new(Catalog::default()),
 		approvals,
 		max_time: Some(Duration::from_secs(10)),
+		turn_started: std::time::Instant::now(),
 		max_turns: 1,
 		tools_enabled: true,
 		cancellation_token: None,

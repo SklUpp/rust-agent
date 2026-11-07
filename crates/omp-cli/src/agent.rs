@@ -191,6 +191,10 @@ pub struct RunRequest {
 	pub max_time: Option<Duration>,
 	/// Assistant-turn budget handed to the agent loop.
 	pub max_turns: usize,
+	/// Wall-clock start of this turn. The CLI stream deadline and the runtime
+	/// interrupt timer both measure `max_time` from this instant, so their
+	/// verdicts can never disagree.
+	pub turn_started: std::time::Instant,
 	/// `false` when `--no-tools` was passed.
 	pub tools_enabled: bool,
 	/// Optional cancellation trigger from the consumer.
