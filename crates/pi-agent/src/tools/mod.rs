@@ -2263,7 +2263,7 @@ impl WriteTool {
 			let current_bytes = tokio::fs::read(&entry.absolute_path)
 				.await
 				.map_err(|e| ToolError::ExecutionFailed(format!("read {}: {e}", entry.display_path)))?;
-			let current_meta = tokio::fs::symlink_metadata(&entry.absolute_path).ok();
+			let current_meta = tokio::fs::symlink_metadata(&entry.absolute_path).await.ok();
 			let source_dev_ino = current_meta.as_ref().map(|m| crate::tools::staged_ops::dev_ino(m));
 			let source_mode = current_meta.as_ref().map(|m| crate::tools::staged_ops::file_mode(m));
 			let original_text = String::from_utf8_lossy(&current_bytes).into_owned();
@@ -2474,7 +2474,7 @@ impl WriteTool {
 						continue;
 					}
 				};
-				let current_meta = tokio::fs::symlink_metadata(&absolute_path).ok();
+				let current_meta = tokio::fs::symlink_metadata(&absolute_path).await.ok();
 				let source_dev_ino = current_meta.as_ref().map(|m| crate::tools::staged_ops::dev_ino(m));
 				let source_mode = current_meta.as_ref().map(|m| crate::tools::staged_ops::file_mode(m));
 				let mut text = String::from_utf8_lossy(&current_bytes).into_owned();
@@ -2482,7 +2482,7 @@ impl WriteTool {
 				for entry in &entries {
 					let replacement = match &directives {
 						Some(d) => d.get(&entry.id).map(String::as_str).unwrap_or(""),
-						None => content,
+						None => content.as_str(),
 					};
 					match conflict::expand_content_tokens(replacement, entry)
 						.and_then(|expanded| conflict::splice_conflict(&text, entry, &expanded))

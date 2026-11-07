@@ -294,9 +294,9 @@ pub async fn execute_sections(
 				).with_description(desc)
 			}
 			Some(parser::FileOp::Move(dest)) => {
-				let serialized = hash::denormalize_file(&entry.bom, &entry.after, entry.line_ending);
+				let serialized = format!("{}{}", entry.bom, hash::restore_line_endings(&entry.after, entry.line_ending));
 				let dest_path = entry.move_dest.clone().unwrap_or_else(|| PathBuf::from(dest));
-				let mut desc = format!("Moved {} -> {dest}{}", entry.section.path, first_suffix(entry.first_changed));
+				let mut desc = format!("Moved {} -> {dest}{}", entry.section.path, first_suffix(entry.first_changed_line));
 				append_warnings(&mut desc, &entry.warnings);
 				crate::tools::staged_ops::PreparedOp::new_move(
 					entry.section.file_path,
@@ -310,8 +310,8 @@ pub async fn execute_sections(
 				).with_description(desc)
 			}
 			None => {
-				let serialized = hash::denormalize_file(&entry.bom, &entry.after, entry.line_ending);
-				let mut desc = format!("Updated {}{}", entry.section.path, first_suffix(entry.first_changed));
+				let serialized = format!("{}{}", entry.bom, hash::restore_line_endings(&entry.after, entry.line_ending));
+				let mut desc = format!("Updated {}{}", entry.section.path, first_suffix(entry.first_changed_line));
 				append_warnings(&mut desc, &entry.warnings);
 				crate::tools::staged_ops::PreparedOp::new_update(
 					entry.section.file_path,

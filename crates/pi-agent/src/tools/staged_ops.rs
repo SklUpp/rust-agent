@@ -433,7 +433,7 @@ pub fn nearest_existing_ancestor(path: &Path) -> (Option<PathBuf>, Option<(u64, 
 	loop {
 		if let Ok(pin) = DirPin::open(current) {
 			subdirs.reverse();
-			return (Some(pin.path), pin.dev_ino, subdirs);
+			return (Some(pin.path.clone()), pin.dev_ino, subdirs);
 		}
 		if let Some(name) = current.file_name().and_then(|n| n.to_str()) {
 			subdirs.push(name.to_string());
@@ -452,7 +452,7 @@ pub fn nearest_existing_ancestor(path: &Path) -> (Option<PathBuf>, Option<(u64, 
 	let dot = Path::new(".");
 	if let Ok(pin) = DirPin::open(dot) {
 		subdirs.reverse();
-		return (Some(pin.path), pin.dev_ino, subdirs);
+		return (Some(pin.path.clone()), pin.dev_ino, subdirs);
 	}
 	let canonical = canonical_identity(parent);
 	let d_i = std::fs::symlink_metadata(&canonical).ok().map(|m| dev_ino(&m));
@@ -1976,7 +1976,7 @@ impl PendingAction for FileOpsAction {
 						}
 					};
 
-					match current_status {
+					let dest_dev_ino = match current_status {
 						OpStatus::Pending => {
 							// Verify destination does not exist under held dest_dir_pin
 							match dest_dir_pin.stat_file(dest_file_name) {
@@ -2533,7 +2533,6 @@ impl PendingAction for FileOpsAction {
 
 						// HIGH review fix: re-verify destination exact bytes from held dest_file fd
 						// AFTER reading source to catch in-place destination corruption/truncation!
-						use std::os::unix::io::AsRawFd;
 						let mut post_source_dest_stat: libc::stat = unsafe { std::mem::zeroed() };
 						if unsafe { libc::fstat(dest_file.as_raw_fd(), &mut post_source_dest_stat) } != 0 {
 							drop(dest_file);
