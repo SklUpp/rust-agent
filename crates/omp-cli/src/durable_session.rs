@@ -678,8 +678,8 @@ impl DurableSession {
 		})?;
 		let reconciled_proj = parts.projection.clone();
 		*lock(&self.projection) = reconciled_proj.clone();
-		*lock(&self.tracked).clear();
-		*lock(&self.tracked_ids).clear();
+		lock(&self.tracked).clear();
+		lock(&self.tracked_ids).clear();
 		*lock(&self.resume_seed) = Some(seed_entries(
 			&parts.branch_messages,
 			reconciled_proj.as_ref(),
@@ -721,8 +721,8 @@ impl DurableSession {
 			};
 			store.compact_session(msg, projection.clone())?;
 			cursor.leaf = Some(stored.id);
-			*lock(&tracked_arc).clear();
-			*lock(&tracked_ids_arc).clear();
+			lock(&tracked_arc).clear();
+			lock(&tracked_ids_arc).clear();
 			match load_parts(store, &session_id) {
 				Ok(parts) => {
 					let reconciled_proj = parts.projection.clone();
