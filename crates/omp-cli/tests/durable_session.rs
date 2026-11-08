@@ -1431,7 +1431,7 @@ async fn reopened_session_recovers_missing_sibling_tool_result_when_first_alread
 					id: "msg-tool-A".to_string(),
 					session_id: "s-sibling".to_string(),
 					branch_id: "s-sibling.main".to_string(),
-					parent_message_id: Some(asst_id),
+					parent_message_id: Some(asst_id.clone()),
 					payload: json!({
 						"type": "message",
 						"id": "msg-tool-A",
