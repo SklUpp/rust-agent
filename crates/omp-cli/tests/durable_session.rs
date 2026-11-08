@@ -528,11 +528,15 @@ async fn duplicate_provider_call_ids_get_distinct_execution_ids() {
 		name: "effect".to_string(),
 		arguments: json!({}),
 	};
+
+	// Real production order: assistant turn is persisted before the tool effect finishes
+	let asst1 = Message::assistant_with_tools("one", vec![call.clone()]);
+	session
+		.persist_messages(&[asst1.clone()])
+		.await
+		.expect("persist assistant one");
+
 	let first = session.begin_execution(&call).await.expect("first intent");
-	let second = session.begin_execution(&call).await.expect("second intent");
-	assert_ne!(first, second, "execution identity must be store-owned");
-	assert_ne!(first, call.id);
-	assert_ne!(second, call.id);
 	let result = ToolResult {
 		tool_call_id: call.id.clone(),
 		content: "ok".to_string(),
@@ -544,6 +548,23 @@ async fn duplicate_provider_call_ids_get_distinct_execution_ids() {
 		.finish_execution(&first, &call, &result)
 		.await
 		.expect("first outcome");
+
+	let asst2 = Message::assistant_with_tools("two", vec![call.clone()]);
+	let messages_turn2 = vec![
+		asst1.clone(),
+		Message::tool_with_status(call.id.clone(), "effect", "ok", false),
+		asst2.clone(),
+	];
+	session
+		.persist_messages(&messages_turn2)
+		.await
+		.expect("persist assistant two");
+
+	let second = session.begin_execution(&call).await.expect("second intent");
+	assert_ne!(first, second, "execution identity must be store-owned");
+	assert_ne!(first, call.id);
+	assert_ne!(second, call.id);
+
 	session
 		.finish_execution(&second, &call, &result)
 		.await
@@ -554,10 +575,10 @@ async fn duplicate_provider_call_ids_get_distinct_execution_ids() {
 	// two occurrences are skipped. A third synthetic result with the same id is
 	// a different execution and must still be written.
 	let messages = vec![
-		Message::assistant("one"),
-		Message::tool_with_status(call.id.clone(), "effect", "one", false),
-		Message::assistant("two"),
-		Message::tool_with_status(call.id.clone(), "effect", "two", false),
+		asst1,
+		Message::tool_with_status(call.id.clone(), "effect", "ok", false),
+		asst2,
+		Message::tool_with_status(call.id.clone(), "effect", "ok", false),
 		Message::assistant("three"),
 		Message::tool_with_status(call.id.clone(), "effect", "synthetic", false),
 	];
@@ -570,6 +591,37 @@ async fn duplicate_provider_call_ids_get_distinct_execution_ids() {
 		.collect();
 	assert_eq!(tools.len(), 3, "two outcomes plus the synthetic result");
 	assert!(tools.iter().any(|entry| entry.message.content.text() == "synthetic"));
+
+	// Check execution IDs linkage and replay order:
+	let eids: Vec<_> = tools
+		.iter()
+		.map(|entry| {
+			entry
+				.message
+				.extra
+				.get("details")
+				.and_then(|d| d.get("executionId"))
+				.and_then(Value::as_str)
+		})
+		.collect();
+	assert_eq!(eids[0], Some(first.as_str()));
+	assert_eq!(eids[1], Some(second.as_str()));
+	assert_eq!(eids[2], None, "synthetic tool result has no executionId");
+
+	// Verify full branch message ordering:
+	assert_eq!(
+		loaded.branch_messages.len(),
+		6,
+		"Asst1 -> Tool1 -> Asst2 -> Tool2 -> Asst3 -> Tool3"
+	);
+	assert_eq!(loaded.branch_messages[0].message.role, "assistant");
+	assert_eq!(loaded.branch_messages[1].message.role, "toolResult");
+	assert_eq!(loaded.branch_messages[2].message.role, "assistant");
+	assert_eq!(loaded.branch_messages[3].message.role, "toolResult");
+	assert_eq!(loaded.branch_messages[4].message.role, "assistant");
+	assert_eq!(loaded.branch_messages[5].message.role, "toolResult");
+
+	std::fs::remove_dir_all(dir).ok();
 }
 
 #[test]
