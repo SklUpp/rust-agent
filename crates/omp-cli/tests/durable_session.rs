@@ -1953,6 +1953,88 @@ async fn reopen_with_unresolved_intent_refuses_dangling_replay_fail_closed() {
 }
 
 #[tokio::test]
+async fn reopen_with_missing_intent_refuses_dangling_replay_and_creates_no_execution() {
+	let dir = temp_dir("missing-intent");
+	let db = dir.join("sessions.db");
+	let session =
+		DurableSession::create(db.clone(), header("s-missing", &dir)).expect("create");
+
+	// Crash window: assistant tool call persisted, intent never admitted.
+	let asst_msg = Message::assistant_with_tools(
+		"calling tool",
+		vec![ToolCall {
+			id: "call-missing".to_string(),
+			name: "effect".to_string(),
+			arguments: json!({}),
+		}],
+	);
+	session
+		.persist_messages(&[Message::user("hi"), asst_msg])
+		.await
+		.expect("persist assistant");
+	drop(session);
+
+	let execution_count = |path: &std::path::Path| -> i64 {
+		let conn = rusqlite::Connection::open(path).expect("open raw sqlite");
+		conn.query_row("SELECT COUNT(*) FROM executions", [], |row| row.get(0))
+			.expect("count executions")
+	};
+	assert_eq!(execution_count(&db), 0, "no intent row may exist before reopen");
+
+	let (reopened, loaded) =
+		DurableSession::open(db.clone(), "s-missing", header("s-missing", &dir)).expect("reopen");
+	let loaded = loaded.expect("loaded session");
+
+	// Missing intent is invisible to the executions table.
+	assert!(
+		reopened.unresolved_intents().expect("unresolved").is_empty(),
+		"no intent row means unresolved_intents stays empty"
+	);
+	assert!(
+		reopened.executions_needing_recovery().expect("needing").is_empty(),
+		"no outcome means nothing needs recovery"
+	);
+	assert_eq!(loaded.branch_messages.len(), 2);
+
+	// Raw read stays available.
+	let before = reopened.load().expect("raw read of branch must stay available");
+	assert_eq!(before.branch_messages.len(), 2);
+
+	// Write/replay still fail closed on the dangling call — same refusal as unresolved intent.
+	let err = reopened
+		.persist_messages(&[Message::user("next turn")])
+		.await
+		.expect_err("write boundary must fail closed on missing-intent dangling call");
+	assert!(
+		err.to_string().contains("dangling tool call call-missing"),
+		"error must cite the orphan call: {err}"
+	);
+
+	assert_eq!(
+		reopened.load().expect("read after refuse").branch_messages.len(),
+		2,
+		"refused write must not append rows"
+	);
+
+	// Refusal is sticky: another write hits the same dangling seed error.
+	let err_again = reopened
+		.persist_messages(&[Message::user("retry turn")])
+		.await
+		.expect_err("second write must keep failing closed");
+	assert!(
+		err_again.to_string().contains("dangling tool call call-missing"),
+		"second refuse must cite the same orphan call: {err_again}"
+	);
+	assert_eq!(
+		reopened.load().expect("read after second refuse").branch_messages.len(),
+		2,
+		"second refused write must not append rows"
+	);
+
+	std::fs::remove_dir_all(dir).ok();
+}
+
+#[tokio::test]
 async fn multiple_outcomes_keep_distinct_execution_ids_and_call_ids() {
 	let dir = temp_dir("multi-exec-ids");
 	let db = dir.join("sessions.db");
