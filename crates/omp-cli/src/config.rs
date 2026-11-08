@@ -2644,7 +2644,8 @@ pub fn parse_enabled_value(val: Option<&serde_json::Value>) -> (Option<bool>, Op
 		None | Some(serde_json::Value::Null) => (None, None),
 		Some(serde_json::Value::Bool(b)) => (Some(*b), None),
 		Some(serde_json::Value::String(s)) => {
-			let lower = s.trim().to_ascii_lowercase();
+			let expanded = expand_env_vars(s);
+			let lower = expanded.trim().to_ascii_lowercase();
 			if lower == "false" || lower == "0" {
 				(Some(false), None)
 			} else if lower == "true" || lower == "1" {
