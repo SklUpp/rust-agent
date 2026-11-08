@@ -338,11 +338,12 @@ fn test_allow_permits_write() {
 	]);
 
 	// always-ask with --allow write
-	let req = make_run_request(
+	let mut req = make_run_request(
 		addr,
 		&temp.path,
 		Approvals::new(ApprovalMode::AlwaysAsk, vec!["write".to_string()]),
 	);
+	req.max_turns = 3;
 
 	let runner = PiAgentRunner::new().expect("runner");
 	let stream = runner.run(&req).expect("run");
@@ -396,6 +397,7 @@ fn test_allow_edit_authorizes_apply_patch_wire_name() {
 		&temp.path,
 		closed_approvals(ApprovalMode::AlwaysAsk, vec!["edit".to_string()]),
 	);
+	req.max_turns = 3;
 	req.config.edit.mode = Some(EditMode::ApplyPatch);
 
 	let runner = PiAgentRunner::new().expect("runner");
