@@ -463,7 +463,7 @@ fn store_session(
 	let call: ContentPart =
 		serde_json::from_value(call).expect("a toolCall part parses with or without a name");
 	let assistant = MessageEntry::new(
-		assistant_id,
+		assistant_id.clone(),
 		Some(user_id),
 		"2026-11-02T00:00:02.000Z",
 		SessionMessage::assistant(
@@ -476,8 +476,25 @@ fn store_session(
 			2000,
 		),
 	);
+	let mut entries = vec![user, assistant];
+	if let Some(tool_name) = tool_name {
+		let tool_id = format!("{id}-tool");
+		let tool_result = MessageEntry::new(
+			tool_id,
+			Some(assistant_id),
+			"2026-11-02T00:00:03.000Z",
+			SessionMessage::tool_result(
+				"call-1".to_string(),
+				tool_name.to_string(),
+				MessageContent::Text("tool output".to_string()),
+				false,
+				3000,
+			),
+		);
+		entries.push(tool_result);
+	}
 	store
-		.append_messages_compat(&[user, assistant])
+		.append_messages_compat(&entries)
 		.expect("store the fixture context");
 	// The fixture is meaningful only while replayability matches the name.
 	let branch: Vec<MessageEntry> = store.branch_messages().into_iter().cloned().collect();
@@ -747,7 +764,14 @@ fn prewalk_switches_to_smol_after_todo_and_first_write_then_resumes_on_default()
 		)]),
 		text_sse("resumed follow-up"),
 	]);
-	let b = MockWireServer::start(vec![text_sse("switched response")]);
+	let b = MockWireServer::start(vec![
+		tool_sse(&[(
+			"call-apply",
+			"write",
+			serde_json::json!({"path": "xd://resolve", "content": "apply"}),
+		)]),
+		text_sse("switched response"),
+	]);
 	let base = temp_dir("prewalk-switch");
 	let (agent_dir, cwd, sessions) = setup_two_providers(&base, a.port, b.port, selectable_extra());
 
@@ -768,7 +792,7 @@ fn prewalk_switches_to_smol_after_todo_and_first_write_then_resumes_on_default()
 		String::from_utf8_lossy(&first.stderr)
 	);
 	assert_eq!(a.request_count(), 3, "three primary turns before the switch");
-	assert_eq!(b.request_count(), 1, "the switched request reaches the fast endpoint");
+	assert_eq!(b.request_count(), 2, "the switched request reaches the fast endpoint");
 	// The plan nudge is injected after the first text-only turn and reaches the
 	// primary model, never the fast one.
 	assert!(
@@ -826,7 +850,7 @@ fn prewalk_switches_to_smol_after_todo_and_first_write_then_resumes_on_default()
 		String::from_utf8_lossy(&resumed.stderr)
 	);
 	assert_eq!(a.request_count(), 4, "resume stays on the default provider");
-	assert_eq!(b.request_count(), 1, "an ephemeral switch must not survive resume");
+	assert_eq!(b.request_count(), 2, "an ephemeral switch must not survive resume");
 	let replay = a.request(3);
 	assert_eq!(occurrences(&replay, "RESUME-TOKEN"), 1);
 	assert!(
@@ -868,6 +892,11 @@ fn plan_yolo_guards_then_switches_and_resumes_on_default() {
 			"write",
 			serde_json::json!({"path": "probe.txt", "content": "done"}),
 		)]),
+		tool_sse(&[(
+			"call-apply",
+			"write",
+			serde_json::json!({"path": "xd://resolve", "content": "apply"}),
+		)]),
 		text_sse("implemented"),
 	]);
 	let base = temp_dir("plan-yolo-switch");
@@ -891,7 +920,7 @@ fn plan_yolo_guards_then_switches_and_resumes_on_default() {
 		String::from_utf8_lossy(&first.stderr)
 	);
 	assert_eq!(a.request_count(), 3, "guard, plan write, then proposal");
-	assert_eq!(b.request_count(), 2, "switch happens before implementation");
+	assert_eq!(b.request_count(), 3, "switch happens before implementation");
 	assert!(!cwd.join("blocked.txt").exists(), "guard must block working-tree writes");
 	let plan = b.request(0);
 	assert_eq!(plan["model"], "model-b");
@@ -935,7 +964,7 @@ fn plan_yolo_guards_then_switches_and_resumes_on_default() {
 		String::from_utf8_lossy(&resumed.stderr)
 	);
 	assert_eq!(a.request_count(), 4, "resume restores the default provider");
-	assert_eq!(b.request_count(), 2, "the ephemeral plan target must not survive");
+	assert_eq!(b.request_count(), 3, "the ephemeral plan target must not survive");
 	assert_eq!(a.request(3)["model"], "model-a");
 	assert!(
 		!entries(&log)
@@ -1111,6 +1140,11 @@ fn prewalk_config_setting_is_ignored_on_resume() {
 			"write",
 			serde_json::json!({"path": "probe.txt", "content": "x"}),
 		)]),
+		tool_sse(&[(
+			"call-apply",
+			"write",
+			serde_json::json!({"path": "xd://resolve", "content": "apply"}),
+		)]),
 		text_sse("resumed without prewalk"),
 	]);
 	let b = MockWireServer::start(vec![text_sse("must stay unused")]);
@@ -1159,7 +1193,14 @@ fn prewalk_explicit_into_switches_on_first_write_when_todo_is_not_offered() {
 		"write",
 		serde_json::json!({"path": "probe.txt", "content": "x"}),
 	)])]);
-	let b = MockWireServer::start(vec![text_sse("switched immediately")]);
+	let b = MockWireServer::start(vec![
+		tool_sse(&[(
+			"call-apply",
+			"write",
+			serde_json::json!({"path": "xd://resolve", "content": "apply"}),
+		)]),
+		text_sse("switched immediately"),
+	]);
 	let base = temp_dir("prewalk-explicit");
 	let (agent_dir, cwd, sessions) = setup_two_providers(&base, a.port, b.port, "");
 	let run_out = run(
@@ -1181,7 +1222,7 @@ fn prewalk_explicit_into_switches_on_first_write_when_todo_is_not_offered() {
 		String::from_utf8_lossy(&run_out.stderr)
 	);
 	assert_eq!(a.request_count(), 1, "no todo gate when todo is not offered");
-	assert_eq!(b.request_count(), 1);
+	assert_eq!(b.request_count(), 2);
 	let fast = b.request(0);
 	assert_eq!(fast["model"], "model-b");
 	assert_eq!(occurrences(&fast, "Before task complete, verify:"), 1);
@@ -1313,7 +1354,14 @@ fn prewalk_default_auto_matches_explicit_auto() {
 			"write",
 			serde_json::json!({"path": "probe.txt", "content": "x"}),
 		)])]);
-		let b = MockWireServer::start(vec![text_sse("auto endpoint")]);
+		let b = MockWireServer::start(vec![
+			tool_sse(&[(
+				"call-apply",
+				"write",
+				serde_json::json!({"path": "xd://resolve", "content": "apply"}),
+			)]),
+			text_sse("auto endpoint"),
+		]);
 		let base = temp_dir("prewalk-auto");
 		let (agent_dir, cwd, sessions) =
 			setup_same_provider_two_endpoints(&base, a.port, b.port);
@@ -1335,7 +1383,7 @@ fn prewalk_default_auto_matches_explicit_auto() {
 			"auto run failed for {target}: {}",
 			String::from_utf8_lossy(&run_out.stderr)
 		);
-		assert_eq!(b.request_count(), 1, "target request for {target}");
+		assert_eq!(b.request_count(), 2, "target request for {target}");
 		let body = b.request(0);
 		let stderr = String::from_utf8_lossy(&run_out.stderr).to_string();
 		let root = base.to_string_lossy().to_string();
