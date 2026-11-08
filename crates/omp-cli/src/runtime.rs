@@ -329,10 +329,24 @@ impl RunnerSession {
 	/// the new one is held. A second owner (another session or process) gets an
 	/// explicit occupied error instead of sharing the workspace.
 	fn ensure_workspace_lease(&self, cwd: &Path) -> std::result::Result<(), String> {
+		self.ensure_workspace_lease_with_fallback(cwd, None)
+	}
+
+	fn ensure_workspace_lease_with_fallback(
+		&self,
+		cwd: &Path,
+		fallback: Option<Arc<pi_agent::workspace_writer::WorkspaceScopeLease>>,
+	) -> std::result::Result<(), String> {
 		let canonical = pi_agent::workspace_writer::canonical_identity(cwd);
 		let mut held = self.workspace_lease.lock().unwrap_or_else(|poison| poison.into_inner());
 		if held.as_ref().is_some_and(|lease| lease.canonical() == canonical) {
 			return Ok(());
+		}
+		if let Some(lease) = fallback {
+			if lease.canonical() == canonical {
+				*held = Some(lease);
+				return Ok(());
+			}
 		}
 		let writer = pi_agent::workspace_writer::WorkspaceWriter::new()
 			.map_err(|error| format!("workspace writer lock root unavailable: {error}"))?;
@@ -1537,6 +1551,7 @@ impl AgentRunner for PiAgentRunner {
 		self.reopen_session_scope(session_id, session_file);
 	}
 
+
 	fn run(&self, request: &RunRequest) -> Result<EventStream> {
 		// The request token belongs to the caller's operation, not to this
 		// stream: `StreamHandles::drop` cancels only what the stream owns. A
@@ -1695,8 +1710,14 @@ impl AgentRunner for PiAgentRunner {
 		// mutate files, so even the restricted security worker claims the
 		// workspace. A child agent runs inside this root session and never
 		// re-acquires the `flock`.
+		let canonical = pi_agent::workspace_writer::canonical_identity(&request.cwd);
+		let inherited_lease = request
+			.parent_workspace_lease
+			.as_ref()
+			.filter(|lease| lease.canonical() == canonical)
+			.cloned();
 		if request.tools_enabled
-			&& let Err(message) = session.ensure_workspace_lease(&request.cwd)
+			&& let Err(message) = session.ensure_workspace_lease_with_fallback(&request.cwd, inherited_lease)
 		{
 			self.runtime
 				.block_on(close_mcp_sessions(mcp_spawn.connections.iter().cloned()));
@@ -1713,20 +1734,26 @@ impl AgentRunner for PiAgentRunner {
 		// restricted `RunRequest` through this same runner.
 		let security_host: Option<Arc<dyn crate::security::SecurityHost>> =
 			request.config.security.enabled().then(|| {
+				let parent_workspace_lease = session
+					.workspace_lease
+					.lock()
+					.unwrap_or_else(|poison| poison.into_inner())
+					.clone();
 				let host = crate::security_runtime::RuntimeSecurityHost {
-					config:       request.config.clone(),
-					catalog:      Arc::clone(&request.catalog),
-					cwd:          request.cwd.clone(),
-					session_id:   request.session_id.clone(),
-					agent_id:     None,
-					active_model: Some(active_model.clone()),
-					state_root:   Some(crate::dirs::root_subdir(
+					config:                 request.config.clone(),
+					catalog:                Arc::clone(&request.catalog),
+					cwd:                    request.cwd.clone(),
+					session_id:             request.session_id.clone(),
+					agent_id:               None,
+					active_model:           Some(active_model.clone()),
+					state_root:             Some(crate::dirs::root_subdir(
 						"security",
 						crate::dirs::AgentDirCategory::State,
 					)),
-					auth_db:      crate::dirs::agent_dir().join("agent.db"),
-					approvals:    request.approvals.clone(),
-					service_tier: request.service_tier_by_family.clone(),
+					auth_db:                crate::dirs::agent_dir().join("agent.db"),
+					approvals:              request.approvals.clone(),
+					service_tier:           request.service_tier_by_family.clone(),
+					parent_workspace_lease,
 				};
 				Arc::new(host) as Arc<dyn crate::security::SecurityHost>
 			});
@@ -7230,6 +7257,7 @@ mod tests {
 			service_tier_by_family: std::collections::BTreeMap::new(),
 			security_host: None,
 			security_worker: false,
+			parent_workspace_lease: None,
 		}
 }
 
@@ -10826,6 +10854,77 @@ mod process_scope_tests {
 		drop(owner);
 		drop(contender);
 		let _ = std::fs::remove_dir_all(&base);
+	}
+
+	#[test]
+	fn workspace_lease_fallback_reuses_matching_parent_lease_and_rejects_mismatch() {
+		let unique = std::time::SystemTime::now()
+			.duration_since(std::time::UNIX_EPOCH)
+			.expect("clock")
+			.as_nanos();
+		let base = std::env::temp_dir().join(format!(
+			"omp-workspace-lease-fallback-{}-{unique}",
+			std::process::id()
+		));
+		let project = base.join("project");
+		let other = base.join("other");
+		std::fs::create_dir_all(&project).expect("project workspace");
+		std::fs::create_dir_all(&other).expect("other workspace");
+
+		let parent = RunnerSession::new(EditToolOptions::default());
+		parent.ensure_workspace_lease(&project).expect("parent takes project");
+		let parent_lease = parent
+			.workspace_lease
+			.lock()
+			.unwrap_or_else(|p| p.into_inner())
+			.clone()
+			.expect("held parent lease");
+
+		// 1. Successful parent Arc reuse when canonical identities match.
+		let child = RunnerSession::new(EditToolOptions::default());
+		child
+			.ensure_workspace_lease_with_fallback(&project, Some(Arc::clone(&parent_lease)))
+			.expect("child adopts matching parent lease");
+		assert_eq!(
+			child
+				.workspace_lease
+				.lock()
+				.unwrap_or_else(|p| p.into_inner())
+				.as_ref()
+				.map(|l| l.canonical().to_path_buf()),
+			Some(pi_agent::workspace_writer::canonical_identity(&project)),
+			"child holds matching parent lease"
+		);
+
+		// 2. Mismatch: parent lease is for `project`, but child requests `other`.
+		// Fallback must not be used; independent OS acquire for `other` succeeds.
+		let mismatched_child = RunnerSession::new(EditToolOptions::default());
+		mismatched_child
+			.ensure_workspace_lease_with_fallback(&other, Some(Arc::clone(&parent_lease)))
+			.expect("mismatched fallback ignored, independent acquire of other succeeds");
+		assert_eq!(
+			mismatched_child
+				.workspace_lease
+				.lock()
+				.unwrap_or_else(|p| p.into_inner())
+				.as_ref()
+				.map(|l| l.canonical().to_path_buf()),
+			Some(pi_agent::workspace_writer::canonical_identity(&other)),
+			"child acquired its own lease for other"
+		);
+
+		// 3. Independent session without parent capability gets occupied error on `project`.
+		let independent = RunnerSession::new(EditToolOptions::default());
+		let error = independent
+			.ensure_workspace_lease_with_fallback(&project, None)
+			.expect_err("independent session on project must be refused as occupied");
+		assert!(error.contains("already owned by another writer session"), "{error}");
+
+		drop(parent);
+		drop(child);
+		drop(mismatched_child);
+		drop(independent);
+		std::fs::remove_dir_all(&base).ok();
 	}
 
 	#[test]

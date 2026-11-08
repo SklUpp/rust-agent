@@ -269,6 +269,11 @@ pub struct RunRequest {
 	/// (aside flush, preserve, or steered note) so each host persists/forwards
 	/// the custom `advisor` message without duplicating it on the event wire.
 	pub advisor_card_sink: Option<AdvisorCardHandle>,
+	/// Parent-owned workspace lease explicitly transferred to a child worker
+	/// session. Only a run that receives this explicit capability can share the
+	/// parent's held lease; any other session must acquire its own lease or get
+	/// `Occupied`.
+	pub parent_workspace_lease: Option<std::sync::Arc<pi_agent::workspace_writer::WorkspaceScopeLease>>,
 }
 
 /// Host plan-mode wiring for one run.

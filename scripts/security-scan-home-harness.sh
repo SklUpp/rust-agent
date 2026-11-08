@@ -564,18 +564,27 @@ check "store committed the scan" bash -c "find '$ROOT' -path '*security*/scans/*
 PUBLISHED_SESSION_FILE="$(grep -o '"sessionFile":"[^"]*"' "$RUN_OUT" | tail -1 | sed 's/^"sessionFile":"//;s/"$//')"
 check "published sessionFile present" test -n "$PUBLISHED_SESSION_FILE"
 JOURNAL="$PUBLISHED_SESSION_FILE"
-check "published sessionFile exists" test -f "$JOURNAL"
+JOURNAL_DB="$(dirname "$JOURNAL")/sessions.db"
+check "published session storage exists" bash -c "test -f '$JOURNAL' || test -f '$JOURNAL_DB'"
 check "journal lives in the security store" \
 	bash -c "case '$JOURNAL' in */security/*/sessions/*.jsonl) true;; *) false;; esac"
-check "journal has assistant turn" bash -c "grep -q '\"role\":\"assistant\"' '$JOURNAL'"
-check "journal has tool result" bash -c "grep -q '\"role\":\"toolResult\"' '$JOURNAL'"
-check "one journal for the scan" \
-	bash -c "test \"\$(find \"\$(dirname '$JOURNAL')\" -name '*.jsonl' | wc -l)\" -eq 1"
 SCAN_ID_FROM_JOURNAL="$(basename "$JOURNAL" .jsonl)"
 SCAN_ID_FROM_OUTPUT="$(grep -o 'secscan_[0-9a-zA-Z]*' "$RUN_OUT" | tail -1)"
-# Session logs are `<file-safe-timestamp>_<id>.jsonl`; the id must be the suffix.
 check "journal is named after the scan" \
-	bash -c "case '$SCAN_ID_FROM_JOURNAL' in *_'$SCAN_ID_FROM_OUTPUT') true;; *) false;; esac"
+	bash -c "test -n '$SCAN_ID_FROM_OUTPUT' && test '$SCAN_ID_FROM_JOURNAL' = '$SCAN_ID_FROM_OUTPUT'"
+if test -f "$JOURNAL"; then
+	check "journal has assistant turn" bash -c "grep -q '\"role\":\"assistant\"' '$JOURNAL'"
+	check "journal has tool result" bash -c "grep -q '\"role\":\"toolResult\"' '$JOURNAL'"
+	check "one journal for the scan" \
+		bash -c "test \"\$(find \"\$(dirname '$JOURNAL')\" -name '*.jsonl' | wc -l)\" -eq 1"
+else
+	check "journal has assistant turn" \
+		python3 -c "import sqlite3, sys; conn = sqlite3.connect(sys.argv[1]); cur = conn.cursor(); cur.execute('SELECT 1 FROM messages WHERE session_id = ? AND json_extract(payload_json, ?) = ? LIMIT 1', (sys.argv[2], '\$.message.role', 'assistant')); sys.exit(0 if cur.fetchone() else 1)" "$JOURNAL_DB" "$SCAN_ID_FROM_OUTPUT"
+	check "journal has tool result" \
+		python3 -c "import sqlite3, sys; conn = sqlite3.connect(sys.argv[1]); cur = conn.cursor(); cur.execute('SELECT 1 FROM messages WHERE session_id = ? AND json_extract(payload_json, ?) = ? LIMIT 1', (sys.argv[2], '\$.message.role', 'toolResult')); sys.exit(0 if cur.fetchone() else 1)" "$JOURNAL_DB" "$SCAN_ID_FROM_OUTPUT"
+	check "one journal for the scan" \
+		python3 -c "import sqlite3, sys; conn = sqlite3.connect(sys.argv[1]); cur = conn.cursor(); cur.execute('SELECT count(*) FROM sessions WHERE id = ?', (sys.argv[2],)); sys.exit(0 if cur.fetchone()[0] == 1 else 1)" "$JOURNAL_DB" "$SCAN_ID_FROM_OUTPUT"
+fi
 check "scan session kept lsp despite parent off" grep -q 'lsp' "$ROOT/tools.log"
 check "scan session had publication tool" grep -q 'security_publish' "$ROOT/tools.log"
 check "worker marker reached the provider" \
@@ -629,6 +638,12 @@ check "disabled scan selection named the setting" \
 echo "harness root: $ROOT"
 if [[ "$FAILED" -ne 0 ]]; then
 	echo "security harness failed; see $RUN_ERR and $SERVER_LOG" >&2
+	echo "=== RUN_OUT ===" >&2
+	cat "$RUN_OUT" >&2 || true
+	echo "=== RUN_ERR ===" >&2
+	cat "$RUN_ERR" >&2 || true
+	echo "=== SERVER_LOG ===" >&2
+	cat "$SERVER_LOG" >&2 || true
 	exit 1
 fi
 echo "security harness passed"

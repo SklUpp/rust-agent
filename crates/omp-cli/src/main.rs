@@ -2460,7 +2460,8 @@ impl Session<'_> {
 			service_tier_by_family,
 			security_host: None,
 			security_worker: false,
-})
+			parent_workspace_lease: None,
+		})
 	}
 
 	fn turn<W: Write, E: Write>(

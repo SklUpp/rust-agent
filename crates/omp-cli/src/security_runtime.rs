@@ -48,6 +48,7 @@ pub struct RuntimeSecurityHost {
 	pub auth_db:      PathBuf,
 	pub approvals:    Approvals,
 	pub service_tier: std::collections::BTreeMap<String, String>,
+	pub parent_workspace_lease: Option<Arc<pi_agent::workspace_writer::WorkspaceScopeLease>>,
 }
 
 impl SecurityHost for RuntimeSecurityHost {
@@ -122,6 +123,7 @@ impl SecurityHost for RuntimeSecurityHost {
 			self.approvals.clone(),
 			self.state_root.clone(),
 			self.service_tier.clone(),
+			self.parent_workspace_lease.clone(),
 		)?))
 	}
 }
@@ -139,6 +141,7 @@ pub struct SecurityRunSession {
 	service_tier: std::collections::BTreeMap<String, String>,
 	journal:      std::sync::Mutex<SessionStore>,
 	session_file: PathBuf,
+	parent_workspace_lease: Option<Arc<pi_agent::workspace_writer::WorkspaceScopeLease>>,
 }
 
 impl SecurityRunSession {
@@ -150,6 +153,7 @@ impl SecurityRunSession {
 		_approvals: Approvals,
 		state_root: Option<PathBuf>,
 		service_tier: std::collections::BTreeMap<String, String>,
+		parent_workspace_lease: Option<Arc<pi_agent::workspace_writer::WorkspaceScopeLease>>,
 	) -> Result<Self, String> {
 		let store = crate::security::SecurityStore::open(
 			Path::new(&request.plan.repository_root),
@@ -203,6 +207,7 @@ impl SecurityRunSession {
 			service_tier,
 			journal: std::sync::Mutex::new(journal),
 			session_file,
+			parent_workspace_lease,
 		})
 	}
 
@@ -300,6 +305,7 @@ impl SecurityRunSession {
 			continuation: false,
 			security_host: None,
 			security_worker: true,
+			parent_workspace_lease: self.parent_workspace_lease.clone(),
 		})
 	}
 
@@ -634,6 +640,7 @@ mod tests {
 				std::iter::empty::<String>(),
 			),
 			service_tier: std::collections::BTreeMap::new(),
+			parent_workspace_lease: None,
 		}
 	}
 
@@ -778,6 +785,7 @@ mod tests {
 			Approvals::new(crate::approve::ApprovalMode::Yolo, std::iter::empty::<String>()),
 			Some(root.join("state")),
 			std::collections::BTreeMap::new(),
+			None,
 		)
 		.expect("worker session");
 

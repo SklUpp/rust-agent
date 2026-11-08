@@ -142,6 +142,7 @@ fn request(catalog: Catalog, tiers: &[(&str, &str)]) -> RunRequest {
 		service_tier_by_family,
 		security_host: None,
 		security_worker: false,
+		parent_workspace_lease: None,
 	}
 }
 

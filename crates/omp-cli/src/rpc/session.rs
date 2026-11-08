@@ -2299,7 +2299,8 @@ impl RpcSession {
 			service_tier_by_family: self.service_tier_by_family(),
 			security_host: None,
 			security_worker: false,
-})
+			parent_workspace_lease: None,
+		})
 	}
 
 	/// Persist one host-injected developer message (TS plan reminder) exactly
