@@ -14,6 +14,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
 use std::time::Duration;
+use omp_cli::session::{SessionOptions, SessionStore};
 
 static COUNTER: AtomicU32 = AtomicU32::new(0);
 
@@ -522,32 +523,35 @@ fn public_reasoning_stays_apart_and_never_replays() {
 			"say hi",
 		],
 	);
-	let log_path = fs::read_dir(&session_dir)
-		.expect("read session dir")
-		.flatten()
-		.map(|entry| entry.path())
-		.find(|path| {
-			path.extension().and_then(|ext| ext.to_str()) == Some("jsonl")
-				&& path
-					.file_stem()
-					.and_then(|stem| stem.to_str())
-					.map_or(false, |stem| stem.ends_with("reasoning-turn"))
-		})
-		.expect("session log must exist");
-	let log = fs::read_to_string(&log_path).expect("read session log");
+	let store = SessionStore::open(&SessionOptions {
+		enabled: true,
+		cwd: cwd.clone(),
+		model: None,
+		provider: None,
+		dir: Some(session_dir.clone()),
+		id: Some("reasoning-turn".to_string()),
+		continue_latest: false,
+		parent_session: None,
+		no_title: true,
+	});
+	assert!(store.enabled(), "durable session must open from SQLite");
+	let messages = store.messages();
+	let all_text = serde_json::to_string(&messages).expect("serialize messages");
 	assert_eq!(
-		log.matches("weigh options").count(),
+		all_text.matches("weigh options").count(),
 		1,
-		"reasoning must persist exactly once: {log}"
+		"reasoning must persist exactly once: {all_text}"
 	);
-	assert!(
-		log.contains(r#"{"type":"thinking","thinking":"weigh options"}"#),
-		"thinking must persist as a typed part: {log}"
-	);
-	assert!(
-		log.contains(r#"{"type":"text","text":"answer"}"#),
-		"answer must persist unchanged: {log}"
-	);
+	let assistant = messages
+		.iter()
+		.find(|m| m.message.role == "assistant")
+		.expect("assistant message must be persisted");
+	let parts = assistant.message.content.parts();
+	assert_eq!(parts.len(), 2, "assistant must have thinking and text parts");
+	assert_eq!(parts[0].kind, "thinking");
+	assert_eq!(parts[0].thinking_text(), Some("weigh options"));
+	assert_eq!(parts[1].kind, "text");
+	assert_eq!(parts[1].text.as_deref(), Some("answer"));
 
 	// Resumed turn replays the history but never the reasoning.
 	run_omp_raw(
@@ -632,31 +636,31 @@ fn text_first_reasoning_keeps_block_order_on_resume() {
 	];
 
 	// Persisted turn keeps answer-first block order, each block once.
-	let log_path = fs::read_dir(&session_dir)
-		.expect("read session dir")
-		.flatten()
-		.map(|entry| entry.path())
-		.find(|path| {
-			path.extension().and_then(|ext| ext.to_str()) == Some("jsonl")
-				&& path
-					.file_stem()
-					.and_then(|stem| stem.to_str())
-					.map_or(false, |stem| stem.ends_with("text-first-turn"))
-		})
-		.expect("session log must exist");
-	let log = fs::read_to_string(&log_path).expect("read session log");
-	assert_eq!(log.matches("weigh options").count(), 1, "{log}");
-	let text_at = log
-		.find(r#"{"type":"text","text":"answer"}"#)
-		.expect("answer part must persist");
-	let thinking_at = log
-		.find(r#"{"type":"thinking","thinking":"weigh options"}"#)
-		.expect("thinking part must persist");
-	assert!(
-		text_at < thinking_at,
-		"persisted parts must keep streamed order: {log}"
-	);
-
+	let store = SessionStore::open(&SessionOptions {
+		enabled: true,
+		cwd: cwd.clone(),
+		model: None,
+		provider: None,
+		dir: Some(session_dir.clone()),
+		id: Some("text-first-turn".to_string()),
+		continue_latest: false,
+		parent_session: None,
+		no_title: true,
+	});
+	assert!(store.enabled(), "durable session must open from SQLite");
+	let messages = store.messages();
+	let all_text = serde_json::to_string(&messages).expect("serialize messages");
+	assert_eq!(all_text.matches("weigh options").count(), 1, "{all_text}");
+	let assistant = messages
+		.iter()
+		.find(|m| m.message.role == "assistant")
+		.expect("assistant message must be persisted");
+	let parts = assistant.message.content.parts();
+	assert_eq!(parts.len(), 2, "assistant must have text and thinking parts");
+	assert_eq!(parts[0].kind, "text");
+	assert_eq!(parts[0].text.as_deref(), Some("answer"));
+	assert_eq!(parts[1].kind, "thinking");
+	assert_eq!(parts[1].thinking_text(), Some("weigh options"));
 	// Resumed turn: history replays in the recorded order and the new stream is
 	// still indexed from zero with one kind per block.
 	let resumed = run_omp_raw(
