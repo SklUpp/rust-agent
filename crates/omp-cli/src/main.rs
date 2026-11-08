@@ -2934,25 +2934,10 @@ impl Session<'_> {
 						.map_or(0, |(request, _)| request.turn_start);
 					let mut decision = pi_agent::TurnAckDecision::default();
 					if store.enabled() {
-						let persisted_tools: Vec<MessageEntry> = {
-							let call_ids: std::collections::HashSet<&str> = tool_results
-								.iter()
-								.map(|result| result.tool_call_id.as_str())
-								.collect();
-							store
-								.messages()
-								.iter()
-								.filter(|entry| {
-									entry.message.role == "toolResult"
-										&& entry
-											.message
-											.tool_call_id
-											.as_deref()
-											.is_some_and(|id| call_ids.contains(id))
-								})
-								.cloned()
-								.collect()
-						};
+						let persisted_tools = crate::session::select_current_turn_persisted_tools(
+							store.messages(),
+							tool_results,
+						);
 						let captured = host.note_persisted_tool_results(store, &persisted_tools);
 						if let Err(err) = host.persist_active_reminder(store) {
 							eprintln!("warning: {err}");

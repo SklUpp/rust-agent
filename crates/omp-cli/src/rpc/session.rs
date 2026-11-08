@@ -2781,22 +2781,10 @@ impl RpcSession {
 				{
 					eprintln!("warning: cannot record service tier change: {err}");
 				}
-				let call_ids: std::collections::HashSet<&str> =
-					tool_results.iter().map(|result| result.tool_call_id.as_str()).collect();
-				let persisted: Vec<MessageEntry> = self
-					.store
-					.messages()
-					.iter()
-					.filter(|entry| {
-						entry.message.role == "toolResult"
-							&& entry
-								.message
-								.tool_call_id
-								.as_deref()
-								.is_some_and(|id| call_ids.contains(id))
-					})
-					.cloned()
-					.collect();
+				let persisted = crate::session::select_current_turn_persisted_tools(
+					self.store.messages(),
+					tool_results,
+				);
 				let captured =
 					self.checkpoint_host.note_persisted_tool_results(&self.store, &persisted);
 				if let Err(err) = self.checkpoint_host.persist_active_reminder(&mut self.store) {

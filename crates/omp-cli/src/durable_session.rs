@@ -1903,10 +1903,10 @@ fn seed_entries(
 	projection: Option<&StoredProjection>,
 	all: &[MessageEntry],
 ) -> StoreResult<Vec<(u64, Option<String>)>> {
+	let by_id: HashMap<&str, &MessageEntry> =
+		all.iter().map(|entry| (entry.id.as_str(), entry)).collect();
 	let source: Vec<MessageEntry> = match projection {
 		Some(projection) => {
-			let by_id: HashMap<&str, &MessageEntry> =
-				all.iter().map(|entry| (entry.id.as_str(), entry)).collect();
 			projection
 				.kept
 				.iter()
@@ -1949,6 +1949,11 @@ fn seed_entries(
 							.tool_call_id
 							.as_deref()
 							.is_some_and(|id| call_ids.contains(id))
+						&& crate::session::chains_to_assistant(
+							&by_id,
+							sibling.parent_id.as_deref(),
+							&entry.id,
+						)
 				}) {
 					if emitted.insert(sibling.id.clone()) {
 						ordered.push(sibling.clone());
@@ -2388,6 +2393,84 @@ mod projection_tests {
 			.filter_map(|(_, id)| id)
 			.collect();
 		assert_eq!(ids, vec!["u1", "a1", "t1"], "sibling result is replayed after its call");
+	}
+
+	#[test]
+	fn seed_does_not_steal_sibling_results_with_duplicate_call_ids_across_turns() {
+		let a1 = entry(json!({
+			"type": "message",
+			"id": "a1",
+			"parentId": "u1",
+			"timestamp": "2026-01-01T00:00:00.000Z",
+			"message": {
+				"role": "assistant",
+				"content": [{ "type": "toolCall", "id": "c1", "name": "bash", "arguments": {} }],
+				"stopReason": "toolUse",
+				"timestamp": 1
+			}
+		}));
+		let t1 = entry(json!({
+			"type": "message",
+			"id": "t1",
+			"parentId": "a1",
+			"timestamp": "2026-01-01T00:00:00.000Z",
+			"message": {
+				"role": "toolResult",
+				"toolCallId": "c1",
+				"toolName": "bash",
+				"content": "ok 1",
+				"isError": false,
+				"timestamp": 1
+			}
+		}));
+		let u2 = entry(json!({
+			"type": "message",
+			"id": "u2",
+			"parentId": "t1",
+			"timestamp": "2026-01-01T00:00:00.000Z",
+			"message": {
+				"role": "user",
+				"content": "next",
+				"timestamp": 2
+			}
+		}));
+		let a2 = entry(json!({
+			"type": "message",
+			"id": "a2",
+			"parentId": "u2",
+			"timestamp": "2026-01-01T00:00:00.000Z",
+			"message": {
+				"role": "assistant",
+				"content": [{ "type": "toolCall", "id": "c1", "name": "bash", "arguments": {} }],
+				"stopReason": "toolUse",
+				"timestamp": 2
+			}
+		}));
+		let t2 = entry(json!({
+			"type": "message",
+			"id": "t2",
+			"parentId": "a2",
+			"timestamp": "2026-01-01T00:00:00.000Z",
+			"message": {
+				"role": "toolResult",
+				"toolCallId": "c1",
+				"toolName": "bash",
+				"content": "ok 2",
+				"isError": false,
+				"timestamp": 2
+			}
+		}));
+		let branch = vec![user("u1"), a1, t1, u2, a2, t2];
+		let ids: Vec<String> = seed_entries(&branch, None, &branch)
+			.expect("seed with duplicate tool call ids across turns")
+			.into_iter()
+			.filter_map(|(_, id)| id)
+			.collect();
+		assert_eq!(
+			ids,
+			vec!["u1", "a1", "t1", "u2", "a2", "t2"],
+			"duplicate tool call ids in distinct turns must each retain their own results"
+		);
 	}
 
 	#[test]

@@ -526,6 +526,11 @@ impl CheckpointHost {
 								.tool_call_id
 								.as_deref()
 								.is_some_and(|id| call_ids.contains(id))
+							&& crate::session::chains_to_assistant(
+								&by_id,
+								sibling.parent_id.as_deref(),
+								message.id.as_str(),
+							)
 					}) {
 						if emitted.insert(sibling.id.as_str()) {
 							run.push(sibling.clone());
@@ -1395,6 +1400,42 @@ mod tests {
 			.expect("read call");
 		assert_eq!(call.result, "sibling contents");
 		assert!(!call.is_error);
+		fs::remove_dir_all(dir).ok();
+	}
+
+	#[test]
+	fn context_and_branch_messages_preserve_duplicate_tool_call_ids_across_turns() {
+		let dir = temp_dir();
+		let mut store = SessionStore::open(&options(dir.clone(), "dup-context"));
+		let entries = vec![
+			user("u1", None, "first turn"),
+			assistant("a1", Some("u1"), "", ("c1", "bash")),
+			tool_result("t1", "a1", "c1", "bash", "result 1", None),
+			user("u2", Some("t1"), "second turn"),
+			assistant("a2", Some("u2"), "", ("c1", "bash")),
+			tool_result("t2", "a2", "c1", "bash", "result 2", None),
+		];
+		store.append_messages(&entries).expect("append");
+		let branch_msgs = store.branch_messages();
+		assert_eq!(
+			branch_msgs.iter().map(|m| m.id.as_str()).collect::<Vec<_>>(),
+			vec!["u1", "a1", "t1", "u2", "a2", "t2"]
+		);
+		let context = CheckpointHost::context_messages(&store).expect("context");
+		assert_eq!(
+			context
+				.iter()
+				.map(|m| (m.role, m.content.as_str()))
+				.collect::<Vec<_>>(),
+			vec![
+				(pi_agent::Role::User, "first turn"),
+				(pi_agent::Role::Assistant, ""),
+				(pi_agent::Role::Tool, "result 1"),
+				(pi_agent::Role::User, "second turn"),
+				(pi_agent::Role::Assistant, ""),
+				(pi_agent::Role::Tool, "result 2"),
+			]
+		);
 		fs::remove_dir_all(dir).ok();
 	}
 

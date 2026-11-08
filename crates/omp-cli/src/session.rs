@@ -2331,6 +2331,17 @@ impl SessionStore {
 			.into_iter()
 			.map(|entry| entry.id.as_str())
 			.collect();
+		let by_id: std::collections::HashMap<&str, &MessageEntry> = self
+			.messages
+			.iter()
+			.map(|message| (message.id.as_str(), message))
+			.collect();
+		let branch_assistant_ids: std::collections::HashSet<&str> = self
+			.messages
+			.iter()
+			.filter(|entry| ids.contains(entry.id.as_str()) && entry.message.role == "assistant")
+			.map(|entry| entry.id.as_str())
+			.collect();
 		// A branch cut may land after the checkpoint result while the same
 		// assistant message also called a sibling tool. Production appends
 		// each later toolResult under the previous result, so parentage cannot
@@ -2364,11 +2375,11 @@ impl SessionStore {
 							.message
 							.tool_call_id
 							.as_deref()
-							.is_some_and(|id| batch_call_ids.contains(id)))
+							.is_some_and(|id| batch_call_ids.contains(id))
+						&& chains_to_any_assistant(&by_id, entry.parent_id.as_deref(), &branch_assistant_ids))
 			})
 			.collect()
 	}
-
 	/// `TurnRecord` view of the active branch (TS `buildSessionContext` message
 	/// rebuild). Abandoned entries never contribute.
 	pub fn branch_history(&self) -> Result<Vec<TurnRecord>, String> {
@@ -3174,6 +3185,98 @@ impl SessionStore {
 			));
 		}
 	}
+}
+
+/// Returns true if a tool result message chains back along `parentId` links
+/// through consecutive toolResult messages to the specified assistant message.
+pub(crate) fn chains_to_assistant(
+	messages_by_id: &std::collections::HashMap<&str, &MessageEntry>,
+	parent_id: Option<&str>,
+	assistant_id: &str,
+) -> bool {
+	let Some(mut current) = parent_id else {
+		return true;
+	};
+	let mut seen = std::collections::HashSet::new();
+	while !current.is_empty() {
+		if current == assistant_id {
+			return true;
+		}
+		if !seen.insert(current) {
+			break;
+		}
+		let Some(entry) = messages_by_id.get(current) else {
+			break;
+		};
+		if entry.message.role != "toolResult" {
+			break;
+		}
+		match entry.parent_id.as_deref() {
+			Some(parent) => current = parent,
+			None => break,
+		}
+	}
+	false
+}
+
+/// Returns true if an off-branch tool result chains back along `parentId` links
+/// through consecutive toolResult messages to any assistant message in `assistant_ids`.
+pub(crate) fn chains_to_any_assistant(
+	messages_by_id: &std::collections::HashMap<&str, &MessageEntry>,
+	parent_id: Option<&str>,
+	assistant_ids: &std::collections::HashSet<&str>,
+) -> bool {
+	let Some(mut current) = parent_id else {
+		return true;
+	};
+	let mut seen = std::collections::HashSet::new();
+	while !current.is_empty() {
+		if assistant_ids.contains(current) {
+			return true;
+		}
+		if !seen.insert(current) {
+			break;
+		}
+		let Some(entry) = messages_by_id.get(current) else {
+			break;
+		};
+		if entry.message.role != "toolResult" {
+			break;
+		}
+		match entry.parent_id.as_deref() {
+			Some(parent) => current = parent,
+			None => break,
+		}
+	}
+	false
+}
+
+/// Selects the most recent toolResult messages from the store that correspond to the
+/// current turn's tool execution results, avoiding older turn results with identical call IDs.
+pub fn select_current_turn_persisted_tools(
+	messages: &[MessageEntry],
+	tool_results: &[pi_agent::ToolResult],
+) -> Vec<MessageEntry> {
+	let mut needed: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
+	for result in tool_results {
+		*needed.entry(result.tool_call_id.as_str()).or_insert(0) += 1;
+	}
+	let mut persisted = Vec::with_capacity(tool_results.len());
+	for entry in messages.iter().rev() {
+		if entry.message.role == "toolResult"
+			&& let Some(id) = entry.message.tool_call_id.as_deref()
+			&& let Some(rem) = needed.get_mut(id)
+			&& *rem > 0
+		{
+			*rem -= 1;
+			persisted.push(entry.clone());
+			if needed.values().all(|&c| c == 0) {
+				break;
+			}
+		}
+	}
+	persisted.reverse();
+	persisted
 }
 #[cfg(test)]
 /// Test fault injection targets for storage rollback guarantees.
@@ -7113,5 +7216,78 @@ mod tests {
 		assert_eq!(turn.tool_calls[0].details, Some(expected_details));
 
 		fs::remove_dir_all(dir).ok();
+	}
+
+	#[test]
+	fn select_current_turn_persisted_tools_extracts_recent_results_on_duplicate_ids() {
+		let t1_a = MessageEntry::new(
+			"t1_a".to_string(),
+			Some("a1".to_string()),
+			"2026-01-01T00:00:00.000Z",
+			SessionMessage::tool_result(
+				"call-0".to_string(),
+				"bash".to_string(),
+				MessageContent::Text("result 1a".to_string()),
+				false,
+				1,
+			),
+		);
+		let t1_b = MessageEntry::new(
+			"t1_b".to_string(),
+			Some("t1_a".to_string()),
+			"2026-01-01T00:00:00.000Z",
+			SessionMessage::tool_result(
+				"call-1".to_string(),
+				"read".to_string(),
+				MessageContent::Text("result 1b".to_string()),
+				false,
+				2,
+			),
+		);
+		let t2_a = MessageEntry::new(
+			"t2_a".to_string(),
+			Some("a2".to_string()),
+			"2026-01-01T00:00:00.000Z",
+			SessionMessage::tool_result(
+				"call-0".to_string(),
+				"bash".to_string(),
+				MessageContent::Text("result 2a".to_string()),
+				false,
+				3,
+			),
+		);
+		let t2_b = MessageEntry::new(
+			"t2_b".to_string(),
+			Some("t2_a".to_string()),
+			"2026-01-01T00:00:00.000Z",
+			SessionMessage::tool_result(
+				"call-1".to_string(),
+				"read".to_string(),
+				MessageContent::Text("result 2b".to_string()),
+				false,
+				4,
+			),
+		);
+		let messages = vec![t1_a, t1_b, t2_a, t2_b];
+		let results = vec![
+			pi_agent::ToolResult {
+				tool_call_id: "call-0".to_string(),
+				content: "result 2a".to_string(),
+				is_error: false,
+				terminate: false,
+				details: None,
+			},
+			pi_agent::ToolResult {
+				tool_call_id: "call-1".to_string(),
+				content: "result 2b".to_string(),
+				is_error: false,
+				terminate: false,
+				details: None,
+			},
+		];
+		let selected = select_current_turn_persisted_tools(&messages, &results);
+		assert_eq!(selected.len(), 2);
+		assert_eq!(selected[0].id, "t2_a");
+		assert_eq!(selected[1].id, "t2_b");
 	}
 }
