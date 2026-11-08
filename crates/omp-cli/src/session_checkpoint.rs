@@ -725,7 +725,7 @@ mod tests {
 		assert_eq!(messages.len(), 1);
 		assert_eq!(messages[0].role, pi_agent::Role::User);
 		assert_eq!(messages[0].custom_type.as_deref(), Some("compaction"));
-		assert_eq!(messages[0].content.text(), "Compacted history summary");
+		assert_eq!(messages[0].content, "Compacted history summary");
 
 		fs::remove_dir_all(dir).ok();
 	}
