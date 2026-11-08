@@ -9189,7 +9189,7 @@ mod tests {
 		let plain = EditToolOptions { enforce_seen_lines: false };
 		let build = |session: &Arc<RunnerSession>, options: EditToolOptions| {
 			build_registry_full(
-				&["read", "edit"],
+				&["read", "edit", "write"],
 				Vec::new(),
 				Vec::new(),
 				Vec::new(),

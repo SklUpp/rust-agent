@@ -33,6 +33,10 @@ use crate::state::{Message, ToolCall, ToolResult};
 /// before the next provider request.
 pub const DURABILITY_FAILURE_CODE: &str = "durability_failure";
 
+/// Detail marker for tool admission failure where the effect was not started.
+/// A safe error tool result is recorded so reopen/resume does not leave a dangling call.
+pub const DURABILITY_ADMISSION_FAILURE_CODE: &str = "durability_admission_failure";
+
 /// Durable write failure. The message is the storage error, never a generic
 /// "persistence disabled" substitute.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]

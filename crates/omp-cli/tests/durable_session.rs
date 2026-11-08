@@ -152,6 +152,57 @@ impl DurableBoundary for FailBegin {
 	}
 }
 
+/// Delegates message/intent writes to the real store but fails `finish_execution`
+/// for specified call ids (or all if None), simulating outcome write failure after effect.
+#[derive(Debug)]
+struct FailFinishExecution {
+	session: Arc<DurableSession>,
+	fail_call_id: Option<String>,
+}
+
+#[async_trait]
+impl DurableBoundary for FailFinishExecution {
+	async fn persist_messages(&self, messages: &[Message]) -> Result<(), DurableError> {
+		self.session.persist_messages(messages).await
+	}
+
+	async fn compacted(
+		&self,
+		messages: &[Message],
+		report: &pi_agent::CompactionReport,
+	) -> Result<(), DurableError> {
+		self.session.compacted(messages, report).await
+	}
+
+	async fn resync_messages(&self, messages: &[Message]) -> Result<(), DurableError> {
+		self.session.resync_messages(messages).await
+	}
+
+	async fn begin_execution(&self, call: &ToolCall) -> Result<String, DurableError> {
+		self.session.begin_execution(call).await
+	}
+
+	async fn finish_execution(
+		&self,
+		execution_id: &str,
+		call: &ToolCall,
+		result: &ToolResult,
+	) -> Result<(), DurableError> {
+		if self.fail_call_id.as_deref().is_none_or(|id| id == call.id) {
+			return Err(DurableError::new("injected finish_execution failure"));
+		}
+		self.session.finish_execution(execution_id, call, result).await
+	}
+
+	async fn finish_turn(
+		&self,
+		stop_reason: &str,
+		error_message: Option<&str>,
+	) -> Result<(), DurableError> {
+		self.session.finish_turn(stop_reason, error_message).await
+	}
+}
+
 fn temp_dir(label: &str) -> PathBuf {
 	static NEXT: AtomicUsize = AtomicUsize::new(0);
 	let path = std::env::temp_dir().join(format!(
@@ -253,6 +304,76 @@ async fn intent_failure_prevents_the_effect() {
 }
 
 #[tokio::test]
+async fn begin_execution_failure_reopen_records_safe_result_and_permits_resume() {
+	let dir = temp_dir("begin-fail-reopen");
+	let db = dir.join("sessions.db");
+	let session = Arc::new(
+		DurableSession::create(db.clone(), header("s-bfail", &dir)).expect("create"),
+	);
+	let runs = Arc::new(AtomicUsize::new(0));
+	let provider = Arc::new(ScriptedProvider {
+		script: Mutex::new([tool_call("call_fail"), Message::assistant("done")].into()),
+		calls: AtomicUsize::new(0),
+		unresolved_on_second: Mutex::new(None),
+		session: Arc::clone(&session),
+	});
+	let boundary: Arc<dyn DurableBoundary> = Arc::new(FailBegin(Arc::clone(&session)));
+	let agent =
+		AgentLoop::new(config(&dir), provider, registry(Arc::clone(&runs))).with_durable(Some(boundary));
+	let mut state = AgentState { messages: Vec::new(), total_turns: 0 };
+	let error = agent
+		.run_dialog("go", &mut state, None)
+		.await
+		.expect_err("intent write failure must terminate the run");
+
+	assert!(matches!(error, AgentError::Durable(_)), "{error:?}");
+	assert_eq!(runs.load(Ordering::SeqCst), 0, "no effect may run after intent failure");
+
+	// Safe toolResult must be staged in-memory for admission failure:
+	let tool_msgs: Vec<_> = state
+		.messages
+		.iter()
+		.filter(|m| m.role == Role::Tool)
+		.collect();
+	assert_eq!(tool_msgs.len(), 1);
+	assert_eq!(tool_msgs[0].tool_call_id.as_deref(), Some("call_fail"));
+	assert!(tool_msgs[0].content.contains("tool not started"));
+
+	drop(agent);
+	drop(session);
+
+	// Reopen session from disk:
+	let (reopened, loaded) =
+		DurableSession::open(db.clone(), "s-bfail", header("s-bfail", &dir)).expect("reopen");
+	let loaded = loaded.expect("loaded session");
+
+	// 1. Unresolved intents is empty (intent was never persisted):
+	let unresolved = reopened.unresolved_intents().expect("read unresolved");
+	assert!(unresolved.is_empty(), "intent was never committed, unresolved must be empty");
+
+	// 2. Safe toolResult was persisted to messages on disk:
+	let tool_results: Vec<_> = loaded
+		.branch_messages
+		.iter()
+		.filter(|e| e.message.role == "toolResult")
+		.collect();
+	assert_eq!(tool_results.len(), 1);
+	assert_eq!(tool_results[0].message.tool_call_id.as_deref(), Some("call_fail"));
+
+	// 3. Resume / next turn does NOT fail closed with dangling call; tool call was safely closed:
+	let mut resume_messages =
+		omp_cli::runtime::history_messages_from_entries(&loaded.branch_messages)
+			.expect("replay stored branch");
+	resume_messages.push(Message::user("resume turn"));
+	reopened
+		.persist_messages(&resume_messages)
+		.await
+		.expect("resume after admission failure must succeed");
+
+	std::fs::remove_dir_all(dir).ok();
+}
+
+#[tokio::test]
 async fn outcome_is_durable_before_the_next_model_request() {
 	let dir = temp_dir("outcome-order");
 	let session = Arc::new(
@@ -301,6 +422,99 @@ async fn reopened_unresolved_intent_is_not_replayed() {
 	assert_eq!(unresolved.len(), 1);
 	assert_eq!(unresolved[0].execution_id, execution);
 	assert_eq!(unresolved[0].provider_call_id, call.id);
+}
+
+#[tokio::test]
+async fn finish_execution_failure_leaves_unresolved_intent_and_refuses_replay() {
+	let dir = temp_dir("finish-fail-reopen");
+	let db = dir.join("sessions.db");
+	let session = Arc::new(
+		DurableSession::create(db.clone(), header("s-ffail", &dir)).expect("create"),
+	);
+	let runs = Arc::new(AtomicUsize::new(0));
+
+	let asst = Message::assistant_with_tools(
+		"calling two tools",
+		vec![
+			ToolCall {
+				id: "call_ok".to_string(),
+				name: "effect".to_string(),
+				arguments: json!({}),
+			},
+			ToolCall {
+				id: "call_fail".to_string(),
+				name: "effect".to_string(),
+				arguments: json!({}),
+			},
+		],
+	);
+
+	let provider = Arc::new(ScriptedProvider {
+		script: Mutex::new(vec![asst, Message::assistant("done")].into()),
+		calls: AtomicUsize::new(0),
+		unresolved_on_second: Mutex::new(None),
+		session: Arc::clone(&session),
+	});
+
+	let boundary: Arc<dyn DurableBoundary> = Arc::new(FailFinishExecution {
+		session: Arc::clone(&session),
+		fail_call_id: Some("call_fail".to_string()),
+	});
+
+	let agent = AgentLoop::new(config(&dir), provider, registry(Arc::clone(&runs)))
+		.with_durable(Some(boundary));
+	let mut state = AgentState { messages: Vec::new(), total_turns: 0 };
+	let error = agent
+		.run_dialog("go", &mut state, None)
+		.await
+		.expect_err("finish_execution failure must terminate the run");
+
+	assert!(matches!(error, AgentError::Durable(_)), "{error:?}");
+	assert_eq!(runs.load(Ordering::SeqCst), 2, "both tools ran before second finish failed");
+
+	// In-memory state messages must NOT have synthetic toolResult for call_fail,
+	// but MUST preserve completed outcome call_ok:
+	let tool_msgs: Vec<_> = state
+		.messages
+		.iter()
+		.filter(|m| m.role == Role::Tool)
+		.collect();
+	assert_eq!(tool_msgs.len(), 1);
+	assert_eq!(tool_msgs[0].tool_call_id.as_deref(), Some("call_ok"));
+
+	drop(agent);
+	drop(session);
+
+	// Reopen session from disk:
+	let (reopened, loaded) =
+		DurableSession::open(db.clone(), "s-ffail", header("s-ffail", &dir)).expect("reopen");
+	let loaded = loaded.expect("loaded session");
+
+	// 1. Unresolved intents must surface call_fail (not masked by synthetic toolResult!):
+	let unresolved = reopened.unresolved_intents().expect("read unresolved");
+	assert_eq!(unresolved.len(), 1);
+	assert_eq!(unresolved[0].provider_call_id, "call_fail");
+
+	// 2. Completed outcome call_ok was persisted; call_fail has NO toolResult message:
+	let tool_results: Vec<_> = loaded
+		.branch_messages
+		.iter()
+		.filter(|e| e.message.role == "toolResult")
+		.collect();
+	assert_eq!(tool_results.len(), 1);
+	assert_eq!(tool_results[0].message.tool_call_id.as_deref(), Some("call_ok"));
+
+	// 3. Replay fails closed: next turn is refused because call_fail is an unresolvable dangling call:
+	let replay_err = reopened
+		.persist_messages(&[Message::user("next turn")])
+		.await
+		.expect_err("dangling unresolvable call must refuse replay");
+	assert!(
+		replay_err.to_string().contains("call_fail"),
+		"error must cite call_fail: {replay_err}"
+	);
+
+	std::fs::remove_dir_all(dir).ok();
 }
 
 #[tokio::test]

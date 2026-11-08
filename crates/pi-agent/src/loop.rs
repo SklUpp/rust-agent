@@ -7,7 +7,7 @@ use tokio_util::sync::CancellationToken;
 use crate::{
 	compaction::{CompactionReport, Compactor},
 	delivery::BackgroundResultSink,
-	durable::DURABILITY_FAILURE_CODE,
+	durable::{DURABILITY_ADMISSION_FAILURE_CODE, DURABILITY_FAILURE_CODE},
 	mailbox::{Mailbox, format_incoming},
 	provider::{ModelProvider, ProviderError, StreamAssembler, ToolChoice},
 	state::{
@@ -1838,12 +1838,34 @@ impl AgentLoop {
 				}
 			}
 
+			let durability_failure = outcome.results.iter().find_map(|result| {
+				result
+					.details
+					.as_ref()
+					.and_then(|details| details.get("code"))
+					.and_then(serde_json::Value::as_str)
+					.filter(|code| *code == DURABILITY_FAILURE_CODE || *code == DURABILITY_ADMISSION_FAILURE_CODE)
+					.map(|_| result.content.clone())
+			});
+
 			let tool_names: std::collections::HashMap<&str, &str> = assistant
 				.tool_calls
 				.iter()
 				.map(|c| (c.id.as_str(), c.name.as_str()))
 				.collect();
 			for result in &outcome.results {
+				let is_unknown_outcome = result
+					.details
+					.as_ref()
+					.and_then(|details| details.get("code"))
+					.and_then(serde_json::Value::as_str)
+					== Some(DURABILITY_FAILURE_CODE);
+				if is_unknown_outcome {
+					// Post-effect unknown: finish_execution failed after the effect
+					// may have run. Never store a synthetic toolResult; the unresolved
+					// intent in the store must remain unmasked.
+					continue;
+				}
 				let name = tool_names.get(result.tool_call_id.as_str()).copied().unwrap_or("tool");
 				match image_parts.get(&result.tool_call_id) {
 					Some(parts) => state.messages.push(Message::tool_with_status_and_parts(
@@ -1860,6 +1882,15 @@ impl AgentLoop {
 						result.is_error,
 					)),
 				}
+			}
+
+			if let Some(error) = durability_failure {
+				// Stop before another model request or next tool effect.
+				// For admission failure, the safe not-started toolResult was pushed
+				// and is persisted here so resume does not see a dangling call.
+				// For unknown outcome, only completed tools were pushed.
+				let _ = self.persist_conversation(&state.messages).await;
+				return Err(AgentError::Durable(error));
 			}
 			// A tool may cancel the turn itself (interactive `ask` cancel/abort).
 			// TS ToolAbortError interrupts the whole turn; never issue another
@@ -1931,22 +1962,6 @@ impl AgentLoop {
 				replacement_context_limit,
 			) {
 				self.resync_conversation(&state.messages).await?;
-			}
-
-			let durability_failure = outcome.results.iter().find_map(|result| {
-				result
-					.details
-					.as_ref()
-					.and_then(|details| details.get("code"))
-					.and_then(serde_json::Value::as_str)
-					.filter(|code| *code == DURABILITY_FAILURE_CODE)
-					.map(|_| result.content.clone())
-			});
-			if let Some(error) = durability_failure {
-				// The effect may already have run; its intent stays unresolved.
-				// Terminate instead of issuing another model request, and never
-				// replay the call automatically.
-				return Err(AgentError::Durable(error));
 			}
 
 			let should_terminate = outcome.results.iter().any(|r| r.terminate);

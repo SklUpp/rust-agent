@@ -3,7 +3,9 @@ use std::sync::Arc;
 use futures::future::join_all;
 
 use super::registry::{ToolRegistry, excluded_tool_reason};
-use crate::durable::{DURABILITY_FAILURE_CODE, DurableBoundary};
+use crate::durable::{
+	DURABILITY_ADMISSION_FAILURE_CODE, DURABILITY_FAILURE_CODE, DurableBoundary,
+};
 use crate::tool::ToolError;
 use crate::state::{AgentContext, ToolApprover, ToolCall, ToolResult};
 /// Scheduler partitions a tool batch into concurrent non-exclusive runs and
@@ -199,7 +201,7 @@ impl ToolScheduler {
 				Err(error) => {
 					// Admission failed: the effect must not start. The durable
 					// intent row is the only evidence; there is nothing to replay.
-					return durable_failure_result(
+					return durable_admission_failure_result(
 						&call.id,
 						format!(
 							"tool not started: durable intent write failed: {error}"
@@ -275,6 +277,19 @@ fn durable_failure_result(tool_call_id: &str, message: String) -> ToolResult {
 		terminate: true,
 		details: Some(serde_json::json!({
 			"code": DURABILITY_FAILURE_CODE,
+		})),
+	}
+}
+
+/// Terminal result for an admission durability failure where the effect was not started.
+fn durable_admission_failure_result(tool_call_id: &str, message: String) -> ToolResult {
+	ToolResult {
+		tool_call_id: tool_call_id.to_string(),
+		content: message,
+		is_error: true,
+		terminate: true,
+		details: Some(serde_json::json!({
+			"code": DURABILITY_ADMISSION_FAILURE_CODE,
 		})),
 	}
 }
