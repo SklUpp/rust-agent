@@ -34,6 +34,7 @@ use rusqlite::{
 };
 use serde_json::{Value, json};
 
+use crate::durable_session::StoredProjection;
 /// Current schema version. Bump only with a new branch in [`SqliteStore::initialize`].
 pub const SCHEMA_VERSION: i64 = 1;
 
@@ -858,6 +859,52 @@ impl SqliteStore {
 
 		// Append the summary message on the new branch
 		append_message_tx(&transaction, &summary_message, now)?;
+
+		transaction.commit()?;
+		Ok(())
+	}
+
+	/// Atomically append a compaction message and set durableProjection on the session payload.
+	/// All committed in a single IMMEDIATE transaction.
+	pub fn compact_session(
+		&mut self,
+		message: NewMessage,
+		projection: StoredProjection,
+	) -> StoreResult<()> {
+		validate_id("compaction message id", &message.id)?;
+		validate_id("compaction session id", &message.session_id)?;
+		validate_id("compaction branch id", &message.branch_id)?;
+		let now = now_ms();
+		let transaction = self
+			.connection
+			.transaction_with_behavior(TransactionBehavior::Immediate)?;
+
+		let session_row: Option<String> = transaction
+			.query_row(
+				"SELECT payload_json FROM sessions WHERE id = ?1",
+				params![message.session_id],
+				|row| row.get(0),
+			)
+			.optional()?;
+		let Some(session_payload_json) = session_row else {
+			return Err(StoreError::NotFound(format!(
+				"session {} not found",
+				message.session_id
+			)));
+		};
+
+		append_message_tx(&transaction, &message, now)?;
+
+		let mut session_payload: Value = decode_json(&session_payload_json)?;
+		let Some(map) = session_payload.as_object_mut() else {
+			return Err(StoreError::Corrupt("session payload is not an object".to_string()));
+		};
+		map.insert("durableProjection".to_string(), serde_json::to_value(&projection)?);
+		let updated_payload_json = encode_json(&session_payload)?;
+		transaction.execute(
+			"UPDATE sessions SET payload_json = ?1, updated_at_ms = ?2 WHERE id = ?3",
+			params![updated_payload_json, now, message.session_id],
+		)?;
 
 		transaction.commit()?;
 		Ok(())
@@ -2704,6 +2751,11 @@ fn reconcile_durable_projection_tx(
 	let Some(proj_obj) = proj_val.as_object_mut() else {
 		return Ok(0);
 	};
+	let anchor_id = proj_obj
+		.get("anchor")
+		.or_else(|| proj_obj.get("firstKeptEntryId"))
+		.and_then(Value::as_str)
+		.map(str::to_string);
 	let Some(kept_val) = proj_obj.get_mut("kept") else {
 		return Ok(0);
 	};
@@ -2717,36 +2769,44 @@ fn reconcile_durable_projection_tx(
 		.map(str::to_string)
 		.collect();
 
-	if kept_ids.is_empty() {
-		return Ok(0);
-	}
-
 	let branch_messages = branch_messages_tx(transaction, &active_branch_id)?;
 	if branch_messages.is_empty() {
 		return Ok(0);
 	}
 
-	let branch_id_set: HashSet<&str> = branch_messages.iter().map(|m| m.id.as_str()).collect();
+	let last_kept_idx: Option<usize> = if kept_ids.is_empty() {
+		// Only recover from an explicit compaction anchor. Never do an un-anchored
+		// fallback scan that could resurrect previously pruned history.
+		anchor_id.as_deref().and_then(|id| {
+			branch_messages.iter().position(|m| m.id == id)
+		})
+	} else {
+		let branch_id_set: HashSet<&str> = branch_messages.iter().map(|m| m.id.as_str()).collect();
 
-	if !validate_kept_messages_tx(transaction, session_id, &kept_ids, &branch_messages)? {
-		session_payload.as_object_mut().unwrap().remove("durableProjection");
-		let updated_json = encode_json(&session_payload)?;
-		transaction.execute(
-			"UPDATE sessions SET payload_json = ?1, updated_at_ms = ?2 WHERE id = ?3",
-			params![updated_json, now, session_id],
-		)?;
-		return Ok(0);
-	}
-	let mut last_kept_idx: Option<usize> = None;
-	let kept_set: HashSet<&str> = kept_ids.iter().map(String::as_str).collect();
-
-	for (idx, msg) in branch_messages.iter().enumerate() {
-		if kept_set.contains(msg.id.as_str()) {
-			last_kept_idx = Some(idx);
+		if !validate_kept_messages_tx(transaction, session_id, &kept_ids, &branch_messages)? {
+			session_payload.as_object_mut().unwrap().remove("durableProjection");
+			let updated_json = encode_json(&session_payload)?;
+			transaction.execute(
+				"UPDATE sessions SET payload_json = ?1, updated_at_ms = ?2 WHERE id = ?3",
+				params![updated_json, now, session_id],
+			)?;
+			return Ok(0);
 		}
-	}
+		let mut last_idx = None;
+		let kept_set: HashSet<&str> = kept_ids.iter().map(String::as_str).collect();
+
+		for (idx, msg) in branch_messages.iter().enumerate() {
+			if kept_set.contains(msg.id.as_str()) {
+				last_idx = Some(idx);
+			}
+		}
+		last_idx
+	};
 
 	let Some(last_kept_idx) = last_kept_idx else {
+		if kept_ids.is_empty() && anchor_id.is_none() {
+			return Ok(0);
+		}
 		session_payload.as_object_mut().unwrap().remove("durableProjection");
 		let updated_json = encode_json(&session_payload)?;
 		transaction.execute(
@@ -3044,6 +3104,94 @@ mod tests {
 		(dir, path)
 	}
 
+
+	#[test]
+	fn compact_session_atomic_rollback_on_failure() {
+		let mut store = seeded_store();
+		store.append_message(message("m1", None)).expect("append m1");
+
+		// Trigger on UPDATE sessions aborts the transaction AFTER append_message_tx has executed
+		store
+			.connection
+			.execute(
+				"CREATE TRIGGER fail_session_update BEFORE UPDATE ON sessions \
+				 BEGIN SELECT RAISE(ABORT, 'forced update failure'); END;",
+				[],
+			)
+			.expect("create trigger");
+
+		let compact_msg = NewMessage {
+			id: "m_compact".to_string(),
+			session_id: "s1".to_string(),
+			branch_id: "b1".to_string(),
+			parent_message_id: Some("m1".to_string()),
+			payload: json!({ "type": "custom_message" }),
+		};
+		let proj = StoredProjection {
+			kept: Vec::new(),
+			synthetic: vec![json!({"role": "user", "content": "summary"})],
+			anchor: Some("m_compact".to_string()),
+		};
+
+		let res = store.compact_session(compact_msg, proj);
+		assert!(res.is_err(), "compact_session must fail when trigger aborts update");
+
+		store
+			.connection
+			.execute("DROP TRIGGER fail_session_update", [])
+			.expect("drop trigger");
+
+		// Verify atomic rollback: neither message was added nor leaf updated nor durableProjection set
+		let session = store.session("s1").expect("load session").expect("session exists");
+		assert!(
+			session.payload.get("durableProjection").is_none(),
+			"durableProjection must not exist after rollback"
+		);
+		let branch_msgs = store.branch_messages("b1").expect("branch messages");
+		assert_eq!(branch_msgs.len(), 1, "only m1 must exist; m_compact must be rolled back");
+		assert_eq!(branch_msgs[0].id, "m1");
+
+		let branch_leaf: Option<String> = store
+			.connection
+			.query_row("SELECT leaf_message_id FROM branches WHERE id = 'b1'", [], |r| r.get(0))
+			.unwrap();
+		assert_eq!(branch_leaf.as_deref(), Some("m1"));
+	}
+
+	#[test]
+	fn reconcile_removes_projection_when_anchor_missing_from_active_branch() {
+		let (dir, path) = temp_db("absent-anchor");
+		let mut store = SqliteStore::open(&path).expect("open store");
+		store
+			.create_session(NewSession {
+				id: "s1".to_string(),
+				parent_session_id: None,
+				payload: json!({
+					"cwd": "/tmp/project",
+					"durableProjection": {
+						"kept": [],
+						"synthetic": [{"role": "user", "content": "summary"}],
+						"anchor": "missing_anchor_id"
+					}
+				}),
+				initial_branch_id: "b1".to_string(),
+				initial_branch_payload: json!({ "kind": "root" }),
+			})
+			.expect("create session");
+
+		store.append_message(message("m1", None)).expect("append m1");
+
+		let reconciled = store.reconcile_durable_projection("s1").expect("reconcile");
+		assert_eq!(reconciled, 0);
+
+		let session = store.session("s1").expect("load session").expect("session exists");
+		assert!(
+			session.payload.get("durableProjection").is_none(),
+			"durableProjection must be pruned from SQLite payload when anchor missing"
+		);
+
+		std::fs::remove_dir_all(dir).ok();
+	}
 	#[test]
 	fn reopen_reports_unresolved_intent() {
 		let (dir, path) = temp_db("reopen");

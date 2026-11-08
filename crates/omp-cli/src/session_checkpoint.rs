@@ -589,6 +589,11 @@ impl CheckpointHost {
 						match (is_prewalk, custom_type) {
 							(true, Some(custom_type)) => messages
 								.push(Message::guidance(custom_type.to_string(), content)),
+							(_, Some("compaction")) => {
+								let mut msg = Message::user(content);
+								msg.custom_type = Some("compaction".to_string());
+								messages.push(msg);
+							},
 							_ => messages.push(Message::system(content)),
 						}
 					}
@@ -703,6 +708,26 @@ mod tests {
 			parent_session: None,
 			no_title: true,
 		}
+	}
+
+	#[test]
+	fn unprojected_compaction_replays_as_user_role_not_system() {
+		let dir = temp_dir();
+		let mut store = SessionStore::open(&options(dir.clone(), "unprojected-compaction"));
+		store
+			.append_custom_message("compaction", "Compacted history summary", false, json!({}))
+			.expect("append compaction message");
+
+		// Ensure there is no projection
+		assert!(store.projection().is_none());
+
+		let messages = CheckpointHost::context_messages(&store).expect("context messages");
+		assert_eq!(messages.len(), 1);
+		assert_eq!(messages[0].role, pi_agent::Role::User);
+		assert_eq!(messages[0].custom_type.as_deref(), Some("compaction"));
+		assert_eq!(messages[0].content.text(), "Compacted history summary");
+
+		fs::remove_dir_all(dir).ok();
 	}
 
 	const TS: &str = "2026-10-29T00:00:00.000Z";

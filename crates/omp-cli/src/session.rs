@@ -1736,6 +1736,46 @@ impl SessionStore {
 		self.projection.as_ref()
 	}
 
+
+	/// Clear the selected compacted projection.
+	pub fn clear_projection(&mut self) -> Result<(), String> {
+		if let Some(durable) = &self.durable {
+			durable
+				.clear_projection()
+				.map_err(|error| format!("cannot clear compacted projection: {error}"))?;
+		}
+		self.projection = None;
+		Ok(())
+	}
+
+	/// Atomically persist a compaction entry and its durable projection.
+	pub fn compact_session(
+		&mut self,
+		entry: SessionEntry,
+		projection: crate::durable_session::StoredProjection,
+	) -> Result<String, String> {
+		if let Some(reason) = &self.corrupt_reason {
+			return Err(format!("cannot compact corrupted session: {reason}"));
+		}
+		if !self.enabled {
+			return Ok(entry.id);
+		}
+		let id = if let Some(durable) = self.durable.clone() {
+			durable
+				.compact_session(entry.clone(), projection.clone())
+				.map_err(|error| error.to_string())?
+		} else {
+			// Legacy read-only or in-memory session without durable store
+			entry.id.clone()
+		};
+		self.leaf = Some(id.clone());
+		self.entries.push(entry);
+		let mut proj = projection;
+		proj.anchor = Some(id.clone());
+		self.projection = Some(proj);
+		Ok(id)
+	}
+
 	/// Rebuild the in-memory view from the SQLite authority after a concurrent
 	/// writer (the agent loop boundary) appended messages or branches.
 	pub fn reload_from_durable(&mut self) -> Result<(), String> {
@@ -2596,6 +2636,11 @@ impl SessionStore {
 		self.corrupt_reason.as_deref()
 	}
 
+	#[cfg(test)]
+	pub fn set_corrupt_for_test(&mut self, reason: &str) {
+		self.corrupt_reason = Some(reason.to_string());
+	}
+
 	/// Append one raw/custom entry (`custom`, `title_change`, ...) to the SQLite
 	/// authority. A failed write leaves the in-memory view untouched.
 	pub fn append_entry(&mut self, entry: SessionEntry) -> Result<(), String> {
@@ -2636,10 +2681,7 @@ impl SessionStore {
 		self.refresh_title_from_entries();
 		if branch_cut {
 			// A branch cut replaces the selected compressed view.
-			self.projection = None;
-			durable
-				.clear_projection()
-				.map_err(|error| format!("cannot clear compacted projection: {error}"))?;
+			self.clear_projection()?;
 		}
 		// A rename is part of the durable header too; listings read the header
 		// without replaying every `title_change` entry.

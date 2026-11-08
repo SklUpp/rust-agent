@@ -180,6 +180,8 @@ pub struct StoredProjection {
 	pub kept: Vec<String>,
 	#[serde(default)]
 	pub synthetic: Vec<Value>,
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub anchor: Option<String>,
 }
 
 pub(crate) struct LoadedParts {
@@ -643,9 +645,13 @@ impl DurableSession {
 			.map_err(|error| DurableError::new(error.to_string()))
 	}
 
-	/// Remove the selected projection synchronously (branch cut/rewind).
-	pub fn clear_projection(&self) -> StoreResult<()> {
+	/// Set or replace the selected projection synchronously.
+	pub fn set_projection_sync(&self, projection: Option<StoredProjection>) -> StoreResult<()> {
 		let session_id = self.session_id.clone();
+		let proj_val = projection
+			.as_ref()
+			.map(serde_json::to_value)
+			.transpose()?;
 		self.writer.call(move |store| {
 			let mut payload = store
 				.session(&session_id)?
@@ -656,20 +662,86 @@ impl DurableSession {
 			let Some(map) = payload.as_object_mut() else {
 				return Err(StoreError::Corrupt("session payload is not an object".to_string()));
 			};
-			map.remove("durableProjection");
+			match proj_val {
+				Some(val) => {
+					map.insert("durableProjection".to_string(), val);
+				},
+				None => {
+					map.remove("durableProjection");
+				},
+			}
 			store.update_session_payload(&session_id, payload)
 		})?;
-		*lock(&self.projection) = None;
 		let parts = self.writer.call({
 			let session_id = self.session_id.clone();
 			move |store| load_parts(store, &session_id)
 		})?;
+		let reconciled_proj = parts.projection.clone();
+		*lock(&self.projection) = reconciled_proj.clone();
+		*lock(&self.tracked).clear();
+		*lock(&self.tracked_ids).clear();
 		*lock(&self.resume_seed) = Some(seed_entries(
 			&parts.branch_messages,
-			None,
+			reconciled_proj.as_ref(),
 			&parts.messages,
 		));
 		Ok(())
+	}
+
+	/// Remove the selected projection synchronously (branch cut/rewind).
+	pub fn clear_projection(&self) -> StoreResult<()> {
+		self.set_projection_sync(None)
+	}
+
+	/// Atomically append a compaction session entry and set the selected durable projection.
+	pub fn compact_session(
+		&self,
+		entry: SessionEntry,
+		mut projection: StoredProjection,
+	) -> StoreResult<String> {
+		let id = entry.id.clone();
+		projection.anchor = Some(id.clone());
+		let cursor = Arc::clone(&self.cursor);
+		let session_id = self.session_id.clone();
+		let projection_arc = Arc::clone(&self.projection);
+		let resume_seed_arc = Arc::clone(&self.resume_seed);
+		let tracked_arc = Arc::clone(&self.tracked);
+		let tracked_ids_arc = Arc::clone(&self.tracked_ids);
+		self.writer.call(move |store| {
+			let mut cursor = lock(&cursor);
+			let parent = cursor.leaf.clone();
+			let mut stored = entry;
+			stored.parent_id = parent.clone();
+			let msg = NewMessage {
+				id: stored.id.clone(),
+				session_id: session_id.clone(),
+				branch_id: cursor.branch.clone(),
+				parent_message_id: parent,
+				payload: serde_json::to_value(&stored)?,
+			};
+			store.compact_session(msg, projection.clone())?;
+			cursor.leaf = Some(stored.id);
+			*lock(&tracked_arc).clear();
+			*lock(&tracked_ids_arc).clear();
+			match load_parts(store, &session_id) {
+				Ok(parts) => {
+					let reconciled_proj = parts.projection.clone();
+					*lock(&projection_arc) = reconciled_proj.clone();
+					*lock(&resume_seed_arc) = Some(seed_entries(
+						&parts.branch_messages,
+						reconciled_proj.as_ref(),
+						&parts.messages,
+					));
+				},
+				Err(err) => {
+					eprintln!("warning: cannot reload session parts after compact: {err}");
+					*lock(&projection_arc) = Some(projection);
+					*lock(&resume_seed_arc) = None;
+				},
+			}
+			Ok(())
+		})?;
+		Ok(id)
 	}
 
 	/// Unresolved executions for startup surfacing. Presence is not proof the
@@ -1090,7 +1162,7 @@ impl DurableBoundary for DurableSession {
 					.map_err(|error| DurableError::new(error.to_string()))?,
 			);
 		}
-		let projection = StoredProjection { kept, synthetic };
+		let projection = StoredProjection { kept, synthetic, anchor: None };
 		self.set_projection(Some(projection.clone())).await?;
 		let mut next_ids = vec![None; report.kept_at];
 		next_ids.extend(retained_ids);

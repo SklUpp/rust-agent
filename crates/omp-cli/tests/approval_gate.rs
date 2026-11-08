@@ -108,6 +108,80 @@ fn spawn_mock_model_server(
 	(addr, handle)
 }
 
+fn spawn_mock_model_server_sequence(
+	steps: Vec<(&'static str, serde_json::Value)>,
+) -> (SocketAddr, std::thread::JoinHandle<()>) {
+	let (addr_tx, addr_rx) = std::sync::mpsc::channel::<SocketAddr>();
+	let handle = std::thread::spawn(move || {
+		let listener = TcpListener::bind("127.0.0.1:0").expect("bind listener");
+		let _ = listener.set_nonblocking(true);
+		addr_tx.send(listener.local_addr().unwrap()).unwrap();
+		let deadline = std::time::Instant::now() + FIXTURE_DEADLINE;
+		for (turn_idx, (tool_name, tool_args)) in steps.into_iter().enumerate() {
+			let mut socket = loop {
+				if std::time::Instant::now() >= deadline {
+					return;
+				}
+				match listener.accept() {
+					Ok((sock, _)) => break sock,
+					Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+						std::thread::sleep(Duration::from_millis(10));
+					}
+					Err(_) => return,
+				}
+			};
+			let _ = socket.set_read_timeout(Some(Duration::from_secs(1)));
+			let _ = socket.set_write_timeout(Some(Duration::from_secs(2)));
+			let mut buf = [0u8; 4096];
+			while std::time::Instant::now() < deadline {
+				match socket.read(&mut buf) {
+					Ok(0) => break,
+					Ok(_) => break,
+					Err(e) if e.kind() == std::io::ErrorKind::WouldBlock || e.kind() == std::io::ErrorKind::TimedOut => {
+						continue;
+					}
+					Err(_) => break,
+				}
+			}
+
+			let escaped_args = serde_json::to_string(&tool_args.to_string()).unwrap();
+			let response_body = format!(
+				"data: {{\"choices\":[{{\"delta\":{{\"tool_calls\":[{{\"index\":0,\"id\":\"call_{turn_idx}\",\"type\":\"function\",\"function\":{{\"name\":\"{tool_name}\",\"arguments\":{escaped_args}}}}}]}},\"finish_reason\":null}}]}}\n\ndata: [DONE]\n\n"
+			);
+
+			let _ = socket.write_all(
+				format!(
+					"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n{}",
+					response_body
+				)
+				.as_bytes(),
+			);
+			let _ = socket.flush();
+		}
+
+		let post_deadline = std::time::Instant::now() + Duration::from_millis(500);
+		while std::time::Instant::now() < post_deadline {
+			match listener.accept() {
+				Ok((mut socket, _)) => {
+					let _ = socket.write_all(
+						b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n\
+						data: {\"choices\":[{\"delta\":{\"content\":\"done\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n"
+					);
+					let _ = socket.flush();
+					break;
+				}
+				Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+					std::thread::sleep(Duration::from_millis(10));
+				}
+				Err(_) => break,
+			}
+		}
+	});
+
+	let addr = addr_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+	(addr, handle)
+}
+
 /// Approvals whose prompt boundary reads an injected, already-closed stdin, so
 /// the suite never waits on the process terminal even under a developer TTY.
 fn closed_approvals(mode: ApprovalMode, allow: Vec<String>) -> Approvals {
@@ -246,13 +320,22 @@ fn test_allow_permits_write() {
 	let target_file = temp.path.join("allowed.txt");
 	assert!(!target_file.exists());
 
-	let (addr, handle) = spawn_mock_model_server(
-		"write",
-		json!({
-			"path": target_file.to_str().unwrap(),
-			"content": "hello allowed world"
-		}),
-	);
+	let (addr, handle) = spawn_mock_model_server_sequence(vec![
+		(
+			"write",
+			json!({
+				"path": target_file.to_str().unwrap(),
+				"content": "hello allowed world"
+			}),
+		),
+		(
+			"write",
+			json!({
+				"path": "xd://resolve",
+				"content": "apply"
+			}),
+		),
+	]);
 
 	// always-ask with --allow write
 	let req = make_run_request(
@@ -272,10 +355,11 @@ fn test_allow_permits_write() {
 	}
 	handle.join().unwrap();
 
-	assert_eq!(tool_results.len(), 1);
-	let (_, tool, _, error) = &tool_results[0];
-	assert_eq!(tool, "write");
-	assert!(error.is_none(), "expected success with --allow write");
+	assert_eq!(tool_results.len(), 2);
+	assert_eq!(tool_results[0].1, "write");
+	assert!(tool_results[0].3.is_none(), "expected staging success with --allow write");
+	assert_eq!(tool_results[1].1, "write");
+	assert!(tool_results[1].3.is_none(), "expected resolve success");
 
 	// File MUST exist with exact content
 	assert!(target_file.exists());
@@ -289,12 +373,21 @@ fn test_allow_edit_authorizes_apply_patch_wire_name() {
 	let created = temp.path.join("allowed.txt");
 	assert!(!created.exists());
 
-	let (addr, handle) = spawn_mock_model_server(
-		"apply_patch",
-		json!({
-			"input": "*** Begin Patch\n*** Add File: allowed.txt\n+hello\n*** End Patch"
-		}),
-	);
+	let (addr, handle) = spawn_mock_model_server_sequence(vec![
+		(
+			"apply_patch",
+			json!({
+				"input": "*** Begin Patch\n*** Add File: allowed.txt\n+hello\n*** End Patch"
+			}),
+		),
+		(
+			"write",
+			json!({
+				"path": "xd://resolve",
+				"content": "apply"
+			}),
+		),
+	]);
 
 	// `--allow edit` must authorize the advertised `apply_patch` wire name;
 	// stdin is closed, so any prompt would deny and no file would appear.
@@ -315,7 +408,7 @@ fn test_allow_edit_authorizes_apply_patch_wire_name() {
 	}
 	handle.join().unwrap();
 
-	assert_eq!(tool_results.len(), 1);
+	assert_eq!(tool_results.len(), 2);
 	assert_eq!(tool_results[0].1, "apply_patch");
 	assert!(
 		tool_results[0].3.is_none(),
@@ -323,6 +416,8 @@ fn test_allow_edit_authorizes_apply_patch_wire_name() {
 		tool_results[0].2,
 		tool_results[0].3
 	);
+	assert_eq!(tool_results[1].1, "write");
+	assert!(tool_results[1].3.is_none(), "resolve must succeed");
 	assert_eq!(fs::read_to_string(&created).expect("mutation landed"), "hello\n");
 
 	// The alias must not widen the allowlist: `write` is still denied.

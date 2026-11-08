@@ -39,7 +39,7 @@ use crate::{
 	prompts::Prompts,
 	runtime,
 	session::{
-		self, ContentPart, MessageContent, MessageEntry, SessionMessage, SessionOptions,
+		self, ContentPart, MessageContent, MessageEntry, SessionEntry, SessionMessage, SessionOptions,
 		SessionStore, TurnBuilder, TurnRecord,
 	},
 	session_checkpoint::CheckpointHost,
@@ -2423,6 +2423,7 @@ impl RpcSession {
 			// assistant/tool tail entry (persist_turn_end, record_user_steer), so
 			// appending the turn record here would write the whole turn twice.
 			// Rebuild the view from the log instead.
+			self.history_messages = None;
 			self.refresh_history_from_store();
 		} else if rewound {
 			// Same as headless: the rewind turn is abandoned, so its record must
@@ -3486,16 +3487,49 @@ impl RpcSession {
 			.or_else(|| self.in_memory_context_tokens())
 			.unwrap_or(0);
 		let messages_removed = self.messages.len();
-		let summary_message = runtime::user_message_from_parts(&summary, &[])
+		let mut summary_message = runtime::user_message_from_parts(&summary, &[])
 			.map_err(|err| Error::new(err.to_string()))?;
+		summary_message.custom_type = Some("compaction".to_string());
+
+		let mut first_kept = String::new();
 		if self.store.enabled() {
-			self.history_messages = Some(vec![summary_message]);
+			let entry = SessionEntry {
+				kind: "custom_message".to_string(),
+				id: format!("entry-{}", output::session_id()),
+				parent_id: self.store.leaf_id().map(str::to_string),
+				timestamp: output::iso8601(SystemTime::now()),
+				extra: json!({
+					"customType": "compaction",
+					"content": summary,
+					"display": false,
+					"attribution": "agent",
+					"details": {
+						"tokensBefore": tokens_before,
+						"messagesRemoved": messages_removed,
+					},
+				}),
+			};
+			let synthetic_val = serde_json::to_value(&summary_message)
+				.map_err(|err| Error::new(err.to_string()))?;
+			let projection = crate::durable_session::StoredProjection {
+				kept: Vec::new(),
+				synthetic: vec![synthetic_val],
+				anchor: None,
+			};
+			first_kept = self
+				.store
+				.compact_session(entry, projection)
+				.map_err(|err| Error::new(format!("cannot persist compaction: {err}")))?;
+		}
+
+		if self.store.enabled() {
+			self.history_messages = Some(vec![summary_message.clone()]);
 		} else {
 			// No-session mode sends `in_memory_messages`, not `history_messages`;
 			// the compacted summary must replace the pre-compaction history or
 			// the next turn still sends it.
 			self.history_messages = None;
-			self.in_memory_messages = Some(vec![summary_message]);
+			self.in_memory_messages = Some(vec![summary_message.clone()]);
 		}
 		self.messages = vec![json!({
 			"role": "user",
@@ -3504,25 +3538,7 @@ impl RpcSession {
 		})];
 		self.pending_wire = None;
 		self.last_assistant_text = None;
-		// The rewrite retains no prior entry: the rebuilt context starts at this
-		// compaction entry, so its id is the real `firstKeptEntryId` (same
-		// convention as the importer, `foreign_session.rs` compaction entries).
-		// An empty id only when the log is disabled or the append failed.
-		let mut first_kept = String::new();
-		if self.store.enabled() {
-			match self.store.append_custom_message(
-				"compaction",
-				&summary,
-				false,
-				json!({
-					"tokensBefore": tokens_before,
-					"messagesRemoved": messages_removed,
-				}),
-			) {
-				Ok(id) => first_kept = id,
-				Err(err) => eprintln!("warning: {err}"),
-			}
-		}
+
 		Ok(json!({
 			"summary": summary,
 			"firstKeptEntryId": first_kept,
@@ -4098,6 +4114,549 @@ mod tests {
 			session.last_assistant_text(),
 			Some("CHECKPOINT-ACK"),
 			"the cut abandoned the rewind turn, so the retained answer stands"
+		);
+	}
+
+	struct CompactTestRunner {
+		summary: String,
+	}
+
+	impl AgentRunner for CompactTestRunner {
+		fn run(&self, _request: &RunRequest) -> Result<crate::agent::EventStream> {
+			let events: Vec<Result<AgentEvent>> = vec![
+				Ok(AgentEvent::MessageUpdate {
+					delta: self.summary.clone(),
+				}),
+				Ok(AgentEvent::turn_end(
+					pi_agent::Message::assistant(&self.summary),
+					Vec::new(),
+					"stop",
+				)),
+			];
+			Ok(Box::new(events.into_iter()))
+		}
+	}
+
+	/// Regression: RPC compact must persist a durable projection so that after
+	/// restart, replay does not resurrect pre-compaction history along with the summary,
+	/// while the archive preserves all historical entries untouched.
+	#[tokio::test]
+	async fn rpc_compact_turn_restart_turn_preserves_context_and_archive() {
+		use pi_agent::DurableBoundary as _;
+
+		let sink: Arc<dyn FrameSink> = Arc::new(NullSink);
+		let cwd = std::env::temp_dir();
+		let dir = cwd.join(format!(
+			"omp-rpc-compact-test-{}-{}",
+			std::process::id(),
+			std::time::SystemTime::now()
+				.duration_since(std::time::UNIX_EPOCH)
+				.unwrap_or_default()
+				.as_nanos()
+		));
+		std::fs::create_dir_all(&dir).expect("session dir");
+		let mut config = Config::default();
+		config.checkpoint.enabled = Some(true);
+
+		let make_launch = |session_dir: std::path::PathBuf| RpcLaunch {
+			runner: Arc::new(CompactTestRunner {
+				summary: "Compacted summary of turn 1".to_string(),
+			}),
+			config: config.clone(),
+			cwd: cwd.clone(),
+			prompts: Prompts::default(),
+			skill_snapshot: SkillSnapshot::new(),
+			skill_options: LoadOptions::new(cwd.clone()),
+			catalog: Arc::new(Catalog::default()),
+			agent_db: cwd.join("agent.db"),
+			approval_mode: ApprovalMode::Yolo,
+			allow: Vec::new(),
+			model: Some("local/mock-model".to_string()),
+			provider: Some("local".to_string()),
+			api_key: Some("sk-test".to_string()),
+			thinking: None,
+			restore_model: false,
+			prewalk: None,
+			plan_yolo: None,
+			max_time: None,
+			max_turns: 8,
+			tools_enabled: true,
+			prompt_cache_key: None,
+			prompt_cache_key_inherited: false,
+			service_tier_explicit: false,
+			provider_session_id: None,
+			store_options: SessionOptions {
+				enabled: true,
+				cwd: cwd.clone(),
+				model: None,
+				provider: None,
+				dir: Some(session_dir),
+				id: Some("rpc-compact-session".to_string()),
+				continue_latest: false,
+				parent_session: None,
+				no_title: true,
+			},
+			steer: None,
+		};
+
+		let mut session = RpcSession::open(
+			make_launch(dir.clone()),
+			Approvals::new(ApprovalMode::Yolo, Vec::new()),
+			Arc::new(HostToolBridge::new(Arc::clone(&sink))),
+			Arc::new(HostUriBridge::new(Arc::clone(&sink))),
+			Arc::new(InternalUrlRouter::new()),
+			Arc::new(NoopObserver),
+			Arc::new(NoopResolver),
+		)
+		.expect("open session");
+
+		// 1. Turn 1: initial dialogue before compaction
+		let mut prepared1 = start_turn(&mut session, "turn 1 user question");
+		session
+			.store
+			.durable_boundary()
+			.expect("durable boundary")
+			.persist_messages(&[
+				pi_agent::Message::user("turn 1 user question"),
+				pi_agent::Message::assistant("turn 1 assistant answer"),
+			])
+			.await
+			.expect("persist turn 1");
+		session.finish_turn(&mut prepared1, &TurnOutcome::default());
+
+		assert_eq!(session.store.messages().len(), 2);
+
+		// 2. RPC compact: summarize prior turns into durable projection
+		let compact_result = session.compact(None).expect("compact");
+		assert_eq!(
+			compact_result["summary"].as_str(),
+			Some("Compacted summary of turn 1")
+		);
+
+		let proj_after_compact = session.store.projection().expect("projection exists");
+		assert_eq!(proj_after_compact.kept.len(), 0);
+		assert_eq!(proj_after_compact.synthetic.len(), 1);
+
+		// 3. Turn 2 (next turn after compact, before restart)
+		let mut prepared2 = start_turn(&mut session, "turn 2 user question");
+		let req2 = session
+			.request("turn 2 user question".to_string(), Vec::new(), false)
+			.expect("turn 2 request");
+		let h2 = req2.history_messages.expect("turn 2 history");
+		// History contains only the summary, not pre-compaction turn 1
+		assert_eq!(h2.len(), 1);
+		assert_eq!(h2[0].content, "Compacted summary of turn 1");
+
+		let mut turn2_full = h2.clone();
+		turn2_full.push(pi_agent::Message::user("turn 2 user question"));
+		turn2_full.push(pi_agent::Message::assistant("turn 2 assistant answer"));
+		session
+			.store
+			.durable_boundary()
+			.expect("durable boundary")
+			.persist_messages(&turn2_full)
+			.await
+			.expect("persist turn 2");
+		session.finish_turn(&mut prepared2, &TurnOutcome::default());
+
+		// 4. Restart session
+		drop(session);
+
+		let mut restarted = RpcSession::open(
+			make_launch(dir.clone()),
+			Approvals::new(ApprovalMode::Yolo, Vec::new()),
+			Arc::new(HostToolBridge::new(Arc::clone(&sink))),
+			Arc::new(HostUriBridge::new(Arc::clone(&sink))),
+			Arc::new(InternalUrlRouter::new()),
+			Arc::new(NoopObserver),
+			Arc::new(NoopResolver),
+		)
+		.expect("reopen session after restart");
+
+		// Projection survived restart
+		let proj_reopened = restarted.store.projection().expect("reopened projection");
+		assert_eq!(proj_reopened.synthetic.len(), 1);
+		assert_eq!(proj_reopened.kept.len(), 2);
+
+		// Archive preservation: all historical entries remain in SQLite archive
+		let archive = restarted.store.messages();
+		assert!(
+			archive.iter().any(|m| m.message.content.text() == "turn 1 user question"),
+			"archive must preserve turn 1 user question"
+		);
+		assert!(
+			archive.iter().any(|m| m.message.content.text() == "turn 1 assistant answer"),
+			"archive must preserve turn 1 assistant answer"
+		);
+		assert!(
+			archive.iter().any(|m| m.message.content.text() == "turn 2 user question"),
+			"archive must preserve turn 2 user question"
+		);
+
+		// 5. Turn 3 (next turn after restart)
+		let mut prepared3 = start_turn(&mut restarted, "turn 3 user question");
+		let req3 = restarted
+			.request("turn 3 user question".to_string(), Vec::new(), false)
+			.expect("turn 3 request");
+		let h3 = req3.history_messages.expect("turn 3 replayed context");
+
+		// Context verification: must NOT contain turn 1 pre-compaction messages
+		assert!(
+			!h3.iter().any(|m| m.content.contains("turn 1 user question")),
+			"replayed context must not resurrect pre-compaction turn 1 user question"
+		);
+		assert!(
+			!h3.iter().any(|m| m.content.contains("turn 1 assistant answer")),
+			"replayed context must not resurrect pre-compaction turn 1 assistant answer"
+		);
+		// Context verification: must contain summary and turn 2
+		assert!(
+			h3.iter().any(|m| m.content == "Compacted summary of turn 1"),
+			"replayed context must contain compaction summary"
+		);
+		assert!(
+			h3.iter().any(|m| m.content == "turn 2 user question"),
+			"replayed context must contain turn 2 user question"
+		);
+		assert!(
+			h3.iter().any(|m| m.content == "turn 2 assistant answer"),
+			"replayed context must contain turn 2 assistant answer"
+		);
+
+		// Persist Turn 3 after restart: durable alignment must succeed without divergence
+		let mut turn3_full = h3.clone();
+		turn3_full.push(pi_agent::Message::user("turn 3 user question"));
+		turn3_full.push(pi_agent::Message::assistant("turn 3 assistant answer"));
+		restarted
+			.store
+			.durable_boundary()
+			.expect("durable boundary")
+			.persist_messages(&turn3_full)
+			.await
+			.expect("persist turn 3 on restarted session");
+		restarted.finish_turn(&mut prepared3, &TurnOutcome::default());
+
+		std::fs::remove_dir_all(dir).ok();
+	}
+
+	/// Regression: When crash occurs after messages are appended but before
+	/// durable projection's `kept` is updated, reconcile anchors on the compaction
+	/// custom message and backfills the missing kept messages from the branch suffix.
+	#[tokio::test]
+	async fn synthetic_only_projection_crash_before_kept_backfills_from_compaction_anchor() {
+		use pi_agent::DurableBoundary as _;
+
+		let sink: Arc<dyn FrameSink> = Arc::new(NullSink);
+		let cwd = std::env::temp_dir();
+		let dir = cwd.join(format!(
+			"omp-rpc-compact-reconcile-{}-{}",
+			std::process::id(),
+			std::time::SystemTime::now()
+				.duration_since(std::time::UNIX_EPOCH)
+				.unwrap_or_default()
+				.as_nanos()
+		));
+		std::fs::create_dir_all(&dir).expect("session dir");
+		let mut config = Config::default();
+		config.checkpoint.enabled = Some(true);
+
+		let make_launch = |session_dir: std::path::PathBuf| RpcLaunch {
+			runner: Arc::new(CompactTestRunner {
+				summary: "Compacted summary".to_string(),
+			}),
+			config: config.clone(),
+			cwd: cwd.clone(),
+			prompts: Prompts::default(),
+			skill_snapshot: SkillSnapshot::new(),
+			skill_options: LoadOptions::new(cwd.clone()),
+			catalog: Arc::new(Catalog::default()),
+			agent_db: cwd.join("agent.db"),
+			approval_mode: ApprovalMode::Yolo,
+			allow: Vec::new(),
+			model: Some("local/mock-model".to_string()),
+			provider: Some("local".to_string()),
+			api_key: Some("sk-test".to_string()),
+			thinking: None,
+			restore_model: false,
+			prewalk: None,
+			plan_yolo: None,
+			max_time: None,
+			max_turns: 8,
+			tools_enabled: true,
+			prompt_cache_key: None,
+			prompt_cache_key_inherited: false,
+			service_tier_explicit: false,
+			provider_session_id: None,
+			store_options: SessionOptions {
+				enabled: true,
+				cwd: cwd.clone(),
+				model: None,
+				provider: None,
+				dir: Some(session_dir),
+				id: Some("rpc-reconcile-session".to_string()),
+				continue_latest: false,
+				parent_session: None,
+				no_title: true,
+			},
+			steer: None,
+		};
+
+		let mut session = RpcSession::open(
+			make_launch(dir.clone()),
+			Approvals::new(ApprovalMode::Yolo, Vec::new()),
+			Arc::new(HostToolBridge::new(Arc::clone(&sink))),
+			Arc::new(HostUriBridge::new(Arc::clone(&sink))),
+			Arc::new(InternalUrlRouter::new()),
+			Arc::new(NoopObserver),
+			Arc::new(NoopResolver),
+		)
+		.expect("open session");
+
+		// Turn 1
+		let mut prepared1 = start_turn(&mut session, "turn 1");
+		session
+			.store
+			.durable_boundary()
+			.expect("durable boundary")
+			.persist_messages(&[
+				pi_agent::Message::user("turn 1"),
+				pi_agent::Message::assistant("turn 1 reply"),
+			])
+			.await
+			.expect("persist turn 1");
+		session.finish_turn(&mut prepared1, &TurnOutcome::default());
+
+		// Compact: creates projection with kept: [], synthetic: [summary], anchor: Some(first_kept)
+		let compact_res = session.compact(None).expect("compact");
+		let first_kept = compact_res["firstKeptEntryId"].as_str().unwrap().to_string();
+
+		// Turn 2: persist to branch
+		let mut prepared2 = start_turn(&mut session, "turn 2");
+		let req2 = session
+			.request("turn 2".to_string(), Vec::new(), false)
+			.expect("turn 2 request");
+		let h2 = req2.history_messages.expect("turn 2 history");
+		let mut turn2_full = h2.clone();
+		turn2_full.push(pi_agent::Message::user("turn 2"));
+		turn2_full.push(pi_agent::Message::assistant("turn 2 reply"));
+		session
+			.store
+			.durable_boundary()
+			.expect("durable boundary")
+			.persist_messages(&turn2_full)
+			.await
+			.expect("persist turn 2");
+		session.finish_turn(&mut prepared2, &TurnOutcome::default());
+
+		// Simulate crash: close session, then directly update SQLite payload
+		// to kept = [] on disk, modeling a crash before kept was committed.
+		drop(session);
+
+		let db_path = crate::durable_session::database_path(&dir);
+		{
+			let conn = rusqlite::Connection::open(&db_path).expect("open sqlite db");
+			let mut payload: Value = conn
+				.query_row(
+					"SELECT payload_json FROM sessions WHERE id = ?1",
+					rusqlite::params!["rpc-reconcile-session"],
+					|row| {
+						let s: String = row.get(0)?;
+						Ok(serde_json::from_str(&s).unwrap())
+					},
+				)
+				.expect("query session payload");
+			payload["durableProjection"]["kept"] = json!([]);
+			conn.execute(
+				"UPDATE sessions SET payload_json = ?1 WHERE id = ?2",
+				rusqlite::params![payload.to_string(), "rpc-reconcile-session"],
+			)
+			.expect("reset kept to empty");
+		}
+
+		// Reopen session: reconcile must anchor on `first_kept` and backfill turn 2
+		let mut restarted = RpcSession::open(
+			make_launch(dir.clone()),
+			Approvals::new(ApprovalMode::Yolo, Vec::new()),
+			Arc::new(HostToolBridge::new(Arc::clone(&sink))),
+			Arc::new(HostUriBridge::new(Arc::clone(&sink))),
+			Arc::new(InternalUrlRouter::new()),
+			Arc::new(NoopObserver),
+			Arc::new(NoopResolver),
+		)
+		.expect("reopen session after crash");
+
+		let proj = restarted.store.projection().expect("reopened projection");
+		assert_eq!(
+			proj.kept.len(),
+			2,
+			"reconcile must have backfilled the 2 messages of turn 2 into kept"
+		);
+
+		let req3 = restarted
+			.request("turn 3".to_string(), Vec::new(), false)
+			.expect("turn 3 request");
+		let h3 = req3.history_messages.expect("turn 3 history");
+		assert_eq!(h3.len(), 3);
+		assert_eq!(h3[0].content, "Compacted summary");
+		assert_eq!(h3[1].content, "turn 2");
+		assert_eq!(h3[2].content, "turn 2 reply");
+
+		std::fs::remove_dir_all(dir).ok();
+	}
+
+	/// Regression: If durable projection persistence fails during compact,
+	/// compact must return Err and not publish live state as compacted.
+	#[tokio::test]
+	async fn compact_rejects_on_durable_projection_failure_without_publishing_live_state() {
+		let sink: Arc<dyn FrameSink> = Arc::new(NullSink);
+		let cwd = std::env::temp_dir();
+		let dir = cwd.join(format!(
+			"omp-rpc-compact-err-{}-{}",
+			std::process::id(),
+			std::time::SystemTime::now()
+				.duration_since(std::time::UNIX_EPOCH)
+				.unwrap_or_default()
+				.as_nanos()
+		));
+		std::fs::create_dir_all(&dir).expect("session dir");
+		let mut config = Config::default();
+		config.checkpoint.enabled = Some(true);
+
+		let launch = RpcLaunch {
+			runner: Arc::new(CompactTestRunner {
+				summary: "Compacted summary".to_string(),
+			}),
+			config: config.clone(),
+			cwd: cwd.clone(),
+			prompts: Prompts::default(),
+			skill_snapshot: SkillSnapshot::new(),
+			skill_options: LoadOptions::new(cwd.clone()),
+			catalog: Arc::new(Catalog::default()),
+			agent_db: cwd.join("agent.db"),
+			approval_mode: ApprovalMode::Yolo,
+			allow: Vec::new(),
+			model: Some("local/mock-model".to_string()),
+			provider: Some("local".to_string()),
+			api_key: Some("sk-test".to_string()),
+			thinking: None,
+			restore_model: false,
+			prewalk: None,
+			plan_yolo: None,
+			max_time: None,
+			max_turns: 8,
+			tools_enabled: true,
+			prompt_cache_key: None,
+			prompt_cache_key_inherited: false,
+			service_tier_explicit: false,
+			provider_session_id: None,
+			store_options: SessionOptions {
+				enabled: true,
+				cwd: cwd.clone(),
+				model: None,
+				provider: None,
+				dir: Some(dir.clone()),
+				id: Some("rpc-err-session".to_string()),
+				continue_latest: false,
+				parent_session: None,
+				no_title: true,
+			},
+			steer: None,
+		};
+
+		let mut session = RpcSession::open(
+			launch,
+			Approvals::new(ApprovalMode::Yolo, Vec::new()),
+			Arc::new(HostToolBridge::new(Arc::clone(&sink))),
+			Arc::new(HostUriBridge::new(Arc::clone(&sink))),
+			Arc::new(InternalUrlRouter::new()),
+			Arc::new(NoopObserver),
+			Arc::new(NoopResolver),
+		)
+		.expect("open session");
+
+		// Simulate session being marked corrupt so append/set_projection fails
+		session.store.set_corrupt_for_test("forced database failure for testing");
+
+		let compact_err = session.compact(None);
+		assert!(compact_err.is_err(), "compact must fail when store cannot persist");
+
+		// Live state must NOT be published as compacted
+		assert!(session.history_messages.is_none());
+		assert!(session.messages.is_empty());
+
+		std::fs::remove_dir_all(dir).ok();
+	}
+
+	/// Regression: Compaction in a session without a durable store (e.g. in-memory or disabled)
+	/// succeeds in-memory and publishes summary without attempting or requiring SQLite persistence.
+	#[tokio::test]
+	async fn compact_in_memory_session_publishes_summary_without_durable_store() {
+		let sink: Arc<dyn FrameSink> = Arc::new(NullSink);
+		let cwd = std::env::temp_dir();
+		let mut config = Config::default();
+		config.checkpoint.enabled = Some(false);
+
+		let launch = RpcLaunch {
+			runner: Arc::new(CompactTestRunner {
+				summary: "In-memory summary".to_string(),
+			}),
+			config: config.clone(),
+			cwd: cwd.clone(),
+			prompts: Prompts::default(),
+			skill_snapshot: SkillSnapshot::new(),
+			skill_options: LoadOptions::new(cwd.clone()),
+			catalog: Arc::new(Catalog::default()),
+			agent_db: cwd.join("agent.db"),
+			approval_mode: ApprovalMode::Yolo,
+			allow: Vec::new(),
+			model: Some("local/mock-model".to_string()),
+			provider: Some("local".to_string()),
+			api_key: Some("sk-test".to_string()),
+			thinking: None,
+			restore_model: false,
+			prewalk: None,
+			plan_yolo: None,
+			max_time: None,
+			max_turns: 8,
+			tools_enabled: true,
+			prompt_cache_key: None,
+			prompt_cache_key_inherited: false,
+			service_tier_explicit: false,
+			provider_session_id: None,
+			store_options: SessionOptions {
+				enabled: false,
+				cwd: cwd.clone(),
+				model: None,
+				provider: None,
+				dir: None,
+				id: None,
+				continue_latest: false,
+				parent_session: None,
+				no_title: true,
+			},
+			steer: None,
+		};
+
+		let mut session = RpcSession::open(
+			launch,
+			Approvals::new(ApprovalMode::Yolo, Vec::new()),
+			Arc::new(HostToolBridge::new(Arc::clone(&sink))),
+			Arc::new(HostUriBridge::new(Arc::clone(&sink))),
+			Arc::new(InternalUrlRouter::new()),
+			Arc::new(NoopObserver),
+			Arc::new(NoopResolver),
+		)
+		.expect("open in-memory session");
+
+		let compact_res = session.compact(None).expect("in-memory compact");
+		assert_eq!(compact_res["summary"].as_str(), Some("In-memory summary"));
+		assert_eq!(
+			session.in_memory_messages.as_ref().map(|m| m.len()),
+			Some(1)
+		);
+		assert_eq!(
+			session.in_memory_messages.as_ref().unwrap()[0].content,
+			"In-memory summary"
 		);
 	}
 }
