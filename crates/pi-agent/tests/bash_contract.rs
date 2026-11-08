@@ -481,6 +481,58 @@ async fn persistent_shell_keeps_cwd_exports_and_functions_per_agent() {
 		.expect("child session");
 	assert_eq!(child_state.cwd, dir.path.to_string_lossy().into_owned(), "child inherited parent cwd");
 	assert!(!child_state.env.contains_key("KEEP"), "child inherited parent export");
+
+	let shared = dir.join("shared.bin");
+	let shared_path = shared.display().to_string();
+	let wrote = tool
+		.execute(
+			&json!({"command": format!("printf 'shared-bytes' > {shared_path}")}),
+			&ctx,
+		)
+		.await
+		.expect("parent write shared");
+	assert!(!wrote.is_error, "got: {}", wrote.content);
+
+	let read = tool
+		.execute(
+			&json!({"command": format!("od -An -tx1 {shared_path}; pwd; printf '%s\\n' \"${{KEEP-}}\"")}),
+			&child_ctx,
+		)
+		.await
+		.expect("child read shared");
+	assert!(!read.is_error, "got: {}", read.content);
+	assert!(
+		read.content.contains("73 68 61 72 65 64 2d 62 79 74 65 73"),
+		"child missed shared bytes: {}",
+		read.content
+	);
+	assert!(
+		!read.content.contains("kept"),
+		"child env leaked after shared read: {}",
+		read.content
+	);
+	let parent_state = ctx
+		.shell
+		.as_ref()
+		.expect("parent shell")
+		.snapshot_state()
+		.await
+		.expect("parent session");
+	assert_eq!(parent_state.cwd, sub.to_string_lossy().into_owned(), "parent cwd leaked");
+	assert_eq!(parent_state.env.get("KEEP").map(String::as_str), Some("kept"));
+	let child_after = child_ctx
+		.shell
+		.as_ref()
+		.expect("child shell")
+		.snapshot_state()
+		.await
+		.expect("child session after read");
+	assert_eq!(
+		child_after.cwd,
+		dir.path.to_string_lossy().into_owned(),
+		"child cwd leaked"
+	);
+	assert!(!child_after.env.contains_key("KEEP"), "child env leaked");
 }
 
 #[derive(Default)]
