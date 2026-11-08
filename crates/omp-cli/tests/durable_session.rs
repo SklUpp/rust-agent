@@ -2232,6 +2232,8 @@ async fn branch_cut_via_append_entry_clears_projection_in_sqlite_and_in_memory()
 	let dir = temp_dir("branch-cut-proj");
 	let db = dir.join("sessions.db");
 	let session = DurableSession::create(db.clone(), header("s-cut", &dir)).expect("create");
+	let original = vec![Message::user("first turn"), Message::assistant("first answer")];
+	session.persist_messages(&original).await.expect("persist original");
 
 	let notice = Message::system(format!(
 		"{}1 earlier turn(s) were pruned to fit the context limit]",
@@ -2241,7 +2243,6 @@ async fn branch_cut_via_append_entry_clears_projection_in_sqlite_and_in_memory()
 	let report = pi_agent::CompactionReport { old_len: 2, kept_from: 1, kept_at: 1 };
 	session.compacted(&compacted, &report).await.expect("compacted");
 	session.persist_messages(&compacted).await.expect("persist compacted");
-
 	let loaded_before = session.load().expect("load");
 	assert!(loaded_before.projection.is_some());
 	let parent_id = loaded_before.leaf.clone();
@@ -2274,6 +2275,9 @@ async fn clear_projection_clears_both_sqlite_and_in_memory_state() {
 	let dir = temp_dir("clear-proj");
 	let db = dir.join("sessions.db");
 	let session = DurableSession::create(db.clone(), header("s-clear", &dir)).expect("create");
+
+	let original = vec![Message::user("first turn"), Message::assistant("first answer")];
+	session.persist_messages(&original).await.expect("persist original");
 
 	let notice = Message::system(format!(
 		"{}1 earlier turn(s) were pruned to fit the context limit]",
@@ -2520,6 +2524,390 @@ async fn durable_session_finish_turn_amends_assistant_row_and_drops_from_replay(
 		.finish_turn("aborted", Some("Interrupted by user"))
 		.await
 		.expect("fail_begin finish_turn forward");
+
+	std::fs::remove_dir_all(dir).ok();
+}
+
+#[tokio::test]
+async fn durable_worker_recovery_after_restart_loss_of_queue() {
+	let dir = temp_dir("worker-rec");
+	let db = dir.join("session.db");
+	let sid = "s-worker-rec";
+
+	// 1. Open session, spawn child worker via durability factory
+	{
+		let (session, _) = DurableSession::open(db.clone(), sid, header(sid, &dir)).expect("open");
+		let factory = session.child_durability_factory().expect("child factory");
+		let child = factory.open_child("w1").expect("open child");
+
+		// Persist initial user message
+		session
+			.persist_messages(&[Message::user("start work")])
+			.await
+			.expect("persist user");
+
+		// Complete worker: writes completion and delivery to SQLite
+		let completion = json!({ "status": "completed", "output": "worker done" });
+		let delivery = json!({
+			"version": 2,
+			"kind": "task-result",
+			"mode": "background",
+			"notify_parent": true,
+			"agent": "scout",
+			"status": "completed",
+			"text": "<task-result id=\"w1\" agent=\"scout\" status=\"completed\"><output>worker done</output></task-result>",
+			"durationMs": 50,
+			"usage": null,
+			"outputId": null,
+			"id": "w1",
+		});
+		child.complete(completion, delivery).expect("complete child");
+
+		// Simulate process termination without in-memory delivery drain: drop session
+	}
+
+	// 2. Reopen session on restart
+	let (reopened, loaded) = DurableSession::open(db.clone(), sid, header(sid, &dir)).expect("reopen");
+	let loaded = loaded.expect("loaded session");
+	assert_eq!(loaded.branch_messages.len(), 1, "before recovery only initial user message on branch");
+
+	// 3. Turn boundary: accept pending worker deliveries
+	let recovered = reopened
+		.accept_pending_worker_deliveries()
+		.await
+		.expect("accept pending worker deliveries");
+	assert_eq!(recovered.len(), 1);
+	assert_eq!(recovered[0].delivery_id, "w1");
+	assert_eq!(recovered[0].worker_id, "w1");
+	assert!(recovered[0].text.contains("<task-result id=\"w1\""));
+
+	// 4. Repeated accept is idempotent: returns empty
+	let recovered_again = reopened
+		.accept_pending_worker_deliveries()
+		.await
+		.expect("accept again");
+	assert!(recovered_again.is_empty(), "duplicate accept must return empty");
+
+	// 5. Appending to history and subsequent persist causes zero duplicate rows
+	let history = vec![Message::user("start work"), recovered[0].message.clone()];
+	reopened
+		.persist_messages(&history)
+		.await
+		.expect("persist conversation after recovery");
+
+	let loaded_after = reopened.load().expect("load after recovery");
+	assert_eq!(loaded_after.branch_messages.len(), 2, "exactly two messages: user + recovered worker");
+	assert_eq!(loaded_after.branch_messages[1].text, recovered[0].text);
+
+	std::fs::remove_dir_all(dir).ok();
+}
+
+#[tokio::test]
+async fn durable_worker_crash_boundary_delivered_unprocessed_no_re_injection() {
+	let dir = temp_dir("worker-crash");
+	let db = dir.join("session.db");
+	let sid = "s-worker-crash";
+
+	// 1. Session with accepted delivery but crash before model response (unprocessed)
+	let delivery_text = "<task-result id=\"w-crash\" agent=\"scout\" status=\"completed\"><output>done</output></task-result>";
+	{
+		let (session, _) = DurableSession::open(db.clone(), sid, header(sid, &dir)).expect("open");
+		let factory = session.child_durability_factory().expect("child factory");
+		let child = factory.open_child("w-crash").expect("open child");
+
+		let completion = json!({ "status": "completed" });
+		let delivery = json!({
+			"version": 2,
+			"kind": "task-result",
+			"mode": "background",
+			"notify_parent": true,
+			"agent": "scout",
+			"status": "completed",
+			"text": delivery_text,
+			"id": "w-crash",
+		});
+		child.complete(completion, delivery).expect("complete");
+
+		let recovered = session
+			.accept_pending_worker_deliveries()
+			.await
+			.expect("accept delivery");
+		assert_eq!(recovered.len(), 1);
+		// Crash here! delivered_at_ms is set, but mark_deliveries_processed was never called.
+	}
+
+	// 2. Reopen after crash
+	let (reopened, loaded) = DurableSession::open(db.clone(), sid, header(sid, &dir)).expect("reopen");
+	let loaded = loaded.expect("loaded");
+	assert_eq!(loaded.branch_messages.len(), 1, "history already has the message from SQLite");
+
+	// Recovery must not re-inject delivered-but-unprocessed
+	let recovered_after_reopen = reopened
+		.accept_pending_worker_deliveries()
+		.await
+		.expect("accept after reopen");
+	assert!(recovered_after_reopen.is_empty(), "must not re-inject already delivered completion");
+
+	// Unconfirmed delivery IDs finds w-crash in messages
+	let messages = vec![Message::user(delivery_text)];
+	let unconfirmed = reopened
+		.unconfirmed_delivery_ids(&messages)
+		.await
+		.expect("unconfirmed IDs");
+	assert_eq!(unconfirmed, vec!["w-crash"]);
+
+	// Model responds: mark processed
+	reopened
+		.mark_deliveries_processed(&unconfirmed)
+		.await
+		.expect("mark processed");
+
+	// Unconfirmed is now empty
+	let unconfirmed_after = reopened
+		.unconfirmed_delivery_ids(&messages)
+		.await
+		.expect("unconfirmed after mark");
+	assert!(unconfirmed_after.is_empty());
+
+	std::fs::remove_dir_all(dir).ok();
+}
+
+#[tokio::test]
+async fn durable_worker_branch_cut_consumes_into_active_branch() {
+	let dir = temp_dir("worker-branch");
+	let db = dir.join("session.db");
+	let sid = "s-worker-branch";
+
+	let (session, _) = DurableSession::open(db.clone(), sid, header(sid, &dir)).expect("open");
+	session
+		.persist_messages(&[Message::user("m1 on b1")])
+		.await
+		.expect("persist m1");
+
+	// Spawn child worker while active branch is root (b1)
+	let factory = session.child_durability_factory().expect("child factory");
+	let child = factory.open_child("w-cut").expect("open child");
+
+	// Cut to new branch b2 via append_entry with branch_summary
+	let loaded_before = session.load().expect("load before cut");
+	let cut_entry = SessionEntry {
+		kind: "branch_summary".to_string(),
+		id: "msg-cut-1".to_string(),
+		parent_id: loaded_before.leaf,
+		timestamp: output::iso8601(std::time::SystemTime::now()),
+		extra: json!({}),
+	};
+	session.append_entry(cut_entry).expect("append branch cut");
+	let loaded_cut = session.load().expect("load after cut");
+	let b2_id = loaded_cut.branch_id.clone();
+
+	// Complete child worker
+	let completion = json!({ "status": "completed" });
+	let delivery = json!({
+		"version": 2,
+		"kind": "task-result",
+		"mode": "background",
+		"notify_parent": true,
+		"agent": "worker",
+		"status": "completed",
+		"text": "<task-result id=\"w-cut\">ok</task-result>",
+		"id": "w-cut",
+	});
+	child.complete(completion, delivery).expect("complete child");
+
+	// Accept delivery: must consume into b2 (active branch), keeping origin b1
+	let recovered = session
+		.accept_pending_worker_deliveries()
+		.await
+		.expect("accept into active branch");
+	assert_eq!(recovered.len(), 1);
+
+	let loaded = session.load().expect("load");
+	assert_eq!(loaded.branch_id, b2_id);
+	assert!(
+		loaded.branch_messages.iter().any(|m| m.text.contains("<task-result id=\"w-cut\">")),
+		"message must land on active branch b2"
+	);
+
+	std::fs::remove_dir_all(dir).ok();
+}
+
+#[tokio::test]
+async fn durable_worker_fails_closed_on_legacy_corrupt_row() {
+	let dir = temp_dir("worker-failclosed");
+	let db = dir.join("session.db");
+	let sid = "s-worker-failclosed";
+
+	let (session, _) = DurableSession::open(db.clone(), sid, header(sid, &dir)).expect("open");
+	session
+		.persist_messages(&[Message::user("init")])
+		.await
+		.expect("persist");
+
+	// Insert legacy corrupt row directly into SQLite (empty text)
+	{
+		let conn = rusqlite::Connection::open(&db).expect("open raw sqlite");
+		conn.execute(
+			"INSERT INTO deliveries (delivery_id, worker_id, session_id, origin_branch_id, payload_json, created_at_ms, delivered_at_ms, processed_at_ms, message_id) \
+			 VALUES ('bad-del', 'w-bad', 's-worker-failclosed', 's-worker-failclosed.main', '{\"text\":\"\"}', 10, NULL, NULL, NULL)",
+			[],
+		)
+		.expect("insert delivery");
+		conn.execute(
+			"INSERT INTO worker_completions (worker_id, session_id, origin_branch_id, delivery_id, completion_json, completed_at_ms) \
+			 VALUES ('w-bad', 's-worker-failclosed', 's-worker-failclosed.main', 'bad-del', '{\"status\":\"completed\"}', 10)",
+			[],
+		)
+		.expect("insert completion");
+	}
+
+	// Turn boundary: accept_pending_worker_deliveries must fail closed
+	let err = session.accept_pending_worker_deliveries().await;
+	assert!(err.is_err(), "must fail closed on legacy corrupt row");
+
+	std::fs::remove_dir_all(dir).ok();
+}
+
+#[tokio::test]
+async fn durable_worker_projection_saved_and_survives_crash_before_assistant() {
+	let dir = temp_dir("worker-proj-save");
+	let db = dir.join("session.db");
+	let sid = "s-proj-save";
+
+	// 1. Session with compaction projection
+	let (session, _) = DurableSession::open(db.clone(), sid, header(sid, &dir)).expect("open");
+	let original = vec![Message::user("turn 1"), Message::assistant("ans 1")];
+	session.persist_messages(&original).await.expect("persist original");
+
+	let notice = Message::system(format!(
+		"{}1 earlier turn(s) were pruned to fit the context limit]",
+		pi_agent::compaction::COMPACTION_NOTICE_PREFIX
+	));
+	let compacted = vec![notice.clone(), Message::assistant("ans 1")];
+	let report = pi_agent::CompactionReport { old_len: 2, kept_from: 1, kept_at: 1 };
+	session.compacted(&compacted, &report).await.expect("compacted");
+	session.persist_messages(&compacted).await.expect("persist compacted");
+
+	// 2. Child completes
+	let factory = session.child_durability_factory().expect("factory");
+	let child = factory.open_child("w-proj").expect("child");
+	let completion = json!({ "status": "completed" });
+	let delivery = json!({
+		"version": 2,
+		"kind": "task-result",
+		"mode": "background",
+		"notify_parent": true,
+		"agent": "scout",
+		"status": "completed",
+		"text": "<task-result id=\"w-proj\">ok</task-result>",
+		"id": "w-proj",
+	});
+	child.complete(completion, delivery).expect("complete child");
+
+	// 3. Drop session, and directly consume delivery via raw SqliteStore
+	// without set_projection (modeling crash immediately after consume_delivery)
+	drop(session);
+	let delivery_msg = Message::user("<task-result id=\"w-proj\">ok</task-result>");
+	let session_msg = SessionMessage::user(
+		MessageContent::Text("<task-result id=\"w-proj\">ok</task-result>".to_string()),
+		100,
+	);
+	let entry = MessageEntry::new(
+		"msg-worker-w-proj".to_string(),
+		None,
+		output::iso8601(std::time::SystemTime::now()),
+		session_msg,
+	);
+	{
+		let mut store = SqliteStore::open(&db).expect("open store");
+		store
+			.consume_delivery(
+				"w-proj",
+				omp_cli::session_store::NewMessage {
+					id: "msg-worker-w-proj".to_string(),
+					session_id: sid.to_string(),
+					branch_id: String::new(),
+					parent_message_id: None,
+					payload: serde_json::to_value(&entry).unwrap(),
+				},
+				100,
+			)
+			.expect("consume directly without set_projection");
+	}
+
+	// 4. Reopen: load_parts runs reconcile_durable_projection and backfills the projection
+	let (reopened, loaded) =
+		DurableSession::open(db.clone(), sid, header(sid, &dir)).expect("reopen");
+	let loaded = loaded.expect("loaded");
+	let proj = loaded.projection.expect("has projection");
+	assert!(
+		proj.kept.contains(&"msg-worker-w-proj".to_string()),
+		"reconcile must backfill consumed worker message into projection"
+	);
+
+	// 5. Normal persist of the next turn does not duplicate the worker message
+	let history = vec![
+		notice,
+		Message::assistant("ans 1"),
+		delivery_msg,
+		Message::assistant("ans 2"),
+	];
+	reopened.persist_messages(&history).await.expect("persist history");
+
+	let loaded_after = reopened.load().expect("load after persist");
+	let worker_msgs: Vec<_> = loaded_after
+		.branch_messages
+		.iter()
+		.filter(|m| m.text.contains("<task-result id=\"w-proj\">"))
+		.collect();
+	assert_eq!(worker_msgs.len(), 1, "worker message must appear exactly once on branch");
+
+	std::fs::remove_dir_all(dir).ok();
+}
+
+#[tokio::test]
+async fn durable_worker_unconfirmed_matches_namespaced_id() {
+	let dir = temp_dir("worker-unconfirmed-ns");
+	let db = dir.join("session.db");
+	let sid = "s-unconfirmed-ns";
+
+	let delivery_text = "<task-result id=\"task-1\" agent=\"scout\" status=\"completed\"><output>done</output></task-result>";
+	{
+		let (session, _) = DurableSession::open(db.clone(), sid, header(sid, &dir)).expect("open");
+		let factory = session.child_durability_factory().expect("factory");
+		let child = factory.open_child("ns:task-1").expect("child");
+
+		let completion = json!({ "status": "completed" });
+		let delivery = json!({
+			"version": 2,
+			"kind": "task-result",
+			"mode": "background",
+			"notify_parent": true,
+			"agent": "scout",
+			"status": "completed",
+			"text": delivery_text,
+			"id": "task-1", // child local id
+		});
+		child.complete(completion, delivery).expect("complete");
+
+		let recovered = session.accept_pending_worker_deliveries().await.expect("accept");
+		assert_eq!(recovered.len(), 1);
+		assert_eq!(recovered[0].delivery_id, "ns:task-1");
+		assert_eq!(recovered[0].result_key.as_deref(), Some("ns:task-1"), "canonical result_key must match delivery_id");
+	}
+
+	// Reopen after crash before mark_deliveries_processed
+	let (reopened, _) = DurableSession::open(db.clone(), sid, header(sid, &dir)).expect("reopen");
+	let messages = vec![Message::user(delivery_text)];
+	let unconfirmed = reopened
+		.unconfirmed_delivery_ids(&messages)
+		.await
+		.expect("unconfirmed");
+	assert_eq!(unconfirmed, vec!["ns:task-1"], "must find ns:task-1 via branch message linkage");
+
+	reopened.mark_deliveries_processed(&unconfirmed).await.expect("mark processed");
+	let remaining = reopened.unconfirmed_delivery_ids(&messages).await.expect("remaining");
+	assert!(remaining.is_empty());
 
 	std::fs::remove_dir_all(dir).ok();
 }

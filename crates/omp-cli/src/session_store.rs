@@ -17,8 +17,12 @@
 //!   stored intent is not proof the effect started; callers must use the tool
 //!   contract, never a blind retry.
 //! - [`SqliteStore::complete_worker`] commits the worker completion and the
-//!   parent delivery atomically. The delivery keeps the origin branch even
-//!   after the session's active branch changes.
+//!   parent delivery atomically. Synchronous completions are marked delivered
+//!   and processed immediately; background completions remain pending.
+//! - [`SqliteStore::consume_delivery`] atomically appends the delivery message
+//!   to the active branch and records `delivered_at_ms` and `message_id` under
+//!   an immediate write lock. Replay is idempotent; legacy rows without message_id
+//!   fail closed.
 //! - `delivered_at_ms` and `processed_at_ms` are distinct states. Delivery is
 //!   at-least-once; marking processed is not implied by handing it to a context.
 
@@ -36,8 +40,7 @@ use serde_json::{Value, json};
 
 use crate::durable_session::StoredProjection;
 /// Current schema version. Bump only with a new branch in [`SqliteStore::initialize`].
-pub const SCHEMA_VERSION: i64 = 1;
-
+pub const SCHEMA_VERSION: i64 = 2;
 const SCHEMA_VERSION_DDL: &str = "
 	CREATE TABLE IF NOT EXISTS schema_version (
 		id INTEGER PRIMARY KEY CHECK (id = 1),
@@ -96,7 +99,8 @@ const SCHEMA_V1_DDL: &str = "
 		payload_json TEXT NOT NULL,
 		created_at_ms INTEGER NOT NULL,
 		delivered_at_ms INTEGER,
-		processed_at_ms INTEGER
+		processed_at_ms INTEGER,
+		message_id TEXT REFERENCES messages(id)
 	);
 
 	CREATE TABLE worker_completions (
@@ -126,6 +130,7 @@ const SCHEMA_V1_DDL: &str = "
 	CREATE INDEX executions_unresolved_idx ON executions(session_id) WHERE outcome_json IS NULL;
 	CREATE INDEX deliveries_pending_idx ON deliveries(session_id, delivered_at_ms, processed_at_ms);
 	CREATE INDEX artifacts_session_idx ON artifacts(session_id);
+	CREATE UNIQUE INDEX deliveries_message_id_idx ON deliveries(message_id) WHERE message_id IS NOT NULL;
 
 	CREATE TRIGGER executions_outcome_immutable
 	BEFORE UPDATE OF outcome_json ON executions
@@ -133,6 +138,11 @@ const SCHEMA_V1_DDL: &str = "
 	BEGIN
 		SELECT RAISE(ABORT, 'execution outcome is terminal');
 	END;
+";
+
+const SCHEMA_V2_MIGRATION_DDL: &str = "
+	ALTER TABLE deliveries ADD COLUMN message_id TEXT REFERENCES messages(id);
+	CREATE UNIQUE INDEX IF NOT EXISTS deliveries_message_id_idx ON deliveries(message_id) WHERE message_id IS NOT NULL;
 ";
 
 /// Store failure. Every variant is returned to the caller; nothing is logged
@@ -360,6 +370,7 @@ pub struct DeliveryRecord {
 	pub created_at_ms: i64,
 	pub delivered_at_ms: Option<i64>,
 	pub processed_at_ms: Option<i64>,
+	pub message_id: Option<String>,
 }
 
 /// Metadata for an already-published external artifact. This module never
@@ -466,6 +477,13 @@ impl SqliteStore {
 				transaction.execute_batch(SCHEMA_V1_DDL)?;
 				transaction.execute(
 					"INSERT INTO schema_version (id, version) VALUES (1, ?1)",
+					params![SCHEMA_VERSION],
+				)?;
+			},
+			Some(1) => {
+				transaction.execute_batch(SCHEMA_V2_MIGRATION_DDL)?;
+				transaction.execute(
+					"UPDATE schema_version SET version = ?1 WHERE id = 1",
 					params![SCHEMA_VERSION],
 				)?;
 			},
@@ -1666,19 +1684,34 @@ impl SqliteStore {
 			)));
 		}
 
+		let is_sync = completion
+			.delivery
+			.get("notify_parent")
+			.and_then(Value::as_bool)
+			.map(|b| !b)
+			.unwrap_or_else(|| {
+				completion.delivery.get("mode").and_then(Value::as_str) == Some("sync")
+			});
+		let (delivered_at, processed_at) = if is_sync {
+			(Some(now), Some(now))
+		} else {
+			(None, None)
+		};
 		// Delivery first so the completion's foreign key is satisfied inside the
 		// same transaction. Both rows commit or neither does.
 		transaction.execute(
 			"INSERT INTO deliveries \
-			 (delivery_id, worker_id, session_id, origin_branch_id, payload_json, created_at_ms, delivered_at_ms, processed_at_ms) \
-			 VALUES (?1, ?2, ?3, ?4, ?5, ?6, NULL, NULL)",
+			 (delivery_id, worker_id, session_id, origin_branch_id, payload_json, created_at_ms, delivered_at_ms, processed_at_ms, message_id) \
+			 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, NULL)",
 			params![
 				completion.delivery_id,
 				completion.worker_id,
 				completion.session_id,
 				completion.origin_branch_id,
 				delivery_json,
-				now
+				now,
+				delivered_at,
+				processed_at,
 			],
 		)?;
 		transaction.execute(
@@ -1754,8 +1787,8 @@ impl SqliteStore {
 		let now = now_ms();
 		transaction.execute(
 			"INSERT INTO deliveries \
-			 (delivery_id, worker_id, session_id, origin_branch_id, payload_json, created_at_ms, delivered_at_ms, processed_at_ms) \
-			 VALUES (?1, ?2, ?3, ?4, ?5, ?6, NULL, NULL)",
+			 (delivery_id, worker_id, session_id, origin_branch_id, payload_json, created_at_ms, delivered_at_ms, processed_at_ms, message_id) \
+			 VALUES (?1, ?2, ?3, ?4, ?5, ?6, NULL, NULL, NULL)",
 			params![
 				delivery.delivery_id,
 				delivery.worker_id,
@@ -1776,19 +1809,49 @@ impl SqliteStore {
 	pub fn consume_delivery(
 		&mut self,
 		delivery_id: &str,
-		message: NewMessage,
+		mut message: NewMessage,
 		at_ms: i64,
 	) -> StoreResult<()> {
 		validate_id("delivery id", delivery_id)?;
-		let transaction = self.connection.transaction()?;
-		let delivery: Option<(String, Option<i64>)> = transaction
+		let transaction = self
+			.connection
+			.transaction_with_behavior(TransactionBehavior::Immediate)?;
+		let delivery: Option<(
+			String,
+			String,
+			Option<i64>,
+			Option<i64>,
+			Option<String>,
+			String,
+			String,
+		)> = transaction
 			.query_row(
-				"SELECT session_id, delivered_at_ms FROM deliveries WHERE delivery_id = ?1",
+				"SELECT session_id, origin_branch_id, delivered_at_ms, processed_at_ms, message_id, payload_json, worker_id \
+				 FROM deliveries WHERE delivery_id = ?1",
 				params![delivery_id],
-				|row| Ok((row.get(0)?, row.get(1)?)),
+				|row| {
+					Ok((
+						row.get(0)?,
+						row.get(1)?,
+						row.get(2)?,
+						row.get(3)?,
+						row.get(4)?,
+						row.get(5)?,
+						row.get(6)?,
+					))
+				},
 			)
 			.optional()?;
-		let Some((session_id, delivered_at)) = delivery else {
+		let Some((
+			session_id,
+			origin_branch_id,
+			delivered_at,
+			_processed_at,
+			message_id,
+			payload_json,
+			delivery_worker_id,
+		)) = delivery
+		else {
 			return Err(StoreError::NotFound(format!(
 				"delivery {delivery_id} does not exist"
 			)));
@@ -1798,21 +1861,155 @@ impl SqliteStore {
 				"delivery message belongs to a different session".to_string(),
 			));
 		}
+
+		// Origin branch must exist and belong to session
+		let origin_session: Option<String> = transaction
+			.query_row(
+				"SELECT session_id FROM branches WHERE id = ?1",
+				params![origin_branch_id],
+				|row| row.get(0),
+			)
+			.optional()?;
+		match &origin_session {
+			None => {
+				return Err(StoreError::NotFound(format!(
+					"origin branch {origin_branch_id} does not exist"
+				)));
+			},
+			Some(s) if s != &session_id => {
+				return Err(StoreError::Validation(
+					"origin branch belongs to a different session".to_string(),
+				));
+			},
+			Some(_) => {},
+		}
+
+		// Check worker completion if this is a worker delivery
+		let wc: Option<(String, String)> = transaction
+			.query_row(
+				"SELECT worker_id, completion_json FROM worker_completions WHERE delivery_id = ?1",
+				params![delivery_id],
+				|row| Ok((row.get(0)?, row.get(1)?)),
+			)
+			.optional()?;
+		if let Some((wc_worker_id, _wc_json)) = wc {
+			if wc_worker_id != delivery_worker_id {
+				return Err(StoreError::Corrupt(format!(
+					"delivery {delivery_id} worker {delivery_worker_id} does not match completion worker {wc_worker_id}"
+				)));
+			}
+			let parsed_payload: Value = decode_json(&payload_json)?;
+			if parsed_payload.get("mode").and_then(Value::as_str) == Some("sync")
+				|| parsed_payload.get("notify_parent").and_then(Value::as_bool) == Some(false)
+			{
+				return Err(StoreError::Validation(format!(
+					"delivery {delivery_id} is a synchronous worker result; cannot be consumed as background delivery"
+				)));
+			}
+			// Fail-closed on legacy ambiguous rows
+			if parsed_payload.get("version").and_then(Value::as_i64).unwrap_or(0) < 2
+				&& parsed_payload.get("notify_parent").is_none()
+			{
+				return Err(StoreError::Corrupt(format!(
+					"delivery {delivery_id} has ambiguous legacy worker payload; failing closed"
+				)));
+			}
+		}
+
+		// Idempotency / conflict check on already-delivered delivery
 		if delivered_at.is_some() {
+			let Some(stored_msg_id) = message_id else {
+				return Err(StoreError::Corrupt(format!(
+					"delivery {delivery_id} marked delivered without recorded message id (ambiguous legacy state)"
+				)));
+			};
+			if stored_msg_id == message.id {
+				let stored_message: Option<(String, String, String)> = transaction
+					.query_row(
+						"SELECT session_id, branch_id, payload_json FROM messages WHERE id = ?1",
+						params![stored_msg_id],
+						|row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+					)
+					.optional()?;
+				if let Some((stored_session, stored_branch, stored_payload)) = stored_message {
+					if stored_session == message.session_id
+						&& (message.branch_id.is_empty() || message.branch_id == stored_branch)
+						&& decode_json::<Value>(&stored_payload)? == message.payload
+					{
+						transaction.commit()?;
+						return Ok(());
+					}
+				}
+				return Err(StoreError::Conflict(format!(
+					"delivery {delivery_id} already consumed with different message data"
+				)));
+			}
 			return Err(StoreError::Conflict(format!(
-				"delivery {delivery_id} was already appended to the target context"
+				"delivery {delivery_id} was already appended to the target context with message {stored_msg_id}"
 			)));
 		}
+
+		// Pending delivery checks
+		if message_id.is_some() {
+			return Err(StoreError::Corrupt(format!(
+				"delivery {delivery_id} has message_id without delivered_at_ms"
+			)));
+		}
+		let existing_message: Option<String> = transaction
+			.query_row(
+				"SELECT id FROM messages WHERE id = ?1",
+				params![message.id],
+				|row| row.get(0),
+			)
+			.optional()?;
+		if existing_message.is_some() {
+			return Err(StoreError::Conflict(format!(
+				"message {} already exists for pending delivery {}",
+				message.id, delivery_id
+			)));
+		}
+
+		// Target active branch check
+		let active_branch_id: String = transaction.query_row(
+			"SELECT active_branch_id FROM sessions WHERE id = ?1",
+			params![message.session_id],
+			|row| row.get(0),
+		)?;
+		if message.branch_id.is_empty() {
+			message.branch_id = active_branch_id.clone();
+		} else if message.branch_id != active_branch_id {
+			return Err(StoreError::Validation(format!(
+				"delivery target branch {} is not active branch {}",
+				message.branch_id, active_branch_id
+			)));
+		}
+
+		// Determine leaf and chain inside transaction
+		let (branch_parent, branch_leaf): (Option<String>, Option<String>) = transaction.query_row(
+			"SELECT parent_message_id, leaf_message_id FROM branches WHERE id = ?1",
+			params![active_branch_id],
+			|row| Ok((row.get(0)?, row.get(1)?)),
+		)?;
+		let expected_parent = branch_leaf.or(branch_parent);
+		if message.parent_message_id.is_none() {
+			message.parent_message_id = expected_parent.clone();
+		} else if message.parent_message_id != expected_parent {
+			return Err(StoreError::Validation(format!(
+				"message {} must chain to {:?}, not {:?}",
+				message.id, expected_parent, message.parent_message_id
+			)));
+		}
+
+		append_message_tx(&transaction, &message, at_ms)?;
 		let changes = transaction.execute(
-			"UPDATE deliveries SET delivered_at_ms = ?1 WHERE delivery_id = ?2 AND delivered_at_ms IS NULL",
-			params![at_ms, delivery_id],
+			"UPDATE deliveries SET delivered_at_ms = ?1, message_id = ?2 WHERE delivery_id = ?3 AND delivered_at_ms IS NULL",
+			params![at_ms, message.id, delivery_id],
 		)?;
 		if changes == 0 {
 			return Err(StoreError::Conflict(format!(
 				"delivery {delivery_id} was already appended to the target context"
 			)));
 		}
-		append_message_tx(&transaction, &message, at_ms)?;
 		transaction.commit()?;
 		Ok(())
 	}
@@ -1820,8 +2017,23 @@ impl SqliteStore {
 	/// Deliveries not yet durably offered to the target context.
 	pub fn pending_deliveries(&self, session_id: &str) -> StoreResult<Vec<DeliveryRecord>> {
 		self.query_deliveries(
-			"SELECT delivery_id, worker_id, session_id, origin_branch_id, payload_json, created_at_ms, delivered_at_ms, processed_at_ms \
+			"SELECT delivery_id, worker_id, session_id, origin_branch_id, payload_json, created_at_ms, delivered_at_ms, processed_at_ms, message_id \
 			 FROM deliveries WHERE session_id = ?1 AND delivered_at_ms IS NULL ORDER BY created_at_ms, delivery_id",
+			session_id,
+		)
+	}
+
+	/// Worker completions with undelivered parent notifications in `session_id`.
+	/// Excludes peer deliveries and non-worker deliveries by joining with
+	/// `worker_completions`.
+	pub fn pending_worker_deliveries(&self, session_id: &str) -> StoreResult<Vec<DeliveryRecord>> {
+		self.query_deliveries(
+			"SELECT d.delivery_id, d.worker_id, d.session_id, d.origin_branch_id, d.payload_json, \
+			        d.created_at_ms, d.delivered_at_ms, d.processed_at_ms, d.message_id \
+			 FROM deliveries d \
+			 JOIN worker_completions wc ON wc.delivery_id = d.delivery_id AND wc.session_id = d.session_id \
+			 WHERE d.session_id = ?1 AND d.delivered_at_ms IS NULL \
+			 ORDER BY d.created_at_ms, d.delivery_id",
 			session_id,
 		)
 	}
@@ -1830,7 +2042,7 @@ impl SqliteStore {
 	/// processed. These are crash-recovery candidates, not automatic retries.
 	pub fn unprocessed_deliveries(&self, session_id: &str) -> StoreResult<Vec<DeliveryRecord>> {
 		self.query_deliveries(
-			"SELECT delivery_id, worker_id, session_id, origin_branch_id, payload_json, created_at_ms, delivered_at_ms, processed_at_ms \
+			"SELECT delivery_id, worker_id, session_id, origin_branch_id, payload_json, created_at_ms, delivered_at_ms, processed_at_ms, message_id \
 			 FROM deliveries WHERE session_id = ?1 AND delivered_at_ms IS NOT NULL AND processed_at_ms IS NULL \
 			 ORDER BY delivered_at_ms, delivery_id",
 			session_id,
@@ -1849,6 +2061,7 @@ impl SqliteStore {
 				row.get::<_, i64>(5)?,
 				row.get::<_, Option<i64>>(6)?,
 				row.get::<_, Option<i64>>(7)?,
+				row.get::<_, Option<String>>(8)?,
 			))
 		})?;
 		let mut deliveries = Vec::new();
@@ -1862,6 +2075,7 @@ impl SqliteStore {
 				created_at_ms,
 				delivered_at_ms,
 				processed_at_ms,
+				message_id,
 			) = row?;
 			deliveries.push(DeliveryRecord {
 				delivery_id,
@@ -1872,6 +2086,7 @@ impl SqliteStore {
 				created_at_ms,
 				delivered_at_ms,
 				processed_at_ms,
+				message_id,
 			});
 		}
 		Ok(deliveries)
@@ -3450,6 +3665,145 @@ mod tests {
 			.expect("explicit processed checkpoint");
 		assert!(store.unprocessed_deliveries("s1").expect("done").is_empty());
 		let _ = std::fs::remove_dir_all(dir);
+	}
+
+	#[test]
+	fn worker_delivery_consume_is_atomic_and_links_message_id() {
+		let mut store = seeded_store();
+		store.append_message(message("m1", None)).expect("append m1");
+		let completion = WorkerCompletion {
+			worker_id: "w1".to_string(),
+			delivery_id: "w1".to_string(),
+			session_id: "s1".to_string(),
+			origin_branch_id: "b1".to_string(),
+			completion: json!({ "status": "completed" }),
+			delivery: json!({ "version": 2, "kind": "task-result", "mode": "background", "notify_parent": true, "text": "result w1" }),
+		};
+		store.complete_worker(completion).expect("complete worker");
+
+		let pending = store.pending_worker_deliveries("s1").expect("pending worker");
+		assert_eq!(pending.len(), 1);
+		assert_eq!(pending[0].delivery_id, "w1");
+		assert_eq!(pending[0].message_id, None);
+
+		let msg = NewMessage {
+			id: "msg-w1".to_string(),
+			session_id: "s1".to_string(),
+			branch_id: "b1".to_string(),
+			parent_message_id: Some("m1".to_string()),
+			payload: json!({ "id": "msg-w1", "role": "user", "text": "result w1" }),
+		};
+		store.consume_delivery("w1", msg.clone(), 100).expect("consume");
+
+		let branch = store.branch("b1").expect("branch").expect("row");
+		assert_eq!(branch.leaf_message_id.as_deref(), Some("msg-w1"));
+
+		let unprocessed = store.unprocessed_deliveries("s1").expect("unprocessed");
+		assert_eq!(unprocessed.len(), 1);
+		assert_eq!(unprocessed[0].delivered_at_ms, Some(100));
+		assert_eq!(unprocessed[0].message_id.as_deref(), Some("msg-w1"));
+
+		// Idempotent duplicate consume
+		store.consume_delivery("w1", msg, 100).expect("idempotent consume");
+		assert_eq!(store.branch_messages("b1").expect("msgs").len(), 2);
+
+		// Conflicting reuse is rejected
+		let conflict = store.consume_delivery(
+			"w1",
+			NewMessage {
+				id: "msg-other".to_string(),
+				session_id: "s1".to_string(),
+				branch_id: "b1".to_string(),
+				parent_message_id: Some("msg-w1".to_string()),
+				payload: json!({ "id": "msg-other", "role": "user", "text": "diff" }),
+			},
+			101,
+		);
+		assert!(matches!(conflict, Err(StoreError::Conflict(_))));
+	}
+
+	#[test]
+	fn synchronous_worker_completion_is_never_pending() {
+		let mut store = seeded_store();
+		let completion = WorkerCompletion {
+			worker_id: "sync-1".to_string(),
+			delivery_id: "sync-1".to_string(),
+			session_id: "s1".to_string(),
+			origin_branch_id: "b1".to_string(),
+			completion: json!({ "status": "completed" }),
+			delivery: json!({ "version": 2, "kind": "task-result", "mode": "sync", "notify_parent": false, "text": "" }),
+		};
+		store.complete_worker(completion).expect("complete sync worker");
+
+		assert!(store.pending_worker_deliveries("s1").expect("pending worker").is_empty());
+		assert!(store.pending_deliveries("s1").expect("pending").is_empty());
+
+		// Cannot consume a synchronous completion as delivery
+		let err = store.consume_delivery(
+			"sync-1",
+			NewMessage {
+				id: "m-sync".to_string(),
+				session_id: "s1".to_string(),
+				branch_id: "b1".to_string(),
+				parent_message_id: None,
+				payload: json!({ "id": "m-sync" }),
+			},
+			100,
+		);
+		assert!(matches!(err, Err(StoreError::Validation(_))));
+	}
+
+	#[test]
+	fn worker_recovery_fails_closed_on_legacy_ambiguous_rows() {
+		let mut store = seeded_store();
+		store.append_message(message("m1", None)).expect("append m1");
+		// Manually insert legacy ambiguous row (delivered without message_id)
+		store.connection.execute(
+			"INSERT INTO deliveries (delivery_id, worker_id, session_id, origin_branch_id, payload_json, created_at_ms, delivered_at_ms, processed_at_ms, message_id) \
+			 VALUES ('legacy-del', 'legacy-w', 's1', 'b1', '{\"text\":\"legacy\"}', 10, 20, NULL, NULL)",
+			[],
+		).expect("insert legacy delivery");
+
+		let err = store.consume_delivery(
+			"legacy-del",
+			NewMessage {
+				id: "m-legacy".to_string(),
+				session_id: "s1".to_string(),
+				branch_id: "b1".to_string(),
+				parent_message_id: Some("m1".to_string()),
+				payload: json!({ "id": "m-legacy", "text": "legacy" }),
+			},
+			30,
+		);
+		assert!(matches!(err, Err(StoreError::Corrupt(_))));
+	}
+
+	#[test]
+	fn pending_worker_deliveries_excludes_peer_deliveries() {
+		let mut store = seeded_store();
+		store.enqueue_delivery(NewDelivery {
+			delivery_id: "peer-1".to_string(),
+			worker_id: "peer:sender".to_string(),
+			session_id: "s1".to_string(),
+			origin_branch_id: "b1".to_string(),
+			payload: json!({ "kind": "peer-message", "from": "sender", "text": "hello" }),
+		}).expect("enqueue peer delivery");
+
+		store.complete_worker(WorkerCompletion {
+			worker_id: "worker-1".to_string(),
+			delivery_id: "worker-1".to_string(),
+			session_id: "s1".to_string(),
+			origin_branch_id: "b1".to_string(),
+			completion: json!({ "status": "completed" }),
+			delivery: json!({ "version": 2, "kind": "task-result", "mode": "background", "notify_parent": true, "text": "worker ok" }),
+		}).expect("complete worker");
+
+		let worker_pending = store.pending_worker_deliveries("s1").expect("worker pending");
+		assert_eq!(worker_pending.len(), 1);
+		assert_eq!(worker_pending[0].delivery_id, "worker-1");
+
+		let all_pending = store.pending_deliveries("s1").expect("all pending");
+		assert_eq!(all_pending.len(), 2);
 	}
 
 	#[test]

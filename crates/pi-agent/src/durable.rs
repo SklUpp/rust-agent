@@ -26,7 +26,7 @@ use async_trait::async_trait;
 use serde_json::Value;
 
 use crate::compaction::CompactionReport;
-use crate::state::{Message, ToolCall, ToolResult};
+use crate::state::{Message, TokenUsage, ToolCall, ToolResult};
 
 /// Detail marker the scheduler adds to a result whose durability write failed.
 /// The loop turns any such result into [`crate::AgentError::Durable`] and stops
@@ -138,6 +138,26 @@ pub trait DurableBoundary: Send + Sync + std::fmt::Debug {
 	) -> Result<(), DurableError> {
 		Ok(())
 	}
+
+	/// Atomically accept pending worker deliveries for the active session, appending
+	/// them to durable branch history and marking them delivered in one transaction.
+	///
+	/// Returns the delivered worker completions so the loop can update in-memory state,
+	/// emit events, and track delivery IDs for processed confirmation.
+	async fn accept_pending_worker_deliveries(
+		&self,
+	) -> Result<Vec<DeliveredWorkerResult>, DurableError> {
+		Ok(Vec::new())
+	}
+
+	/// Delivery IDs that are delivered on the active branch but not yet confirmed
+	/// processed by a model response, and whose message is present in `messages`.
+	async fn unconfirmed_delivery_ids(
+		&self,
+		_messages: &[Message],
+	) -> Result<Vec<String>, DurableError> {
+		Ok(Vec::new())
+	}
 }
 
 /// Immutable worker identity captured at spawn. `worker_id` is the spawn-time
@@ -160,6 +180,21 @@ pub trait WorkerCompletionSink: Send + Sync + std::fmt::Debug {
 		completion: Value,
 		delivery: Value,
 	) -> Result<(), DurableError>;
+}
+
+/// Result of a durably delivered worker completion.
+#[derive(Debug, Clone)]
+pub struct DeliveredWorkerResult {
+	pub delivery_id: String,
+	pub worker_id: String,
+	pub message: Message,
+	pub agent: String,
+	pub status: String,
+	pub text: String,
+	pub duration_ms: u64,
+	pub usage: Option<TokenUsage>,
+	pub output_id: Option<String>,
+	pub result_key: Option<String>,
 }
 
 /// Durable child scope handed to one worker loop.

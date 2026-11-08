@@ -25,7 +25,7 @@ pub mod workspace_writer;
 pub use compaction::{CompactionReport, Compactor};
 pub use durable::{
 	ChildDurability, ChildDurabilityFactory, DURABILITY_ADMISSION_FAILURE_CODE,
-	DURABILITY_FAILURE_CODE, DurableBoundary, DurableError,
+	DURABILITY_FAILURE_CODE, DeliveredWorkerResult, DurableBoundary, DurableError,
 	WorkerCompletionSink, WorkerIdentity,
 };
 pub use loop_module::{

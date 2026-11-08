@@ -1364,6 +1364,7 @@ impl TaskTool {
 						result.usage,
 						result.output_id.as_deref(),
 						&agent_name,
+						None,
 					) {
 						let message = format!("failed (durable completion): {error}");
 						result.exit_code = 1;
@@ -1396,6 +1397,7 @@ impl TaskTool {
 						result.usage,
 						result.output_id.as_deref(),
 						&agent_name,
+						None,
 					) {
 						eprintln!(
 							"warning: child {outstanding_id} durable completion failed: {error}"
@@ -1423,6 +1425,7 @@ impl TaskTool {
 						result.usage,
 						result.output_id.as_deref(),
 						&agent_name,
+						None,
 					) {
 						eprintln!(
 							"warning: child {outstanding_id} durable abort failed: {error}"
@@ -1957,8 +1960,44 @@ fn worker_completion_value(
 	})
 }
 
-fn worker_delivery_value(agent: &str, status: &str, text: &str) -> Value {
-	json!({ "kind": "task-result", "agent": agent, "status": status, "text": text })
+fn worker_delivery_value(
+	agent: &str,
+	status: &str,
+	notification: Option<&str>,
+	duration_ms: u64,
+	usage: Option<TokenUsage>,
+	output_id: Option<&str>,
+	child_id: &str,
+) -> Value {
+	if let Some(text) = notification {
+		json!({
+			"version": 2,
+			"kind": "task-result",
+			"mode": "background",
+			"notify_parent": true,
+			"agent": agent,
+			"status": status,
+			"text": text,
+			"durationMs": duration_ms,
+			"usage": usage,
+			"outputId": output_id,
+			"id": child_id,
+		})
+	} else {
+		json!({
+			"version": 2,
+			"kind": "task-result",
+			"mode": "sync",
+			"notify_parent": false,
+			"agent": agent,
+			"status": status,
+			"text": "",
+			"durationMs": duration_ms,
+			"usage": usage,
+			"outputId": output_id,
+			"id": child_id,
+		})
+	}
 }
 
 /// Commit the completion and parent notification together. A configured
@@ -1973,9 +2012,11 @@ fn record_durable_completion(
 	usage: Option<TokenUsage>,
 	output_id: Option<&str>,
 	agent: &str,
+	notification: Option<&str>,
 ) -> Result<(), String> {
 	let completion = worker_completion_value(status, text, duration_ms, usage, output_id);
-	let delivery = worker_delivery_value(agent, status, text);
+	let delivery =
+		worker_delivery_value(agent, status, notification, duration_ms, usage, output_id, id);
 	supervisor.complete_child_durable(id, completion, delivery)
 }
 
@@ -1983,7 +2024,7 @@ fn record_durable_completion(
 /// row is the persisted parent notification; no success status is invented.
 fn record_early_abort(supervisor: &Arc<Supervisor>, id: &str, agent: &str, reason: &str) {
 	if let Err(error) =
-		record_durable_completion(supervisor, id, "aborted", reason, 0, None, None, agent)
+		record_durable_completion(supervisor, id, "aborted", reason, 0, None, None, agent, None)
 	{
 		eprintln!("warning: child {id} early-abort completion failed: {error}");
 	}
@@ -2486,6 +2527,7 @@ fn settle_background_result(
 					usage,
 					output_id.as_deref(),
 					&agent,
+					Some(&envelope),
 				) {
 					settle_durable_failure(&supervisor, &id, &agent, duration_ms, usage, error);
 					return;
@@ -2517,6 +2559,7 @@ fn settle_background_result(
 					usage,
 					output_id.as_deref(),
 					&agent,
+					Some(&envelope),
 				) {
 					settle_durable_failure(&supervisor, &id, &agent, duration_ms, usage, error);
 					return;
@@ -2552,6 +2595,7 @@ fn settle_background_result(
 					usage,
 					output_id.as_deref(),
 					&agent,
+					Some(&envelope),
 				) {
 					settle_durable_failure(&supervisor, &id, &agent, duration_ms, usage, error);
 					return;
@@ -2597,6 +2641,7 @@ fn settle_background_result(
 					usage,
 					output_id.as_deref(),
 					&agent,
+					Some(&envelope),
 				) {
 					settle_durable_failure(&supervisor, &id, &agent, duration_ms, usage, error);
 					return;
@@ -2634,6 +2679,7 @@ fn settle_background_result(
 				usage,
 				output_id.as_deref(),
 				&agent,
+				Some(&envelope),
 			) {
 				settle_durable_failure(&supervisor, &id, &agent, duration_ms, usage, error);
 				return;
@@ -2677,6 +2723,7 @@ fn settle_background_result(
 					observed,
 					output_id.as_deref(),
 					&agent,
+					Some(&envelope),
 				) {
 					settle_durable_failure(&supervisor, &id, &agent, duration_ms, observed, error);
 					return;
@@ -2698,16 +2745,17 @@ fn settle_background_result(
 				None,
 				observed.as_ref(),
 			);
-			if let Err(error) = record_durable_completion(
-				&supervisor,
-				&id,
-				"aborted",
-				reason,
-				duration_ms,
-				observed,
-				output_id.as_deref(),
-				&agent,
-			) {
+				if let Err(error) = record_durable_completion(
+					&supervisor,
+					&id,
+					"aborted",
+					reason,
+					duration_ms,
+					observed,
+					output_id.as_deref(),
+					&agent,
+					Some(&envelope),
+				) {
 				settle_durable_failure(&supervisor, &id, &agent, duration_ms, observed, error);
 				return;
 			}
@@ -2751,6 +2799,7 @@ fn settle_background_result(
 					observed,
 					output_id.as_deref(),
 					&agent,
+					Some(&envelope),
 				) {
 					settle_durable_failure(&supervisor, &id, &agent, duration_ms, observed, error);
 					return;
@@ -2779,6 +2828,7 @@ fn settle_background_result(
 				observed,
 				output_id.as_deref(),
 				&agent,
+				Some(&envelope),
 			) {
 				settle_durable_failure(&supervisor, &id, &agent, duration_ms, observed, error);
 				return;

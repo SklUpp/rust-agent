@@ -34,6 +34,11 @@ pub trait BackgroundResultSink: Send + Sync {
 			})
 			.collect()
 	}
+
+	/// Acknowledge that a delivery was already handled (e.g. through durable
+	/// recovery or store consumption). Removes it from pending and marks it
+	/// consumed so it is not returned by subsequent takes.
+	fn acknowledge_delivery(&self, _delivery_id: &str) {}
 }
 
 /// A delivered background result with the identity and reported usage that

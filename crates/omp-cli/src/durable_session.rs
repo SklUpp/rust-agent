@@ -25,7 +25,7 @@ use pi_agent::CompactionReport;
 use rusqlite::{OpenFlags, OptionalExtension as _};
 use tokio::runtime::{Handle, RuntimeFlavor};
 use pi_agent::{
-	ChildDurability, ChildDurabilityFactory, DurableBoundary, DurableError,
+	ChildDurability, ChildDurabilityFactory, DeliveredWorkerResult, DurableBoundary, DurableError,
 	WorkerCompletionSink, WorkerIdentity,
 	state::{Message, Role, StopReason, ToolCall, ToolResult},
 };
@@ -574,6 +574,7 @@ impl DurableSession {
 				};
 				*tracked = digests[..boundary].to_vec();
 				*lock(&self.tracked_ids) = matched[..boundary].to_vec();
+				return Ok(boundary);
 			}
 			let start = tracked.len();
 			if start > 0 && messages.len() >= start && tracked.as_slice() == &digests[..start] {
@@ -1362,6 +1363,186 @@ impl DurableBoundary for DurableSession {
 			})
 			.await
 			.map_err(|error| DurableError::new(error.to_string()))
+	}
+
+	async fn accept_pending_worker_deliveries(
+		&self,
+	) -> Result<Vec<DeliveredWorkerResult>, DurableError> {
+		let session_id = self.session_id.clone();
+		let cursor = Arc::clone(&self.cursor);
+		let tracked = Arc::clone(&self.tracked);
+		let tracked_ids = Arc::clone(&self.tracked_ids);
+		let projection_slot = Arc::clone(&self.projection);
+
+		let pending_items: Vec<(String, Value, i64)> = self
+			.writer
+			.call_async({
+				let session_id = session_id.clone();
+				move |store| {
+					let records = store.pending_worker_deliveries(&session_id)?;
+					Ok(records
+						.into_iter()
+						.map(|r| (r.delivery_id, r.payload, r.created_at_ms))
+						.collect())
+				}
+			})
+			.await
+			.map_err(|error| DurableError::new(error.to_string()))?;
+
+		if pending_items.is_empty() {
+			return Ok(Vec::new());
+		}
+
+		let mut delivered = Vec::new();
+		for (delivery_id, payload, _created_at) in pending_items {
+			let mode = payload.get("mode").and_then(Value::as_str);
+			let notify_parent = payload.get("notify_parent").and_then(Value::as_bool);
+			if mode == Some("sync") || notify_parent == Some(false) {
+				continue;
+			}
+			let version = payload.get("version").and_then(Value::as_i64).unwrap_or(0);
+			if version < 2 && notify_parent.is_none() {
+				return Err(DurableError::new(format!(
+					"pending worker delivery {delivery_id} has ambiguous legacy payload; failing closed"
+				)));
+			}
+
+			let text = payload
+				.get("text")
+				.and_then(Value::as_str)
+				.unwrap_or_default()
+				.to_string();
+			let agent = payload
+				.get("agent")
+				.and_then(Value::as_str)
+				.unwrap_or_default()
+				.to_string();
+			let status = payload
+				.get("status")
+				.and_then(Value::as_str)
+				.unwrap_or_default()
+				.to_string();
+			let duration_ms = payload
+				.get("durationMs")
+				.and_then(Value::as_u64)
+				.unwrap_or(0);
+			let output_id = payload
+				.get("outputId")
+				.and_then(Value::as_str)
+				.map(str::to_string);
+			let child_id = payload
+				.get("id")
+				.and_then(Value::as_str)
+				.unwrap_or(&delivery_id)
+				.to_string();
+			let usage: Option<pi_agent::state::TokenUsage> = payload
+				.get("usage")
+				.and_then(|v| serde_json::from_value(v.clone()).ok());
+
+			let message_id = format!("msg-worker-{}", delivery_id);
+			let msg = Message::user(text.clone());
+			let session_message = Self::project_message(&msg)
+				.ok_or_else(|| DurableError::new("failed to project worker message"))?;
+			let message_entry = MessageEntry::new(
+				message_id.clone(),
+				None,
+				output::iso8601(SystemTime::now()),
+				session_message,
+			);
+			let entry_payload = serde_json::to_value(&message_entry)
+				.map_err(|e| DurableError::new(e.to_string()))?;
+
+			let session_id_clone = session_id.clone();
+			let delivery_id_clone = delivery_id.clone();
+			let message_id_clone = message_id.clone();
+			let now = unix_ms();
+
+			self.writer
+				.call_async(move |store| {
+					store.consume_delivery(
+						&delivery_id_clone,
+						NewMessage {
+							id: message_id_clone,
+							session_id: session_id_clone,
+							branch_id: String::new(),
+							parent_message_id: None,
+							payload: entry_payload,
+						},
+						now,
+					)
+				})
+				.await
+				.map_err(|error| DurableError::new(error.to_string()))?;
+
+			let digest = self.incoming_digest(&msg);
+			let proj_to_save = {
+				lock(&cursor).leaf = Some(message_id.clone());
+				lock(&tracked).push(digest);
+				lock(&tracked_ids).push(Some(message_id.clone()));
+				let mut proj = lock(&projection_slot);
+				if let Some(proj) = proj.as_mut() {
+					if !proj.kept.contains(&message_id) {
+						proj.kept.push(message_id.clone());
+					}
+					Some(proj.clone())
+				} else {
+					None
+				}
+			};
+			if let Some(p) = proj_to_save {
+				self.set_projection(Some(p)).await?;
+			}
+
+			delivered.push(DeliveredWorkerResult {
+				delivery_id: delivery_id.clone(),
+				worker_id: child_id.clone(),
+				message: msg,
+				agent,
+				status,
+				text,
+				duration_ms,
+				usage,
+				output_id,
+				result_key: Some(delivery_id),
+			});
+		}
+
+		Ok(delivered)
+	}
+
+	async fn unconfirmed_delivery_ids(
+		&self,
+		_messages: &[Message],
+	) -> Result<Vec<String>, DurableError> {
+		let session_id = self.session_id.clone();
+		let active_branch = lock(&self.cursor).branch.clone();
+		let unconfirmed: Vec<String> = self
+			.writer
+			.call_async(move |store| {
+				let records = store.unprocessed_deliveries(&session_id)?;
+				let parts = load_parts(store, &session_id)?;
+				if parts.branch_id != active_branch {
+					return Ok(Vec::new());
+				}
+				let active_ids: HashSet<String> = if let Some(proj) = &parts.projection {
+					proj.kept.iter().cloned().collect()
+				} else {
+					parts.branch_messages.into_iter().map(|m| m.id).collect()
+				};
+				Ok(records
+					.into_iter()
+					.filter(|r| {
+						r.message_id
+							.as_ref()
+							.is_some_and(|id| active_ids.contains(id))
+					})
+					.map(|r| r.delivery_id)
+					.collect())
+			})
+			.await
+			.map_err(|error| DurableError::new(error.to_string()))?;
+
+		Ok(unconfirmed)
 	}
 }
 

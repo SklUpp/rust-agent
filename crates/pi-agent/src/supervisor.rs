@@ -165,6 +165,10 @@ impl BackgroundResultSink for OwnerResultSink {
 	fn take_background_deliveries(&self) -> Vec<BackgroundDelivery> {
 		self.supervisor.take_deliveries_for(self.owner.as_deref())
 	}
+
+	fn acknowledge_delivery(&self, delivery_id: &str) {
+		self.supervisor.acknowledge_consumed_delivery(delivery_id);
+	}
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1377,6 +1381,7 @@ impl Supervisor {
 		}
 	}
 
+
 	/// Durable child conversation for a cold revive. `None` means no SQLite child
 	/// scope exists, so the caller may read a legacy transcript explicitly.
 	pub fn load_child_messages(&self, worker_id: &str) -> Result<Option<Vec<Message>>, String> {
@@ -1500,6 +1505,27 @@ impl Supervisor {
 		taken
 	}
 
+	/// Acknowledge that a delivery was consumed (e.g. by durable SQLite recovery),
+	/// removing it from in-memory pending deliveries and marking its admission slot consumed.
+	pub fn acknowledge_consumed_delivery(&self, delivery_id: &str) {
+		let mut state = self.state.lock().unwrap();
+		let mut index = 0;
+		while index < state.pending.len() {
+			let matches = state.pending[index].delivery_id.as_deref() == Some(delivery_id)
+				|| state.pending[index].result_key.as_deref() == Some(delivery_id)
+				|| state.pending[index].id == delivery_id;
+			if matches {
+				if let Some(delivery) = state.pending.remove(index) {
+					state.consumed.insert(delivery.id.clone());
+					state.outstanding.remove(&delivery.id);
+					state.pending_bytes = state.pending_bytes.saturating_sub(delivery.text.len());
+				}
+			} else {
+				index += 1;
+			}
+		}
+	}
+
 	/// Enqueue a settled background result for exactly-once delivery. If the
 	/// spawning agent already settled before its nested job finished, route to
 	/// the nearest live ancestor (root = `None`) instead of orphaning the result.
@@ -1510,19 +1536,23 @@ impl Supervisor {
 		if state.consumed.contains(id) || !state.outstanding.contains(id) {
 			return;
 		}
+		let is_durable =
+			state.completed_children.contains(id) || state.durable_children.contains_key(id);
 		let mut owner = state.records.get(id).and_then(|record| record.parent_id.clone());
-		while let Some(current) = owner.clone() {
-			let live = state
-				.records
-				.get(&current)
-				.is_some_and(|record| record.status == ChildStatus::Running);
-			if live {
-				break;
+		if !is_durable {
+			while let Some(current) = owner.clone() {
+				let live = state
+					.records
+					.get(&current)
+					.is_some_and(|record| record.status == ChildStatus::Running);
+				if live {
+					break;
+				}
+				owner = state
+					.records
+					.get(&current)
+					.and_then(|record| record.parent_id.clone());
 			}
-			owner = state
-				.records
-				.get(&current)
-				.and_then(|record| record.parent_id.clone());
 		}
 		let (mut text, _) = cap_result_text(&text);
 		let remaining = MAX_PENDING_RESULT_BYTES.saturating_sub(state.pending_bytes);
@@ -2855,9 +2885,15 @@ impl Supervisor {
 					"usage": usage,
 				});
 				let delivery = serde_json::json!({
+					"version": 2,
 					"kind": "task-result",
+					"mode": "background",
+					"notify_parent": true,
+					"agent": "worker",
 					"status": "aborted",
-					"text": reason,
+					"text": format!("<task-result id=\"{id}\" status=\"aborted\"><output>\n{reason}\n</output></task-result>"),
+					"reason": reason,
+					"usage": usage,
 				});
 				match child.complete(completion, delivery) {
 					Ok(()) => {

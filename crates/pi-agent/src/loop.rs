@@ -961,6 +961,9 @@ impl AgentLoop {
 		let mut delivery_ids = Vec::new();
 		if let Some(sink) = &self.background_results {
 			for delivery in sink.take_background_deliveries() {
+				if self.durable.is_some() && delivery.delivery_id.is_some() {
+					continue;
+				}
 				state.messages.push(Message::user(delivery.text.clone()));
 				if let Some(delivery_id) = delivery.delivery_id {
 					delivery_ids.push(delivery_id);
@@ -1209,7 +1212,7 @@ impl AgentLoop {
 			state.messages.push(user_message);
 		}
 		let _presence = PresenceGuard::install(&self.peer_inbox);
-		let mut pending_delivery_ids = self.inject_boundary_messages(state, events.as_ref()).await;
+		let mut pending_delivery_ids = Vec::new();
 		let ctx = AgentContext::with_approver(
 			self.config.cwd.clone(),
 			cancellation_token.clone(),
@@ -1252,11 +1255,50 @@ impl AgentLoop {
 					return Err(interrupt_error(steering.reason));
 				}
 			}
+			// Persist preceding messages in order before appending worker completions.
+			self.persist_conversation(&state.messages).await?;
+
+			// Authoritative durable worker completions recovery/accept checkpoint:
+			// Consumes pending worker deliveries atomically in SQLite before provider request.
+			let mut worker_delivery_ids = Vec::new();
+			if let Some(durable) = &self.durable {
+				let recovered = durable
+					.accept_pending_worker_deliveries()
+					.await
+					.map_err(|error| AgentError::Durable(error.to_string()))?;
+				for delivery in recovered {
+					if let Some(sink) = &self.background_results {
+						sink.acknowledge_delivery(&delivery.delivery_id);
+					}
+					state.messages.push(delivery.message);
+					if let Some(events) = events.as_ref() {
+						let _ = events
+							.send(AgentEvent::BackgroundResult {
+								id: delivery.worker_id,
+								result_key: delivery.result_key,
+								text: delivery.text,
+								usage: delivery.usage,
+							})
+							.await;
+					}
+					worker_delivery_ids.push(delivery.delivery_id);
+				}
+			}
+
 			// Results that settled while the previous assistant turn ran land
-			// before this one, exactly once.
-			pending_delivery_ids.extend(
-				self.inject_boundary_messages(state, events.as_ref()).await,
-			);
+			// before this one, exactly once (ephemeral background results and peer-mail).
+			let ephemeral_and_peer_ids =
+				self.inject_boundary_messages(state, events.as_ref()).await;
+
+			// Unconfirmed delivery IDs (delivered-but-unprocessed on reopen) matching active messages
+			let unconfirmed_ids = if let Some(durable) = &self.durable {
+				durable
+					.unconfirmed_delivery_ids(&state.messages)
+					.await
+					.map_err(|error| AgentError::Durable(error.to_string()))?
+			} else {
+				Vec::new()
+			};
 
 			// Peek the session queue before compaction so the reminder is part
 			// of this request and stays in the newest history. A requirement
@@ -1284,10 +1326,15 @@ impl AgentLoop {
 			// "persistence disabled" downgrade.
 			self.persist_conversation(&state.messages).await?;
 			// Delivered means the target conversation persisted the message, not
-			// that a mailbox or queue handed it out.
-			self.mark_deliveries_delivered(&pending_delivery_ids).await?;
+			// that a mailbox or queue handed it out. Only marks peer-mail delivery IDs;
+			// worker completions are marked atomically during consume_delivery in SQLite.
+			let mut to_mark_delivered = std::mem::take(&mut pending_delivery_ids);
+			to_mark_delivered.extend(ephemeral_and_peer_ids.clone());
+			self.mark_deliveries_delivered(&to_mark_delivered).await?;
+			pending_delivery_ids.extend(worker_delivery_ids);
+			pending_delivery_ids.extend(to_mark_delivered);
+			pending_delivery_ids.extend(unconfirmed_ids);
 			let request_delivery_ids = std::mem::take(&mut pending_delivery_ids);
-
 			// Durable before destructive: the owner journals everything accepted
 			// so far. If that write failed, the prune below is skipped — dropping
 			// a turn the transcript does not hold would lose it silently. The next

@@ -433,6 +433,406 @@ async fn agent_loop_injects_delivery_and_peer_mail_at_turn_boundary() -> Result<
 	Ok(())
 }
 
+#[derive(Debug)]
+struct MockDurableWorker {
+	pending: Mutex<Option<pi_agent::durable::DeliveredWorkerResult>>,
+	processed: Arc<Mutex<Vec<String>>>,
+}
+
+#[async_trait]
+impl pi_agent::durable::DurableBoundary for MockDurableWorker {
+	async fn persist_messages(&self, _messages: &[Message]) -> Result<(), pi_agent::durable::DurableError> {
+		Ok(())
+	}
+	async fn begin_execution(&self, _call: &pi_agent::state::ToolCall) -> Result<String, pi_agent::durable::DurableError> {
+		Ok("mock-exec".to_string())
+	}
+	async fn compacted(
+		&self,
+		_messages: &[Message],
+		_report: &pi_agent::compaction::CompactionReport,
+	) -> Result<(), pi_agent::durable::DurableError> {
+		Ok(())
+	}
+	async fn resync_messages(&self, _messages: &[Message]) -> Result<(), pi_agent::durable::DurableError> {
+		Ok(())
+	}
+	async fn finish_execution(
+		&self,
+		_execution_id: &str,
+		_call: &pi_agent::state::ToolCall,
+		_result: &pi_agent::state::ToolResult,
+	) -> Result<(), pi_agent::durable::DurableError> {
+		Ok(())
+	}
+	async fn finish_turn(
+		&self,
+		_stop_reason: &str,
+		_error_message: Option<&str>,
+	) -> Result<(), pi_agent::durable::DurableError> {
+		Ok(())
+	}
+	async fn accept_pending_worker_deliveries(
+		&self,
+	) -> Result<Vec<pi_agent::durable::DeliveredWorkerResult>, pi_agent::durable::DurableError> {
+		if let Some(item) = self.pending.lock().unwrap().take() {
+			Ok(vec![item])
+		} else {
+			Ok(Vec::new())
+		}
+	}
+	async fn mark_deliveries_processed(
+		&self,
+		delivery_ids: &[String],
+	) -> Result<(), pi_agent::durable::DurableError> {
+		self.processed.lock().unwrap().extend_from_slice(delivery_ids);
+		Ok(())
+	}
+}
+
+#[derive(Debug)]
+struct MockCompletionSink;
+
+impl pi_agent::durable::WorkerCompletionSink for MockCompletionSink {
+	fn complete_worker(
+		&self,
+		_identity: &pi_agent::durable::WorkerIdentity,
+		_completion: serde_json::Value,
+		_delivery: serde_json::Value,
+	) -> Result<(), pi_agent::durable::DurableError> {
+		Ok(())
+	}
+}
+
+#[derive(Debug)]
+struct MockChildDurabilityFactory;
+
+impl pi_agent::durable::ChildDurabilityFactory for MockChildDurabilityFactory {
+	fn open_child(&self, worker_id: &str) -> Result<pi_agent::durable::ChildDurability, pi_agent::durable::DurableError> {
+		let identity = pi_agent::durable::WorkerIdentity {
+			worker_id: worker_id.to_string(),
+			session_id: "s1".to_string(),
+			origin_branch_id: "b1".to_string(),
+		};
+		Ok(pi_agent::durable::ChildDurability::new(
+			identity,
+			Arc::new(MockDurableWorker {
+				pending: Mutex::new(None),
+				processed: Arc::new(Mutex::new(Vec::new())),
+			}),
+			Arc::new(MockCompletionSink),
+		))
+	}
+}
+
+#[tokio::test]
+async fn agent_loop_recovers_durable_worker_completion_at_turn_boundary() -> Result<(), AgentError> {
+	let captured = Arc::new(Mutex::new(Vec::<Message>::new()));
+	let provider = Arc::new(TestProvider {
+		reply: "done".to_string(),
+		gate: None,
+		entered: None,
+		captured: Some(captured.clone()),
+	});
+	let processed_ids = Arc::new(Mutex::new(Vec::new()));
+	let durable = Arc::new(MockDurableWorker {
+		pending: Mutex::new(Some(pi_agent::durable::DeliveredWorkerResult {
+			delivery_id: "w-rec-1".to_string(),
+			worker_id: "w-rec-1".to_string(),
+			message: Message::user("<task-result id=\"w-rec-1\">recovered ok</task-result>"),
+			agent: "scout".to_string(),
+			status: "completed".to_string(),
+			text: "<task-result id=\"w-rec-1\">recovered ok</task-result>".to_string(),
+			duration_ms: 42,
+			usage: None,
+			output_id: None,
+			result_key: Some("w-rec-1".to_string()),
+		})),
+		processed: processed_ids.clone(),
+	});
+
+	let (event_tx, mut event_rx) = tokio::sync::mpsc::channel(32);
+	let agent = AgentLoop::new(
+		AgentConfig {
+			max_turns: 2,
+			context_limit: 100_000,
+			system_prompt: None,
+			cwd: std::env::temp_dir(),
+		},
+		provider,
+		ToolRegistry::new(),
+	)
+	.with_durable(Some(durable));
+
+	let mut state = pi_agent::state::AgentState::default();
+	let turns = agent
+		.run_dialog_message_with_cancel(
+			Message::user("start turn"),
+			&mut state,
+			None,
+			Some(&event_tx),
+			tokio_util::sync::CancellationToken::new(),
+		)
+		.await?;
+	assert_eq!(turns.len(), 1);
+
+	// Verify provider captured the recovered worker message
+	let seen = captured.lock().unwrap().clone();
+	assert!(seen.iter().any(|m| m.content.contains("<task-result id=\"w-rec-1\">recovered ok</task-result>")));
+
+	// Verify BackgroundResult event was emitted
+	let mut background_event_seen = false;
+	while let Ok(event) = event_rx.try_recv() {
+		if let pi_agent::AgentEvent::BackgroundResult { id, text, .. } = event {
+			if id == "w-rec-1" && text.contains("recovered ok") {
+				background_event_seen = true;
+			}
+		}
+	}
+	assert!(background_event_seen, "AgentEvent::BackgroundResult must be emitted");
+
+	// Verify mark_deliveries_processed was called
+	let processed = processed_ids.lock().unwrap().clone();
+	assert_eq!(processed, vec!["w-rec-1"]);
+
+	Ok(())
+}
+
+#[tokio::test]
+async fn agent_loop_no_duplicate_worker_injection_when_sink_and_durable_both_have_delivery() -> Result<(), AgentError> {
+	let captured = Arc::new(Mutex::new(Vec::<Message>::new()));
+	let provider = Arc::new(TestProvider {
+		reply: "done".to_string(),
+		gate: None,
+		entered: None,
+		captured: Some(captured.clone()),
+	});
+	let supervisor = Supervisor::new(
+		ToolRegistry::new(),
+		provider.clone(),
+		None,
+		DelegationLimits { max_depth: 2, max_concurrency: 4 },
+	);
+	let sink = supervisor.owner_results_sink(None);
+
+	let (id, _token) = supervisor
+		.reserve_child("dup", 0, "scout", "task", None)
+		.expect("reserve");
+	let result_key = supervisor.capture_result_key(&id).expect("result key");
+	let delivery_text = format!("<task-result id=\"{id}\">test</task-result>");
+	let factory: Arc<dyn pi_agent::durable::ChildDurabilityFactory> = Arc::new(MockChildDurabilityFactory);
+	supervisor.set_child_durability_factory(Some(factory));
+	supervisor
+		.open_child_durable(&id, Some(result_key.as_str()))
+		.expect("open child durable")
+		.expect("durable child");
+	supervisor
+		.complete_child_durable(&id, json!({ "status": "completed" }), json!({ "kind": "task-result" }))
+		.expect("complete child durable");
+	supervisor.mark_completed(&id, 10, &delivery_text);
+	supervisor.enqueue_delivery(&id, delivery_text.clone());
+	let processed_ids = Arc::new(Mutex::new(Vec::new()));
+	let durable = Arc::new(MockDurableWorker {
+		pending: Mutex::new(Some(pi_agent::durable::DeliveredWorkerResult {
+			delivery_id: result_key.clone(),
+			worker_id: id.clone(),
+			message: Message::user(delivery_text.clone()),
+			agent: "scout".to_string(),
+			status: "completed".to_string(),
+			text: delivery_text.clone(),
+			duration_ms: 10,
+			usage: None,
+			output_id: None,
+			result_key: Some(result_key.clone()),
+		})),
+		processed: processed_ids.clone(),
+	});
+	let (event_tx, mut event_rx) = tokio::sync::mpsc::channel(32);
+	let agent = AgentLoop::new(
+		AgentConfig {
+			max_turns: 2,
+			context_limit: 100_000,
+			system_prompt: None,
+			cwd: std::env::temp_dir(),
+		},
+		provider,
+		ToolRegistry::new(),
+	)
+	.with_durable(Some(durable))
+	.with_background_results(sink);
+
+	let mut state = pi_agent::state::AgentState::default();
+	agent
+		.run_dialog_message_with_cancel(
+			Message::user("user message"),
+			&mut state,
+			None,
+			Some(&event_tx),
+			tokio_util::sync::CancellationToken::new(),
+		)
+		.await?;
+
+	// Verify delivery is injected exactly once into state.messages
+	let count = state.messages.iter().filter(|m| m.content.contains(&format!("<task-result id=\"{id}\">"))).count();
+	assert_eq!(count, 1, "worker message must be injected exactly once, not duplicated");
+
+	// Verify AgentEvent::BackgroundResult is emitted exactly once
+	let mut event_count = 0;
+	while let Ok(event) = event_rx.try_recv() {
+		if let pi_agent::AgentEvent::BackgroundResult { result_key: ev_key, .. } = event {
+			if ev_key.as_deref() == Some(result_key.as_str()) {
+				event_count += 1;
+			}
+		}
+	}
+	assert_eq!(event_count, 1, "BackgroundResult event must be emitted exactly once");
+
+	Ok(())
+}
+
+struct RaceSink {
+	delivery: Mutex<Option<pi_agent::delivery::BackgroundDelivery>>,
+}
+
+impl pi_agent::BackgroundResultSink for RaceSink {
+	fn take_background_results(&self) -> Vec<String> {
+		Vec::new()
+	}
+	fn take_background_deliveries(&self) -> Vec<pi_agent::delivery::BackgroundDelivery> {
+		self.delivery.lock().unwrap().take().into_iter().collect()
+	}
+}
+
+#[tokio::test]
+async fn agent_loop_skips_durable_worker_delivery_in_boundary_inject_to_prevent_unlinked_mark() -> Result<(), AgentError> {
+	let captured = Arc::new(Mutex::new(Vec::<Message>::new()));
+	let provider = Arc::new(TestProvider {
+		reply: "done".to_string(),
+		gate: None,
+		entered: None,
+		captured: Some(captured.clone()),
+	});
+
+	let race_delivery = pi_agent::delivery::BackgroundDelivery {
+		id: "w-race-1".to_string(),
+		result_key: Some("ns:w-race-1".to_string()),
+		delivery_id: Some("ns:w-race-1".to_string()),
+		text: "<task-result id=\"w-race-1\">race text</task-result>".to_string(),
+		usage: None,
+	};
+	let sink = Arc::new(RaceSink {
+		delivery: Mutex::new(Some(race_delivery)),
+	});
+
+	let delivered_ids = Arc::new(Mutex::new(Vec::new()));
+	let processed_ids = Arc::new(Mutex::new(Vec::new()));
+
+	#[derive(Debug)]
+	struct RaceDurable {
+		delivered: Arc<Mutex<Vec<String>>>,
+		processed: Arc<Mutex<Vec<String>>>,
+	}
+	#[async_trait]
+	impl pi_agent::durable::DurableBoundary for RaceDurable {
+		async fn persist_messages(&self, _messages: &[Message]) -> Result<(), pi_agent::durable::DurableError> {
+			Ok(())
+		}
+		async fn begin_execution(&self, _call: &pi_agent::state::ToolCall) -> Result<String, pi_agent::durable::DurableError> {
+			Ok("mock-exec".to_string())
+		}
+		async fn compacted(
+			&self,
+			_messages: &[Message],
+			_report: &pi_agent::compaction::CompactionReport,
+		) -> Result<(), pi_agent::durable::DurableError> {
+			Ok(())
+		}
+		async fn resync_messages(&self, _messages: &[Message]) -> Result<(), pi_agent::durable::DurableError> {
+			Ok(())
+		}
+		async fn finish_execution(
+			&self,
+			_execution_id: &str,
+			_call: &pi_agent::state::ToolCall,
+			_result: &pi_agent::state::ToolResult,
+		) -> Result<(), pi_agent::durable::DurableError> {
+			Ok(())
+		}
+		async fn finish_turn(
+			&self,
+			_stop_reason: &str,
+			_error_message: Option<&str>,
+		) -> Result<(), pi_agent::durable::DurableError> {
+			Ok(())
+		}
+		async fn accept_pending_worker_deliveries(
+			&self,
+		) -> Result<Vec<pi_agent::durable::DeliveredWorkerResult>, pi_agent::durable::DurableError> {
+			// Simulates turn 1: accept has not seen the race delivery in SQLite yet
+			Ok(Vec::new())
+		}
+		async fn mark_deliveries_delivered(
+			&self,
+			delivery_ids: &[String],
+		) -> Result<(), pi_agent::durable::DurableError> {
+			self.delivered.lock().unwrap().extend_from_slice(delivery_ids);
+			Ok(())
+		}
+		async fn mark_deliveries_processed(
+			&self,
+			delivery_ids: &[String],
+		) -> Result<(), pi_agent::durable::DurableError> {
+			self.processed.lock().unwrap().extend_from_slice(delivery_ids);
+			Ok(())
+		}
+	}
+
+	let durable = Arc::new(RaceDurable {
+		delivered: delivered_ids.clone(),
+		processed: processed_ids.clone(),
+	});
+
+	let agent = AgentLoop::new(
+		AgentConfig {
+			max_turns: 2,
+			context_limit: 100_000,
+			system_prompt: None,
+			cwd: std::env::temp_dir(),
+		},
+		provider,
+		ToolRegistry::new(),
+	)
+	.with_durable(Some(durable))
+	.with_background_results(sink);
+
+	let mut state = pi_agent::state::AgentState::default();
+	agent
+		.run_dialog_message_with_cancel(
+			Message::user("run turn"),
+			&mut state,
+			None,
+			None,
+			tokio_util::sync::CancellationToken::new(),
+		)
+		.await?;
+
+	// Assert: because delivery carried delivery_id: Some("ns:w-race-1"),
+	// inject_boundary_messages skipped it:
+	// 1. Not injected into state.messages
+	assert!(
+		!state.messages.iter().any(|m| m.content.contains("race text")),
+		"durable worker delivery must be skipped by inject_boundary_messages to avoid unlinked delivery"
+	);
+	// 2. Not marked delivered by mark_deliveries_delivered
+	let delivered = delivered_ids.lock().unwrap().clone();
+	assert!(
+		!delivered.contains(&"ns:w-race-1".to_string()),
+		"durable worker delivery must not be marked delivered without message_id linkage"
+	);
+
+	Ok(())
+}
+
 /// First completion hangs (holding the parent job's permit), later ones answer
 /// immediately, so a nested spawn can only finish if it uses fresh permits.
 struct ScriptedProvider {
