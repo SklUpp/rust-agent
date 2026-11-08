@@ -627,7 +627,19 @@ async fn agent_loop_no_duplicate_worker_injection_when_sink_and_durable_both_hav
 		.expect("open child durable")
 		.expect("durable child");
 	supervisor
-		.complete_child_durable(&id, json!({ "status": "completed" }), json!({ "kind": "task-result" }))
+		.complete_child_durable(
+			&id,
+			json!({ "status": "completed" }),
+			json!({
+				"version": 2,
+				"kind": "task-result",
+				"mode": "background",
+				"notify_parent": true,
+				"agent": "scout",
+				"status": "completed",
+				"text": delivery_text,
+			}),
+		)
 		.expect("complete child durable");
 	supervisor.mark_completed(&id, 10, &delivery_text);
 	supervisor.enqueue_delivery(&id, delivery_text.clone());

@@ -2749,7 +2749,7 @@ async fn durable_worker_fails_closed_on_legacy_corrupt_row() {
 		let conn = rusqlite::Connection::open(&db).expect("open raw sqlite");
 		conn.execute(
 			"INSERT INTO deliveries (delivery_id, worker_id, session_id, origin_branch_id, payload_json, created_at_ms, delivered_at_ms, processed_at_ms, message_id) \
-			 VALUES ('bad-del', 'w-bad', 's-worker-failclosed', 's-worker-failclosed.main', '{\"text\":\"\"}', 10, NULL, NULL, NULL)",
+			 VALUES ('bad-del', 'w-bad', 's-worker-failclosed', 's-worker-failclosed.main', '{\"kind\":\"task-result\",\"text\":\"\"}', 10, NULL, NULL, NULL)",
 			[],
 		)
 		.expect("insert delivery");

@@ -3627,7 +3627,13 @@ mod tests {
 					session_id: "s1".to_string(),
 					origin_branch_id: "b1".to_string(),
 					completion: json!({ "status": "completed" }),
-					delivery: json!({ "text": "result" }),
+					delivery: json!({
+						"version": 2,
+						"kind": "task-result",
+						"mode": "background",
+						"notify_parent": true,
+						"text": "result",
+					}),
 				})
 				.expect("complete worker on b1");
 		}
@@ -3760,7 +3766,7 @@ mod tests {
 		// Manually insert legacy ambiguous row (delivered without message_id)
 		store.connection.execute(
 			"INSERT INTO deliveries (delivery_id, worker_id, session_id, origin_branch_id, payload_json, created_at_ms, delivered_at_ms, processed_at_ms, message_id) \
-			 VALUES ('legacy-del', 'legacy-w', 's1', 'b1', '{\"text\":\"legacy\"}', 10, 20, NULL, NULL)",
+			 VALUES ('legacy-del', 'legacy-w', 's1', 'b1', '{\"kind\":\"task-result\",\"text\":\"legacy\"}', 10, 20, NULL, NULL)",
 			[],
 		).expect("insert legacy delivery");
 
@@ -3776,6 +3782,36 @@ mod tests {
 			30,
 		);
 		assert!(matches!(err, Err(StoreError::Corrupt(_))));
+	}
+
+	#[test]
+	fn legacy_worker_completion_fails_closed_on_consume_gate() {
+		let mut store = seeded_store();
+		store.append_message(message("m1", None)).expect("append m1");
+		// Real worker_completions row with legacy ambiguous delivery payload
+		store.connection.execute(
+			"INSERT INTO deliveries (delivery_id, worker_id, session_id, origin_branch_id, payload_json, created_at_ms, delivered_at_ms, processed_at_ms, message_id) \
+			 VALUES ('legacy-w1', 'w-leg', 's1', 'b1', '{\"kind\":\"task-result\",\"text\":\"legacy result\"}', 10, NULL, NULL, NULL)",
+			[],
+		).expect("insert legacy delivery");
+		store.connection.execute(
+			"INSERT INTO worker_completions (worker_id, session_id, origin_branch_id, delivery_id, completion_json, completed_at_ms) \
+			 VALUES ('w-leg', 's1', 'b1', 'legacy-w1', '{\"status\":\"completed\"}', 10)",
+			[],
+		).expect("insert worker completion");
+
+		let err = store.consume_delivery(
+			"legacy-w1",
+			NewMessage {
+				id: "m-legacy".to_string(),
+				session_id: "s1".to_string(),
+				branch_id: "b1".to_string(),
+				parent_message_id: Some("m1".to_string()),
+				payload: json!({ "id": "m-legacy", "text": "legacy result" }),
+			},
+			20,
+		);
+		assert!(matches!(err, Err(StoreError::Corrupt(msg)) if msg.contains("ambiguous legacy worker payload")));
 	}
 
 	#[test]
