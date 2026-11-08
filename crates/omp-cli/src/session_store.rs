@@ -1934,7 +1934,7 @@ impl SqliteStore {
 				if let Some((stored_session, stored_branch, stored_payload)) = stored_message {
 					if stored_session == message.session_id
 						&& (message.branch_id.is_empty() || message.branch_id == stored_branch)
-						&& decode_json::<Value>(&stored_payload)? == message.payload
+						&& decode_json(&stored_payload)? == message.payload
 					{
 						transaction.commit()?;
 						return Ok(());
