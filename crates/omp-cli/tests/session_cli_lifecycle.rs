@@ -133,7 +133,7 @@ fn test_resume_known_v3_session() {
 
 	let fixture_path =
 		PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/v3_session.jsonl");
-	let session_id = "0195e342-9f7a-7b3b-8f3a-3c9f7a7b3b8f";
+	let session_id = "01a178ce-3463-7504-8047-ca4fab78a16b";
 	let v3_filename = format!("2026-03-31T08-00-00-000Z_{session_id}.jsonl");
 	let v3_file = sessions_dir.join(&v3_filename);
 	fs::copy(&fixture_path, &v3_file).expect("copy v3 fixture");

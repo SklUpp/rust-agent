@@ -2641,3 +2641,40 @@ fn advisor_card_is_published_by_the_rpc_pump_before_eof() {
 	);
 	assert!(harness.join().is_ok(), "EOF must publish the settled card");
 }
+
+#[test]
+fn rpc_auto_title_survives_restart_and_preserves_initial_title() {
+	let root = checkpoint_root("rpc-title");
+	let worktree = root.join("worktree");
+	let sessions = root.join("sessions");
+	let session_id = "rpc-title-session";
+
+	// 1. First run with titling enabled (no_title: false)
+	let port1 = spawn_model(vec![StreamScript { text: "first response".to_string(), pause: None }]);
+	let mut launch1 = launch_checkpoint(port1, &worktree, &sessions, Some(session_id));
+	launch1.store_options.no_title = false;
+	let harness1 = Harness::start(launch1);
+	harness1.send(json!({ "type": "prompt", "id": "p1", "message": "first user prompt" }));
+	harness1.wait_frame("agent_end", timeout());
+	drop(harness1);
+
+	// Verify title was persisted to SQLite store
+	let opts = checkpoint_session_options(&worktree, &sessions, Some(session_id));
+	let store1 = SessionStore::open(&opts);
+	assert_eq!(store1.header().and_then(|h| h.title.as_deref()), Some("first user prompt"));
+
+	// 2. Restart harness, resume session, and send second prompt
+	let port2 = spawn_model(vec![StreamScript { text: "second response".to_string(), pause: None }]);
+	let mut launch2 = launch_checkpoint(port2, &worktree, &sessions, Some(session_id));
+	launch2.store_options.no_title = false;
+	let harness2 = Harness::start(launch2);
+	harness2.send(json!({ "type": "prompt", "id": "p2", "message": "second user prompt" }));
+	harness2.wait_frame("agent_end", timeout());
+	drop(harness2);
+
+	// Verify title preserved after restart and second prompt
+	let store2 = SessionStore::open(&opts);
+	assert_eq!(store2.header().and_then(|h| h.title.as_deref()), Some("first user prompt"));
+
+	fs::remove_dir_all(root).ok();
+}

@@ -1782,6 +1782,8 @@ impl SessionStore {
 		let Some(durable) = self.durable.clone() else {
 			return Err("session persistence has no durable store".to_string());
 		};
+		let prior_message_ids: std::collections::HashSet<String> =
+			self.messages.iter().map(|m| m.id.clone()).collect();
 		let loaded = durable.load().map_err(|error| error.to_string())?;
 		self.header = Some(loaded.header);
 		self.entries = loaded.entries;
@@ -1803,32 +1805,37 @@ impl SessionStore {
 					.unwrap_or_default(),
 			});
 		self.refresh_title_from_entries();
-		// Auto-title is part of the session header, not a JSONL-only slot. Write
-		// it through the durable owner once the first real user message exists.
+
+		// Auto-title: when titling is enabled for this invocation (!no_title)
+		// and the session does not yet have a title, title it using the first
+		// user message newly persisted in this invocation (not older turns
+		// where titling may have been disabled).
 		if self.header.as_ref().is_some_and(|header| header.title.is_none()) && !self.no_title {
-			let branch = self.branch_messages();
-			let title = branch.into_iter().find_map(|entry| {
-				(entry.message.role == "user")
-					.then(|| entry.message.content.text())
-					.filter(|text| !text.is_empty())
-			});
-			if let Some(title) = title {
+			let new_user_prompt = loaded
+				.branch_messages
+				.iter()
+				.filter(|entry| !prior_message_ids.contains(&entry.id))
+				.find_map(|entry| {
+					(entry.message.role == "user")
+						.then(|| entry.message.content.text())
+						.filter(|text| !text.is_empty())
+				});
+			if let Some(prompt) = new_user_prompt {
 				let updated_at = output::iso8601(SystemTime::now());
-				let header = if let Some(header) = &mut self.header {
-					header.title = Some(title.clone());
-					header.title_source = Some("auto".to_string());
-					header.clone()
-				} else {
+				let Some(mut header) = self.header.clone() else {
 					return Ok(());
 				};
-				self.title_slot = Some(TitleSlot {
-					title,
-					source: Some("auto".to_string()),
-					updated_at,
-				});
+				header.title = Some(prompt.clone());
+				header.title_source = Some("auto".to_string());
 				durable
 					.update_header(&header)
 					.map_err(|error| format!("cannot persist session title: {error}"))?;
+				self.title_slot = Some(TitleSlot {
+					title: prompt,
+					source: Some("auto".to_string()),
+					updated_at,
+				});
+				self.header = Some(header);
 			}
 		}
 		Ok(())
@@ -2852,6 +2859,7 @@ impl SessionStore {
 				.filter(|text| !text.is_empty())
 		})
 	}
+
 
 	fn apply_auto_title(
 		&mut self,
@@ -7289,5 +7297,64 @@ mod tests {
 		assert_eq!(selected.len(), 2);
 		assert_eq!(selected[0].id, "t2_a");
 		assert_eq!(selected[1].id, "t2_b");
+	}
+
+	#[tokio::test]
+	async fn reload_from_durable_titles_with_active_user_prompt_and_preserves_on_restart() {
+		use pi_agent::durable::DurableBoundary;
+		let dir = temp_dir();
+		let opts = options(dir.clone(), Some("reload-title-test"));
+		let mut store = SessionStore::open(&opts);
+		assert!(store.header().unwrap().title.is_none());
+
+		// 1. When no_title is true, turn messages appended to durable storage do NOT title.
+		store.no_title = true;
+		let boundary = store.durable_boundary().unwrap();
+		boundary
+			.persist_messages(&[
+				pi_agent::Message::user("first prompt"),
+				pi_agent::Message::assistant("first answer"),
+			])
+			.await
+			.expect("persist");
+		store.reload_from_durable().expect("reload");
+		assert!(store.header().unwrap().title.is_none());
+
+		// 2. Next invocation re-enables titling (no_title: false) and appends second turn.
+		store.no_title = false;
+		boundary
+			.persist_messages(&[
+				pi_agent::Message::user("first prompt"),
+				pi_agent::Message::assistant("first answer"),
+				pi_agent::Message::user("resume prompt"),
+				pi_agent::Message::assistant("second answer"),
+			])
+			.await
+			.expect("persist");
+		store.reload_from_durable().expect("reload");
+		assert_eq!(store.header().unwrap().title.as_deref(), Some("resume prompt"));
+		assert_eq!(store.header().unwrap().title_source.as_deref(), Some("auto"));
+
+		// 3. Subsequent turn does not overwrite the existing title.
+		boundary
+			.persist_messages(&[
+				pi_agent::Message::user("first prompt"),
+				pi_agent::Message::assistant("first answer"),
+				pi_agent::Message::user("resume prompt"),
+				pi_agent::Message::assistant("second answer"),
+				pi_agent::Message::user("third prompt"),
+				pi_agent::Message::assistant("third answer"),
+			])
+			.await
+			.expect("persist");
+		store.reload_from_durable().expect("reload");
+		assert_eq!(store.header().unwrap().title.as_deref(), Some("resume prompt"));
+
+		// 4. Persistence across reopen / restart:
+		drop(store);
+		let reopened = SessionStore::open(&opts);
+		assert_eq!(reopened.header().unwrap().title.as_deref(), Some("resume prompt"));
+
+		fs::remove_dir_all(dir).ok();
 	}
 }
