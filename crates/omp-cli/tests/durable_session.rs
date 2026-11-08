@@ -2597,7 +2597,7 @@ async fn durable_worker_recovery_after_restart_loss_of_queue() {
 
 	let loaded_after = reopened.load().expect("load after recovery");
 	assert_eq!(loaded_after.branch_messages.len(), 2, "exactly two messages: user + recovered worker");
-	assert_eq!(loaded_after.branch_messages[1].text, recovered[0].text);
+	assert_eq!(loaded_after.branch_messages[1].message.content.text(), recovered[0].text);
 
 	std::fs::remove_dir_all(dir).ok();
 }
@@ -2725,7 +2725,7 @@ async fn durable_worker_branch_cut_consumes_into_active_branch() {
 	let loaded = session.load().expect("load");
 	assert_eq!(loaded.branch_id, b2_id);
 	assert!(
-		loaded.branch_messages.iter().any(|m| m.text.contains("<task-result id=\"w-cut\">")),
+		loaded.branch_messages.iter().any(|m| m.message.content.text().contains("<task-result id=\"w-cut\">")),
 		"message must land on active branch b2"
 	);
 
@@ -2858,7 +2858,7 @@ async fn durable_worker_projection_saved_and_survives_crash_before_assistant() {
 	let worker_msgs: Vec<_> = loaded_after
 		.branch_messages
 		.iter()
-		.filter(|m| m.text.contains("<task-result id=\"w-proj\">"))
+		.filter(|m| m.message.content.text().contains("<task-result id=\"w-proj\">"))
 		.collect();
 	assert_eq!(worker_msgs.len(), 1, "worker message must appear exactly once on branch");
 
