@@ -40,6 +40,8 @@ pub const REWIND_TOOL_NAME: &str = "rewind";
 pub const REWIND_REPORT_CUSTOM_TYPE: &str = "rewind-report";
 /// Persisted transient custom-message type nudging the next turn to `rewind`.
 pub const CHECKPOINT_ACTIVE_REMINDER_TYPE: &str = "checkpoint-active-reminder";
+/// Runtime custom-message type tagging projected branch summary context.
+pub const BRANCH_SUMMARY_CUSTOM_TYPE: &str = "branch_summary";
 
 /// Model-facing description, mirroring `prompts/tools/checkpoint.md`.
 pub const CHECKPOINT_DESCRIPTION: &str = "Context checkpoint: before exploratory work; later `rewind`, retaining only concise report.

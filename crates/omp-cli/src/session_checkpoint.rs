@@ -31,9 +31,9 @@ use serde_json::{Value, json};
 
 use pi_agent::InMemoryRewind;
 use pi_agent::tools::checkpoint::{
-	CHECKPOINT_ACTIVE_NOTICE, CHECKPOINT_ACTIVE_REMINDER_TYPE, CHECKPOINT_TOOL_NAME,
-	CheckpointController, CheckpointTool, REWIND_REPORT_CUSTOM_TYPE, REWIND_TOOL_NAME, RewindTool,
-	now_iso8601, render_branch_summary_context, render_rewind_report,
+	BRANCH_SUMMARY_CUSTOM_TYPE, CHECKPOINT_ACTIVE_NOTICE, CHECKPOINT_ACTIVE_REMINDER_TYPE,
+	CHECKPOINT_TOOL_NAME, CheckpointController, CheckpointTool, REWIND_REPORT_CUSTOM_TYPE,
+	REWIND_TOOL_NAME, RewindTool, now_iso8601, render_branch_summary_context, render_rewind_report,
 };
 use pi_agent::{Message, ToolResult};
 
@@ -57,7 +57,9 @@ pub fn apply_in_memory_rewind(messages: &mut Vec<Message>, rewind: &InMemoryRewi
 		.min(messages.len());
 	messages.truncate(keep);
 	if !rewind.summary.is_empty() {
-		messages.push(Message::user(rewind.summary.as_str()));
+		let mut msg = Message::user(rewind.summary.as_str());
+		msg.custom_type = Some(BRANCH_SUMMARY_CUSTOM_TYPE.to_string());
+		messages.push(msg);
 	}
 	if !rewind.report.is_empty() {
 		messages.push(Message::system(rewind.report.as_str()));
@@ -541,7 +543,9 @@ impl CheckpointHost {
 						.and_then(Value::as_str)
 						.filter(|summary| !summary.is_empty());
 					if let Some(summary) = summary {
-						messages.push(Message::user(render_branch_summary_context(summary)));
+						let mut msg = Message::user(render_branch_summary_context(summary));
+						msg.custom_type = Some(BRANCH_SUMMARY_CUSTOM_TYPE.to_string());
+						messages.push(msg);
 					}
 				},
 				// Upstream replays every valid custom message; rewind reports are

@@ -429,11 +429,22 @@ impl DurableSession {
 			};
 			if entry.kind == "branch_summary" {
 				let branch_id = format!("{}.branch-{}", session_id, output::session_id());
-				let (parent_branch_id, parent_message_id) = match &parent {
-					Some(point) => (Some(cursor.branch.clone()), Some(point.clone())),
+				let parent_branch_id = match &parent {
+					Some(point) => {
+						let record = store
+							.message(point)?
+							.ok_or_else(|| StoreError::NotFound(format!("branch point message {point} not found")))?;
+						if record.session_id != session_id {
+							return Err(StoreError::Validation(format!(
+								"branch point message {point} belongs to session {}, not {session_id}",
+								record.session_id
+							)));
+						}
+						Some(record.branch_id)
+					},
 					// An explicit root cut starts an empty branch, not a child of
 					// the current branch with a missing point.
-					None => (None, None),
+					None => None,
 				};
 				let new_branch = NewBranch {
 					id: branch_id.clone(),

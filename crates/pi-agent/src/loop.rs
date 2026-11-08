@@ -488,7 +488,9 @@ fn apply_in_memory_cut(messages: &mut Vec<Message>, rewind: &InMemoryRewind) {
 		.min(messages.len());
 	messages.truncate(keep);
 	if !rewind.summary.is_empty() {
-		messages.push(Message::user(rewind.summary.clone()));
+		let mut msg = Message::user(rewind.summary.clone());
+		msg.custom_type = Some(crate::tools::checkpoint::BRANCH_SUMMARY_CUSTOM_TYPE.to_string());
+		messages.push(msg);
 	}
 	if !rewind.report.is_empty() {
 		messages.push(Message::system(rewind.report.clone()));

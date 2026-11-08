@@ -1600,6 +1600,30 @@ fn rpc_completed_rewind_survives_restart_and_fork() {
 		"completed guard not restored after restart: {}",
 		restarted[1]
 	);
+	assert!(
+		restarted[0].to_string().contains("Branch-return summary"),
+		"branch summary missing from restart request: {}",
+		restarted[0]
+	);
+
+	let store = SessionStore::open(&checkpoint_session_options(
+		&worktree,
+		&sessions,
+		Some("cp-smoke"),
+	));
+	let entries = store.entries();
+	assert!(
+		entries.iter().any(|e| e.kind == "branch_summary"),
+		"branch_summary entry must remain in session log"
+	);
+	assert!(
+		!store.branch_messages().iter().any(|m| {
+			m.message.role == "user"
+				&& m.message.content.text().contains("Branch-return summary")
+		}),
+		"runtime summary must not be persisted as a duplicate user message row in SQLite"
+	);
+	drop(store);
 
 	let fork_dir = root.join("forks");
 	let source = sessions.join(format!("{session_id}.jsonl"));
@@ -1994,6 +2018,10 @@ fn rpc_plan_yolo_guards_proposes_switches_and_journals_fallback() {
 			text: String::new(),
 			tool: Some(("write", json!({ "path": "probe.txt", "content": "done" }))),
 		},
+		ToolScript {
+			text: String::new(),
+			tool: Some(("write", json!({ "path": "xd://resolve", "content": "apply" }))),
+		},
 		ToolScript { text: "implemented".to_string(), tool: None },
 	]);
 	let mut launch = launch(port, "local/mock-model", "local");
@@ -2030,7 +2058,7 @@ fn rpc_plan_yolo_guards_proposes_switches_and_journals_fallback() {
 		.lock()
 		.unwrap_or_else(std::sync::PoisonError::into_inner)
 		.clone();
-	assert_eq!(bodies.len(), 5, "plan-yolo request sequence: {bodies:#?}");
+	assert_eq!(bodies.len(), 6, "plan-yolo request sequence: {bodies:#?}");
 	assert!(
 		!worktree.join("blocked.txt").exists(),
 		"the guard must deny working-tree writes before approval"

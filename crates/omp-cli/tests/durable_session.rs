@@ -2963,3 +2963,129 @@ async fn durable_worker_unconfirmed_matches_namespaced_id() {
 
 	std::fs::remove_dir_all(dir).ok();
 }
+
+#[tokio::test]
+async fn real_user_message_with_summary_prefix_persists_and_resumes_intact() {
+	let dir = temp_dir("user-summary-prefix");
+	let db = dir.join("session.db");
+	let sid = "s-user-prefix";
+
+	let user_text = "Branch-return summary:\n\n<summary>\nUser wrote this explicitly\n</summary>";
+	{
+		let (session, _) = DurableSession::open(db.clone(), sid, header(sid, &dir)).expect("open");
+		session
+			.persist_messages(&[Message::user(user_text)])
+			.await
+			.expect("persist user");
+	}
+
+	// Reopen session
+	let (reopened, loaded) =
+		DurableSession::open(db.clone(), sid, header(sid, &dir)).expect("reopen");
+	let loaded = loaded.expect("loaded");
+	assert_eq!(loaded.branch_messages.len(), 1);
+	assert_eq!(loaded.branch_messages[0].message.content.text(), user_text);
+
+	// Persist next turn
+	let history = vec![Message::user(user_text), Message::assistant("answer")];
+	reopened.persist_messages(&history).await.expect("persist next turn");
+
+	let loaded_after = reopened.load().expect("load");
+	assert_eq!(loaded_after.branch_messages.len(), 2);
+	assert_eq!(loaded_after.branch_messages[0].message.content.text(), user_text);
+	assert_eq!(loaded_after.branch_messages[1].message.content.text(), "answer");
+
+	std::fs::remove_dir_all(dir).ok();
+}
+
+#[tokio::test]
+async fn cut_branch_to_offbranch_point_succeeds_and_sets_correct_parent_branch() {
+	let dir = temp_dir("cut-offbranch");
+	let db = dir.join("session.db");
+	let sid = "s-cut-offbranch";
+
+	let (session, _) = DurableSession::open(db.clone(), sid, header(sid, &dir)).expect("open");
+	session
+		.persist_messages(&[Message::user("m1"), Message::assistant("a1"), Message::user("m2")])
+		.await
+		.expect("persist m1 a1 m2");
+
+	let loaded = session.load().expect("load");
+	let m1_id = loaded.branch_messages[0].id.clone();
+	let m2_id = loaded.branch_messages[2].id.clone();
+	let main_branch_id = loaded.branch_id.clone();
+
+	// 1. Cut branch b1 at m1
+	let cut_b1 = SessionEntry {
+		kind: "branch_summary".to_string(),
+		id: "b1-summary".to_string(),
+		parent_id: Some(m1_id),
+		timestamp: output::iso8601(std::time::SystemTime::now()),
+		extra: json!({}),
+	};
+	session.append_entry(cut_b1).expect("cut b1");
+	let b1_id = session.load().expect("load after b1").branch_id;
+	assert_ne!(b1_id, main_branch_id);
+
+	// Persist on b1
+	session
+		.persist_messages(&[Message::user("m1"), Message::user("on b1")])
+		.await
+		.expect("persist on b1");
+
+	// 2. Cut branch b2 at m2 (which lives on main, NOT on b1)
+	let cut_b2 = SessionEntry {
+		kind: "branch_summary".to_string(),
+		id: "b2-summary".to_string(),
+		parent_id: Some(m2_id.clone()),
+		timestamp: output::iso8601(std::time::SystemTime::now()),
+		extra: json!({}),
+	};
+	session.append_entry(cut_b2).expect("cut b2 off-branch from m2");
+	let b2_id = session.load().expect("load after b2").branch_id;
+	assert_ne!(b2_id, b1_id);
+	assert_ne!(b2_id, main_branch_id);
+
+	// Verify in SQLite that b2's parent_branch_id is main_branch_id, and parent_message_id is m2_id
+	let store = SqliteStore::open(&db).expect("open store");
+	let branch_b2 = store.branch(&b2_id).expect("branch b2").expect("exists");
+	assert_eq!(branch_b2.parent_branch_id.as_deref(), Some(main_branch_id.as_str()));
+	assert_eq!(branch_b2.parent_message_id.as_deref(), Some(m2_id.as_str()));
+
+	std::fs::remove_dir_all(dir).ok();
+}
+
+#[tokio::test]
+async fn cut_branch_rejects_foreign_session_point() {
+	let dir = temp_dir("cut-foreign");
+	let db = dir.join("session.db");
+	let s1 = "s-foreign-1";
+	let s2 = "s-foreign-2";
+
+	// Session 1 writes m1
+	let (session1, _) = DurableSession::open(db.clone(), s1, header(s1, &dir)).expect("open s1");
+	session1
+		.persist_messages(&[Message::user("m1 in s1")])
+		.await
+		.expect("persist s1");
+	let m1_id = session1.load().expect("load s1").branch_messages[0].id.clone();
+
+	// Session 2 attempts to branch from m1
+	let (session2, _) = DurableSession::open(db.clone(), s2, header(s2, &dir)).expect("open s2");
+	let cut_foreign = SessionEntry {
+		kind: "branch_summary".to_string(),
+		id: "b-foreign-summary".to_string(),
+		parent_id: Some(m1_id),
+		timestamp: output::iso8601(std::time::SystemTime::now()),
+		extra: json!({}),
+	};
+	let err = session2.append_entry(cut_foreign);
+	assert!(err.is_err(), "branching from a foreign session point must fail");
+	let err_msg = err.unwrap_err().to_string();
+	assert!(
+		err_msg.contains("belongs to session") && err_msg.contains(s1),
+		"error must mention foreign session: {err_msg}"
+	);
+
+	std::fs::remove_dir_all(dir).ok();
+}
