@@ -531,8 +531,7 @@ async fn seen_line_enforcement_can_be_disabled() {
 	assert!(rejected.content.contains("never displayed"), "{}", rejected.content);
 	assert_eq!(dir.read("note.txt"), "alpha\nbeta\ngamma\n");
 
-	let lax = EditTool::with_options(store.clone(), EditToolOptions { enforce_seen_lines: false });
-	let accepted = lax.execute(&json!({ "input": input }), &ctx).await.expect("lax");
+	let accepted = run_edit_with_options(&dir.path, &store, &input, EditToolOptions { enforce_seen_lines: false }).await;
 	assert!(!accepted.is_error, "{}", accepted.content);
 	assert_eq!(dir.read("note.txt"), "alpha\nbeta\nGAMMA\n");
 }
