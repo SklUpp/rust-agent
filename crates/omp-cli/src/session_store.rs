@@ -4591,6 +4591,7 @@ mod tests {
 			})
 			.expect("m1");
 
+		store.connection.execute_batch("PRAGMA foreign_keys = OFF").expect("disable foreign keys for corrupt fixture");
 		store
 			.connection
 			.execute(
@@ -4599,6 +4600,7 @@ mod tests {
 				[],
 			)
 			.expect("inject broken row");
+		store.connection.execute_batch("PRAGMA foreign_keys = ON").expect("restore foreign keys");
 		store
 			.connection
 			.execute("UPDATE branches SET leaf_message_id = 'm2' WHERE id = 'b1'", [])

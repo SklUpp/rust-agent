@@ -9231,6 +9231,8 @@ mod tests {
 		}), &ctx)
 		.await;
 		assert!(!cut.is_error, "{}", cut.content);
+		let applied = execute(&turn1, "write", serde_json::json!({"path": "xd://resolve", "content": "apply"}), &ctx).await;
+		assert!(!applied.is_error, "{}", applied.content);
 		assert_eq!(
 			std::fs::read_to_string(dir.join("note.txt")).expect("read"),
 			"a\nc\nd\ne\nf\ng\nh\ni\nj\n"
@@ -9245,6 +9247,8 @@ mod tests {
 		}), &ctx)
 		.await;
 		assert!(!paste.is_error, "{}", paste.content);
+		let applied = execute(&turn2, "write", serde_json::json!({"path": "xd://resolve", "content": "apply"}), &ctx).await;
+		assert!(!applied.is_error, "{}", applied.content);
 		assert_eq!(
 			std::fs::read_to_string(dir.join("note.txt")).expect("read"),
 			"a\nc\nd\ne\nf\ng\nh\ni\nj\nb\n"
@@ -9276,6 +9280,8 @@ mod tests {
 		}), &ctx)
 		.await;
 		assert!(!recovered.is_error, "{}", recovered.content);
+		let applied = execute(&turn3, "write", serde_json::json!({"path": "xd://resolve", "content": "apply"}), &ctx).await;
+		assert!(!applied.is_error, "{}", applied.content);
 		assert_eq!(
 			std::fs::read_to_string(dir.join("note.txt")).expect("read"),
 			"zero\na\nA\nd\ne\nf\ng\nh\ni\nj\nb\n"
@@ -9310,6 +9316,8 @@ mod tests {
 		}), &ctx)
 		.await;
 		assert!(!landed.is_error, "{}", landed.content);
+		let applied = execute(&turn4, "write", serde_json::json!({"path": "xd://resolve", "content": "apply"}), &ctx).await;
+		assert!(!applied.is_error, "{}", applied.content);
 		assert_eq!(
 			std::fs::read_to_string(dir.join("other.txt")).expect("read"),
 			"o1\no2\no3\no4\no5\no6\no7\no8\nX\no10\n"
