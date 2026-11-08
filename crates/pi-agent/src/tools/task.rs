@@ -5391,6 +5391,51 @@ mod tests {
 		assert!(effective.is_none(), "None ceiling must not expand to a set");
 	}
 
+	#[test]
+	fn restricted_parent_ceiling_blocks_escalation() {
+		let supervisor = Supervisor::with_selection(
+			ToolRegistry::with_builtins(),
+			Arc::new(NullProvider),
+			None,
+			DelegationLimits::default(),
+			true,
+			false,
+		);
+		let mut tool = TaskTool::new(supervisor, 0);
+		tool.parent_tools = Some(BTreeSet::from(["read".to_string()]));
+		let context = tool.child_context();
+
+		let mut role = model_agent();
+		role.tools = Some(vec!["read".to_string(), "write".to_string()]);
+		let (registry, effective) = context
+			.prepare_registry("role-1", &role, None)
+			.expect("registry");
+		assert!(registry.get("read").is_some());
+		assert!(
+			registry.get("write").is_none(),
+			"role allowlist cannot escalate past parent ceiling"
+		);
+		let effective = effective.expect("restricted ceiling");
+		assert!(effective.contains("read"));
+		assert!(!effective.contains("write"));
+
+		let mut open = model_agent();
+		open.tools = None;
+		let (registry, effective) = context
+			.prepare_registry("open-1", &open, None)
+			.expect("registry");
+		assert_eq!(
+			effective,
+			Some(BTreeSet::from(["read".to_string()])),
+			"tools=None must inherit parent ceiling verbatim"
+		);
+		assert!(registry.get("read").is_some());
+		assert!(
+			registry.get("write").is_none(),
+			"tools=None must not gain tools beyond parent"
+		);
+	}
+
 	struct SharedFactory(Arc<dyn ModelProvider>);
 
 	impl ChildModelFactory for SharedFactory {
