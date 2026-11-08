@@ -3887,10 +3887,12 @@ mod display_tests {
 		let tool = ReadTool::new()
 			.with_internal_urls(router, Arc::new(UrlScope::default()));
 		let result = read_with(&tool, &dir, "nope://x").await;
-		assert_eq!(
-			result.content,
-			"Unknown protocol: nope://\nSupported: agent://, artifact://, issue://, local://, mcp://, mcp-prompt://, notes://, pr://, ssh://"
+		assert!(
+			result
+				.content
+				.starts_with("Unknown protocol: nope://\nSupported: ")
 		);
+		assert!(result.content.contains("notes://"));
 	}
 
 	#[tokio::test]

@@ -787,7 +787,7 @@ impl FileOpsAction {
 	}
 
 	pub fn has_any_partial_effects(&self) -> bool {
-		!self.cumulative_written.lock().unwrap().is_empty()
+		self.wrote_anything()
 			|| !self.cumulative_invalidated.lock().unwrap().is_empty()
 			|| !self.created_dirs.lock().unwrap().is_empty()
 	}
@@ -799,6 +799,14 @@ impl FileOpsAction {
 
 	pub fn ops(&self) -> &[PreparedOp] {
 		&self.ops
+	}
+
+	fn written_len(&self) -> usize {
+		self.cumulative_written.lock().unwrap().len()
+	}
+
+	fn wrote_anything(&self) -> bool {
+		!self.cumulative_written.lock().unwrap().is_empty()
 	}
 
 	fn partial_result(
@@ -813,6 +821,10 @@ impl FileOpsAction {
 		failed_target: Option<String>,
 		cleanup_warnings: Vec<String>,
 	) -> ToolResult {
+		debug_assert!(
+			self.cumulative_written.try_lock().is_ok(),
+			"partial_result re-entered cumulative_written"
+		);
 		let cum_written = self.cumulative_written.lock().unwrap().clone();
 		let cum_invalidated = self.cumulative_invalidated.lock().unwrap().clone();
 		let cum_created_dirs = self.created_dirs.lock().unwrap().clone();
@@ -822,7 +834,12 @@ impl FileOpsAction {
 				all_cleanup_warnings.push(w);
 			}
 		}
-		let is_partial = partial || self.has_any_partial_effects() || !attempt_written.is_empty() || !attempt_created_dirs.is_empty();
+		let is_partial = partial
+			|| !cum_written.is_empty()
+			|| !cum_invalidated.is_empty()
+			|| !cum_created_dirs.is_empty()
+			|| !attempt_written.is_empty()
+			|| !attempt_created_dirs.is_empty();
 		let is_stale = stale || (!cum_written.is_empty() && attempt_written.is_empty());
 
 		let mut text = message;
@@ -1107,7 +1124,7 @@ impl PendingAction for FileOpsAction {
 				&[],
 				&[],
 				&[],
-				!self.cumulative_written.lock().unwrap().is_empty(),
+				self.wrote_anything(),
 				true,
 				None,
 				Vec::new(),
@@ -1129,8 +1146,8 @@ impl PendingAction for FileOpsAction {
 
 			if ctx.cancellation_token.is_cancelled() {
 				return Ok(self.partial_result(
-					format!("Cancelled after applying {} of {total_ops} operations; remaining operations were not performed.", self.cumulative_written.lock().unwrap().len()),
-					&attempt_written, &attempt_invalidated, &attempt_created_dirs, &fresh_tags, !self.cumulative_written.lock().unwrap().is_empty(), false, None, cleanup_warnings,
+					format!("Cancelled after applying {} of {total_ops} operations; remaining operations were not performed.", self.written_len()),
+					&attempt_written, &attempt_invalidated, &attempt_created_dirs, &fresh_tags, self.wrote_anything(), false, None, cleanup_warnings,
 				));
 			}
 
@@ -1141,16 +1158,16 @@ impl PendingAction for FileOpsAction {
 				Ok(p) => {
 					if let Err(e) = p.verify_against(ancestor_path, op.parent_dev_ino) {
 						return Ok(self.partial_result(
-							format!("Parent directory ancestor verification failed at {}: {e}. {} of {total_ops} operations were performed.", op.display, self.cumulative_written.lock().unwrap().len()),
-							&attempt_written, &attempt_invalidated, &attempt_created_dirs, &fresh_tags, !self.cumulative_written.lock().unwrap().is_empty(), true, Some(op.display.clone()), cleanup_warnings,
+							format!("Parent directory ancestor verification failed at {}: {e}. {} of {total_ops} operations were performed.", op.display, self.written_len()),
+							&attempt_written, &attempt_invalidated, &attempt_created_dirs, &fresh_tags, self.wrote_anything(), true, Some(op.display.clone()), cleanup_warnings,
 						));
 					}
 					p
 				}
 				Err(err) => {
 					return Ok(self.partial_result(
-						format!("Parent directory ancestor pinning failed at {}: {err}. {} of {total_ops} operations were performed.", op.display, self.cumulative_written.lock().unwrap().len()),
-						&attempt_written, &attempt_invalidated, &attempt_created_dirs, &fresh_tags, !self.cumulative_written.lock().unwrap().is_empty(), true, Some(op.display.clone()), cleanup_warnings,
+						format!("Parent directory ancestor pinning failed at {}: {err}. {} of {total_ops} operations were performed.", op.display, self.written_len()),
+						&attempt_written, &attempt_invalidated, &attempt_created_dirs, &fresh_tags, self.wrote_anything(), true, Some(op.display.clone()), cleanup_warnings,
 					));
 				}
 			};
@@ -1166,8 +1183,8 @@ impl PendingAction for FileOpsAction {
 					attempt_created_dirs.extend(created_dirs.clone());
 					self.created_dirs.lock().unwrap().extend(created_dirs);
 					return Ok(self.partial_result(
-						format!("Parent directory subdirectory creation failed at {}: {err}. {} of {total_ops} operations were performed.", op.display, self.cumulative_written.lock().unwrap().len()),
-						&attempt_written, &attempt_invalidated, &attempt_created_dirs, &fresh_tags, !self.cumulative_written.lock().unwrap().is_empty(), true, Some(op.display.clone()), cleanup_warnings,
+						format!("Parent directory subdirectory creation failed at {}: {err}. {} of {total_ops} operations were performed.", op.display, self.written_len()),
+						&attempt_written, &attempt_invalidated, &attempt_created_dirs, &fresh_tags, self.wrote_anything(), true, Some(op.display.clone()), cleanup_warnings,
 					));
 				}
 			};
@@ -1175,15 +1192,15 @@ impl PendingAction for FileOpsAction {
 			if !matches!(current_status, OpStatus::DestPublished { .. }) {
 				if let Err(err) = Self::check_file_identity(op).await {
 					return Ok(self.partial_result(
-						format!("Preview is stale / no longer matches at {}: {err}. {} of {total_ops} operations were performed.", op.display, self.cumulative_written.lock().unwrap().len()),
-						&attempt_written, &attempt_invalidated, &attempt_created_dirs, &fresh_tags, !self.cumulative_written.lock().unwrap().is_empty(), true, Some(op.display.clone()), cleanup_warnings,
+						format!("Preview is stale / no longer matches at {}: {err}. {} of {total_ops} operations were performed.", op.display, self.written_len()),
+						&attempt_written, &attempt_invalidated, &attempt_created_dirs, &fresh_tags, self.wrote_anything(), true, Some(op.display.clone()), cleanup_warnings,
 					));
 				}
 			}
 			if ctx.cancellation_token.is_cancelled() {
 				return Ok(self.partial_result(
-					format!("Cancelled after applying {} of {total_ops} operations; remaining operations were not performed.", self.cumulative_written.lock().unwrap().len()),
-					&attempt_written, &attempt_invalidated, &attempt_created_dirs, &fresh_tags, !self.cumulative_written.lock().unwrap().is_empty(), false, None, cleanup_warnings,
+					format!("Cancelled after applying {} of {total_ops} operations; remaining operations were not performed.", self.written_len()),
+					&attempt_written, &attempt_invalidated, &attempt_created_dirs, &fresh_tags, self.wrote_anything(), false, None, cleanup_warnings,
 				));
 			}
 
@@ -1195,14 +1212,14 @@ impl PendingAction for FileOpsAction {
 					match dir_pin.stat_file(file_name) {
 						Ok(Some(_)) => {
 							return Ok(self.partial_result(
-								format!("Cannot create {}: file already exists under held directory descriptor. {} of {total_ops} operations performed.", op.display, self.cumulative_written.lock().unwrap().len()),
-								&attempt_written, &attempt_invalidated, &attempt_created_dirs, &fresh_tags, !self.cumulative_written.lock().unwrap().is_empty(), true, Some(op.display.clone()), cleanup_warnings,
+								format!("Cannot create {}: file already exists under held directory descriptor. {} of {total_ops} operations performed.", op.display, self.written_len()),
+								&attempt_written, &attempt_invalidated, &attempt_created_dirs, &fresh_tags, self.wrote_anything(), true, Some(op.display.clone()), cleanup_warnings,
 							));
 						}
 						Err(e) => {
 							return Ok(self.partial_result(
-								format!("Cannot stat target {}: {e}. {} of {total_ops} operations performed.", op.display, self.cumulative_written.lock().unwrap().len()),
-								&attempt_written, &attempt_invalidated, &attempt_created_dirs, &fresh_tags, !self.cumulative_written.lock().unwrap().is_empty(), false, Some(op.display.clone()), cleanup_warnings,
+								format!("Cannot stat target {}: {e}. {} of {total_ops} operations performed.", op.display, self.written_len()),
+								&attempt_written, &attempt_invalidated, &attempt_created_dirs, &fresh_tags, self.wrote_anything(), false, Some(op.display.clone()), cleanup_warnings,
 							));
 						}
 						Ok(None) => {}
@@ -1211,8 +1228,8 @@ impl PendingAction for FileOpsAction {
 						Ok(res) => res,
 						Err(err) => {
 							return Ok(self.partial_result(
-								format!("Failed to create temp file for {}: {err}. {} of {total_ops} operations performed.", op.display, self.cumulative_written.lock().unwrap().len()),
-								&attempt_written, &attempt_invalidated, &attempt_created_dirs, &fresh_tags, !self.cumulative_written.lock().unwrap().is_empty(), false, Some(op.display.clone()), cleanup_warnings,
+								format!("Failed to create temp file for {}: {err}. {} of {total_ops} operations performed.", op.display, self.written_len()),
+								&attempt_written, &attempt_invalidated, &attempt_created_dirs, &fresh_tags, self.wrote_anything(), false, Some(op.display.clone()), cleanup_warnings,
 							));
 						}
 					};
@@ -1221,16 +1238,16 @@ impl PendingAction for FileOpsAction {
 						drop(temp_file);
 						drop(temp_guard);
 						return Ok(self.partial_result(
-							format!("write {}: {e}. {} of {total_ops} operations performed.", op.display, self.cumulative_written.lock().unwrap().len()),
-							&attempt_written, &attempt_invalidated, &attempt_created_dirs, &fresh_tags, !self.cumulative_written.lock().unwrap().is_empty(), false, Some(op.display.clone()), cleanup_warnings,
+							format!("write {}: {e}. {} of {total_ops} operations performed.", op.display, self.written_len()),
+							&attempt_written, &attempt_invalidated, &attempt_created_dirs, &fresh_tags, self.wrote_anything(), false, Some(op.display.clone()), cleanup_warnings,
 						));
 					}
 					if let Err(e) = temp_file.flush() {
 						drop(temp_file);
 						drop(temp_guard);
 						return Ok(self.partial_result(
-							format!("flush {}: {e}. {} of {total_ops} operations performed.", op.display, self.cumulative_written.lock().unwrap().len()),
-							&attempt_written, &attempt_invalidated, &attempt_created_dirs, &fresh_tags, !self.cumulative_written.lock().unwrap().is_empty(), false, Some(op.display.clone()), cleanup_warnings,
+							format!("flush {}: {e}. {} of {total_ops} operations performed.", op.display, self.written_len()),
+							&attempt_written, &attempt_invalidated, &attempt_created_dirs, &fresh_tags, self.wrote_anything(), false, Some(op.display.clone()), cleanup_warnings,
 						));
 					}
 
@@ -1244,7 +1261,7 @@ impl PendingAction for FileOpsAction {
 							drop(temp_guard);
 							return Ok(self.partial_result(
 								format!("fchmod target mode failed for {}: {err}", op.display),
-								&attempt_written, &attempt_invalidated, &attempt_created_dirs, &fresh_tags, !self.cumulative_written.lock().unwrap().is_empty(), false, Some(op.display.clone()), cleanup_warnings,
+								&attempt_written, &attempt_invalidated, &attempt_created_dirs, &fresh_tags, self.wrote_anything(), false, Some(op.display.clone()), cleanup_warnings,
 							));
 						}
 					}
@@ -1259,7 +1276,7 @@ impl PendingAction for FileOpsAction {
 								drop(temp_guard);
 								return Ok(self.partial_result(
 									format!("Temp file {temp_name} entry in directory was replaced concurrently (expected {temp_dev_ino:?}, found {other_dev_ino:?}). Publication aborted."),
-									&attempt_written, &attempt_invalidated, &attempt_created_dirs, &fresh_tags, !self.cumulative_written.lock().unwrap().is_empty(), false, Some(op.display.clone()), cleanup_warnings,
+									&attempt_written, &attempt_invalidated, &attempt_created_dirs, &fresh_tags, self.wrote_anything(), false, Some(op.display.clone()), cleanup_warnings,
 								));
 							}
 							_ => {
@@ -1267,7 +1284,7 @@ impl PendingAction for FileOpsAction {
 								drop(temp_guard);
 								return Ok(self.partial_result(
 									format!("Temp file {temp_name} missing from directory before publication. Publication aborted."),
-									&attempt_written, &attempt_invalidated, &attempt_created_dirs, &fresh_tags, !self.cumulative_written.lock().unwrap().is_empty(), false, Some(op.display.clone()), cleanup_warnings,
+									&attempt_written, &attempt_invalidated, &attempt_created_dirs, &fresh_tags, self.wrote_anything(), false, Some(op.display.clone()), cleanup_warnings,
 								));
 							}
 						}
@@ -1288,7 +1305,7 @@ impl PendingAction for FileOpsAction {
 								drop(temp_guard);
 								return Ok(self.partial_result(
 									format!("Invalid temp file name: {e}"),
-									&attempt_written, &attempt_invalidated, &attempt_created_dirs, &fresh_tags, !self.cumulative_written.lock().unwrap().is_empty(), false, Some(op.display.clone()), cleanup_warnings,
+									&attempt_written, &attempt_invalidated, &attempt_created_dirs, &fresh_tags, self.wrote_anything(), false, Some(op.display.clone()), cleanup_warnings,
 								));
 							}
 						};
@@ -1299,7 +1316,7 @@ impl PendingAction for FileOpsAction {
 								drop(temp_guard);
 								return Ok(self.partial_result(
 									format!("Invalid target file name: {e}"),
-									&attempt_written, &attempt_invalidated, &attempt_created_dirs, &fresh_tags, !self.cumulative_written.lock().unwrap().is_empty(), false, Some(op.display.clone()), cleanup_warnings,
+									&attempt_written, &attempt_invalidated, &attempt_created_dirs, &fresh_tags, self.wrote_anything(), false, Some(op.display.clone()), cleanup_warnings,
 								));
 							}
 						};
@@ -1358,14 +1375,14 @@ impl PendingAction for FileOpsAction {
 						}
 						Ok(false) => {
 							return Ok(self.partial_result(
-								format!("Cannot create {}: file was created concurrently. {} of {total_ops} operations performed.", op.display, self.cumulative_written.lock().unwrap().len()),
-								&attempt_written, &attempt_invalidated, &attempt_created_dirs, &fresh_tags, !self.cumulative_written.lock().unwrap().is_empty(), true, Some(op.display.clone()), cleanup_warnings,
+								format!("Cannot create {}: file was created concurrently. {} of {total_ops} operations performed.", op.display, self.written_len()),
+								&attempt_written, &attempt_invalidated, &attempt_created_dirs, &fresh_tags, self.wrote_anything(), true, Some(op.display.clone()), cleanup_warnings,
 							));
 						}
 						Err(e) => {
 							return Ok(self.partial_result(
-								format!("Publish {}: {e}. {} of {total_ops} operations performed.", op.display, self.cumulative_written.lock().unwrap().len()),
-								&attempt_written, &attempt_invalidated, &attempt_created_dirs, &fresh_tags, !self.cumulative_written.lock().unwrap().is_empty(), false, Some(op.display.clone()), cleanup_warnings,
+								format!("Publish {}: {e}. {} of {total_ops} operations performed.", op.display, self.written_len()),
+								&attempt_written, &attempt_invalidated, &attempt_created_dirs, &fresh_tags, self.wrote_anything(), false, Some(op.display.clone()), cleanup_warnings,
 							));
 						}
 					}
@@ -1378,7 +1395,7 @@ impl PendingAction for FileOpsAction {
 						Err(e) => {
 							return Ok(self.partial_result(
 								format!("workspace writer {}: {e}", op.display),
-								&attempt_written, &attempt_invalidated, &attempt_created_dirs, &fresh_tags, !self.cumulative_written.lock().unwrap().is_empty(), false, Some(op.display.clone()), cleanup_warnings,
+								&attempt_written, &attempt_invalidated, &attempt_created_dirs, &fresh_tags, self.wrote_anything(), false, Some(op.display.clone()), cleanup_warnings,
 							));
 						}
 					};
@@ -1387,7 +1404,7 @@ impl PendingAction for FileOpsAction {
 						Err(e) => {
 							return Ok(self.partial_result(
 								format!("lease {}: {e}", op.display),
-								&attempt_written, &attempt_invalidated, &attempt_created_dirs, &fresh_tags, !self.cumulative_written.lock().unwrap().is_empty(), false, Some(op.display.clone()), cleanup_warnings,
+								&attempt_written, &attempt_invalidated, &attempt_created_dirs, &fresh_tags, self.wrote_anything(), false, Some(op.display.clone()), cleanup_warnings,
 							));
 						}
 					};
@@ -1400,7 +1417,7 @@ impl PendingAction for FileOpsAction {
 							Err(e) => {
 								return Ok(self.partial_result(
 									format!("Invalid source path: {e}"),
-									&attempt_written, &attempt_invalidated, &attempt_created_dirs, &fresh_tags, !self.cumulative_written.lock().unwrap().is_empty(), false, Some(op.display.clone()), cleanup_warnings,
+									&attempt_written, &attempt_invalidated, &attempt_created_dirs, &fresh_tags, self.wrote_anything(), false, Some(op.display.clone()), cleanup_warnings,
 								));
 							}
 						};
@@ -1410,7 +1427,7 @@ impl PendingAction for FileOpsAction {
 						if fd < 0 {
 							return Ok(self.partial_result(
 								format!("Cannot pin source file {}: {}. Source was preserved.", op.display, std::io::Error::last_os_error()),
-								&attempt_written, &attempt_invalidated, &attempt_created_dirs, &fresh_tags, !self.cumulative_written.lock().unwrap().is_empty(), true, Some(op.display.clone()), cleanup_warnings,
+								&attempt_written, &attempt_invalidated, &attempt_created_dirs, &fresh_tags, self.wrote_anything(), true, Some(op.display.clone()), cleanup_warnings,
 							));
 						}
 						use std::os::unix::io::FromRawFd;
@@ -1421,14 +1438,14 @@ impl PendingAction for FileOpsAction {
 						if unsafe { libc::fstat(file.as_raw_fd(), &mut stat) } != 0 {
 							return Ok(self.partial_result(
 								format!("Cannot fstat source {}: {}. Source preserved.", op.display, std::io::Error::last_os_error()),
-								&attempt_written, &attempt_invalidated, &attempt_created_dirs, &fresh_tags, !self.cumulative_written.lock().unwrap().is_empty(), true, Some(op.display.clone()), cleanup_warnings,
+								&attempt_written, &attempt_invalidated, &attempt_created_dirs, &fresh_tags, self.wrote_anything(), true, Some(op.display.clone()), cleanup_warnings,
 							));
 						}
 						if let Some(expected_dev_ino) = op.base_dev_ino {
 							if (stat.st_dev as u64, stat.st_ino as u64) != expected_dev_ino {
 								return Ok(self.partial_result(
 									format!("Source {} identity (dev/ino) changed concurrently. Source preserved.", op.display),
-									&attempt_written, &attempt_invalidated, &attempt_created_dirs, &fresh_tags, !self.cumulative_written.lock().unwrap().is_empty(), true, Some(op.display.clone()), cleanup_warnings,
+									&attempt_written, &attempt_invalidated, &attempt_created_dirs, &fresh_tags, self.wrote_anything(), true, Some(op.display.clone()), cleanup_warnings,
 								));
 							}
 						}
@@ -1437,7 +1454,7 @@ impl PendingAction for FileOpsAction {
 							if current_mode != expected_base_mode {
 								return Ok(self.partial_result(
 									format!("Source {} mode changed from 0o{expected_base_mode:o} to 0o{current_mode:o} concurrently. Source preserved.", op.display),
-									&attempt_written, &attempt_invalidated, &attempt_created_dirs, &fresh_tags, !self.cumulative_written.lock().unwrap().is_empty(), true, Some(op.display.clone()), cleanup_warnings,
+									&attempt_written, &attempt_invalidated, &attempt_created_dirs, &fresh_tags, self.wrote_anything(), true, Some(op.display.clone()), cleanup_warnings,
 								));
 							}
 						}
@@ -1447,14 +1464,14 @@ impl PendingAction for FileOpsAction {
 						if let Err(e) = rdr.read_to_end(&mut current_bytes) {
 							return Ok(self.partial_result(
 								format!("Cannot read source {}: {e}. Source preserved.", op.display),
-								&attempt_written, &attempt_invalidated, &attempt_created_dirs, &fresh_tags, !self.cumulative_written.lock().unwrap().is_empty(), false, Some(op.display.clone()), cleanup_warnings,
+								&attempt_written, &attempt_invalidated, &attempt_created_dirs, &fresh_tags, self.wrote_anything(), false, Some(op.display.clone()), cleanup_warnings,
 							));
 						}
 						if let Some(base) = &op.base {
 							if &current_bytes != base {
 								return Ok(self.partial_result(
 									format!("Source {} content changed concurrently. Source preserved.", op.display),
-									&attempt_written, &attempt_invalidated, &attempt_created_dirs, &fresh_tags, !self.cumulative_written.lock().unwrap().is_empty(), true, Some(op.display.clone()), cleanup_warnings,
+									&attempt_written, &attempt_invalidated, &attempt_created_dirs, &fresh_tags, self.wrote_anything(), true, Some(op.display.clone()), cleanup_warnings,
 								));
 							}
 						}
@@ -1468,7 +1485,7 @@ impl PendingAction for FileOpsAction {
 						Err(err) => {
 							return Ok(self.partial_result(
 								format!("Failed to create temp file for {}: {err}", op.display),
-								&attempt_written, &attempt_invalidated, &attempt_created_dirs, &fresh_tags, !self.cumulative_written.lock().unwrap().is_empty(), false, Some(op.display.clone()), cleanup_warnings,
+								&attempt_written, &attempt_invalidated, &attempt_created_dirs, &fresh_tags, self.wrote_anything(), false, Some(op.display.clone()), cleanup_warnings,
 							));
 						}
 					};
@@ -1478,7 +1495,7 @@ impl PendingAction for FileOpsAction {
 						drop(temp_guard);
 						return Ok(self.partial_result(
 							format!("write {}: {e}", op.display),
-							&attempt_written, &attempt_invalidated, &attempt_created_dirs, &fresh_tags, !self.cumulative_written.lock().unwrap().is_empty(), false, Some(op.display.clone()), cleanup_warnings,
+							&attempt_written, &attempt_invalidated, &attempt_created_dirs, &fresh_tags, self.wrote_anything(), false, Some(op.display.clone()), cleanup_warnings,
 						));
 					}
 					if let Err(e) = temp_file.flush() {
@@ -1486,7 +1503,7 @@ impl PendingAction for FileOpsAction {
 						drop(temp_guard);
 						return Ok(self.partial_result(
 							format!("flush {}: {e}", op.display),
-							&attempt_written, &attempt_invalidated, &attempt_created_dirs, &fresh_tags, !self.cumulative_written.lock().unwrap().is_empty(), false, Some(op.display.clone()), cleanup_warnings,
+							&attempt_written, &attempt_invalidated, &attempt_created_dirs, &fresh_tags, self.wrote_anything(), false, Some(op.display.clone()), cleanup_warnings,
 						));
 					}
 
@@ -1500,7 +1517,7 @@ impl PendingAction for FileOpsAction {
 							drop(temp_guard);
 							return Ok(self.partial_result(
 								format!("Failed to fstat source {} before fchmod temp: {}. Source preserved.", op.display, std::io::Error::last_os_error()),
-								&attempt_written, &attempt_invalidated, &attempt_created_dirs, &fresh_tags, !self.cumulative_written.lock().unwrap().is_empty(), false, Some(op.display.clone()), cleanup_warnings,
+								&attempt_written, &attempt_invalidated, &attempt_created_dirs, &fresh_tags, self.wrote_anything(), false, Some(op.display.clone()), cleanup_warnings,
 							));
 						}
 						if let Some(expected_base_mode) = op.base_mode {
@@ -1510,7 +1527,7 @@ impl PendingAction for FileOpsAction {
 								drop(temp_guard);
 								return Ok(self.partial_result(
 									format!("Source {} mode changed from 0o{expected_base_mode:o} to 0o{mid_mode:o} after writing temp. Update aborted. Source preserved.", op.display),
-									&attempt_written, &attempt_invalidated, &attempt_created_dirs, &fresh_tags, !self.cumulative_written.lock().unwrap().is_empty(), true, Some(op.display.clone()), cleanup_warnings,
+									&attempt_written, &attempt_invalidated, &attempt_created_dirs, &fresh_tags, self.wrote_anything(), true, Some(op.display.clone()), cleanup_warnings,
 								));
 							}
 						}
@@ -1526,7 +1543,7 @@ impl PendingAction for FileOpsAction {
 							drop(temp_guard);
 							return Ok(self.partial_result(
 								format!("fchmod target mode failed for {}: {err}", op.display),
-								&attempt_written, &attempt_invalidated, &attempt_created_dirs, &fresh_tags, !self.cumulative_written.lock().unwrap().is_empty(), false, Some(op.display.clone()), cleanup_warnings,
+								&attempt_written, &attempt_invalidated, &attempt_created_dirs, &fresh_tags, self.wrote_anything(), false, Some(op.display.clone()), cleanup_warnings,
 							));
 						}
 					}
@@ -1541,7 +1558,7 @@ impl PendingAction for FileOpsAction {
 							drop(temp_guard);
 							return Ok(self.partial_result(
 								format!("Re-fstat source {} immediately before rename failed: {}. Source preserved.", op.display, std::io::Error::last_os_error()),
-								&attempt_written, &attempt_invalidated, &attempt_created_dirs, &fresh_tags, !self.cumulative_written.lock().unwrap().is_empty(), true, Some(op.display.clone()), cleanup_warnings,
+								&attempt_written, &attempt_invalidated, &attempt_created_dirs, &fresh_tags, self.wrote_anything(), true, Some(op.display.clone()), cleanup_warnings,
 							));
 						}
 						if let Some(expected_dev_ino) = op.base_dev_ino {
@@ -1550,7 +1567,7 @@ impl PendingAction for FileOpsAction {
 								drop(temp_guard);
 								return Ok(self.partial_result(
 									format!("Source {} dev/ino changed immediately before rename. Update aborted.", op.display),
-									&attempt_written, &attempt_invalidated, &attempt_created_dirs, &fresh_tags, !self.cumulative_written.lock().unwrap().is_empty(), true, Some(op.display.clone()), cleanup_warnings,
+									&attempt_written, &attempt_invalidated, &attempt_created_dirs, &fresh_tags, self.wrote_anything(), true, Some(op.display.clone()), cleanup_warnings,
 								));
 							}
 						}
@@ -1561,7 +1578,7 @@ impl PendingAction for FileOpsAction {
 								drop(temp_guard);
 								return Ok(self.partial_result(
 									format!("Source {} mode changed from 0o{expected_base_mode:o} to 0o{final_mode:o} immediately before rename. Update aborted. Source preserved.", op.display),
-									&attempt_written, &attempt_invalidated, &attempt_created_dirs, &fresh_tags, !self.cumulative_written.lock().unwrap().is_empty(), true, Some(op.display.clone()), cleanup_warnings,
+									&attempt_written, &attempt_invalidated, &attempt_created_dirs, &fresh_tags, self.wrote_anything(), true, Some(op.display.clone()), cleanup_warnings,
 								));
 							}
 						}
@@ -1571,7 +1588,7 @@ impl PendingAction for FileOpsAction {
 							drop(temp_guard);
 							return Ok(self.partial_result(
 								format!("Failed to seek source {}: {e}. Source preserved.", op.display),
-								&attempt_written, &attempt_invalidated, &attempt_created_dirs, &fresh_tags, !self.cumulative_written.lock().unwrap().is_empty(), false, Some(op.display.clone()), cleanup_warnings,
+								&attempt_written, &attempt_invalidated, &attempt_created_dirs, &fresh_tags, self.wrote_anything(), false, Some(op.display.clone()), cleanup_warnings,
 							));
 						}
 						let mut final_source_bytes = Vec::new();
@@ -1580,7 +1597,7 @@ impl PendingAction for FileOpsAction {
 							drop(temp_guard);
 							return Ok(self.partial_result(
 								format!("Failed to re-read source {}: {e}. Source preserved.", op.display),
-								&attempt_written, &attempt_invalidated, &attempt_created_dirs, &fresh_tags, !self.cumulative_written.lock().unwrap().is_empty(), false, Some(op.display.clone()), cleanup_warnings,
+								&attempt_written, &attempt_invalidated, &attempt_created_dirs, &fresh_tags, self.wrote_anything(), false, Some(op.display.clone()), cleanup_warnings,
 							));
 						}
 						if let Some(base) = &op.base {
@@ -1589,7 +1606,7 @@ impl PendingAction for FileOpsAction {
 								drop(temp_guard);
 								return Ok(self.partial_result(
 									format!("Source {} content was modified in-place immediately before rename. Update aborted. Source preserved.", op.display),
-									&attempt_written, &attempt_invalidated, &attempt_created_dirs, &fresh_tags, !self.cumulative_written.lock().unwrap().is_empty(), true, Some(op.display.clone()), cleanup_warnings,
+									&attempt_written, &attempt_invalidated, &attempt_created_dirs, &fresh_tags, self.wrote_anything(), true, Some(op.display.clone()), cleanup_warnings,
 								));
 							}
 						}
@@ -1603,7 +1620,7 @@ impl PendingAction for FileOpsAction {
 										drop(temp_guard);
 										return Ok(self.partial_result(
 											format!("Source {} leaf entry in directory replaced immediately before rename. Update aborted.", op.display),
-											&attempt_written, &attempt_invalidated, &attempt_created_dirs, &fresh_tags, !self.cumulative_written.lock().unwrap().is_empty(), true, Some(op.display.clone()), cleanup_warnings,
+											&attempt_written, &attempt_invalidated, &attempt_created_dirs, &fresh_tags, self.wrote_anything(), true, Some(op.display.clone()), cleanup_warnings,
 										));
 									}
 								}
@@ -1613,7 +1630,7 @@ impl PendingAction for FileOpsAction {
 								drop(temp_guard);
 								return Ok(self.partial_result(
 									format!("Source {} leaf entry missing or invalid before rename. Update aborted.", op.display),
-									&attempt_written, &attempt_invalidated, &attempt_created_dirs, &fresh_tags, !self.cumulative_written.lock().unwrap().is_empty(), true, Some(op.display.clone()), cleanup_warnings,
+									&attempt_written, &attempt_invalidated, &attempt_created_dirs, &fresh_tags, self.wrote_anything(), true, Some(op.display.clone()), cleanup_warnings,
 								));
 							}
 						}
@@ -1626,7 +1643,7 @@ impl PendingAction for FileOpsAction {
 								drop(temp_guard);
 								return Ok(self.partial_result(
 									format!("Temp file {temp_name} entry was replaced concurrently (expected {temp_dev_ino:?}, found {other_dev_ino:?}) before rename. Update aborted. Source preserved."),
-									&attempt_written, &attempt_invalidated, &attempt_created_dirs, &fresh_tags, !self.cumulative_written.lock().unwrap().is_empty(), false, Some(op.display.clone()), cleanup_warnings,
+									&attempt_written, &attempt_invalidated, &attempt_created_dirs, &fresh_tags, self.wrote_anything(), false, Some(op.display.clone()), cleanup_warnings,
 								));
 							}
 							_ => {
@@ -1634,7 +1651,7 @@ impl PendingAction for FileOpsAction {
 								drop(temp_guard);
 								return Ok(self.partial_result(
 									format!("Temp file {temp_name} missing from directory before rename. Update aborted. Source preserved."),
-									&attempt_written, &attempt_invalidated, &attempt_created_dirs, &fresh_tags, !self.cumulative_written.lock().unwrap().is_empty(), false, Some(op.display.clone()), cleanup_warnings,
+									&attempt_written, &attempt_invalidated, &attempt_created_dirs, &fresh_tags, self.wrote_anything(), false, Some(op.display.clone()), cleanup_warnings,
 								));
 							}
 						}
@@ -1650,7 +1667,7 @@ impl PendingAction for FileOpsAction {
 								drop(temp_guard);
 								return Ok(self.partial_result(
 									format!("Invalid target file name: {e}"),
-									&attempt_written, &attempt_invalidated, &attempt_created_dirs, &fresh_tags, !self.cumulative_written.lock().unwrap().is_empty(), false, Some(op.display.clone()), cleanup_warnings,
+									&attempt_written, &attempt_invalidated, &attempt_created_dirs, &fresh_tags, self.wrote_anything(), false, Some(op.display.clone()), cleanup_warnings,
 								));
 							}
 						};
@@ -1661,10 +1678,20 @@ impl PendingAction for FileOpsAction {
 								drop(temp_guard);
 								return Ok(self.partial_result(
 									format!("Invalid temp file name: {e}"),
-									&attempt_written, &attempt_invalidated, &attempt_created_dirs, &fresh_tags, !self.cumulative_written.lock().unwrap().is_empty(), false, Some(op.display.clone()), cleanup_warnings,
+									&attempt_written, &attempt_invalidated, &attempt_created_dirs, &fresh_tags, self.wrote_anything(), false, Some(op.display.clone()), cleanup_warnings,
 								));
 							}
 						};
+						#[cfg(test)]
+						crate::tools::run_write_commit_gate(&canonical).await;
+
+						if ctx.cancellation_token.is_cancelled() {
+							drop(temp_file);
+							drop(source_file);
+							drop(temp_guard);
+							return Err(ToolError::Aborted("File operations cancelled".to_string()));
+						}
+
 						let ren = unsafe {
 							libc::renameat(dir_pin.fd, c_temp.as_ptr(), dir_pin.fd, c_target.as_ptr())
 						};
@@ -1675,7 +1702,7 @@ impl PendingAction for FileOpsAction {
 							drop(temp_guard);
 							return Ok(self.partial_result(
 								format!("Failed to rename temp over {}: {err}", op.display),
-								&attempt_written, &attempt_invalidated, &attempt_created_dirs, &fresh_tags, !self.cumulative_written.lock().unwrap().is_empty(), false, Some(op.display.clone()), cleanup_warnings,
+								&attempt_written, &attempt_invalidated, &attempt_created_dirs, &fresh_tags, self.wrote_anything(), false, Some(op.display.clone()), cleanup_warnings,
 							));
 						}
 					}
@@ -1685,7 +1712,7 @@ impl PendingAction for FileOpsAction {
 							drop(temp_guard);
 							return Ok(self.partial_result(
 								format!("Failed to write {}: {e}", op.display),
-								&attempt_written, &attempt_invalidated, &attempt_created_dirs, &fresh_tags, !self.cumulative_written.lock().unwrap().is_empty(), false, Some(op.display.clone()), cleanup_warnings,
+								&attempt_written, &attempt_invalidated, &attempt_created_dirs, &fresh_tags, self.wrote_anything(), false, Some(op.display.clone()), cleanup_warnings,
 							));
 						}
 					}
@@ -1715,7 +1742,7 @@ impl PendingAction for FileOpsAction {
 						Err(e) => {
 							return Ok(self.partial_result(
 								format!("workspace writer {}: {e}", op.display),
-								&attempt_written, &attempt_invalidated, &attempt_created_dirs, &fresh_tags, !self.cumulative_written.lock().unwrap().is_empty(), false, Some(op.display.clone()), cleanup_warnings,
+								&attempt_written, &attempt_invalidated, &attempt_created_dirs, &fresh_tags, self.wrote_anything(), false, Some(op.display.clone()), cleanup_warnings,
 							));
 						}
 					};
@@ -1724,7 +1751,7 @@ impl PendingAction for FileOpsAction {
 						Err(e) => {
 							return Ok(self.partial_result(
 								format!("delete lease {}: {e}", op.display),
-								&attempt_written, &attempt_invalidated, &attempt_created_dirs, &fresh_tags, !self.cumulative_written.lock().unwrap().is_empty(), false, Some(op.display.clone()), cleanup_warnings,
+								&attempt_written, &attempt_invalidated, &attempt_created_dirs, &fresh_tags, self.wrote_anything(), false, Some(op.display.clone()), cleanup_warnings,
 							));
 						}
 					};
@@ -1736,7 +1763,7 @@ impl PendingAction for FileOpsAction {
 							Err(e) => {
 								return Ok(self.partial_result(
 									format!("Invalid file name: {e}"),
-									&attempt_written, &attempt_invalidated, &attempt_created_dirs, &fresh_tags, !self.cumulative_written.lock().unwrap().is_empty(), false, Some(op.display.clone()), cleanup_warnings,
+									&attempt_written, &attempt_invalidated, &attempt_created_dirs, &fresh_tags, self.wrote_anything(), false, Some(op.display.clone()), cleanup_warnings,
 								));
 							}
 						};
@@ -1750,7 +1777,7 @@ impl PendingAction for FileOpsAction {
 							} else {
 								return Ok(self.partial_result(
 									format!("Cannot delete {}: failed to open pinned descriptor: {err}. Source preserved.", op.display),
-									&attempt_written, &attempt_invalidated, &attempt_created_dirs, &fresh_tags, !self.cumulative_written.lock().unwrap().is_empty(), false, Some(op.display.clone()), cleanup_warnings,
+									&attempt_written, &attempt_invalidated, &attempt_created_dirs, &fresh_tags, self.wrote_anything(), false, Some(op.display.clone()), cleanup_warnings,
 								));
 							}
 						} else {
@@ -1766,14 +1793,14 @@ impl PendingAction for FileOpsAction {
 						if unsafe { libc::fstat(source_file.as_raw_fd(), &mut stat) } != 0 {
 							return Ok(self.partial_result(
 								format!("Cannot delete {}: fstat failed: {}. Source preserved.", op.display, std::io::Error::last_os_error()),
-								&attempt_written, &attempt_invalidated, &attempt_created_dirs, &fresh_tags, !self.cumulative_written.lock().unwrap().is_empty(), false, Some(op.display.clone()), cleanup_warnings,
+								&attempt_written, &attempt_invalidated, &attempt_created_dirs, &fresh_tags, self.wrote_anything(), false, Some(op.display.clone()), cleanup_warnings,
 							));
 						}
 						if let Some(expected_dev_ino) = op.base_dev_ino {
 							if (stat.st_dev as u64, stat.st_ino as u64) != expected_dev_ino {
 								return Ok(self.partial_result(
 									format!("Cannot delete {}: file identity (dev/ino) changed concurrently. Source preserved.", op.display),
-									&attempt_written, &attempt_invalidated, &attempt_created_dirs, &fresh_tags, !self.cumulative_written.lock().unwrap().is_empty(), true, Some(op.display.clone()), cleanup_warnings,
+									&attempt_written, &attempt_invalidated, &attempt_created_dirs, &fresh_tags, self.wrote_anything(), true, Some(op.display.clone()), cleanup_warnings,
 								));
 							}
 						}
@@ -1782,7 +1809,7 @@ impl PendingAction for FileOpsAction {
 							if current_mode != expected_base_mode {
 								return Ok(self.partial_result(
 									format!("Cannot delete {}: file mode changed from 0o{expected_base_mode:o} to 0o{current_mode:o} concurrently. Source preserved.", op.display),
-									&attempt_written, &attempt_invalidated, &attempt_created_dirs, &fresh_tags, !self.cumulative_written.lock().unwrap().is_empty(), true, Some(op.display.clone()), cleanup_warnings,
+									&attempt_written, &attempt_invalidated, &attempt_created_dirs, &fresh_tags, self.wrote_anything(), true, Some(op.display.clone()), cleanup_warnings,
 								));
 							}
 						}
@@ -1790,14 +1817,14 @@ impl PendingAction for FileOpsAction {
 						if let Err(e) = source_file.read_to_end(&mut current_bytes) {
 							return Ok(self.partial_result(
 								format!("Cannot delete {}: failed to read file: {e}. Source preserved.", op.display),
-								&attempt_written, &attempt_invalidated, &attempt_created_dirs, &fresh_tags, !self.cumulative_written.lock().unwrap().is_empty(), false, Some(op.display.clone()), cleanup_warnings,
+								&attempt_written, &attempt_invalidated, &attempt_created_dirs, &fresh_tags, self.wrote_anything(), false, Some(op.display.clone()), cleanup_warnings,
 							));
 						}
 						if let Some(base) = &op.base {
 							if &current_bytes != base {
 								return Ok(self.partial_result(
 									format!("Cannot delete {}: file content changed concurrently. Source preserved.", op.display),
-									&attempt_written, &attempt_invalidated, &attempt_created_dirs, &fresh_tags, !self.cumulative_written.lock().unwrap().is_empty(), true, Some(op.display.clone()), cleanup_warnings,
+									&attempt_written, &attempt_invalidated, &attempt_created_dirs, &fresh_tags, self.wrote_anything(), true, Some(op.display.clone()), cleanup_warnings,
 								));
 							}
 						}
@@ -1806,21 +1833,21 @@ impl PendingAction for FileOpsAction {
 						if let Err(e) = source_file.seek(SeekFrom::Start(0)) {
 							return Ok(self.partial_result(
 								format!("Cannot delete {}: failed to seek source: {e}. Source preserved.", op.display),
-								&attempt_written, &attempt_invalidated, &attempt_created_dirs, &fresh_tags, !self.cumulative_written.lock().unwrap().is_empty(), false, Some(op.display.clone()), cleanup_warnings,
+								&attempt_written, &attempt_invalidated, &attempt_created_dirs, &fresh_tags, self.wrote_anything(), false, Some(op.display.clone()), cleanup_warnings,
 							));
 						}
 						let mut final_delete_bytes = Vec::new();
 						if let Err(e) = source_file.read_to_end(&mut final_delete_bytes) {
 							return Ok(self.partial_result(
 								format!("Cannot delete {}: failed to re-read source: {e}. Source preserved.", op.display),
-								&attempt_written, &attempt_invalidated, &attempt_created_dirs, &fresh_tags, !self.cumulative_written.lock().unwrap().is_empty(), false, Some(op.display.clone()), cleanup_warnings,
+								&attempt_written, &attempt_invalidated, &attempt_created_dirs, &fresh_tags, self.wrote_anything(), false, Some(op.display.clone()), cleanup_warnings,
 							));
 						}
 						if let Some(base) = &op.base {
 							if &final_delete_bytes != base {
 								return Ok(self.partial_result(
 									format!("Cannot delete {}: file content changed in-place immediately before delete. Source preserved.", op.display),
-									&attempt_written, &attempt_invalidated, &attempt_created_dirs, &fresh_tags, !self.cumulative_written.lock().unwrap().is_empty(), true, Some(op.display.clone()), cleanup_warnings,
+									&attempt_written, &attempt_invalidated, &attempt_created_dirs, &fresh_tags, self.wrote_anything(), true, Some(op.display.clone()), cleanup_warnings,
 								));
 							}
 						}
@@ -1831,7 +1858,7 @@ impl PendingAction for FileOpsAction {
 								if final_mode != expected_base_mode {
 									return Ok(self.partial_result(
 										format!("Cannot delete {}: file mode changed immediately before delete. Source preserved.", op.display),
-										&attempt_written, &attempt_invalidated, &attempt_created_dirs, &fresh_tags, !self.cumulative_written.lock().unwrap().is_empty(), true, Some(op.display.clone()), cleanup_warnings,
+										&attempt_written, &attempt_invalidated, &attempt_created_dirs, &fresh_tags, self.wrote_anything(), true, Some(op.display.clone()), cleanup_warnings,
 									));
 								}
 							}
@@ -1844,7 +1871,7 @@ impl PendingAction for FileOpsAction {
 									if leaf_dev_ino != expected_dev_ino {
 										return Ok(self.partial_result(
 											format!("Source {} leaf entry in directory replaced before delete. Source preserved.", op.display),
-											&attempt_written, &attempt_invalidated, &attempt_created_dirs, &fresh_tags, !self.cumulative_written.lock().unwrap().is_empty(), true, Some(op.display.clone()), cleanup_warnings,
+											&attempt_written, &attempt_invalidated, &attempt_created_dirs, &fresh_tags, self.wrote_anything(), true, Some(op.display.clone()), cleanup_warnings,
 										));
 									}
 								}
@@ -1852,7 +1879,7 @@ impl PendingAction for FileOpsAction {
 							_ => {
 								return Ok(self.partial_result(
 									format!("Source {} leaf entry missing before delete. Source preserved.", op.display),
-									&attempt_written, &attempt_invalidated, &attempt_created_dirs, &fresh_tags, !self.cumulative_written.lock().unwrap().is_empty(), true, Some(op.display.clone()), cleanup_warnings,
+									&attempt_written, &attempt_invalidated, &attempt_created_dirs, &fresh_tags, self.wrote_anything(), true, Some(op.display.clone()), cleanup_warnings,
 								));
 							}
 						}
@@ -1865,14 +1892,14 @@ impl PendingAction for FileOpsAction {
 									if leaf_dev_ino != expected_dev_ino {
 										return Ok(self.partial_result(
 											format!("Symlink {} leaf entry in directory replaced before delete. Symlink preserved.", op.display),
-											&attempt_written, &attempt_invalidated, &attempt_created_dirs, &fresh_tags, !self.cumulative_written.lock().unwrap().is_empty(), true, Some(op.display.clone()), cleanup_warnings,
+											&attempt_written, &attempt_invalidated, &attempt_created_dirs, &fresh_tags, self.wrote_anything(), true, Some(op.display.clone()), cleanup_warnings,
 										));
 									}
 								}
 								_ => {
 									return Ok(self.partial_result(
 										format!("Symlink {} leaf entry missing before delete. Symlink preserved.", op.display),
-										&attempt_written, &attempt_invalidated, &attempt_created_dirs, &fresh_tags, !self.cumulative_written.lock().unwrap().is_empty(), true, Some(op.display.clone()), cleanup_warnings,
+										&attempt_written, &attempt_invalidated, &attempt_created_dirs, &fresh_tags, self.wrote_anything(), true, Some(op.display.clone()), cleanup_warnings,
 									));
 								}
 							}
@@ -1883,7 +1910,7 @@ impl PendingAction for FileOpsAction {
 					if let Err(e) = dir_pin.unlinkat_file(file_name) {
 						return Ok(self.partial_result(
 							format!("Failed to delete {}: {e}. Source preserved.", op.display),
-							&attempt_written, &attempt_invalidated, &attempt_created_dirs, &fresh_tags, !self.cumulative_written.lock().unwrap().is_empty(), false, Some(op.display.clone()), cleanup_warnings,
+							&attempt_written, &attempt_invalidated, &attempt_created_dirs, &fresh_tags, self.wrote_anything(), false, Some(op.display.clone()), cleanup_warnings,
 						));
 					}
 					attempt_written.push(op.display.clone());
@@ -1905,7 +1932,7 @@ impl PendingAction for FileOpsAction {
 						None => {
 							return Ok(self.partial_result(
 								format!("Missing rename destination for {}", op.display),
-								&attempt_written, &attempt_invalidated, &attempt_created_dirs, &fresh_tags, !self.cumulative_written.lock().unwrap().is_empty(), false, Some(op.display.clone()), cleanup_warnings,
+								&attempt_written, &attempt_invalidated, &attempt_created_dirs, &fresh_tags, self.wrote_anything(), false, Some(op.display.clone()), cleanup_warnings,
 							));
 						}
 					};
@@ -1920,7 +1947,7 @@ impl PendingAction for FileOpsAction {
 						Err(e) => {
 							return Ok(self.partial_result(
 								format!("workspace writer {}: {e}", op.display),
-								&attempt_written, &attempt_invalidated, &attempt_created_dirs, &fresh_tags, !self.cumulative_written.lock().unwrap().is_empty(), false, Some(op.display.clone()), cleanup_warnings,
+								&attempt_written, &attempt_invalidated, &attempt_created_dirs, &fresh_tags, self.wrote_anything(), false, Some(op.display.clone()), cleanup_warnings,
 							));
 						}
 					};
@@ -1929,7 +1956,7 @@ impl PendingAction for FileOpsAction {
 						Err(e) => {
 							return Ok(self.partial_result(
 								format!("source lease {}: {e}", op.display),
-								&attempt_written, &attempt_invalidated, &attempt_created_dirs, &fresh_tags, !self.cumulative_written.lock().unwrap().is_empty(), false, Some(op.display.clone()), cleanup_warnings,
+								&attempt_written, &attempt_invalidated, &attempt_created_dirs, &fresh_tags, self.wrote_anything(), false, Some(op.display.clone()), cleanup_warnings,
 							));
 						}
 					};
@@ -1938,7 +1965,7 @@ impl PendingAction for FileOpsAction {
 						Err(e) => {
 							return Ok(self.partial_result(
 								format!("destination lease {dest_display}: {e}"),
-								&attempt_written, &attempt_invalidated, &attempt_created_dirs, &fresh_tags, !self.cumulative_written.lock().unwrap().is_empty(), false, Some(dest_display), cleanup_warnings,
+								&attempt_written, &attempt_invalidated, &attempt_created_dirs, &fresh_tags, self.wrote_anything(), false, Some(dest_display), cleanup_warnings,
 							));
 						}
 					};
@@ -1952,7 +1979,7 @@ impl PendingAction for FileOpsAction {
 								return Ok(self.partial_result(
 									format!("Destination ancestor verification failed at {dest_display}: {e}"),
 									&attempt_written, &attempt_invalidated, &attempt_created_dirs, &fresh_tags,
-									!self.cumulative_written.lock().unwrap().is_empty(), true, Some(dest_display), cleanup_warnings,
+									self.wrote_anything(), true, Some(dest_display), cleanup_warnings,
 								));
 							}
 							p
@@ -1961,7 +1988,7 @@ impl PendingAction for FileOpsAction {
 							return Ok(self.partial_result(
 								format!("Cannot open destination directory ancestor {}: {e}", dest_ancestor.display()),
 								&attempt_written, &attempt_invalidated, &attempt_created_dirs, &fresh_tags,
-								!self.cumulative_written.lock().unwrap().is_empty(), true, Some(dest_display), cleanup_warnings,
+								self.wrote_anything(), true, Some(dest_display), cleanup_warnings,
 							));
 						}
 					};
@@ -1978,7 +2005,7 @@ impl PendingAction for FileOpsAction {
 							return Ok(self.partial_result(
 								format!("Cannot open or create destination subdirectories for {dest_display}: {e}"),
 								&attempt_written, &attempt_invalidated, &attempt_created_dirs, &fresh_tags,
-								!self.cumulative_written.lock().unwrap().is_empty(), true, Some(dest_display), cleanup_warnings,
+								self.wrote_anything(), true, Some(dest_display), cleanup_warnings,
 							));
 						}
 					};
@@ -1989,14 +2016,14 @@ impl PendingAction for FileOpsAction {
 							match dest_dir_pin.stat_file(dest_file_name) {
 								Ok(Some(_)) => {
 									return Ok(self.partial_result(
-										format!("Cannot move to {dest_display}: destination already exists under held directory descriptor. {} of {total_ops} operations performed.", self.cumulative_written.lock().unwrap().len()),
-										&attempt_written, &attempt_invalidated, &attempt_created_dirs, &fresh_tags, !self.cumulative_written.lock().unwrap().is_empty(), true, Some(dest_display), cleanup_warnings,
+										format!("Cannot move to {dest_display}: destination already exists under held directory descriptor. {} of {total_ops} operations performed.", self.written_len()),
+										&attempt_written, &attempt_invalidated, &attempt_created_dirs, &fresh_tags, self.wrote_anything(), true, Some(dest_display), cleanup_warnings,
 									));
 								}
 								Err(e) => {
 									return Ok(self.partial_result(
-										format!("Cannot stat destination {dest_display}: {e}. {} of {total_ops} operations performed.", self.cumulative_written.lock().unwrap().len()),
-										&attempt_written, &attempt_invalidated, &attempt_created_dirs, &fresh_tags, !self.cumulative_written.lock().unwrap().is_empty(), false, Some(dest_display), cleanup_warnings,
+										format!("Cannot stat destination {dest_display}: {e}. {} of {total_ops} operations performed.", self.written_len()),
+										&attempt_written, &attempt_invalidated, &attempt_created_dirs, &fresh_tags, self.wrote_anything(), false, Some(dest_display), cleanup_warnings,
 									));
 								}
 								Ok(None) => {}
@@ -2010,7 +2037,7 @@ impl PendingAction for FileOpsAction {
 									Err(e) => {
 										return Ok(self.partial_result(
 											format!("Invalid source path: {e}"),
-											&attempt_written, &attempt_invalidated, &attempt_created_dirs, &fresh_tags, !self.cumulative_written.lock().unwrap().is_empty(), false, Some(op.display.clone()), cleanup_warnings,
+											&attempt_written, &attempt_invalidated, &attempt_created_dirs, &fresh_tags, self.wrote_anything(), false, Some(op.display.clone()), cleanup_warnings,
 										));
 									}
 								};
@@ -2026,7 +2053,7 @@ impl PendingAction for FileOpsAction {
 									};
 									return Ok(self.partial_result(
 										msg,
-										&attempt_written, &attempt_invalidated, &attempt_created_dirs, &fresh_tags, !self.cumulative_written.lock().unwrap().is_empty(), true, Some(op.display.clone()), cleanup_warnings,
+										&attempt_written, &attempt_invalidated, &attempt_created_dirs, &fresh_tags, self.wrote_anything(), true, Some(op.display.clone()), cleanup_warnings,
 									));
 								}
 								use std::os::unix::io::FromRawFd;
@@ -2037,14 +2064,14 @@ impl PendingAction for FileOpsAction {
 								if unsafe { libc::fstat(file.as_raw_fd(), &mut stat) } != 0 {
 									return Ok(self.partial_result(
 										format!("Cannot stat source {}: {}. Source preserved.", op.display, std::io::Error::last_os_error()),
-										&attempt_written, &attempt_invalidated, &attempt_created_dirs, &fresh_tags, !self.cumulative_written.lock().unwrap().is_empty(), false, Some(op.display.clone()), cleanup_warnings,
+										&attempt_written, &attempt_invalidated, &attempt_created_dirs, &fresh_tags, self.wrote_anything(), false, Some(op.display.clone()), cleanup_warnings,
 									));
 								}
 								if let Some(expected_dev_ino) = op.base_dev_ino {
 									if (stat.st_dev as u64, stat.st_ino as u64) != expected_dev_ino {
 										return Ok(self.partial_result(
 											format!("Source {} identity (dev/ino) changed concurrently. Source preserved.", op.display),
-											&attempt_written, &attempt_invalidated, &attempt_created_dirs, &fresh_tags, !self.cumulative_written.lock().unwrap().is_empty(), true, Some(op.display.clone()), cleanup_warnings,
+											&attempt_written, &attempt_invalidated, &attempt_created_dirs, &fresh_tags, self.wrote_anything(), true, Some(op.display.clone()), cleanup_warnings,
 										));
 									}
 								}
@@ -2053,7 +2080,7 @@ impl PendingAction for FileOpsAction {
 									if current_mode != expected_base_mode {
 										return Ok(self.partial_result(
 											format!("Source {} mode changed from 0o{expected_base_mode:o} to 0o{current_mode:o} concurrently. Source preserved.", op.display),
-											&attempt_written, &attempt_invalidated, &attempt_created_dirs, &fresh_tags, !self.cumulative_written.lock().unwrap().is_empty(), true, Some(op.display.clone()), cleanup_warnings,
+											&attempt_written, &attempt_invalidated, &attempt_created_dirs, &fresh_tags, self.wrote_anything(), true, Some(op.display.clone()), cleanup_warnings,
 										));
 									}
 								}
@@ -2062,14 +2089,14 @@ impl PendingAction for FileOpsAction {
 								if let Err(e) = rdr.read_to_end(&mut current_bytes) {
 									return Ok(self.partial_result(
 										format!("Cannot read source {}: {e}. Source preserved.", op.display),
-										&attempt_written, &attempt_invalidated, &attempt_created_dirs, &fresh_tags, !self.cumulative_written.lock().unwrap().is_empty(), false, Some(op.display.clone()), cleanup_warnings,
+										&attempt_written, &attempt_invalidated, &attempt_created_dirs, &fresh_tags, self.wrote_anything(), false, Some(op.display.clone()), cleanup_warnings,
 									));
 								}
 								if let Some(base) = &op.base {
 									if &current_bytes != base {
 										return Ok(self.partial_result(
 											format!("Source {} content changed concurrently. Source preserved.", op.display),
-											&attempt_written, &attempt_invalidated, &attempt_created_dirs, &fresh_tags, !self.cumulative_written.lock().unwrap().is_empty(), true, Some(op.display.clone()), cleanup_warnings,
+											&attempt_written, &attempt_invalidated, &attempt_created_dirs, &fresh_tags, self.wrote_anything(), true, Some(op.display.clone()), cleanup_warnings,
 										));
 									}
 								}
@@ -2084,7 +2111,7 @@ impl PendingAction for FileOpsAction {
 								Err(err) => {
 									return Ok(self.partial_result(
 										format!("Failed to create destination temp file for {dest_display}: {err}"),
-										&attempt_written, &attempt_invalidated, &attempt_created_dirs, &fresh_tags, !self.cumulative_written.lock().unwrap().is_empty(), false, Some(dest_display), cleanup_warnings,
+										&attempt_written, &attempt_invalidated, &attempt_created_dirs, &fresh_tags, self.wrote_anything(), false, Some(dest_display), cleanup_warnings,
 									));
 								}
 							};
@@ -2094,7 +2121,7 @@ impl PendingAction for FileOpsAction {
 								drop(temp_dest_guard);
 								return Ok(self.partial_result(
 									format!("write {dest_display}: {e}"),
-									&attempt_written, &attempt_invalidated, &attempt_created_dirs, &fresh_tags, !self.cumulative_written.lock().unwrap().is_empty(), false, Some(dest_display), cleanup_warnings,
+									&attempt_written, &attempt_invalidated, &attempt_created_dirs, &fresh_tags, self.wrote_anything(), false, Some(dest_display), cleanup_warnings,
 								));
 							}
 							if let Err(e) = temp_dest_file.flush() {
@@ -2102,7 +2129,7 @@ impl PendingAction for FileOpsAction {
 								drop(temp_dest_guard);
 								return Ok(self.partial_result(
 									format!("flush {dest_display}: {e}"),
-									&attempt_written, &attempt_invalidated, &attempt_created_dirs, &fresh_tags, !self.cumulative_written.lock().unwrap().is_empty(), false, Some(dest_display), cleanup_warnings,
+									&attempt_written, &attempt_invalidated, &attempt_created_dirs, &fresh_tags, self.wrote_anything(), false, Some(dest_display), cleanup_warnings,
 								));
 							}
 
@@ -2116,7 +2143,7 @@ impl PendingAction for FileOpsAction {
 									drop(temp_dest_guard);
 									return Ok(self.partial_result(
 										format!("Failed to fstat source {} before fchmod temp: {}. Source preserved.", op.display, std::io::Error::last_os_error()),
-										&attempt_written, &attempt_invalidated, &attempt_created_dirs, &fresh_tags, !self.cumulative_written.lock().unwrap().is_empty(), false, Some(op.display.clone()), cleanup_warnings,
+										&attempt_written, &attempt_invalidated, &attempt_created_dirs, &fresh_tags, self.wrote_anything(), false, Some(op.display.clone()), cleanup_warnings,
 									));
 								}
 								if let Some(expected_base_mode) = op.base_mode {
@@ -2126,7 +2153,7 @@ impl PendingAction for FileOpsAction {
 										drop(temp_dest_guard);
 										return Ok(self.partial_result(
 											format!("Source {} mode changed from 0o{expected_base_mode:o} to 0o{mid_mode:o} after writing temp. Move aborted. Source preserved.", op.display),
-											&attempt_written, &attempt_invalidated, &attempt_created_dirs, &fresh_tags, !self.cumulative_written.lock().unwrap().is_empty(), true, Some(op.display.clone()), cleanup_warnings,
+											&attempt_written, &attempt_invalidated, &attempt_created_dirs, &fresh_tags, self.wrote_anything(), true, Some(op.display.clone()), cleanup_warnings,
 										));
 									}
 								}
@@ -2142,7 +2169,7 @@ impl PendingAction for FileOpsAction {
 									drop(temp_dest_guard);
 									return Ok(self.partial_result(
 										format!("fchmod target mode failed for {dest_display}: {err}"),
-										&attempt_written, &attempt_invalidated, &attempt_created_dirs, &fresh_tags, !self.cumulative_written.lock().unwrap().is_empty(), false, Some(dest_display), cleanup_warnings,
+										&attempt_written, &attempt_invalidated, &attempt_created_dirs, &fresh_tags, self.wrote_anything(), false, Some(dest_display), cleanup_warnings,
 									));
 								}
 							}
@@ -2157,7 +2184,7 @@ impl PendingAction for FileOpsAction {
 									drop(temp_dest_guard);
 									return Ok(self.partial_result(
 										format!("Failed to fstat source {} before destination publish: {}. Source preserved.", op.display, std::io::Error::last_os_error()),
-										&attempt_written, &attempt_invalidated, &attempt_created_dirs, &fresh_tags, !self.cumulative_written.lock().unwrap().is_empty(), false, Some(op.display.clone()), cleanup_warnings,
+										&attempt_written, &attempt_invalidated, &attempt_created_dirs, &fresh_tags, self.wrote_anything(), false, Some(op.display.clone()), cleanup_warnings,
 									));
 								}
 								if let Some(expected_dev_ino) = op.base_dev_ino {
@@ -2166,7 +2193,7 @@ impl PendingAction for FileOpsAction {
 										drop(temp_dest_guard);
 										return Ok(self.partial_result(
 											format!("Source {} dev/ino changed before destination publish. Move aborted. Source preserved.", op.display),
-											&attempt_written, &attempt_invalidated, &attempt_created_dirs, &fresh_tags, !self.cumulative_written.lock().unwrap().is_empty(), true, Some(op.display.clone()), cleanup_warnings,
+											&attempt_written, &attempt_invalidated, &attempt_created_dirs, &fresh_tags, self.wrote_anything(), true, Some(op.display.clone()), cleanup_warnings,
 										));
 									}
 								}
@@ -2177,7 +2204,7 @@ impl PendingAction for FileOpsAction {
 										drop(temp_dest_guard);
 										return Ok(self.partial_result(
 											format!("Source {} mode changed from 0o{expected_base_mode:o} to 0o{pre_mode:o} before destination publish. Move aborted. Source preserved.", op.display),
-											&attempt_written, &attempt_invalidated, &attempt_created_dirs, &fresh_tags, !self.cumulative_written.lock().unwrap().is_empty(), true, Some(op.display.clone()), cleanup_warnings,
+											&attempt_written, &attempt_invalidated, &attempt_created_dirs, &fresh_tags, self.wrote_anything(), true, Some(op.display.clone()), cleanup_warnings,
 										));
 									}
 								}
@@ -2186,7 +2213,7 @@ impl PendingAction for FileOpsAction {
 									drop(temp_dest_guard);
 									return Ok(self.partial_result(
 										format!("Failed to seek source {}: {e}. Move aborted.", op.display),
-										&attempt_written, &attempt_invalidated, &attempt_created_dirs, &fresh_tags, !self.cumulative_written.lock().unwrap().is_empty(), false, Some(op.display.clone()), cleanup_warnings,
+										&attempt_written, &attempt_invalidated, &attempt_created_dirs, &fresh_tags, self.wrote_anything(), false, Some(op.display.clone()), cleanup_warnings,
 									));
 								}
 								let mut pre_source_bytes = Vec::new();
@@ -2195,7 +2222,7 @@ impl PendingAction for FileOpsAction {
 									drop(temp_dest_guard);
 									return Ok(self.partial_result(
 										format!("Failed to re-read source {}: {e}. Move aborted.", op.display),
-										&attempt_written, &attempt_invalidated, &attempt_created_dirs, &fresh_tags, !self.cumulative_written.lock().unwrap().is_empty(), false, Some(op.display.clone()), cleanup_warnings,
+										&attempt_written, &attempt_invalidated, &attempt_created_dirs, &fresh_tags, self.wrote_anything(), false, Some(op.display.clone()), cleanup_warnings,
 									));
 								}
 								if let Some(base) = &op.base {
@@ -2204,7 +2231,7 @@ impl PendingAction for FileOpsAction {
 										drop(temp_dest_guard);
 										return Ok(self.partial_result(
 											format!("Source {} content changed in-place before destination publish. Move aborted. Source preserved.", op.display),
-											&attempt_written, &attempt_invalidated, &attempt_created_dirs, &fresh_tags, !self.cumulative_written.lock().unwrap().is_empty(), true, Some(op.display.clone()), cleanup_warnings,
+											&attempt_written, &attempt_invalidated, &attempt_created_dirs, &fresh_tags, self.wrote_anything(), true, Some(op.display.clone()), cleanup_warnings,
 										));
 									}
 								}
@@ -2216,7 +2243,7 @@ impl PendingAction for FileOpsAction {
 												drop(temp_dest_guard);
 												return Ok(self.partial_result(
 													format!("Source {} leaf entry in directory replaced before destination publish. Move aborted. Source preserved.", op.display),
-													&attempt_written, &attempt_invalidated, &attempt_created_dirs, &fresh_tags, !self.cumulative_written.lock().unwrap().is_empty(), true, Some(op.display.clone()), cleanup_warnings,
+													&attempt_written, &attempt_invalidated, &attempt_created_dirs, &fresh_tags, self.wrote_anything(), true, Some(op.display.clone()), cleanup_warnings,
 												));
 											}
 										}
@@ -2226,7 +2253,7 @@ impl PendingAction for FileOpsAction {
 										drop(temp_dest_guard);
 										return Ok(self.partial_result(
 											format!("Source {} leaf entry missing before destination publish. Move aborted. Source preserved.", op.display),
-											&attempt_written, &attempt_invalidated, &attempt_created_dirs, &fresh_tags, !self.cumulative_written.lock().unwrap().is_empty(), true, Some(op.display.clone()), cleanup_warnings,
+											&attempt_written, &attempt_invalidated, &attempt_created_dirs, &fresh_tags, self.wrote_anything(), true, Some(op.display.clone()), cleanup_warnings,
 										));
 									}
 								}
@@ -2238,7 +2265,7 @@ impl PendingAction for FileOpsAction {
 										drop(temp_dest_guard);
 										return Ok(self.partial_result(
 											format!("Destination temp file {temp_dest_name} replaced concurrently (expected {temp_dest_dev_ino:?}, found {other_dev_ino:?}) before publication. Move aborted."),
-											&attempt_written, &attempt_invalidated, &attempt_created_dirs, &fresh_tags, !self.cumulative_written.lock().unwrap().is_empty(), false, Some(dest_display), cleanup_warnings,
+											&attempt_written, &attempt_invalidated, &attempt_created_dirs, &fresh_tags, self.wrote_anything(), false, Some(dest_display), cleanup_warnings,
 										));
 									}
 									_ => {
@@ -2246,7 +2273,7 @@ impl PendingAction for FileOpsAction {
 										drop(temp_dest_guard);
 										return Ok(self.partial_result(
 											format!("Destination temp file {temp_dest_name} missing from directory before publication. Move aborted."),
-											&attempt_written, &attempt_invalidated, &attempt_created_dirs, &fresh_tags, !self.cumulative_written.lock().unwrap().is_empty(), false, Some(dest_display), cleanup_warnings,
+											&attempt_written, &attempt_invalidated, &attempt_created_dirs, &fresh_tags, self.wrote_anything(), false, Some(dest_display), cleanup_warnings,
 										));
 									}
 								}
@@ -2265,7 +2292,7 @@ impl PendingAction for FileOpsAction {
 										drop(temp_dest_guard);
 										return Ok(self.partial_result(
 											format!("Invalid temp destination name: {e}"),
-											&attempt_written, &attempt_invalidated, &attempt_created_dirs, &fresh_tags, !self.cumulative_written.lock().unwrap().is_empty(), false, Some(dest_display), cleanup_warnings,
+											&attempt_written, &attempt_invalidated, &attempt_created_dirs, &fresh_tags, self.wrote_anything(), false, Some(dest_display), cleanup_warnings,
 										));
 									}
 								};
@@ -2276,7 +2303,7 @@ impl PendingAction for FileOpsAction {
 										drop(temp_dest_guard);
 										return Ok(self.partial_result(
 											format!("Invalid destination name: {e}"),
-											&attempt_written, &attempt_invalidated, &attempt_created_dirs, &fresh_tags, !self.cumulative_written.lock().unwrap().is_empty(), false, Some(dest_display), cleanup_warnings,
+											&attempt_written, &attempt_invalidated, &attempt_created_dirs, &fresh_tags, self.wrote_anything(), false, Some(dest_display), cleanup_warnings,
 										));
 									}
 								};
@@ -2340,14 +2367,14 @@ impl PendingAction for FileOpsAction {
 								}
 								Ok(false) => {
 									return Ok(self.partial_result(
-										format!("Cannot move to {dest_display}: destination already exists. {} of {total_ops} operations performed.", self.cumulative_written.lock().unwrap().len()),
-										&attempt_written, &attempt_invalidated, &attempt_created_dirs, &fresh_tags, !self.cumulative_written.lock().unwrap().is_empty(), true, Some(dest_display), cleanup_warnings,
+										format!("Cannot move to {dest_display}: destination already exists. {} of {total_ops} operations performed.", self.written_len()),
+										&attempt_written, &attempt_invalidated, &attempt_created_dirs, &fresh_tags, self.wrote_anything(), true, Some(dest_display), cleanup_warnings,
 									));
 								}
 								Err(e) => {
 									return Ok(self.partial_result(
-										format!("Failed to publish move destination {dest_display}: {e}. {} of {total_ops} operations performed.", self.cumulative_written.lock().unwrap().len()),
-										&attempt_written, &attempt_invalidated, &attempt_created_dirs, &fresh_tags, !self.cumulative_written.lock().unwrap().is_empty(), false, Some(dest_display), cleanup_warnings,
+										format!("Failed to publish move destination {dest_display}: {e}. {} of {total_ops} operations performed.", self.written_len()),
+										&attempt_written, &attempt_invalidated, &attempt_created_dirs, &fresh_tags, self.wrote_anything(), false, Some(dest_display), cleanup_warnings,
 									));
 								}
 							}

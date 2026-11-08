@@ -1218,35 +1218,30 @@ mod tests {
 	#[cfg(unix)]
 	#[tokio::test]
 	async fn partial_apply_retry_reports_prior_writes_and_writes_nothing() {
-		use std::os::unix::fs::PermissionsExt;
-
 		let dir = TempDir::new("partial-retry");
 		let first = dir.0.join("a.ts");
 		let blocked = dir.0.join("blocked");
-		let second = blocked.join("b.ts");
+		// A file whose temp sibling exceeds NAME_MAX ensures the second write
+		// fails deterministically at commit time across all filesystems, roots,
+		// and container environments, without relying on directory permissions.
+		let blocked_name = format!("{}.ts", "x".repeat(237));
+		assert!(
+			blocked_name.len() + "..tmp-0123456789abcdef".len() > 255,
+			"the temp sibling must exceed NAME_MAX"
+		);
+		let second = blocked.join(&blocked_name);
+		let second_rel = format!("blocked/{blocked_name}");
 		fs::create_dir_all(&blocked).expect("blocked dir");
 		fs::write(&first, "const a = foo(1);\n").expect("write first");
 		fs::write(&second, "const b = foo(1);\n").expect("write second");
 		let (tool, pending) = tool();
 		let ctx = AgentContext::new(dir.0.clone());
 
-		tool.execute(&args(&["a.ts", "blocked/b.ts"]), &ctx)
+		tool.execute(&args(&["a.ts", &second_rel]), &ctx)
 			.await
 			.expect("preview");
-		// `a.ts` is written first; the read-only directory makes the second
-		// write fail, exercising the partial path.
-		fs::set_permissions(&blocked, fs::Permissions::from_mode(0o500)).expect("chmod");
-		let probe = blocked.join(".permission-probe");
-		if fs::write(&probe, b"probe").is_ok() {
-			// Root ignores directory write bits; this environment cannot
-			// exercise the partial-write path through permissions.
-			fs::remove_file(&probe).ok();
-			fs::set_permissions(&blocked, fs::Permissions::from_mode(0o700)).expect("restore chmod");
-			return;
-		}
 
 		let partial = pending.resolve(&ctx, "apply").await.expect("partial");
-		fs::set_permissions(&blocked, fs::Permissions::from_mode(0o700)).expect("restore chmod");
 		assert!(partial.is_error, "{}", partial.content);
 		assert!(partial.content.contains("Failed to write") || partial.content.contains("Failed to create temp file"), "{}", partial.content);
 		let partial_source = partial.details.as_ref().expect("details");

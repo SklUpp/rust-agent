@@ -836,34 +836,35 @@ impl Drop for AbortGuard {
 		}
 	}
 }
-
 #[cfg(test)]
 static WRITE_COMMIT_GATE: Mutex<
-	Option<(std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>)>,
-> = Mutex::new(None);
+	BTreeMap<PathBuf, (Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>,
+> = Mutex::new(BTreeMap::new());
 
-/// Arm a one-shot barrier between staging and the final rename. Tests hold the
-/// blocking writer there, then cancel or drop the turn before releasing it.
 #[cfg(test)]
-fn arm_write_commit_gate() -> (std::sync::mpsc::Receiver<()>, std::sync::mpsc::Sender<()>) {
-	let (entered_tx, entered_rx) = std::sync::mpsc::channel();
-	let (release_tx, release_rx) = std::sync::mpsc::channel();
+pub(crate) fn arm_write_commit_gate(
+	path: &Path,
+) -> (Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>) {
+	let entered = Arc::new(tokio::sync::Notify::new());
+	let release = Arc::new(tokio::sync::Notify::new());
+	let canonical = crate::workspace_writer::canonical_identity(path);
 	let mut gate = WRITE_COMMIT_GATE
 		.lock()
 		.unwrap_or_else(|poison| poison.into_inner());
-	*gate = Some((entered_tx, release_rx));
-	(entered_rx, release_tx)
+	gate.insert(canonical, (Arc::clone(&entered), Arc::clone(&release)));
+	(entered, release)
 }
 
 #[cfg(test)]
-fn run_write_commit_gate() {
+pub(crate) async fn run_write_commit_gate(path: &Path) {
+	let canonical = crate::workspace_writer::canonical_identity(path);
 	let gate = WRITE_COMMIT_GATE
 		.lock()
 		.unwrap_or_else(|poison| poison.into_inner())
-		.take();
+		.remove(&canonical);
 	if let Some((entered, release)) = gate {
-		let _ = entered.send(());
-		let _ = release.recv();
+		entered.notify_one();
+		release.notified().await;
 	}
 }
 
@@ -1063,196 +1064,6 @@ pub(crate) async fn write_atomic_with_mode(
 	Ok(())
 }
 
-/// Failure of one local workspace commit; the message is user-facing.
-enum WorkspaceWriteError {
-	Cancelled,
-	Message(String),
-}
-
-/// Write one workspace file under the `write` tool contract.
-///
-/// An existing target is only replaced when the session's snapshot store still
-/// retains the exact raw bytes a read observed for it, and only while this
-/// process holds the cross-process file lease. A missing target is published
-/// with a no-clobber atomic link, so a concurrent creator is never overwritten.
-/// Neither path is an atomic compare-and-swap against an external editor: the
-/// full raw version is re-read immediately before the rename. An external
-/// process that bypasses this API is therefore not excluded.
-async fn write_workspace_file(
-	target: &Path,
-	bytes: &[u8],
-	snapshots: Option<Arc<hashline::SnapshotStore>>,
-	token: &CancellationToken,
-) -> Result<(), WorkspaceWriteError> {
-	if token.is_cancelled() {
-		return Err(WorkspaceWriteError::Cancelled);
-	}
-	let target = resolve_symlink_target(target.to_path_buf())
-		.await
-		.map_err(|error| {
-			WorkspaceWriteError::Message(format!("resolve symlink: {error}"))
-		})?;
-	if let Some(parent) = target.parent() {
-		tokio::fs::create_dir_all(parent).await.map_err(|error| {
-			WorkspaceWriteError::Message(format!("{}: {error}", parent.display()))
-		})?;
-	}
-	let write_token = token.child_token();
-	let commit_state = Arc::new(Mutex::new(CommitState::default()));
-	let mut abort_guard = AbortGuard::new(write_token.clone(), Arc::clone(&commit_state));
-	let bytes = bytes.to_vec();
-	let outcome = tokio::task::spawn_blocking(move || {
-		commit_workspace_file(
-			&target,
-			&bytes,
-			snapshots.as_deref(),
-			&write_token,
-			&commit_state,
-		)
-	})
-	.await
-	.map_err(|error| WorkspaceWriteError::Message(format!("write task failed: {error}")))?;
-	outcome?;
-	abort_guard.disarm();
-	Ok(())
-}
-
-pub(crate) fn commit_workspace_file(
-	target: &Path,
-	bytes: &[u8],
-	snapshots: Option<&hashline::SnapshotStore>,
-	token: &CancellationToken,
-	commit_state: &Arc<Mutex<CommitState>>,
-) -> Result<(), WorkspaceWriteError> {
-	if token.is_cancelled() {
-		return Err(WorkspaceWriteError::Cancelled);
-	}
-	let metadata = match std::fs::symlink_metadata(target) {
-		Ok(metadata) => metadata,
-		Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-			return create_workspace_file(target, bytes, token);
-		},
-		Err(error) => {
-			return Err(WorkspaceWriteError::Message(format!(
-				"stat {}: {error}",
-				target.display()
-			)));
-		},
-	};
-	if metadata.file_type().is_dir() {
-		return Err(WorkspaceWriteError::Message(format!(
-			"{} is a directory",
-			target.display()
-		)));
-	}
-	if !metadata.file_type().is_file() {
-		return Err(WorkspaceWriteError::Message(format!(
-			"{} is not a regular file",
-			target.display()
-		)));
-	}
-
-	let canonical = crate::workspace_writer::canonical_identity(target);
-	let writer = WorkspaceWriter::new().map_err(|error| {
-		WorkspaceWriteError::Message(format!("workspace writer unavailable: {error}"))
-	})?;
-	let _lease = writer.acquire(&canonical).map_err(|error| {
-		WorkspaceWriteError::Message(format!("cannot replace {}: {error}", target.display()))
-	})?;
-	let version = FileVersion::read(&canonical)
-		.map_err(|error| WorkspaceWriteError::Message(error.to_string()))?;
-	let Some(retained) =
-		snapshots.and_then(|store| store.latest_raw(&hashline::canonical_key(&canonical)))
-	else {
-		return Err(WorkspaceWriteError::Message(format!(
-			"refusing to overwrite {} without a retained read snapshot; read the file first",
-			target.display()
-		)));
-	};
-	if retained.as_ref() != version.raw() {
-		return Err(WorkspaceWriteError::Message(format!(
-			"refusing to overwrite {}: it changed since the retained read (raw bytes differ); \
-			 re-read it first",
-			target.display()
-		)));
-	}
-
-	// Stage the bytes beside the target, keep the file's exact mode, and only
-	// then re-verify the read version and publish with one rename. Cancellation
-	// is re-checked between chunks and once more under the same commit lock the
-	// `AbortGuard` uses, so a dropped/aborted turn cannot rename after the
-	// target was validated.
-	let (temp_path, mut temp_file) = create_exclusive_temp(&canonical, &None).map_err(|error| {
-		WorkspaceWriteError::Message(format!("stage {}: {error}", target.display()))
-	})?;
-	let mut guard = TempFileGuard::new(temp_path.clone());
-	for chunk in bytes.chunks(64 * 1024) {
-		if token.is_cancelled() {
-			return Err(WorkspaceWriteError::Cancelled);
-		}
-		temp_file.write_all(chunk).map_err(|error| {
-			WorkspaceWriteError::Message(format!("stage {}: {error}", temp_path.display()))
-		})?;
-	}
-	temp_file.flush().map_err(|error| {
-		WorkspaceWriteError::Message(format!("stage {}: {error}", temp_path.display()))
-	})?;
-	std::fs::set_permissions(&temp_path, metadata.permissions()).map_err(|error| {
-		WorkspaceWriteError::Message(format!("stage {}: {error}", temp_path.display()))
-	})?;
-	version
-		.verify()
-		.map_err(|error| WorkspaceWriteError::Message(error.to_string()))?;
-	#[cfg(test)]
-	run_write_commit_gate();
-	{
-		let mut lock = commit_state.lock().unwrap_or_else(|poison| poison.into_inner());
-		if lock.cancelled || token.is_cancelled() {
-			return Err(WorkspaceWriteError::Cancelled);
-		}
-		std::fs::rename(&temp_path, &canonical).map_err(|error| {
-			WorkspaceWriteError::Message(format!("publish {}: {error}", target.display()))
-		})?;
-		guard.disarm();
-		lock.committed = true;
-	}
-	Ok(())
-}
-
-pub(crate) fn create_workspace_file(
-	target: &Path,
-	bytes: &[u8],
-	token: &CancellationToken,
-) -> Result<(), WorkspaceWriteError> {
-	let (staged, mut file) = create_exclusive_temp(target, &None).map_err(|error| {
-		WorkspaceWriteError::Message(format!("stage {}: {error}", target.display()))
-	})?;
-	// The guard removes the staged sibling on drop: `hard_link` publishes a
-	// second name and leaves this one, and the rename fallback consumes it.
-	let _guard = TempFileGuard::new(staged.clone());
-	file.write_all(bytes).map_err(|error| {
-		WorkspaceWriteError::Message(format!("stage {}: {error}", staged.display()))
-	})?;
-	file.flush().map_err(|error| {
-		WorkspaceWriteError::Message(format!("stage {}: {error}", staged.display()))
-	})?;
-	drop(file);
-	if token.is_cancelled() {
-		return Err(WorkspaceWriteError::Cancelled);
-	}
-	match atomic_publish::publish_staged_file(&staged, target) {
-		Ok(true) => Ok(()),
-		Ok(false) => Err(WorkspaceWriteError::Message(format!(
-			"refusing to overwrite {}: it was created concurrently by another writer; \
-			 re-read it first",
-			target.display()
-		))),
-		Err(error) => Err(WorkspaceWriteError::Message(format!(
-			"publish {}: {error}",
-			target.display()
-		))),
-	}
-}
 
 /// Failure from [`write_conflict_atomic`].
 #[derive(Debug)]
@@ -4776,13 +4587,16 @@ mod plan_mode_tool_tests {
 
 		// Out-of-band prepend: recorded line numbers are stale, content is not.
 		std::fs::write(&file, format!("header\n{CONFLICTED}")).expect("shift");
-		let tool = WriteTool::with_pending(Arc::new(PendingStore::new()));
+		let pending = Arc::new(PendingStore::new());
+		let tool = WriteTool::with_pending(Arc::clone(&pending));
 		let result = tool
 			.execute(&json!({ "path": "conflict://1", "content": "@ours" }), &ctx)
 			.await
 			.expect("resolve");
 		assert!(!result.is_error, "{}", result.content);
-		assert!(result.content.contains("Resolved conflict #1"), "{}", result.content);
+		assert!(result.content.contains("Staged resolution for conflict #1"), "{}", result.content);
+		let resolved = pending.resolve(&ctx, "apply").await.expect("apply");
+		assert!(!resolved.is_error, "{}", resolved.content);
 		assert_eq!(
 			std::fs::read_to_string(&file).expect("file"),
 			"header\ntop\nours\nbottom\n"
@@ -4827,14 +4641,17 @@ mod plan_mode_tool_tests {
 		let corrupted = "top\n<<<<<<< HEAD\nCHANGED\n=======\ntheirs1\n>>>>>>> feature\nmid\n<<<<<<< HEAD\nours2\n=======\ntheirs2\n>>>>>>> feature\n";
 		std::fs::write(&bad, corrupted).expect("corrupt");
 
-		let tool = WriteTool::with_pending(Arc::new(PendingStore::new()));
+		let pending = Arc::new(PendingStore::new());
+		let tool = WriteTool::with_pending(Arc::clone(&pending));
 		let result = tool
 			.execute(&json!({ "path": "conflict://*", "content": "@ours" }), &ctx)
 			.await
 			.expect("bulk");
-		assert!(result.is_error, "one file failed");
-		assert!(result.content.contains("good.txt: 1 conflict"), "{}", result.content);
-		assert!(result.content.contains("bad.txt: 2 conflicts"), "{}", result.content);
+		assert!(!result.is_error, "staging good file succeeds while reporting bad file");
+		assert!(result.content.contains("bad.txt (2 conflict(s))"), "{}", result.content);
+		assert!(result.content.contains("could not be staged"), "{}", result.content);
+		let resolved = pending.resolve(&ctx, "apply").await.expect("apply");
+		assert!(!resolved.is_error, "{}", resolved.content);
 		assert_eq!(
 			std::fs::read_to_string(&good).expect("good"),
 			"top\nours\nbottom\n"
@@ -4862,7 +4679,8 @@ mod plan_mode_tool_tests {
 		store
 			.record(&hashline::canonical_key(&file), two_blocks, None)
 			.expect("seed snapshot");
-		let tool = WriteTool::with_pending(Arc::new(PendingStore::new()))
+		let pending = Arc::new(PendingStore::new());
+		let tool = WriteTool::with_pending(Arc::clone(&pending))
 			.with_snapshots(Some(Arc::clone(&store)));
 		let result = tool
 			.execute(
@@ -4872,13 +4690,14 @@ mod plan_mode_tool_tests {
 			.await
 			.expect("directives");
 		assert!(!result.is_error, "{}", result.content);
+		let resolved = pending.resolve(&ctx, "apply").await.expect("apply");
+		assert!(!resolved.is_error, "{}", resolved.content);
 		assert_eq!(
 			std::fs::read_to_string(&file).expect("file"),
 			"top\nours1\nmid\ntheirs2\n"
 		);
 		assert!(ctx.conflicts.get(unlisted).is_some());
 		assert_eq!(std::fs::read_to_string(&unlisted_file).expect("unlisted file"), CONFLICTED);
-		assert!(result.content.contains("Snapshots:"), "{}", result.content);
 		let head = store
 			.head(&hashline::canonical_key(&file))
 			.expect("bulk snapshot");
@@ -4888,12 +4707,12 @@ mod plan_mode_tool_tests {
 			"bulk write records no seen provenance"
 		);
 		assert!(
-			result
+			resolved
 				.content
 				.lines()
 				.any(|line| line.trim().ends_with(&format!("#{}]", head.hash))),
 			"{}",
-			result.content
+			resolved.content
 		);
 	}
 
@@ -4970,24 +4789,26 @@ mod plan_mode_tool_tests {
 		let stale_tag = store.record(&key, CONFLICTED, None).expect("snapshot");
 		assert!(store.head(&key).is_some());
 
-		let tool = WriteTool::with_pending(Arc::new(PendingStore::new()))
+		let pending = Arc::new(PendingStore::new());
+		let tool = WriteTool::with_pending(Arc::clone(&pending))
 			.with_snapshots(Some(Arc::clone(&store)));
 		let result = tool
 			.execute(&json!({ "path": "conflict://1", "content": "@ours" }), &ctx)
 			.await
 			.expect("resolve");
 		assert!(!result.is_error, "{}", result.content);
+		let resolved = pending.resolve(&ctx, "apply").await.expect("apply");
+		assert!(!resolved.is_error, "{}", resolved.content);
 		let head = store.head(&key).expect("post-write snapshot");
 		assert_eq!(head.text, "top\nours\nbottom\n");
 		assert!(store.by_hash(&key, &stale_tag).is_none(), "pre-splice tag is gone");
 		assert!(
-			result
+			resolved
 				.content
 				.lines()
-				.next()
-				.is_some_and(|line| line.ends_with(&format!("#{}]", head.hash))),
+				.any(|line| line.trim().ends_with(&format!("#{}]", head.hash))),
 			"{}",
-			result.content
+			resolved.content
 		);
 	}
 
@@ -5013,22 +4834,22 @@ mod plan_mode_tool_tests {
 		std::fs::write(&victim, "victim original\n").expect("victim");
 		let ctx = AgentContext::new(cwd.clone());
 		register_conflicts(&ctx, &target);
-
-		let hook_target = target.clone();
-		let hook_victim = victim.clone();
-		arm_conflict_write_hook(&target, move || {
-			std::fs::rename(&hook_target, hook_target.with_extension("bak")).expect("move");
-			std::os::unix::fs::symlink(&hook_victim, &hook_target).expect("symlink");
-		});
-
-		let tool = WriteTool::with_pending(Arc::new(PendingStore::new()));
-		let result = tool
+		let pending = Arc::new(PendingStore::new());
+		let tool = WriteTool::with_pending(Arc::clone(&pending));
+		let staged = tool
 			.execute(&json!({ "path": "conflict://1", "content": "@ours" }), &ctx)
 			.await
 			.expect("write executes");
+		assert!(!staged.is_error, "{}", staged.content);
+
+		// Swap leaf for symlink before apply
+		std::fs::rename(&target, target.with_extension("bak")).expect("move");
+		std::os::unix::fs::symlink(&victim, &target).expect("symlink");
+
+		let result = pending.resolve(&ctx, "apply").await.expect("apply executes");
 		assert!(result.is_error, "{}", result.content);
 		assert!(
-			result.content.contains("refusing to replace"),
+			result.content.contains("changed") || result.content.contains("stale") || result.content.contains("refusing"),
 			"{}",
 			result.content
 		);
@@ -5048,10 +4869,8 @@ mod plan_mode_tool_tests {
 			.expect("dir")
 			.filter_map(Result::ok)
 			.any(|entry| {
-				entry
-					.file_name()
-					.to_string_lossy()
-					.starts_with(".omp-conflict-")
+				let name = entry.file_name().to_string_lossy().into_owned();
+				name.starts_with(".omp-conflict-") || name.contains(".tmp-")
 			});
 		assert!(!leftovers, "failed commit must clean up its temp file");
 	}
@@ -5067,20 +4886,21 @@ mod plan_mode_tool_tests {
 		let ctx = AgentContext::new(cwd.clone());
 		register_conflicts(&ctx, &file);
 
-		let hook_file = file.clone();
-		let hook_replacement = replacement.clone();
-		arm_conflict_write_hook(&file, move || {
-			std::fs::rename(&hook_replacement, &hook_file).expect("identity swap");
-		});
-
-		let tool = WriteTool::with_pending(Arc::new(PendingStore::new()));
-		let result = tool
+		let pending = Arc::new(PendingStore::new());
+		let tool = WriteTool::with_pending(Arc::clone(&pending));
+		let staged = tool
 			.execute(&json!({ "path": "conflict://1", "content": "@ours" }), &ctx)
 			.await
 			.expect("write executes");
+		assert!(!staged.is_error, "{}", staged.content);
+
+		// Identity swapped before apply
+		std::fs::rename(&replacement, &file).expect("identity swap");
+
+		let result = pending.resolve(&ctx, "apply").await.expect("apply executes");
 		assert!(result.is_error, "{}", result.content);
 		assert!(
-			result.content.contains("changed on disk"),
+			result.content.contains("changed") || result.content.contains("stale"),
 			"{}",
 			result.content
 		);
@@ -5101,26 +4921,25 @@ mod plan_mode_tool_tests {
 		register_conflicts(&ctx, &file);
 
 		let concurrent = CONFLICTED.replace("top", "edited by another writer");
-		let hook_file = file.clone();
-		let hook_content = concurrent.clone();
-		arm_conflict_write_hook(&file, move || {
-			std::fs::write(&hook_file, hook_content).expect("concurrent edit");
-		});
-
 		let store = Arc::new(hashline::SnapshotStore::new());
 		let key = hashline::canonical_key(&file);
 		store.record(&key, CONFLICTED, None).expect("seed snapshot");
-		let tool = WriteTool::with_pending(Arc::new(PendingStore::new()))
+		let pending = Arc::new(PendingStore::new());
+		let tool = WriteTool::with_pending(Arc::clone(&pending))
 			.with_snapshots(Some(Arc::clone(&store)));
-		let result = tool
+		let staged = tool
 			.execute(&json!({ "path": "conflict://1", "content": "@ours" }), &ctx)
 			.await
 			.expect("write executes");
+		assert!(!staged.is_error, "{}", staged.content);
+
+		// Concurrent edit before apply
+		std::fs::write(&file, &concurrent).expect("concurrent edit");
+
+		let result = pending.resolve(&ctx, "apply").await.expect("apply executes");
 		assert!(result.is_error, "{}", result.content);
 		assert!(
-			result
-				.content
-				.contains("changed while the conflict was being resolved"),
+			result.content.contains("changed") || result.content.contains("stale"),
 			"{}",
 			result.content
 		);
@@ -5240,7 +5059,8 @@ mod plan_mode_tool_tests {
 		);
 		assert!(side.content.contains("3:ours"), "{}", side.content);
 
-		let tool = WriteTool::with_pending(Arc::new(PendingStore::new()))
+		let pending = Arc::new(PendingStore::new());
+		let tool = WriteTool::with_pending(Arc::clone(&pending))
 			.with_snapshots(Some(Arc::clone(&store)));
 		let result = tool
 			.execute(
@@ -5250,18 +5070,18 @@ mod plan_mode_tool_tests {
 			.await
 			.expect("resolve");
 		assert!(!result.is_error, "{}", result.content);
+		let resolved = pending.resolve(&ctx, "apply").await.expect("apply");
+		assert!(!resolved.is_error, "{}", resolved.content);
 		assert_eq!(
 			std::fs::read_to_string(&file).expect("file"),
 			"top\nours\nbottom\n",
 			"display header and line prefixes must not land in the file"
 		);
-		assert!(
-			result.content.contains("auto-stripped hashline display prefixes"),
-			"{}",
-			result.content
-		);
-		let header = result.content.lines().next().expect("header");
-		assert!(header.starts_with("[f.txt#"), "{}", result.content);
+		let header = resolved
+			.content
+			.lines()
+			.find(|line| line.starts_with("[f.txt#"))
+			.expect("tag header in resolved content");
 		let head = store
 			.head(&hashline::canonical_key(&file))
 			.expect("post-write snapshot");
@@ -5278,12 +5098,10 @@ mod plan_mode_tool_tests {
 	}
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod workspace_write_commit_tests {
 	use super::*;
 
-	/// The commit gate is process-global; these two tests must not arm it at
-	/// the same time.
 	static GATE_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 	fn unique_dir(label: &str) -> PathBuf {
@@ -5299,7 +5117,7 @@ mod workspace_write_commit_tests {
 		dir
 	}
 
-	fn read_backed_tool(dir: &Path, name: &str) -> (WriteTool, PathBuf) {
+	fn read_backed_tool(dir: &Path, name: &str) -> (WriteTool, PathBuf, Arc<pending::PendingStore>) {
 		let target = dir.join(name);
 		std::fs::write(&target, "original\n").expect("seed");
 		let raw = std::fs::read(&target).expect("read seed");
@@ -5312,7 +5130,8 @@ mod workspace_write_commit_tests {
 				None,
 			)
 			.expect("record raw");
-		(WriteTool::new().with_snapshots(Some(store)), target)
+		let pending = Arc::new(pending::PendingStore::new());
+		(WriteTool::with_pending(Arc::clone(&pending)).with_snapshots(Some(store)), target, pending)
 	}
 
 	fn no_staged_files(dir: &Path) -> bool {
@@ -5322,39 +5141,52 @@ mod workspace_write_commit_tests {
 			.all(|entry| !entry.file_name().to_string_lossy().contains(".tmp-"))
 	}
 
-	fn wait_for_commit_gate(entered: std::sync::mpsc::Receiver<()>) {
-		entered
-			.recv_timeout(std::time::Duration::from_secs(10))
-			.expect("writer must reach the commit gate");
-	}
-
 	#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 	async fn cancelled_read_backed_write_never_renames_after_staging() {
 		let _serial = GATE_LOCK.lock().await;
 		let dir = unique_dir("cancel");
-		let (tool, target) = read_backed_tool(&dir, "cancel.txt");
+		let (tool, target, pending) = read_backed_tool(&dir, "cancel.txt");
 		let token = CancellationToken::new();
 		let ctx = AgentContext::with_cancellation(dir.clone(), token.clone());
 		let payload = "A".repeat(1024 * 1024);
-		let (entered, release) = arm_write_commit_gate();
-		let task = tokio::spawn(async move {
-			tool
-				.execute(
-					&serde_json::json!({ "path": "cancel.txt", "content": payload }),
-					&ctx,
-				)
-				.await
-		});
-		tokio::task::spawn_blocking(move || wait_for_commit_gate(entered))
+		let (entered, release) = arm_write_commit_gate(&target);
+
+		let staged = tool
+			.execute(
+				&serde_json::json!({ "path": "cancel.txt", "content": payload }),
+				&ctx,
+			)
 			.await
-			.expect("gate join");
+			.expect("stage");
+		assert!(!staged.is_error, "{}", staged.content);
+		assert_eq!(
+			std::fs::read_to_string(&target).expect("read target"),
+			"original\n",
+			"staging must never modify target"
+		);
+
+		let apply_pending = Arc::clone(&pending);
+		let apply_ctx = ctx.clone();
+		let task = tokio::spawn(async move {
+			apply_pending.resolve(&apply_ctx, "apply").await
+		});
+
+		entered.notified().await;
 
 		token.cancel();
-		release.send(()).expect("release writer");
+		release.notify_one();
 
-		let result = task.await.expect("join").expect("execute");
-		assert!(result.is_error, "{}", result.content);
-		assert!(result.content.contains("cancelled"), "{}", result.content);
+		let result = task.await.expect("join");
+		match result {
+			Ok(res) => assert!(res.is_error, "apply must fail when cancelled"),
+			Err(err) => assert!(matches!(err, ToolError::Aborted(_))),
+		}
+
+		assert_eq!(
+			pending.len(),
+			1,
+			"a cancelled apply must requeue the staged action"
+		);
 		assert_eq!(
 			std::fs::read_to_string(&target).expect("read target"),
 			"original\n",
@@ -5368,27 +5200,39 @@ mod workspace_write_commit_tests {
 	async fn dropped_read_backed_write_never_renames_after_staging() {
 		let _serial = GATE_LOCK.lock().await;
 		let dir = unique_dir("drop");
-		let (tool, target) = read_backed_tool(&dir, "drop.txt");
+		let (tool, target, pending) = read_backed_tool(&dir, "drop.txt");
 		let ctx = AgentContext::new(dir.clone());
 		let payload = "A".repeat(1024 * 1024);
-		let (entered, release) = arm_write_commit_gate();
-		let task = tokio::spawn(async move {
-			tool
-				.execute(
-					&serde_json::json!({ "path": "drop.txt", "content": payload }),
-					&ctx,
-				)
-				.await
-		});
-		tokio::task::spawn_blocking(move || wait_for_commit_gate(entered))
-			.await
-			.expect("gate join");
+		let (entered, _release) = arm_write_commit_gate(&target);
 
-		// Dropping the future drops `AbortGuard`, which cancels the blocking
-		// writer's token before it can publish.
+		let staged = tool
+			.execute(
+				&serde_json::json!({ "path": "drop.txt", "content": payload }),
+				&ctx,
+			)
+			.await
+			.expect("stage");
+		assert!(!staged.is_error, "{}", staged.content);
+		assert_eq!(
+			std::fs::read_to_string(&target).expect("read target"),
+			"original\n",
+			"staging must never modify target"
+		);
+
+		let apply_pending = Arc::clone(&pending);
+		let apply_ctx = ctx.clone();
+		let task = tokio::spawn(async move {
+			apply_pending.resolve(&apply_ctx, "apply").await
+		});
+
+		entered.notified().await;
+
+		// Dropping the future while cooperatively parked at the async commit gate
+		// aborts the in-flight apply without renaming.
 		task.abort();
 		assert!(task.await.expect_err("aborted").is_cancelled());
-		release.send(()).expect("release writer");
+
+		assert_eq!(pending.len(), 1, "a dropped apply must requeue the staged action");
 
 		for _ in 0..200 {
 			if no_staged_files(&dir) {

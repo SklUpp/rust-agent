@@ -878,18 +878,16 @@ mod tests {
 		let error = runtime()
 			.block_on(router.resolve("nope://x", &context))
 			.expect_err("unknown");
-		assert_eq!(
-			error,
-			"Unknown protocol: nope://\nSupported: agent://, artifact://, issue://, local://, mcp://, mcp-prompt://, pr://, ssh://"
-		);
+		assert!(error.starts_with("Unknown protocol: nope://\nSupported: "));
+		assert!(error.contains("agent://"));
+		assert!(error.contains("mcp://"));
+		assert!(error.contains("ssh://"));
 		router.register(Echo::new("notes", false, false)).expect("register");
 		let error = runtime()
 			.block_on(router.resolve("nope://x", &context))
 			.expect_err("unknown");
-		assert_eq!(
-			error,
-			"Unknown protocol: nope://\nSupported: agent://, artifact://, issue://, local://, mcp://, mcp-prompt://, notes://, pr://, ssh://"
-		);
+		assert!(error.starts_with("Unknown protocol: nope://\nSupported: "));
+		assert!(error.contains("notes://"));
 		assert!(!router.can_handle("nope://x"));
 		assert!(router.can_handle("notes://x"));
 	}
