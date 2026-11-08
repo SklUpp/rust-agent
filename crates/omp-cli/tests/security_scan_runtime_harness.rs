@@ -8,22 +8,38 @@
 //! `security://` reads, persistent worker journal, and parent `lsp.enabled:
 //! false` with default `always-ask` approvals.
 
+use std::fs;
 use std::path::PathBuf;
 use std::process::Command;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{SystemTime, UNIX_EPOCH};
 
-#[test]
-fn real_cli_security_scan_harness_passes() {
-	// The harness writes its whole fixture under a disposable root. Use `$HOME`
-	// (never a shared `/tmp`) and remove only that root on exit.
+static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+fn create_unique_harness_root() -> PathBuf {
 	let base = std::env::var_os("HOME")
 		.map(PathBuf::from)
 		.unwrap_or_else(std::env::temp_dir);
-	let root = base.join(format!(
-		".omp-security-runtime-harness-{}",
-		std::process::id()
-	));
-	let _ = std::fs::remove_dir_all(&root);
-	std::fs::create_dir_all(&root).expect("create harness home");
+	let pid = std::process::id();
+	let now = SystemTime::now()
+		.duration_since(UNIX_EPOCH)
+		.map(|d| d.as_nanos())
+		.unwrap_or(0);
+	for _ in 0..100 {
+		let count = COUNTER.fetch_add(1, Ordering::Relaxed);
+		let candidate = base.join(format!(".omp-security-runtime-harness-{pid}-{now}-{count}"));
+		match fs::create_dir(&candidate) {
+			Ok(()) => return candidate,
+			Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => continue,
+			Err(err) => panic!("cannot create unique harness root {}: {err}", candidate.display()),
+		}
+	}
+	panic!("exhausted unique harness root attempts under {}", base.display());
+}
+
+#[test]
+fn real_cli_security_scan_harness_passes() {
+	let root = create_unique_harness_root();
 	let script: PathBuf = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
 		.join("../..")
 		.join("scripts/security-scan-home-harness.sh");
