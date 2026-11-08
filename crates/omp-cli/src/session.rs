@@ -1622,25 +1622,9 @@ impl SessionStore {
 								.unwrap_or_default(),
 						});
 					store.refresh_title_from_entries();
-					if store.title_slot.is_none() {
-						store.title_slot = Some(TitleSlot {
-							title: String::new(),
-							source: Some("auto".to_string()),
-							updated_at: store
-								.header
-								.as_ref()
-								.map(|header| header.timestamp.clone())
-								.unwrap_or_default(),
-						});
-					}
 				} else {
-					let updated_at = header.timestamp.clone();
 					store.header = Some(header);
-					store.title_slot = Some(TitleSlot {
-						title: String::new(),
-						source: Some("auto".to_string()),
-						updated_at,
-					});
+					store.title_slot = None;
 				}
 				let unresolved = store
 					.durable
@@ -2843,11 +2827,13 @@ impl SessionStore {
 	/// disabled (`--no-title`/`PI_NO_TITLE`), once a title exists, or for
 	/// assistant/tool batches.
 	fn auto_title_text(&self, entries: &[MessageEntry]) -> Option<String> {
-		// The in-place write targets the leading 256-byte slot. Slotless v3
-		// logs keep the header on line 1, so writing there would destroy it:
-		// never auto-migrate old formats; require an existing slot.
+		// For legacy JSONL files, the in-place write targets the leading 256-byte
+		// slot. Slotless v3 logs keep the header on line 1, so writing there would
+		// destroy it: never auto-migrate old formats; require an existing slot.
+		// Durable SQLite sessions do not use a fixed-width line slot and persist
+		// the title directly in the database header.
 		if self.no_title
-			|| self.title_slot.is_none()
+			|| (self.durable.is_none() && self.title_slot.is_none())
 			|| !self.header.as_ref().is_some_and(|header| header.title.is_none())
 		{
 			return None;
@@ -4347,10 +4333,26 @@ pub fn read_terminal_breadcrumb(override_path: Option<&Path>) -> Option<Terminal
 		return None;
 	}
 	let breadcrumb_cwd = PathBuf::from(lines[0]);
-	let session_file = PathBuf::from(lines[1]);
+	let mut session_file = PathBuf::from(lines[1]);
 	let fresh = lines.get(2).map_or(false, |l| *l == "fresh");
 
-	let exists = session_file.is_file();
+	let exists = if session_file.is_file() {
+		true
+	} else {
+		match resolve_durable_session_id(&session_file) {
+			Ok(Some(id)) => {
+				if let Some(parent) = session_file.parent() {
+					session_file = crate::durable_session::session_path(parent, &id);
+				}
+				true
+			},
+			Ok(None) => false,
+			Err(err) => {
+				eprintln!("warning: terminal breadcrumb check failed: {err}");
+				false
+			},
+		}
+	};
 	if exists || fresh {
 		Some(TerminalBreadcrumb {
 			cwd: breadcrumb_cwd,
@@ -4361,6 +4363,41 @@ pub fn read_terminal_breadcrumb(override_path: Option<&Path>) -> Option<Terminal
 	} else {
 		None
 	}
+}
+
+/// If a session file does not exist on disk, checks if its stem (or `<ts>_<id>`)
+/// exists in the durable SQLite store in its parent directory, returning the
+/// canonical session id. An exact stem match always takes priority over a
+/// timestamp-stripped id match when both exist.
+fn resolve_durable_session_id(session_file: &Path) -> Result<Option<String>, String> {
+	let Some(parent) = session_file.parent() else {
+		return Ok(None);
+	};
+	if parent.as_os_str().is_empty() {
+		return Ok(None);
+	}
+	let db_path = crate::durable_session::database_path(parent);
+	if !db_path.exists() {
+		return Ok(None);
+	}
+	let Some(stem) = session_file.file_stem().and_then(std::ffi::OsStr::to_str) else {
+		return Ok(None);
+	};
+	match crate::durable_session::session_exists(&db_path, stem) {
+		Ok(true) => return Ok(Some(stem.to_string())),
+		Ok(false) => {},
+		Err(err) => return Err(format!("cannot inspect database {}: {err}", db_path.display())),
+	}
+	if let Some((ts, id)) = stem.split_once('_') {
+		if is_valid_file_safe_timestamp(ts) {
+			match crate::durable_session::session_exists(&db_path, id) {
+				Ok(true) => return Ok(Some(id.to_string())),
+				Ok(false) => {},
+				Err(err) => return Err(format!("cannot inspect database {}: {err}", db_path.display())),
+			}
+		}
+	}
+	Ok(None)
 }
 
 /// TS `artifactsDirectoryFor`: session file minus `.jsonl` suffix.

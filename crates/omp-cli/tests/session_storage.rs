@@ -487,6 +487,123 @@ fn moved_worktree_continue_reroots_and_resume_prefix_matches() {
 }
 
 #[test]
+fn breadcrumb_resumes_durable_session_after_legacy_file_deletion() {
+	let temp = temp_dir("breadcrumb-delete-legacy");
+	let sessions_dir = temp.join("sessions");
+	let cwd = temp.join("project");
+	fs::create_dir_all(&sessions_dir).expect("sessions dir");
+	fs::create_dir_all(&cwd).expect("cwd");
+
+	let session_id = "0192a5b0-7e44-7123-8abc-0123456789ab";
+	let legacy_filename = format!("2026-03-31T08-00-00-000Z_{session_id}.jsonl");
+	let legacy_path = sessions_dir.join(&legacy_filename);
+	let content = format!(
+		r#"{{"type":"session","version":3,"id":"{session_id}","timestamp":"2026-03-31T08:00:00.000Z","cwd":"{}"}}"#,
+		cwd.display()
+	);
+	fs::write(&legacy_path, format!("{content}\n")).expect("write legacy file");
+
+	// 1. Explicit import into SQLite store
+	import_v3_session(&legacy_path, &sessions_dir).expect("import into SQLite");
+
+	// 2. Terminal breadcrumb points to the timestamped legacy path
+	let crumb = temp.join("term-crumb");
+	write_terminal_breadcrumb(&cwd, &legacy_path, false, Some(&crumb)).expect("write crumb");
+
+	// 3. Legacy file is deleted from disk
+	fs::remove_file(&legacy_path).expect("delete legacy file");
+	assert!(!legacy_path.exists());
+
+	// 4. read_terminal_breadcrumb recognizes session in SQLite and normalizes to identity path
+	let breadcrumb = read_terminal_breadcrumb(Some(&crumb)).expect("read breadcrumb");
+	assert!(breadcrumb.exists);
+	let expected_identity = sessions_dir.join(format!("{session_id}.jsonl"));
+	assert_eq!(
+		breadcrumb.session_file, expected_identity,
+		"breadcrumb must be normalized to durable identity path"
+	);
+
+	// 5. continue_recent_with_breadcrumb resumes the imported session
+	let continued = continue_recent_with_breadcrumb(&cwd, Some(&sessions_dir), Some(&crumb))
+		.expect("continue")
+		.expect("session found");
+	assert_eq!(continued, expected_identity);
+
+	// 6. SessionStore opens the resumed session cleanly
+	let store = SessionStore::open(&SessionOptions {
+		enabled: true,
+		cwd: cwd.clone(),
+		model: None,
+		provider: None,
+		dir: Some(sessions_dir.clone()),
+		id: Some(session_id.to_string()),
+		continue_latest: false,
+		parent_session: None,
+		no_title: true,
+	});
+	assert!(store.enabled());
+	assert_eq!(store.id(), session_id);
+
+	fs::remove_dir_all(temp).ok();
+}
+
+#[test]
+fn breadcrumb_exact_stem_takes_priority_over_timestamp_stripped_id() {
+	let temp = temp_dir("breadcrumb-exact-stem");
+	let sessions_dir = temp.join("sessions");
+	let cwd = temp.join("project");
+	fs::create_dir_all(&sessions_dir).expect("sessions dir");
+	fs::create_dir_all(&cwd).expect("cwd");
+
+	let stripped_id = "0192a5b0-test-stripped";
+	let exact_stem_id = format!("2026-03-31T08-00-00-000Z_{stripped_id}");
+
+	// Create both sessions in the durable SQLite database
+	let store_stripped = SessionStore::open(&SessionOptions {
+		enabled: true,
+		cwd: cwd.clone(),
+		model: None,
+		provider: None,
+		dir: Some(sessions_dir.clone()),
+		id: Some(stripped_id.to_string()),
+		continue_latest: false,
+		parent_session: None,
+		no_title: true,
+	});
+	assert!(store_stripped.enabled());
+	drop(store_stripped);
+
+	let store_exact = SessionStore::open(&SessionOptions {
+		enabled: true,
+		cwd: cwd.clone(),
+		model: None,
+		provider: None,
+		dir: Some(sessions_dir.clone()),
+		id: Some(exact_stem_id.clone()),
+		continue_latest: false,
+		parent_session: None,
+		no_title: true,
+	});
+	assert!(store_exact.enabled());
+	drop(store_exact);
+
+	// Write breadcrumb pointing to the exact stem file name (virtual file, does not exist on disk)
+	let breadcrumb_file_path = sessions_dir.join(format!("{exact_stem_id}.jsonl"));
+	let crumb = temp.join("term-crumb");
+	write_terminal_breadcrumb(&cwd, &breadcrumb_file_path, false, Some(&crumb)).expect("write crumb");
+
+	// read_terminal_breadcrumb must match the exact stem session ID, not strip it
+	let breadcrumb = read_terminal_breadcrumb(Some(&crumb)).expect("read breadcrumb");
+	assert!(breadcrumb.exists);
+	assert_eq!(
+		breadcrumb.session_file, breadcrumb_file_path,
+		"exact stem ID must take priority when both exact and stripped IDs exist in SQLite"
+	);
+
+	fs::remove_dir_all(temp).ok();
+}
+
+#[test]
 fn append_turn_titles_and_appends_entries_and_reopens_cleanly() {
 	let temp = temp_dir("append-test");
 	let mut store = SessionStore::open(&SessionOptions {

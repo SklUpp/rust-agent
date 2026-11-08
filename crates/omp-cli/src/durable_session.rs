@@ -2132,15 +2132,25 @@ pub fn session_path(dir: &Path, id: &str) -> PathBuf {
 	dir.join(format!("{id}.jsonl"))
 }
 
-/// Whether the database already contains this session. Opens (and if needed
-/// creates) the schema only when the file exists; a missing file is answered
-/// without creating one.
+/// Whether the database already contains this session. Checks the database
+/// in read-only mode without write locks or migrations; a missing file is
+/// answered without creating one.
 pub fn session_exists(db_path: &Path, session_id: &str) -> StoreResult<bool> {
 	if !db_path.exists() {
 		return Ok(false);
 	}
-	let store = SqliteStore::open(db_path)?;
-	Ok(store.session(session_id)?.is_some())
+	let connection =
+		rusqlite::Connection::open_with_flags(db_path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+	connection.busy_timeout(std::time::Duration::from_millis(5000))?;
+	let exists = connection
+		.query_row(
+			"SELECT 1 FROM sessions WHERE id = ? LIMIT 1",
+			[session_id],
+			|_row| Ok(()),
+		)
+		.optional()?
+		.is_some();
+	Ok(exists)
 }
 
 /// Newest stored session id for `--continue`. Read-only query on the same
