@@ -570,7 +570,7 @@ async fn agent_loop_recovers_durable_worker_completion_at_turn_boundary() -> Res
 			Message::user("start turn"),
 			&mut state,
 			None,
-			Some(&event_tx),
+			Some(event_tx),
 			tokio_util::sync::CancellationToken::new(),
 		)
 		.await?;
@@ -667,7 +667,7 @@ async fn agent_loop_no_duplicate_worker_injection_when_sink_and_durable_both_hav
 			Message::user("user message"),
 			&mut state,
 			None,
-			Some(&event_tx),
+			Some(event_tx),
 			tokio_util::sync::CancellationToken::new(),
 		)
 		.await?;
