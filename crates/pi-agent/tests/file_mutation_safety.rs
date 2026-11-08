@@ -205,10 +205,12 @@ async fn hashline_mode_is_not_served_by_the_plain_engines() {
 	let file = dir.write("a.txt", "keep\n");
 	let ctx = ctx(&dir);
 
-	let error = execute(
+	let error = pi_agent::tools::edit_variants::execute(
 		EditMode::Hashline,
 		&json!({ "input": "[a.txt#0000]\nPUT 1.=1:\n+changed\n" }),
 		&ctx,
+		None,
+		Arc::new(SnapshotStore::new()),
 	)
 	.await
 	.expect_err("hashline must be dispatched to the native engine");
@@ -747,22 +749,12 @@ async fn gate_1_stale_aborts_without_modifying_any_file() {
 	let f2 = dir.write("file2.txt", "two\n");
 	let pending = Arc::new(PendingStore::new());
 	let snapshots = Arc::new(SnapshotStore::new());
-	let tool = EditTool::with_mode(snapshots, pi_agent::tools::hashline::edit::EditToolOptions::default(), EditMode::Patch)
+	let tool = EditTool::with_mode(snapshots, pi_agent::tools::hashline::edit::EditToolOptions::default(), EditMode::ApplyPatch)
 		.with_pending(Arc::clone(&pending));
 	let ctx = ctx(&dir);
 
 	let patch_input = json!({
-		"path": "file1.txt",
-		"edits": [
-			{
-				"path": "file1.txt",
-				"diff": "@@ -1,1 +1,1 @@\n-one\n+ONE\n"
-			},
-			{
-				"path": "file2.txt",
-				"diff": "@@ -1,1 +1,1 @@\n-two\n+TWO\n"
-			}
-		]
+		"input": "*** Begin Patch\n*** Update File: file1.txt\n@@\n-one\n+ONE\n*** Update File: file2.txt\n@@\n-two\n+TWO\n*** End Patch"
 	});
 
 	tool.execute(&patch_input, &ctx).await.expect("stage patch");
@@ -1039,8 +1031,8 @@ async fn update_rejects_concurrent_leaf_replacement_immediately_before_rename() 
 		.expect("stage");
 
 	// Replace the leaf file with a new file (different inode) before apply
-	fs::remove_file(&path).expect("unlink leaf");
-	fs::write(&path, "v1 content\n").expect("new leaf with same bytes but new inode");
+	let replacement = dir.write("replacement.txt", "v1 content\n");
+	fs::rename(&replacement, &path).expect("replace leaf file with different inode");
 
 	let result = pending.resolve(&ctx, "apply").await.expect("resolve");
 	assert!(result.is_error, "replacing leaf file must be detected and rejected");
@@ -1294,8 +1286,9 @@ async fn symlink_delete_unlinks_link_and_preserves_target() {
 		"path": "link_to_target.txt",
 		"edits": [
 			{
+				"op": "delete",
 				"path": "link_to_target.txt",
-				"diff": "@@ -1,1 +0,0 @@\n-critical target data\n"
+				"diff": ""
 			}
 		]
 	});
@@ -1429,7 +1422,7 @@ async fn reject_reports_cumulative_created_directories_without_rollback() {
 	assert!(res_apply.is_error);
 
 	// Now user rejects the remaining pending batch
-	let res_reject = pending.resolve(&ctx, "reject").await.expect("reject");
+	let res_reject = pending.reject(&ctx, "reject").await.expect("reject");
 	assert!(!res_reject.is_error);
 	assert!(res_reject.content.contains("previously created by an earlier attempt remain in workspace"));
 	assert!(res_reject.content.contains("discard does not roll back directory creation"));

@@ -626,14 +626,16 @@ fn parse_one_hunk(lines: &[String], line_number: usize, allow_missing_context: b
 	if is_header && (header_trimmed == EMPTY_CHANGE_CONTEXT_MARKER || empty_context_marker) {
 		start_index = 1;
 	} else if let Some(unified) = unified {
-		if unified.old_start < 1 || unified.new_start < 1 {
+		if (unified.old_start < 1 && unified.old_count > 0)
+			|| (unified.new_start < 1 && unified.new_count > 0)
+		{
 			return Err(parse_error("Line numbers in @@ header must be >= 1", line_number));
 		}
 		if let Some(context) = unified.context {
 			change_contexts.push(context);
 		}
-		old_start_line = Some(unified.old_start);
-		new_start_line = Some(unified.new_start);
+		old_start_line = (unified.old_start >= 1).then_some(unified.old_start);
+		new_start_line = (unified.new_start >= 1).then_some(unified.new_start);
 		start_index = 1;
 	} else if is_header && header_trimmed.starts_with(CHANGE_CONTEXT_MARKER) {
 		let context_value = &header_trimmed[CHANGE_CONTEXT_MARKER.len()..];

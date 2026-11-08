@@ -458,6 +458,43 @@ pub fn nearest_existing_ancestor(path: &Path) -> (Option<PathBuf>, Option<(u64, 
 	(Some(canonical), d_i, Vec::new())
 }
 
+/// Re-resolve the authored (lexical) path and require that its nearest
+/// existing ancestor still matches the identity recorded at preview time.
+/// Tolerates a deeper ancestor when this staged action itself already created
+/// a prefix of the planned `expected_subdirs` (retry accounting).
+fn check_lexical_ancestor(
+	path: &Path,
+	expected: &Option<PathBuf>,
+	expected_dev_ino: Option<(u64, u64)>,
+	expected_subdirs: &[String],
+) -> Result<(), String> {
+	let (Some(expected), Some(expected_dev_ino)) = (expected.as_ref(), expected_dev_ino) else {
+		return Ok(());
+	};
+	let (ancestor, dev_ino, subdirs) = nearest_existing_ancestor(path);
+	let Some(ancestor) = ancestor else {
+		return Err("cannot resolve parent directory".to_string());
+	};
+	if &ancestor == expected && dev_ino == Some(expected_dev_ino) && subdirs.as_slice() == expected_subdirs
+	{
+		return Ok(());
+	}
+	if subdirs.len() < expected_subdirs.len()
+		&& subdirs.as_slice() == &expected_subdirs[expected_subdirs.len() - subdirs.len()..]
+	{
+		let mut planned = expected.clone();
+		for component in &expected_subdirs[..expected_subdirs.len() - subdirs.len()] {
+			planned.push(component);
+		}
+		if planned == ancestor {
+			return Ok(());
+		}
+	}
+	Err(format!(
+		"parent directory identity changed since preview: expected {expected:?} (+{expected_subdirs:?}), found {ancestor:?} (+{subdirs:?})"
+	))
+}
+
 fn open_or_create_subdirs(
 	ancestor_pin: &DirPin,
 	subdirs: &[String],
@@ -930,14 +967,17 @@ impl FileOpsAction {
 	/// Validate parent directory pinning using held directory descriptors.
 	/// Strictly READ-ONLY. No directories are created during Gate 1.
 	fn check_parent_pin(op: &PreparedOp) -> Result<(), String> {
+		check_lexical_ancestor(&op.path, &op.parent_identity, op.parent_dev_ino, &op.parent_subdirs)
+			.map_err(|e| format!("{}: {e}", op.display))?;
 		if let Some(expected_ancestor) = &op.parent_identity {
 			let pin = DirPin::open(expected_ancestor).map_err(|e| format!("{}: {e}", op.display))?;
 			pin.verify_against(expected_ancestor, op.parent_dev_ino)
 				.map_err(|e| format!("{}: {e}", op.display))?;
 		}
-
 		if op.kind == OpKind::Move {
-			if let Some(_dest) = &op.rename_to {
+			if let Some(dest) = &op.rename_to {
+				check_lexical_ancestor(dest, &op.rename_parent_identity, op.rename_parent_dev_ino, &op.rename_parent_subdirs)
+					.map_err(|e| format!("destination for {}: {e}", op.display))?;
 				if let Some(expected_dest_ancestor) = &op.rename_parent_identity {
 					let dest_pin = DirPin::open(expected_dest_ancestor)
 						.map_err(|e| format!("destination for {}: {e}", op.display))?;
@@ -1148,6 +1188,13 @@ impl PendingAction for FileOpsAction {
 				return Ok(self.partial_result(
 					format!("Cancelled after applying {} of {total_ops} operations; remaining operations were not performed.", self.written_len()),
 					&attempt_written, &attempt_invalidated, &attempt_created_dirs, &fresh_tags, self.wrote_anything(), false, None, cleanup_warnings,
+				));
+			}
+
+			if let Err(e) = check_lexical_ancestor(&op.path, &op.parent_identity, op.parent_dev_ino, &op.parent_subdirs) {
+				return Ok(self.partial_result(
+					format!("Parent directory identity changed at {}: {e}. {} of {total_ops} operations were performed.", op.display, self.written_len()),
+					&attempt_written, &attempt_invalidated, &attempt_created_dirs, &fresh_tags, self.wrote_anything(), true, Some(op.display.clone()), cleanup_warnings,
 				));
 			}
 
@@ -1972,6 +2019,13 @@ impl PendingAction for FileOpsAction {
 
 					let dest_file_name = dest.file_name().and_then(|n| n.to_str()).unwrap_or("dest");
 
+					if let Err(e) = check_lexical_ancestor(dest, &op.rename_parent_identity, op.rename_parent_dev_ino, &op.rename_parent_subdirs) {
+						return Ok(self.partial_result(
+							format!("Destination directory identity changed at {dest_display}: {e}"),
+							&attempt_written, &attempt_invalidated, &attempt_created_dirs, &fresh_tags,
+							self.wrote_anything(), true, Some(dest_display), cleanup_warnings,
+						));
+					}
 					let dest_ancestor = op.rename_parent_identity.as_ref().map(|p| p.as_path()).unwrap_or_else(|| Path::new("."));
 					let dest_ancestor_pin = match DirPin::open(dest_ancestor) {
 						Ok(p) => {
