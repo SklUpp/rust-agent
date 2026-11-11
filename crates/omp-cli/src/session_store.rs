@@ -5577,7 +5577,7 @@ mod tests {
 				branches: vec![NewBranch { id: "b".to_string(), session_id: id.to_string(), parent_branch_id: None, parent_message_id: None, payload: json!({}) }],
 				active_branch_id: "b".to_string(),
 				active_leaf_message_id: Some(message_id.clone()),
-				messages: vec![NewMessage { id: message_id.clone(), session_id: id.to_string(), branch_id: "b".to_string(), parent_message_id: None, payload: json!({"type":"message","id":message_id,"message":{"role":"toolResult","toolCallId":"shared","toolName":"bash","content":"x","details":{"executionId":exec}}}) }],
+				messages: vec![NewMessage { id: message_id.clone(), session_id: id.to_string(), branch_id: "b".to_string(), parent_message_id: None, payload: json!({"type":"message","id":message_id,"timestamp":"2026-01-01T00:00:00Z","message":{"role":"toolResult","toolCallId":"shared","toolName":"bash","content":"x","isError":false,"timestamp":2,"details":{"executionId":exec}}}) }],
 				projection: None,
 			}
 		};
@@ -5646,7 +5646,7 @@ mod tests {
 				branches: vec![NewBranch { id: "b".to_string(), session_id: "f1".to_string(), parent_branch_id: None, parent_message_id: None, payload: json!({}) }],
 				active_branch_id: "b".to_string(),
 				active_leaf_message_id: Some("m-f1".to_string()),
-				messages: vec![NewMessage { id: "m-f1".to_string(), session_id: "f1".to_string(), branch_id: "b".to_string(), parent_message_id: None, payload: json!({"type":"message","id":"m-f1","message":{"role":"toolResult","toolCallId":"shared","toolName":"bash","content":"x","details":{"executionId":exec}}}) }],
+				messages: vec![NewMessage { id: "m-f1".to_string(), session_id: "f1".to_string(), branch_id: "b".to_string(), parent_message_id: None, payload: json!({"type":"message","id":"m-f1","timestamp":"2026-01-01T00:00:00Z","message":{"role":"toolResult","toolCallId":"shared","toolName":"bash","content":"x","isError":false,"timestamp":2,"details":{"executionId":exec}}}) }],
 				projection: None,
 			},
 			&[ForkProvenance::new("m-f1".to_string(), exec.clone(), "shared".to_string(), false)],
@@ -5672,7 +5672,7 @@ mod tests {
 				branches: vec![NewBranch { id: "b".to_string(), session_id: id.to_string(), parent_branch_id: None, parent_message_id: None, payload: json!({}) }],
 				active_branch_id: "b".to_string(),
 				active_leaf_message_id: Some(message_id.clone()),
-				messages: vec![NewMessage { id: message_id.clone(), session_id: id.to_string(), branch_id: "b".to_string(), parent_message_id: None, payload: json!({"type":"message","id":message_id,"message":{"role":"toolResult","toolCallId":tool_call_id,"toolName":"bash","content":"x","details":{"executionId":exec}}}) }],
+				messages: vec![NewMessage { id: message_id.clone(), session_id: id.to_string(), branch_id: "b".to_string(), parent_message_id: None, payload: json!({"type":"message","id":message_id,"timestamp":"2026-01-01T00:00:00Z","message":{"role":"toolResult","toolCallId":tool_call_id,"toolName":"bash","content":"x","isError":false,"timestamp":2,"details":{"executionId":exec}}}) }],
 				projection: None,
 			}
 		};
@@ -5718,7 +5718,7 @@ mod tests {
 				branches: vec![NewBranch { id: "b".to_string(), session_id: "f".to_string(), parent_branch_id: None, parent_message_id: None, payload: json!({}) }],
 				active_branch_id: "b".to_string(),
 				active_leaf_message_id: Some("m".to_string()),
-				messages: vec![NewMessage { id: "m".to_string(), session_id: "f".to_string(), branch_id: "b".to_string(), parent_message_id: None, payload: json!({"type":"message","id":"m","message":{"role":"toolResult","toolCallId":"c","toolName":"bash","content":"x","details":{"executionId":"external"}}}) }],
+				messages: vec![NewMessage { id: "m".to_string(), session_id: "f".to_string(), branch_id: "b".to_string(), parent_message_id: None, payload: json!({"type":"message","id":"m","timestamp":"2026-01-01T00:00:00Z","message":{"role":"toolResult","toolCallId":"c","toolName":"bash","content":"x","isError":false,"timestamp":2,"details":{"executionId":"external"}}}) }],
 				projection: None,
 			},
 			&[ForkProvenance::new("m".to_string(), "external".to_string(), "c".to_string(), false)],
@@ -5734,6 +5734,24 @@ mod tests {
 		connection.execute("DELETE FROM sessions WHERE id = 'f'", []).expect("session row");
 		drop(connection);
 		std::fs::remove_dir_all(dir).ok();
+	}
+
+	#[test]
+	fn fork_rejects_message_entry_without_timestamp_and_rolls_back() {
+		let mut store = seeded_store();
+		let err = store
+			.create_fork_atomic(ForkWrite {
+				session: NewSession { id: "f-ts".to_string(), parent_session_id: None, payload: json!({"type":"session","id":"f-ts","timestamp":"2026-01-01T00:00:00Z","cwd":"/tmp"}), initial_branch_id: "b".to_string(), initial_branch_payload: json!({}) },
+				branches: vec![NewBranch { id: "b".to_string(), session_id: "f-ts".to_string(), parent_branch_id: None, parent_message_id: None, payload: json!({}) }],
+				active_branch_id: "b".to_string(),
+				active_leaf_message_id: Some("m-ts".to_string()),
+				messages: vec![NewMessage { id: "m-ts".to_string(), session_id: "f-ts".to_string(), branch_id: "b".to_string(), parent_message_id: None, payload: json!({"type":"message","id":"m-ts","message":{"role":"user","content":"hi","timestamp":1}}) }],
+				projection: None,
+			})
+			.expect_err("fork must never invent a missing entry timestamp");
+		assert!(matches!(err, StoreError::Validation(_)), "{err:?}");
+		assert!(err.to_string().contains("entry timestamp unavailable"), "{err}");
+		assert!(store.session("f-ts").expect("query").is_none(), "rejected fork must not publish a session");
 	}
 
 	#[test]
