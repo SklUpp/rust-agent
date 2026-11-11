@@ -5,7 +5,7 @@ use std::{
 	path::{Path, PathBuf},
 	sync::{
 		Arc, Mutex, MutexGuard, Weak,
-		atomic::{AtomicBool, AtomicU64, Ordering},
+		atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
 	},
 	time::{SystemTime, UNIX_EPOCH},
 };
@@ -755,6 +755,8 @@ impl Supervisor {
 					.join(format!("omp-agent-processes-{}-{scope}", std::process::id()))
 			},
 			process_owner_ns: owner_namespace(scope),
+			lifecycle_cancel: CancellationToken::new(),
+			admission_barrier: Mutex::new(()),
 			admission_shutdown: AtomicBool::new(false),
 			admissions_in_flight: AtomicUsize::new(0),
 			admissions_drained: Notify::new(),

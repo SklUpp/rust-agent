@@ -458,7 +458,10 @@ impl ForkProvenance {
 		})?;
 		let mut captured = Vec::new();
 		for execution_id in referenced {
-			let owned = executions.iter().find(|execution| execution.execution_id == execution_id);
+			// Direct-source ownership only: an execution row owned by an older session
+			// (grandparent after a shared-DB fork) is not this message's source and must
+			// not override the immutable provenance captured by the parent fork.
+			let owned = executions.iter().find(|execution| execution.execution_id == execution_id && execution.session_id == source.session_id);
 			let copied = provenance.iter().find(|entry| entry.message_id == source_message_id && entry.source_execution_id == execution_id);
 			let resolved = match (owned, copied) {
 				(Some(owned), Some(copied)) if owned.outcome.is_some() != copied.outcome_resolved => {
@@ -5631,6 +5634,31 @@ mod tests {
 		let err = writable.load_session_snapshot("s1").expect_err("damaged v3 writable snapshot must fail closed");
 		assert!(err.to_string().contains("missing the fork_provenance table"), "{err}");
 		std::fs::remove_dir_all(dir).ok();
+	}
+
+	#[test]
+	fn capture_uses_direct_parent_provenance_after_same_db_late_resolution() {
+		let mut store = seeded_store();
+		let exec = store.record_intent(NewIntent { session_id: "s1".to_string(), branch_id: "b1".to_string(), provider_call_id: "shared".to_string(), tool_name: "bash".to_string(), payload: json!({}) }).expect("intent");
+		store.create_fork_atomic_with_provenance(
+			ForkWrite {
+				session: NewSession { id: "f1".to_string(), parent_session_id: Some("s1".to_string()), payload: json!({"type":"session","id":"f1","timestamp":"2026-01-01T00:00:00Z","cwd":"/tmp"}), initial_branch_id: "b".to_string(), initial_branch_payload: json!({}) },
+				branches: vec![NewBranch { id: "b".to_string(), session_id: "f1".to_string(), parent_branch_id: None, parent_message_id: None, payload: json!({}) }],
+				active_branch_id: "b".to_string(),
+				active_leaf_message_id: Some("m-f1".to_string()),
+				messages: vec![NewMessage { id: "m-f1".to_string(), session_id: "f1".to_string(), branch_id: "b".to_string(), parent_message_id: None, payload: json!({"type":"message","id":"m-f1","message":{"role":"toolResult","toolCallId":"shared","toolName":"bash","details":{"executionId":exec}}}) }],
+				projection: None,
+			},
+			&[ForkProvenance::new("m-f1".to_string(), exec.clone(), "shared".to_string(), false)],
+		).expect("first fork captures unknown provenance");
+
+		// Grandparent outcome resolves later in the same database.
+		store.record_outcome(&exec, json!({"content":"done","isError":false})).expect("late outcome");
+		let snapshot = store.load_session_snapshot("f1").expect("parent snapshot");
+		let captured = ForkProvenance::capture(&snapshot.session_messages, &snapshot.executions, &snapshot.provenance, "m-f1", "m-f2").expect("capture must not reread the grandparent row");
+		assert_eq!(captured.len(), 1);
+		assert!(!captured[0].outcome_resolved, "direct-parent provenance stays immutable");
+		assert_eq!(captured[0].provider_call_id, "shared");
 	}
 
 	#[test]
