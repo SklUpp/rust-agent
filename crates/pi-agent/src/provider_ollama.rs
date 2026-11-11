@@ -3990,6 +3990,7 @@ fn process_line(
 		))
 	})?;
 
+	let usage = (chunk.done == Some(true)).then(|| done_usage(&chunk));
 	let mut output = Vec::new();
 
 	if let Some(message) = chunk.message {
@@ -4031,7 +4032,7 @@ fn process_line(
 		// TS updates `output.stopReason`/usage here but only pushes the
 		// terminal event after the read loop, so keep the finalization for EOF.
 		state.terminal = Some((
-			Some(done_usage(&chunk)),
+			usage,
 			map_done_reason(chunk.done_reason.as_deref(), state.saw_tool_calls),
 		));
 	}
