@@ -832,8 +832,8 @@ async fn inode_change_with_equal_bytes_is_rejected() {
 	assert_eq!(pending.len(), 1);
 
 	// Replace file with a new file (different inode) having the exact same bytes!
-	fs::remove_file(&file_path).expect("remove file");
-	fs::write(&file_path, "same content\n").expect("new file same bytes");
+	let replacement = dir.write("replacement.txt", "same content\n");
+	fs::rename(&replacement, &file_path).expect("replace with distinct inode");
 
 	let result = pending.resolve(&ctx, "apply").await.expect("resolve");
 	assert!(result.is_error, "dev/ino change must be rejected even when bytes match");
