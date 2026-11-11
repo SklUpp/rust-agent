@@ -7620,6 +7620,7 @@ mod tests {
 		assert_eq!(store.header().unwrap().title.as_deref(), Some("resume prompt"));
 
 		// 4. Persistence across reopen / restart:
+		drop(boundary);
 		drop(store);
 		let reopened = SessionStore::open(&opts);
 		assert_eq!(reopened.header().unwrap().title.as_deref(), Some("resume prompt"));

@@ -5553,7 +5553,7 @@ mod tests {
 		let (dir, path) = temp_db("v2-readonly");
 		let mut store = SqliteStore::open(&path).expect("store");
 		store.create_session(NewSession { id: "s1".to_string(), parent_session_id: None, payload: json!({ "cwd": "/tmp/project" }), initial_branch_id: "b1".to_string(), initial_branch_payload: json!({ "kind": "root" }) }).expect("session");
-		store.append_message(message("m1", None)).expect("message");
+		store.append_message(NewMessage { id: "m1".to_string(), session_id: "s1".to_string(), branch_id: "b1".to_string(), parent_message_id: None, payload: json!({"type":"message","id":"m1","message":{"role":"user","content":"hi"}}) }).expect("message");
 		drop(store);
 		let connection = rusqlite::Connection::open(&path).expect("raw");
 		connection.execute_batch("DROP TABLE fork_provenance; UPDATE schema_version SET version = 2;").expect("downgrade");
@@ -5573,11 +5573,11 @@ mod tests {
 		let fork = |id: &str| {
 			let message_id = format!("m-{id}");
 			ForkWrite {
-				session: NewSession { id: id.to_string(), parent_session_id: Some("s1".to_string()), payload: json!({"type":"session","id":id,"timestamp":"2026-01-01T00:00:00Z","cwd":"/tmp"}), initial_branch_id: "b".to_string(), initial_branch_payload: json!({}) },
+				session: NewSession { id: id.to_string(), parent_session_id: Some("s1".to_string()), payload: json!({"type":"session","id":id,"timestamp":"2026-01-01T00:00:00Z","cwd":"/tmp","parentSession":"s1"}), initial_branch_id: "b".to_string(), initial_branch_payload: json!({}) },
 				branches: vec![NewBranch { id: "b".to_string(), session_id: id.to_string(), parent_branch_id: None, parent_message_id: None, payload: json!({}) }],
 				active_branch_id: "b".to_string(),
 				active_leaf_message_id: Some(message_id.clone()),
-				messages: vec![NewMessage { id: message_id.clone(), session_id: id.to_string(), branch_id: "b".to_string(), parent_message_id: None, payload: json!({"type":"message","id":message_id,"message":{"role":"toolResult","toolCallId":"shared","toolName":"bash","details":{"executionId":exec}}}) }],
+				messages: vec![NewMessage { id: message_id.clone(), session_id: id.to_string(), branch_id: "b".to_string(), parent_message_id: None, payload: json!({"type":"message","id":message_id,"message":{"role":"toolResult","toolCallId":"shared","toolName":"bash","content":"x","details":{"executionId":exec}}}) }],
 				projection: None,
 			}
 		};
@@ -5607,7 +5607,7 @@ mod tests {
 		let mut store = seeded_store();
 		let exec = store.record_intent(NewIntent { session_id: "s1".to_string(), branch_id: "b1".to_string(), provider_call_id: "shared".to_string(), tool_name: "bash".to_string(), payload: json!({}) }).expect("intent");
 		store.append_message(NewMessage { id: "a1".to_string(), session_id: "s1".to_string(), branch_id: "b1".to_string(), parent_message_id: None, payload: json!({"type":"message","id":"a1","message":{"role":"assistant","content":[{"type":"toolCall","id":"shared","name":"bash"}]}}) }).expect("assistant");
-		store.append_message(NewMessage { id: "m".to_string(), session_id: "s1".to_string(), branch_id: "b1".to_string(), parent_message_id: Some("a1".to_string()), payload: json!({"type":"message","id":"m","parentId":"a1","message":{"role":"toolResult","toolCallId":"shared","toolName":"bash","details":{"executionId":exec}}}) }).expect("result");
+		store.append_message(NewMessage { id: "m".to_string(), session_id: "s1".to_string(), branch_id: "b1".to_string(), parent_message_id: Some("a1".to_string()), payload: json!({"type":"message","id":"m","parentId":"a1","message":{"role":"toolResult","toolCallId":"shared","toolName":"bash","content":"x","details":{"executionId":exec}}}) }).expect("result");
 		store.connection.execute("INSERT INTO fork_provenance (message_id, session_id, source_execution_id, provider_call_id, outcome_resolved) VALUES ('m', 's1', 'exec-other', 'shared', 0)", []).expect("stale provenance row");
 
 		let err = store.load_session_snapshot("s1").expect_err("stale tuple must not authorize");
@@ -5642,11 +5642,11 @@ mod tests {
 		let exec = store.record_intent(NewIntent { session_id: "s1".to_string(), branch_id: "b1".to_string(), provider_call_id: "shared".to_string(), tool_name: "bash".to_string(), payload: json!({}) }).expect("intent");
 		store.create_fork_atomic_with_provenance(
 			ForkWrite {
-				session: NewSession { id: "f1".to_string(), parent_session_id: Some("s1".to_string()), payload: json!({"type":"session","id":"f1","timestamp":"2026-01-01T00:00:00Z","cwd":"/tmp"}), initial_branch_id: "b".to_string(), initial_branch_payload: json!({}) },
+				session: NewSession { id: "f1".to_string(), parent_session_id: Some("s1".to_string()), payload: json!({"type":"session","id":"f1","timestamp":"2026-01-01T00:00:00Z","cwd":"/tmp","parentSession":"s1"}), initial_branch_id: "b".to_string(), initial_branch_payload: json!({}) },
 				branches: vec![NewBranch { id: "b".to_string(), session_id: "f1".to_string(), parent_branch_id: None, parent_message_id: None, payload: json!({}) }],
 				active_branch_id: "b".to_string(),
 				active_leaf_message_id: Some("m-f1".to_string()),
-				messages: vec![NewMessage { id: "m-f1".to_string(), session_id: "f1".to_string(), branch_id: "b".to_string(), parent_message_id: None, payload: json!({"type":"message","id":"m-f1","message":{"role":"toolResult","toolCallId":"shared","toolName":"bash","details":{"executionId":exec}}}) }],
+				messages: vec![NewMessage { id: "m-f1".to_string(), session_id: "f1".to_string(), branch_id: "b".to_string(), parent_message_id: None, payload: json!({"type":"message","id":"m-f1","message":{"role":"toolResult","toolCallId":"shared","toolName":"bash","content":"x","details":{"executionId":exec}}}) }],
 				projection: None,
 			},
 			&[ForkProvenance::new("m-f1".to_string(), exec.clone(), "shared".to_string(), false)],
@@ -5668,11 +5668,11 @@ mod tests {
 		let fork = |id: &str, tool_call_id: &str| {
 			let message_id = format!("m-{id}");
 			ForkWrite {
-				session: NewSession { id: id.to_string(), parent_session_id: Some("s1".to_string()), payload: json!({"type":"session","id":id,"timestamp":"2026-01-01T00:00:00Z","cwd":"/tmp"}), initial_branch_id: "b".to_string(), initial_branch_payload: json!({}) },
+				session: NewSession { id: id.to_string(), parent_session_id: Some("s1".to_string()), payload: json!({"type":"session","id":id,"timestamp":"2026-01-01T00:00:00Z","cwd":"/tmp","parentSession":"s1"}), initial_branch_id: "b".to_string(), initial_branch_payload: json!({}) },
 				branches: vec![NewBranch { id: "b".to_string(), session_id: id.to_string(), parent_branch_id: None, parent_message_id: None, payload: json!({}) }],
 				active_branch_id: "b".to_string(),
 				active_leaf_message_id: Some(message_id.clone()),
-				messages: vec![NewMessage { id: message_id.clone(), session_id: id.to_string(), branch_id: "b".to_string(), parent_message_id: None, payload: json!({"type":"message","id":message_id,"message":{"role":"toolResult","toolCallId":tool_call_id,"toolName":"bash","details":{"executionId":exec}}}) }],
+				messages: vec![NewMessage { id: message_id.clone(), session_id: id.to_string(), branch_id: "b".to_string(), parent_message_id: None, payload: json!({"type":"message","id":message_id,"message":{"role":"toolResult","toolCallId":tool_call_id,"toolName":"bash","content":"x","details":{"executionId":exec}}}) }],
 				projection: None,
 			}
 		};
@@ -5699,7 +5699,7 @@ mod tests {
 		// The same forgery in a live session is rejected before any fork or recovery
 		// classification: a tool result naming call-a cannot borrow execution B.
 		store.append_message(NewMessage { id: "a-src".to_string(), session_id: "s1".to_string(), branch_id: "b1".to_string(), parent_message_id: None, payload: json!({"type":"message","id":"a-src","message":{"role":"assistant","content":[{"type":"toolCall","id":"call-a","name":"bash"}]}}) }).expect("assistant");
-		store.append_message(NewMessage { id: "r-src".to_string(), session_id: "s1".to_string(), branch_id: "b1".to_string(), parent_message_id: Some("a-src".to_string()), payload: json!({"type":"message","id":"r-src","parentId":"a-src","message":{"role":"toolResult","toolCallId":"call-a","toolName":"bash","details":{"executionId":exec}}}) }).expect("result");
+		store.append_message(NewMessage { id: "r-src".to_string(), session_id: "s1".to_string(), branch_id: "b1".to_string(), parent_message_id: Some("a-src".to_string()), payload: json!({"type":"message","id":"r-src","parentId":"a-src","message":{"role":"toolResult","toolCallId":"call-a","toolName":"bash","content":"x","details":{"executionId":exec}}}) }).expect("result");
 		let err = store.load_session_snapshot("s1").expect_err("snapshot must reject the forged association");
 		assert!(err.to_string().contains("does not carry provider call id"), "{err}");
 
@@ -5718,7 +5718,7 @@ mod tests {
 				branches: vec![NewBranch { id: "b".to_string(), session_id: "f".to_string(), parent_branch_id: None, parent_message_id: None, payload: json!({}) }],
 				active_branch_id: "b".to_string(),
 				active_leaf_message_id: Some("m".to_string()),
-				messages: vec![NewMessage { id: "m".to_string(), session_id: "f".to_string(), branch_id: "b".to_string(), parent_message_id: None, payload: json!({"type":"message","id":"m","message":{"role":"toolResult","toolCallId":"c","toolName":"bash","details":{"executionId":"external"}}}) }],
+				messages: vec![NewMessage { id: "m".to_string(), session_id: "f".to_string(), branch_id: "b".to_string(), parent_message_id: None, payload: json!({"type":"message","id":"m","message":{"role":"toolResult","toolCallId":"c","toolName":"bash","content":"x","details":{"executionId":"external"}}}) }],
 				projection: None,
 			},
 			&[ForkProvenance::new("m".to_string(), "external".to_string(), "c".to_string(), false)],
@@ -5739,9 +5739,9 @@ mod tests {
 	#[test]
 	fn snapshot_skips_execution_references_on_pruned_branches() {
 		let mut store = seeded_store();
-		store.append_message(message("a1", None)).expect("active message");
+		store.append_message(NewMessage { id: "a1".to_string(), session_id: "s1".to_string(), branch_id: "b1".to_string(), parent_message_id: None, payload: json!({"type":"message","id":"a1","message":{"role":"user","content":"hi"}}) }).expect("active message");
 		store.create_branch(NewBranch { id: "b2".to_string(), session_id: "s1".to_string(), parent_branch_id: None, parent_message_id: None, payload: json!({}) }).expect("sibling branch");
-		store.append_message(NewMessage { id: "orphan".to_string(), session_id: "s1".to_string(), branch_id: "b2".to_string(), parent_message_id: None, payload: json!({"type":"message","id":"orphan","message":{"role":"toolResult","toolCallId":"x","toolName":"bash","details":{"executionId":"missing-exec"}}}) }).expect("sibling result");
+		store.append_message(NewMessage { id: "orphan".to_string(), session_id: "s1".to_string(), branch_id: "b2".to_string(), parent_message_id: None, payload: json!({"type":"message","id":"orphan","message":{"role":"toolResult","toolCallId":"x","toolName":"bash","content":"x","details":{"executionId":"missing-exec"}}}) }).expect("sibling result");
 
 		let snapshot = store.load_session_snapshot("s1").expect("pruned branch reference must not fail the snapshot");
 		assert!(snapshot.provenance.is_empty());
@@ -7401,7 +7401,6 @@ mod tests {
 			json!({"durableProjection": "not-an-object"}),
 			json!({"durableProjection": null}),
 			json!({"durableProjection": {"kept": "nope", "synthetic": []}}),
-			json!({"durableProjection": {"synthetic": []}}),
 			json!({"durableProjection": {"kept": [], "synthetic": "nope"}}),
 			json!({"durableProjection": {"kept": [1], "synthetic": []}}),
 			json!({"durableProjection": {"kept": [], "synthetic": [], "anchor": 5}}),

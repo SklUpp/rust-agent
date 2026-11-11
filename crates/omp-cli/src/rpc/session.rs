@@ -4278,10 +4278,12 @@ mod tests {
 
 		// 3. Turn 2 (next turn after compact, before restart)
 		let mut prepared2 = start_turn(&mut session, "turn 2 user question");
-		let req2 = session
-			.request("turn 2 user question".to_string(), Vec::new(), false)
-			.expect("turn 2 request");
-		let h2 = req2.history_messages.expect("turn 2 history");
+		let h2 = {
+			let req2 = session
+				.request("turn 2 user question".to_string(), Vec::new(), false)
+				.expect("turn 2 request");
+			req2.history_messages.expect("turn 2 history")
+		};
 		// History contains only the summary, not pre-compaction turn 1
 		assert_eq!(h2.len(), 1);
 		assert_eq!(h2[0].content, "Compacted summary of turn 1");
@@ -4472,10 +4474,12 @@ mod tests {
 
 		// Turn 2: persist to branch
 		let mut prepared2 = start_turn(&mut session, "turn 2");
-		let req2 = session
-			.request("turn 2".to_string(), Vec::new(), false)
-			.expect("turn 2 request");
-		let h2 = req2.history_messages.expect("turn 2 history");
+		let h2 = {
+			let req2 = session
+				.request("turn 2".to_string(), Vec::new(), false)
+				.expect("turn 2 request");
+			req2.history_messages.expect("turn 2 history")
+		};
 		let mut turn2_full = h2.clone();
 		turn2_full.push(pi_agent::Message::user("turn 2"));
 		turn2_full.push(pi_agent::Message::assistant("turn 2 reply"));
