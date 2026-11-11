@@ -1175,6 +1175,11 @@ fn run() -> std::result::Result<(), CliError> {
 		for warning in rpc_store.take_warnings() {
 			eprintln!("warning: {warning}");
 		}
+		if let Some(occupied) = rpc_store.occupied() {
+			return Err(CliError::usage(format!(
+				"cannot open the session store: {occupied}"
+			)));
+		}
 		if rpc_store.legacy_read_only() {
 			return Err(CliError::usage(
 				"legacy JSONL sessions are read-only; import the session into the SQLite store first",
@@ -1251,6 +1256,8 @@ fn run() -> std::result::Result<(), CliError> {
 				.clone()
 				.filter(|id| !id.is_empty()),
 			store_options: open_opts,
+			// Transfer the preflight writer so RpcSession does not reacquire.
+			preopened_store: Some(rpc_store),
 			steer,
 		};
 		return RpcMode::run(launch, io::stdin().lock(), io::stdout()).map_err(CliError::from);
@@ -1259,6 +1266,11 @@ fn run() -> std::result::Result<(), CliError> {
 	let mut store = SessionStore::open(&open_opts);
 	for warning in store.take_warnings() {
 		eprintln!("warning: {warning}");
+	}
+	if let Some(occupied) = store.occupied() {
+		return Err(CliError::usage(format!(
+			"cannot open the session store: {occupied}"
+		)));
 	}
 	if store.legacy_read_only() {
 		return Err(CliError::usage(
@@ -4110,7 +4122,7 @@ fn run_export_command(
 		.file_stem()
 		.and_then(|s| s.to_str())
 		.map(str::to_string);
-	let store = SessionStore::open(&SessionOptions {
+	let store = SessionStore::open_snapshot(&SessionOptions {
 		enabled: true,
 		cwd: cwd.to_path_buf(),
 		model: None,
@@ -4122,7 +4134,10 @@ fn run_export_command(
 		no_title: true,
 	});
 	if !store.enabled() {
-		let reason = store.corrupt_reason().unwrap_or("persistence disabled");
+		let reason = store
+			.corrupt_reason()
+			.or_else(|| store.occupied())
+			.unwrap_or("persistence disabled");
 		return Err(CliError::fail(format!(
 			"cannot open session log {}: {reason}",
 			session_path.display()
@@ -4237,7 +4252,7 @@ fn open_headless_session(
 		.file_stem()
 		.and_then(|s| s.to_str())
 		.map(str::to_string);
-	let store = SessionStore::open(&SessionOptions {
+	let store = SessionStore::open_snapshot(&SessionOptions {
 		enabled: true,
 		cwd: cwd.to_path_buf(),
 		model: None,
@@ -4249,7 +4264,10 @@ fn open_headless_session(
 		no_title: true,
 	});
 	if !store.enabled() {
-		let reason = store.corrupt_reason().unwrap_or("persistence disabled");
+		let reason = store
+			.corrupt_reason()
+			.or_else(|| store.occupied())
+			.unwrap_or("persistence disabled");
 		return Err(CliError::fail(format!(
 			"cannot open session log {}: {reason}",
 			session_path.display()

@@ -266,25 +266,14 @@ impl AcpRuntime {
 		let dir = compute_default_session_dir(&cwd, Some(&self.recipe.sessions_root));
 		let forked = session_store::fork_session(&source_path, Some(&cwd), Some(&dir))
 			.map_err(|error| RequestError::new(INTERNAL_ERROR, error))?;
-		let forked_store = SessionStore::open(&SessionOptions {
-			enabled: true,
-			cwd: cwd.clone(),
-			model: None,
-			provider: None,
-			dir: forked.parent().map(Path::to_path_buf),
-			id: forked
-				.file_stem()
-				.and_then(|stem| stem.to_str())
-				.map(str::to_string),
-			continue_latest: false,
-			no_title: true,
-			parent_session: None,
-		});
-		let header = forked_store
-			.header()
-			.cloned()
-			.ok_or_else(|| RequestError::new(INTERNAL_ERROR, "cannot read forked session header"))?;
-		let opened = self.open(cwd, caps, Some(header.id), dir, false, mcp_servers)?;
+		// fork_session already created the target under a writer lease and dropped
+		// it. Open once here — never hold two writers on the same target.
+		let forked_id = forked
+			.file_stem()
+			.and_then(|stem| stem.to_str())
+			.map(str::to_string)
+			.ok_or_else(|| RequestError::new(INTERNAL_ERROR, "cannot read forked session id"))?;
+		let opened = self.open(cwd, caps, Some(forked_id), dir, false, mcp_servers)?;
 		Ok(opened)
 	}
 
@@ -358,6 +347,7 @@ impl AcpRuntime {
 			prompt_cache_key_inherited: false,
 			provider_session_id: None,
 			store_options,
+			preopened_store: None,
 			steer: None,
 		};
 		let token_slot = Arc::new(Mutex::new(None));

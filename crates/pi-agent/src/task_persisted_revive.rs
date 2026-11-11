@@ -433,6 +433,16 @@ pub trait PersistedChildReviverFactory: Send + Sync {
 		replayed: Vec<Message>,
 		supervisor: Option<&Arc<Supervisor>>,
 	) -> Result<RevivedChild, String>;
+
+    fn revive_with_durability(
+        &self,
+        contract: &PersistedChildSession,
+        replayed: Vec<Message>,
+        supervisor: Option<&Arc<Supervisor>>,
+        _durability: Option<crate::durable::ChildDurability>,
+    ) -> Result<RevivedChild, String> {
+        self.revive(contract, replayed, supervisor)
+    }
 }
 
 /// Default factory: one provider snapshot plus the session tool template.

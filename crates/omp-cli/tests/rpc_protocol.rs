@@ -692,6 +692,7 @@ fn launch(port: u16, model: &str, provider: &str) -> RpcLaunch {
 			parent_session: None,
 			no_title: true,
 		},
+		preopened_store: None,
 		steer: None,
 	}
 }
@@ -1301,7 +1302,7 @@ fn rpc_checkpoint_rewind_replaces_context_and_keeps_abandoned_entries() {
 	);
 
 	// Conversation-only rewind: the store keeps every abandoned entry.
-	let store = SessionStore::open(&checkpoint_session_options(
+	let store = SessionStore::open_snapshot(&checkpoint_session_options(
 		&root.join("worktree"),
 		&root.join("sessions"),
 		Some(&session_id),
@@ -1606,7 +1607,7 @@ fn rpc_completed_rewind_survives_restart_and_fork() {
 		restarted[0]
 	);
 
-	let store = SessionStore::open(&checkpoint_session_options(
+	let store = SessionStore::open_snapshot(&checkpoint_session_options(
 		&worktree,
 		&sessions,
 		Some("cp-smoke"),
@@ -1951,7 +1952,7 @@ fn rpc_prewalk_switches_after_todo_and_first_write() {
 		"consumed plan guidance must be scrubbed: {switched}"
 	);
 
-	let store = SessionStore::open(&checkpoint_session_options(
+	let store = SessionStore::open_snapshot(&checkpoint_session_options(
 		&worktree,
 		&sessions,
 		Some("prewalk-rpc"),
@@ -2073,7 +2074,7 @@ fn rpc_plan_yolo_guards_proposes_switches_and_journals_fallback() {
 	);
 	assert_eq!(fs::read_to_string(worktree.join("probe.txt")).expect("probe"), "done");
 
-	let store = SessionStore::open(&checkpoint_session_options(
+	let store = SessionStore::open_snapshot(&checkpoint_session_options(
 		&worktree,
 		&sessions,
 		Some("plan-yolo-rpc"),
@@ -2188,7 +2189,7 @@ fn rpc_failed_plan_switch_surfaces_an_error_instead_of_success() {
 		"provider build fails before any implementation request"
 	);
 	assert!(!worktree.join("probe.txt").exists());
-	let resumed = SessionStore::open(&checkpoint_session_options(
+	let resumed = SessionStore::open_snapshot(&checkpoint_session_options(
 		&worktree,
 		&sessions,
 		Some("plan-yolo-rpc-build-error"),
@@ -2660,7 +2661,7 @@ fn rpc_auto_title_survives_restart_and_preserves_initial_title() {
 
 	// Verify title was persisted to SQLite store
 	let opts = checkpoint_session_options(&worktree, &sessions, Some(session_id));
-	let store1 = SessionStore::open(&opts);
+	let store1 = SessionStore::open_snapshot(&opts);
 	assert_eq!(store1.header().and_then(|h| h.title.as_deref()), Some("first user prompt"));
 
 	// 2. Restart harness, resume session, and send second prompt
@@ -2673,7 +2674,7 @@ fn rpc_auto_title_survives_restart_and_preserves_initial_title() {
 	drop(harness2);
 
 	// Verify title preserved after restart and second prompt
-	let store2 = SessionStore::open(&opts);
+	let store2 = SessionStore::open_snapshot(&opts);
 	assert_eq!(store2.header().and_then(|h| h.title.as_deref()), Some("first user prompt"));
 
 	fs::remove_dir_all(root).ok();

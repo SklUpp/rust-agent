@@ -4,6 +4,7 @@
 use std::{
 	sync::{
 		Arc, Mutex,
+		mpsc::{self, Sender, Receiver},
 		atomic::{AtomicBool, AtomicUsize, Ordering},
 	},
 	time::Duration,
@@ -11,7 +12,7 @@ use std::{
 
 use async_trait::async_trait;
 use pi_agent::{
-	BackgroundResultSink,
+	BackgroundResultSink, ChildDurabilityFactory,
 	loop_module::{AgentLoop, AgentError},
 	mailbox::{IrcMessage, MAIN_AGENT_ID, Mailbox},
 	provider::{ChunkStream, ModelProvider, ProviderError, StreamChunk, ToolChoice},
@@ -523,6 +524,107 @@ impl pi_agent::durable::ChildDurabilityFactory for MockChildDurabilityFactory {
 			Arc::new(MockCompletionSink),
 		))
 	}
+	fn open_child_with_replay(&self, worker_id: &str) -> Result<(pi_agent::durable::ChildDurability, Option<Vec<Message>>), pi_agent::durable::DurableError> {
+		self.open_child(worker_id).map(|child| (child, None))
+	}
+}
+#[derive(Debug)]
+struct BlockingChildFactory { entered: Sender<()>, release: Mutex<Receiver<()>> }
+impl pi_agent::durable::ChildDurabilityFactory for BlockingChildFactory {
+	fn open_child_with_replay(&self, worker_id: &str) -> Result<(pi_agent::durable::ChildDurability, Option<Vec<Message>>), pi_agent::durable::DurableError> {
+		self.entered.send(()).unwrap();
+		self.release.lock().unwrap().recv().unwrap();
+		MockChildDurabilityFactory.open_child_with_replay(worker_id)
+	}
+	fn open_child(&self, worker_id: &str) -> Result<pi_agent::durable::ChildDurability, pi_agent::durable::DurableError> {
+		MockChildDurabilityFactory.open_child(worker_id)
+	}
+}
+
+#[test]
+fn shutdown_racing_blocked_factory_never_publishes_child() {
+	let supervisor = Supervisor::new(ToolRegistry::new(), provider("done"), None, DelegationLimits { max_depth: 2, max_concurrency: 4 });
+	let (entered_tx, entered_rx) = mpsc::channel(); let (release_tx, release_rx) = mpsc::channel();
+	supervisor.set_child_durability_factory(Some(Arc::new(BlockingChildFactory { entered: entered_tx, release: Mutex::new(release_rx) })));
+	let (id, _) = supervisor.reserve_child("shutdown-race", 0, "scout", "task", None).unwrap();
+	let key = supervisor.capture_result_key(&id).unwrap();
+	let thread_key = key.clone();
+	let s = Arc::clone(&supervisor); let id2 = id.clone();
+	let join = std::thread::spawn(move || s.open_child_durable_with_freshness(&id2, Some(&thread_key)));
+	entered_rx.recv_timeout(Duration::from_secs(2)).expect("factory entered");
+	let shutdown_supervisor = Arc::clone(&supervisor);
+	let (done_tx, done_rx) = mpsc::channel();
+	let shutdown = std::thread::spawn(move || { shutdown_supervisor.shutdown(); let _ = done_tx.send(()); });
+	let completed = done_rx.recv_timeout(Duration::from_secs(2)).is_ok();
+	release_tx.send(()).unwrap();
+	assert!(completed, "shutdown must not wait for factory");
+	shutdown.join().expect("shutdown thread");
+	assert!(join.join().expect("admission thread").is_err());
+	assert!(supervisor.open_child_durable(&id, Some(&key)).is_err());
+}
+#[tokio::test]
+async fn close_admissions_drain_waits_for_blocked_factory() {
+	let supervisor = Supervisor::new(ToolRegistry::new(), provider("done"), None, DelegationLimits { max_depth: 2, max_concurrency: 4 });
+	let (entered_tx, entered_rx) = mpsc::channel(); let (release_tx, release_rx) = mpsc::channel();
+	supervisor.set_child_durability_factory(Some(Arc::new(BlockingChildFactory { entered: entered_tx, release: Mutex::new(release_rx) })));
+	let (id, _) = supervisor.reserve_child("drain-race", 0, "scout", "task", None).unwrap();
+	let key = supervisor.capture_result_key(&id).unwrap(); let thread_key = key.clone();
+	let s = Arc::clone(&supervisor); let id2 = id.clone();
+	let admission = std::thread::spawn(move || s.open_child_durable_with_freshness(&id2, Some(&thread_key)));
+	entered_rx.recv_timeout(Duration::from_secs(2)).expect("factory entered");
+	supervisor.close_child_admissions();
+	assert!(tokio::time::timeout(Duration::from_millis(50), supervisor.wait_child_admissions_drained()).await.is_err());
+	release_tx.send(()).unwrap();
+	assert!(admission.join().unwrap().is_err());
+	tokio::time::timeout(Duration::from_secs(2), supervisor.wait_child_admissions_drained()).await.expect("drained");
+}
+#[test]
+fn close_child_admissions_refuses_new_producers_without_actor_shutdown() {
+	let supervisor = Supervisor::new(ToolRegistry::new(), provider("done"), None, DelegationLimits { max_depth: 2, max_concurrency: 4 });
+	supervisor.set_child_durability_factory(Some(Arc::new(MockChildDurabilityFactory)));
+	let (id, _) = supervisor.reserve_child("close-admission", 0, "scout", "task", None).unwrap();
+	let key = supervisor.capture_result_key(&id).unwrap();
+	supervisor.close_child_admissions();
+	assert!(supervisor.open_child_durable(&id, Some(&key)).is_err());
+}
+
+#[test]
+fn concurrent_durable_admission_reuses_one_cached_child() {
+	let supervisor = Supervisor::new(ToolRegistry::new(), provider("done"), None, DelegationLimits { max_depth: 2, max_concurrency: 4 });
+	supervisor.set_child_durability_factory(Some(Arc::new(MockChildDurabilityFactory)));
+	let (id, _) = supervisor.reserve_child("concurrent", 0, "scout", "task", None).expect("reserve");
+	let key = supervisor.capture_result_key(&id).expect("result key");
+	let mut joins = Vec::new();
+	for _ in 0..8 {
+		let supervisor = Arc::clone(&supervisor);
+		let id = id.clone(); let key = key.clone();
+		joins.push(std::thread::spawn(move || supervisor.open_child_durable_with_freshness(&id, Some(&key)).expect("open").expect("child")));
+	}
+	let mut fresh_count = 0;
+	for join in joins {
+		let (_, fresh, _) = join.join().expect("join");
+		fresh_count += usize::from(fresh);
+	}
+	assert_eq!(fresh_count, 1, "exactly one producer may acquire fresh admission");
+}
+#[test]
+fn shutdown_closes_durable_admission_before_publication() {
+	let supervisor = Supervisor::new(ToolRegistry::new(), provider("done"), None, DelegationLimits { max_depth: 2, max_concurrency: 4 });
+	supervisor.set_child_durability_factory(Some(Arc::new(MockChildDurabilityFactory)));
+	let (id, _) = supervisor.reserve_child("shutdown-admission", 0, "scout", "task", None).expect("reserve");
+	let key = supervisor.capture_result_key(&id).expect("result key");
+	supervisor.shutdown();
+	let error = supervisor.open_child_durable_with_freshness(&id, Some(&key)).expect_err("shutdown must refuse durable admission");
+	assert!(error.contains("shutdown"));
+}
+#[test]
+fn cached_child_replay_fails_closed_without_quiescence_proof() {
+    let factory = MockChildDurabilityFactory;
+    let child = factory.open_child("cached-revive").expect("child");
+    let error = factory
+        .load_child_messages_owned("cached-revive", &child)
+        .expect_err("cached replay must refuse without proof");
+    assert_eq!(error.message(), "durable child replay requires a quiescent owner");
 }
 
 #[tokio::test]

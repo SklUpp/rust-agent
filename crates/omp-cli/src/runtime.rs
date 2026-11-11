@@ -730,6 +730,9 @@ impl PiAgentRunner {
 				slot.closed = true;
 				slot.value.take()
 			};
+			if let Some(supervisor) = &supervisor {
+				supervisor.close_child_admissions();
+			}
 			let goal = resources
 				.goal
 				.lock()
@@ -751,6 +754,7 @@ impl PiAgentRunner {
 			let teardown = std::thread::spawn(move || {
 				if let Some(supervisor) = supervisor {
 					supervisor.shutdown();
+					handle.block_on(supervisor.wait_child_admissions_drained());
 					// Live keep-alive actors own their own provider/registry and are
 					// not in `active`; cancel + join them before the session
 					// resources below are released, so no follow-up turn can run
@@ -916,16 +920,14 @@ impl PiAgentRunner {
 			(closing, sessions, supervisors)
 		};
 		let mut actors = Vec::new();
+		let mut drained_supervisors = Vec::new();
 		for (supervisor, goal) in supervisors {
+			supervisor.close_child_admissions();
+			drained_supervisors.push(Arc::clone(&supervisor));
 			supervisor.shutdown();
-			// Live keep-alive actors are not in `active`; keep the manager so the
-			// teardown thread can join them before session resources are released.
 			if let Some(manager) = pi_agent::subagent_lifecycle::lookup(&supervisor) {
 				actors.push(manager);
 			}
-			// Same post-shutdown drain as an explicit scope close: what the
-			// cancelled children's completed requests reported still reaches goal
-			// accounting, and the host writes it before the log closes.
 			if let Some(goal) = goal {
 				drain_accounting(&supervisor, &goal);
 			}
@@ -933,7 +935,7 @@ impl PiAgentRunner {
 		// The plain teardown thread owns every published close handle and all
 		// remaining session releases, even when `sessions` is empty; `LatchFinish`
 		// runs only after both sets are done. Runtime callers never join a worker.
-		if closing.is_empty() && sessions.is_empty() && actors.is_empty() {
+		if closing.is_empty() && sessions.is_empty() && actors.is_empty() && drained_supervisors.is_empty() {
 			self.shutdown_latch.finish();
 			return;
 		}
@@ -944,9 +946,11 @@ impl PiAgentRunner {
 			for scoped in closing {
 				let _ = scoped.join();
 			}
+			for supervisor in drained_supervisors {
+				handle.block_on(supervisor.wait_child_admissions_drained());
+			}
 			// Actor tokens were cancelled with their supervisor above; wait for
-			// the actors to leave before any session resource is released, so no
-			// follow-up turn can run against a closed backend.
+			// actors to leave before session resources release.
 			for manager in actors {
 				handle.block_on(manager.shutdown_actors());
 			}

@@ -542,6 +542,8 @@ pub struct Supervisor {
 	/// Host-injected child durability factory. `None` means no session owner is
 	/// configured (tests/ephemeral); a configured factory must open every child
 	/// scope or the spawn fails.
+	/// Serializes durable child admission per identity without holding state during I/O.
+	durable_admission: Mutex<HashMap<String, Arc<Mutex<()>>>>,
 	child_durability: Mutex<Option<Arc<dyn ChildDurabilityFactory>>>,
 	/// Options copied into each child's fresh `EditTool` (same knobs as the
 	/// parent run, but a fresh store/registers/guard).
@@ -585,6 +587,10 @@ pub struct Supervisor {
 	/// Parent token every live keep-alive actor derives from. Cancelled by
 	/// [`Supervisor::shutdown`] so a follow-up turn can never outlive its scope.
 	lifecycle_cancel: CancellationToken,
+	admission_shutdown: AtomicBool,
+	admission_barrier: Mutex<()>,
+	admissions_in_flight: AtomicUsize,
+	admissions_drained: Notify,
 	state: Mutex<SupervisorState>,
 	seq: AtomicU64,
 	/// Token source for [`Supervisor::reserve_revive`]; unique per reservation so
@@ -685,6 +691,14 @@ fn owner_namespace(scope: u64) -> String {
 	format!("omp-{pid}-{nonce}-{scope}")
 }
 
+struct AdmissionLease<'a> { supervisor: &'a Supervisor }
+impl Drop for AdmissionLease<'_> {
+	fn drop(&mut self) {
+		if self.supervisor.admissions_in_flight.fetch_sub(1, Ordering::AcqRel) == 1 {
+			self.supervisor.admissions_drained.notify_waiters();
+		}
+	}
+}
 impl Supervisor {
 	pub fn new(
 		template: ToolRegistry,
@@ -720,12 +734,13 @@ impl Supervisor {
 			async_enabled: AtomicBool::new(true),
 			external_thinking: AtomicBool::new(false),
 			result_sink_attached: AtomicBool::new(false),
+			display_resolver: Mutex::new(None),
 			autoload: Mutex::new(None),
 			root_permits: Arc::new(Semaphore::new(permits)),
 			mailbox: Arc::new(Mailbox::default()),
+			durable_admission: Mutex::new(HashMap::new()),
 			child_durability: Mutex::new(None),
 			edit_options: Mutex::new(hashline::edit::EditToolOptions::default()),
-			display_resolver: Mutex::new(None),
 			active_model: Mutex::new(None),
 			agent_catalog: Mutex::new(None),
 			child_advisor_hook: Mutex::new(None),
@@ -740,7 +755,9 @@ impl Supervisor {
 					.join(format!("omp-agent-processes-{}-{scope}", std::process::id()))
 			},
 			process_owner_ns: owner_namespace(scope),
-			lifecycle_cancel: CancellationToken::new(),
+			admission_shutdown: AtomicBool::new(false),
+			admissions_in_flight: AtomicUsize::new(0),
+			admissions_drained: Notify::new(),
 			state: Mutex::new(SupervisorState {
 				records: HashMap::new(),
 				order: Vec::new(),
@@ -1319,34 +1336,68 @@ impl Supervisor {
 	/// Open the durable scope for one worker before its first turn. `worker_id`
 	/// is the spawn-time result key; a configured factory never falls back to an
 	/// ephemeral child if that key is missing.
-	pub fn open_child_durable(
-		&self,
-		id: &str,
-		worker_id: Option<&str>,
-	) -> Result<Option<ChildDurability>, String> {
-		let Some(factory) = self.child_durability_factory() else {
-			return Ok(None);
-		};
-		let worker_id = worker_id
-			.filter(|key| !key.is_empty())
-			.ok_or_else(|| format!("child {id} has no spawn-time result key"))?;
-		let child = factory
-			.open_child(worker_id)
-			.map_err(|error| format!("child {id} durable scope: {error}"))?;
-		if child.identity().worker_id != worker_id {
-			return Err(format!(
-				"child {id} durable scope returned worker id {:?}, expected {worker_id:?}",
-				child.identity().worker_id
-			));
-		}
-		self
-			.state
-			.lock()
-			.unwrap()
-			.durable_children
-			.insert(id.to_string(), child.clone());
-		Ok(Some(child))
-	}
+    pub fn open_child_durable(
+        &self,
+        id: &str,
+        worker_id: Option<&str>,
+    ) -> Result<Option<ChildDurability>, String> {
+        self.open_child_durable_with_freshness(id, worker_id)
+            .map(|result| result.map(|(child, _fresh, _replay)| child))
+    }
+
+    /// Open child and report whether this call acquired fresh ownership. Freshness
+    /// is established inside this lock, never inferred by callers from state.
+    pub fn open_child_durable_with_freshness(
+        &self,
+        id: &str,
+        worker_id: Option<&str>,
+    ) -> Result<Option<(ChildDurability, bool, Option<Vec<crate::state::Message>>)>, String> {
+        let Some(worker_id) = worker_id.filter(|key| !key.is_empty()) else {
+            return Err(format!("child {id} has no spawn-time result key"));
+        };
+        let gate = {
+            let mut gates = self.durable_admission.lock().unwrap();
+            Arc::clone(gates.entry(worker_id.to_string()).or_insert_with(|| Arc::new(Mutex::new(()))))
+        };
+        let _admission = gate.lock().unwrap();
+        let factory = {
+            let _barrier = self.admission_barrier.lock().unwrap();
+            if self.admission_shutdown.load(Ordering::Acquire) {
+                return Err(format!("child {id} durable admission refused during shutdown"));
+            }
+            if let Some(existing) = self.state.lock().unwrap().durable_children.get(id).cloned() {
+                if existing.identity().worker_id == worker_id {
+                    return Ok(Some((existing, false, None)));
+                }
+            }
+            self.admissions_in_flight.fetch_add(1, Ordering::AcqRel);
+            self.child_durability_factory()
+        };
+        let _admission_lease = AdmissionLease { supervisor: self };
+        let Some(factory) = factory else {
+            return Ok(None);
+        };
+        let (child, replay) = factory
+            .open_child_with_replay(worker_id)
+            .map_err(|error| format!("child {id} durable scope: {error}"))?;
+        if child.identity().worker_id != worker_id {
+            return Err(format!(
+                "child {id} durable scope returned worker id {:?}, expected {worker_id:?}",
+                child.identity().worker_id
+            ));
+        }
+        let _barrier = self.admission_barrier.lock().unwrap();
+        if self.admission_shutdown.load(Ordering::Acquire) {
+            return Err(format!("child {id} durable admission cancelled during open"));
+        }
+        if let Some(existing) = self.state.lock().unwrap().durable_children.get(id).cloned() {
+            if existing.identity().worker_id == worker_id {
+                return Ok(Some((existing, false, None)));
+            }
+        }
+        self.state.lock().unwrap().durable_children.insert(id.to_string(), child.clone());
+        Ok(Some((child, true, replay)))
+    }
 
 	/// Commit a worker completion and its parent notification. No-op when this
 	/// scope has no durable child (explicit ephemeral), never a silent fallback
@@ -1381,17 +1432,35 @@ impl Supervisor {
 		}
 	}
 
+    /// Read durable child conversation without changing ownership. Used by history and legacy paths.
+    pub fn load_child_messages(&self, worker_id: &str) -> Result<Option<Vec<Message>>, String> {
+        let Some(factory) = self.child_durability_factory() else {
+            return Ok(None);
+        };
+        factory.load_child_messages(worker_id).map_err(|error| error.to_string())
+    }
 
-	/// Durable child conversation for a cold revive. `None` means no SQLite child
-	/// scope exists, so the caller may read a legacy transcript explicitly.
-	pub fn load_child_messages(&self, worker_id: &str) -> Result<Option<Vec<Message>>, String> {
-		let Some(factory) = self.child_durability_factory() else {
-			return Ok(None);
-		};
-		factory
-			.load_child_messages(worker_id)
-			.map_err(|error| error.to_string())
-	}
+    /// Load replay while retaining already-open child ownership.
+    pub fn load_child_messages_owned(
+        &self,
+        worker_id: &str,
+        child: &ChildDurability,
+    ) -> Result<Option<Vec<Message>>, String> {
+        let Some(factory) = self.child_durability_factory() else {
+            return Ok(None);
+        };
+        factory.load_child_messages_owned(worker_id, child).map_err(|error| error.to_string())
+    }
+    pub fn load_child_messages_fresh(
+        &self,
+        worker_id: &str,
+        child: &ChildDurability,
+    ) -> Result<Option<Vec<Message>>, String> {
+        let Some(factory) = self.child_durability_factory() else {
+            return Ok(None);
+        };
+        factory.load_child_messages_fresh(worker_id, child).map_err(|error| error.to_string())
+    }
 
 	/// Persist one peer message into the target scope as a pending delivery.
 	/// Returns `None` when this supervisor has no durable factory.
@@ -1817,12 +1886,30 @@ impl Supervisor {
 	/// call this when the runner is dropped: background tasks hold their own
 	/// `Arc<Supervisor>`, so relying on `Drop` alone would let them outlive the
 	/// runner. Live keep-alive actors are cancelled through the session token
-	/// and then awaited by the manager before resources are released. Safe to
+	/// and then awaited by the manager before resources are released.
+	/// Close durable child admissions without running actor observer callbacks.
+	pub fn close_child_admissions(&self) {
+		let _barrier = self.admission_barrier.lock().unwrap();
+		self.admission_shutdown.store(true, Ordering::Release);
+		*self.child_durability.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+	}
+	pub async fn wait_child_admissions_drained(&self) {
+		loop {
+			let notified = self.admissions_drained.notified();
+			if self.admissions_in_flight.load(Ordering::Acquire) == 0 {
+				return;
+			}
+			notified.await;
+		}
+	}
 	/// call more than once.
 	pub fn shutdown(&self) {
-		// Cancel the parent token first: every live actor (including one that
-		// registered in the same instant) derives from it, so none can start or
-		// continue a follow-up turn after this point.
+		{
+			let _barrier = self.admission_barrier.lock().unwrap();
+			self.admission_shutdown.store(true, Ordering::Release);
+			*self.child_durability.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+		}
+		// Cancel the parent token after admissions close; callbacks below run without barrier.
 		self.lifecycle_cancel.cancel();
 		let (reservations, active, actors) = {
 			let mut state = match self.state.lock() {

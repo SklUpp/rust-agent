@@ -305,6 +305,7 @@ fn service_tier_change_journals_strings_and_reset_survives_resume() {
 	store
 		.append_service_tier_change(&tiers(&[("anthropic", "priority")]))
 		.expect("append selection");
+	drop(store);
 
 	let reopened = SessionStore::open(&tier_options(dir.clone(), "priority-tier"));
 	assert!(reopened.has_service_tier_entry());
@@ -313,24 +314,28 @@ fn service_tier_change_journals_strings_and_reset_survives_resume() {
 		tiers(&[("anthropic", "priority")]),
 		"resume restores the recorded selection"
 	);
+	drop(reopened);
 
 	// Explicit reset: a recorded empty map, not a missing entry.
 	let mut reset = SessionStore::open(&tier_options(dir.clone(), "priority-tier"));
 	reset
 		.append_service_tier_change(&BTreeMap::new())
 		.expect("append reset");
+	drop(reset);
 	let resumed = SessionStore::open(&tier_options(dir.clone(), "priority-tier"));
 	assert!(resumed.has_service_tier_entry(), "the reset is itself recorded");
 	assert!(
 		resumed.service_tier_by_family().is_empty(),
 		"the reset must not re-enable the configured priority"
 	);
+	drop(resumed);
 
 	// Explicit re-arm after the reset wins as the last branch entry.
 	let mut rearm = SessionStore::open(&tier_options(dir.clone(), "priority-tier"));
 	rearm
 		.append_service_tier_change(&tiers(&[("anthropic", "priority")]))
 		.expect("append re-arm");
+	drop(rearm);
 	assert_eq!(
 		SessionStore::open(&tier_options(dir.clone(), "priority-tier")).service_tier_by_family(),
 		tiers(&[("anthropic", "priority")]),
@@ -373,6 +378,7 @@ fn fork_restores_the_recorded_service_tier() {
 		.append_service_tier_change(&tiers(&[("anthropic", "priority")]))
 		.expect("append selection");
 	let source = store.file().map(std::path::Path::to_path_buf).expect("session file");
+	drop(store);
 	let fork = omp_cli::session::fork_session(&source, None, Some(&dir)).expect("fork");
 	let fork_id = fork
 		.file_stem()

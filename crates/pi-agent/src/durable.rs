@@ -234,19 +234,35 @@ impl ChildDurability {
 	}
 }
 
-/// Host factory for child scopes. Every method defaults to "unsupported": a
-/// configured factory that cannot honour the request fails the spawn/revive
-/// instead of silently falling back to an ephemeral child.
+
+/// Host factory for child scopes. Every method defaults to "unsupported".
 pub trait ChildDurabilityFactory: Send + Sync + std::fmt::Debug {
 	fn open_child(&self, _worker_id: &str) -> Result<ChildDurability, DurableError> {
 		Err(DurableError::new("durable child scope is not implemented"))
 	}
+    fn open_child_with_replay(&self, worker_id: &str) -> Result<(ChildDurability, Option<Vec<Message>>), DurableError> {
+        let child = self.open_child(worker_id)?;
+        let replay = self.load_child_messages_fresh(worker_id, &child)?;
+        Ok((child, replay))
+    }
+    fn load_child_messages(&self, _worker_id: &str) -> Result<Option<Vec<Message>>, DurableError> { Ok(None) }
 
-	/// Durable child conversation for a cold revive. `None` means no durable
-	/// child scope exists, so the caller may read a legacy transcript explicitly.
-	fn load_child_messages(&self, _worker_id: &str) -> Result<Option<Vec<Message>>, DurableError> {
-		Ok(None)
+	fn load_child_messages_owned(
+		&self,
+		_worker_id: &str,
+		_child: &ChildDurability,
+	) -> Result<Option<Vec<Message>>, DurableError> {
+		Err(DurableError::new("durable child replay requires a quiescent owner"))
 	}
+
+    /// Load replay after this call acquired fresh exclusive child ownership.
+    fn load_child_messages_fresh(
+        &self,
+        worker_id: &str,
+        child: &ChildDurability,
+    ) -> Result<Option<Vec<Message>>, DurableError> {
+        self.load_child_messages_owned(worker_id, child)
+    }
 
 	/// Explicit one-time migration of a legacy JSONL child into a durable
 	/// scope. A legacy child must be imported before it resumes; otherwise the

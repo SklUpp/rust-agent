@@ -978,7 +978,8 @@ fn test_cli_file_arg_invalid_utf8_lossy_decoded() {
 }
 
 fn session_messages(sessions_dir: &Path) -> Vec<omp_cli::session::MessageEntry> {
-	let store = SessionStore::open(&SessionOptions {
+	// Read-only snapshot: helpers must not take a writer lease that blocks CLI.
+	let store = SessionStore::open_snapshot(&SessionOptions {
 		enabled: true,
 		cwd: PathBuf::from("/work"),
 		model: None,
@@ -996,7 +997,7 @@ fn session_messages(sessions_dir: &Path) -> Vec<omp_cli::session::MessageEntry> 
 /// Reopen the persisted session: `header.title` is materialized from the
 /// fixed-width title slot on read, so this observes what a fresh CLI run sees.
 fn session_title(sessions_dir: &Path, id: &str) -> (Option<String>, String) {
-	let store = SessionStore::open(&SessionOptions {
+	let store = SessionStore::open_snapshot(&SessionOptions {
 		enabled: true,
 		cwd: PathBuf::from("/work"),
 		model: None,
@@ -1085,6 +1086,7 @@ fn test_no_title_gates_auto_titles_per_invocation_and_preserves_existing() {
 			.any(|entry| entry.kind == "title_change"),
 		"--no-title must not write title_change entries"
 	);
+	drop(flag_store);
 
 	// A later run without the flag may title the still-untitled session.
 	run_no_title_fixture(

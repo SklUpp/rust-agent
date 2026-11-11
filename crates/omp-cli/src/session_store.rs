@@ -16,6 +16,11 @@
 //! - [`SqliteStore::unresolved_intents`] reports intents with no outcome. The
 //!   stored intent is not proof the effect started; callers must use the tool
 //!   contract, never a blind retry.
+//! - [`SqliteStore::recover_unresolved_intents`] may append an interrupted
+//!   knowledge `toolResult` for trailing active-branch calls only; it never
+//!   writes `outcome_json` and never retries the effect. Exclusive cooperative
+//!   writer open invokes it once after the session lease is held; plain
+//!   load/reload paths must not.
 //! - [`SqliteStore::complete_worker`] commits the worker completion and the
 //!   parent delivery atomically. Synchronous completions are marked delivered
 //!   and processed immediately; background completions remain pending.
@@ -34,13 +39,13 @@ use std::{
 };
 
 use rusqlite::{
-	Connection, OptionalExtension as _, Transaction, TransactionBehavior, params,
+	Connection, OpenFlags, OptionalExtension as _, Transaction, TransactionBehavior, params,
 };
 use serde_json::{Value, json};
 
 use crate::durable_session::StoredProjection;
 /// Current schema version. Bump only with a new branch in [`SqliteStore::initialize`].
-pub const SCHEMA_VERSION: i64 = 2;
+pub const SCHEMA_VERSION: i64 = 3;
 const SCHEMA_VERSION_DDL: &str = "
 	CREATE TABLE IF NOT EXISTS schema_version (
 		id INTEGER PRIMARY KEY CHECK (id = 1),
@@ -145,6 +150,28 @@ const SCHEMA_V2_MIGRATION_DDL: &str = "
 	CREATE UNIQUE INDEX IF NOT EXISTS deliveries_message_id_idx ON deliveries(message_id) WHERE message_id IS NOT NULL;
 ";
 
+/// Immutable fork-only classification of a copied tool-result message. Not an
+/// intent: rows here never appear in `executions` and can never be recovered as
+/// executable work. `outcome_resolved` is fixed at fork time; UPDATE is blocked
+/// by a trigger. Deletion follows the session/message lifecycle through
+/// `ON DELETE CASCADE`: provenance is derived fork state, not a tombstone, so a
+/// legitimately deleted session does not leave orphan rows and is not blocked.
+const SCHEMA_V3_MIGRATION_DDL: &str = "
+	CREATE TABLE IF NOT EXISTS fork_provenance (
+		message_id TEXT PRIMARY KEY REFERENCES messages(id) ON DELETE CASCADE,
+		session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+		source_execution_id TEXT NOT NULL,
+		provider_call_id TEXT NOT NULL,
+		outcome_resolved INTEGER NOT NULL CHECK (outcome_resolved IN (0, 1))
+	);
+	CREATE INDEX IF NOT EXISTS fork_provenance_session_idx ON fork_provenance(session_id);
+	CREATE TRIGGER IF NOT EXISTS fork_provenance_immutable
+	BEFORE UPDATE ON fork_provenance
+	BEGIN
+		SELECT RAISE(ABORT, 'fork provenance is immutable');
+	END;
+";
+
 /// Store failure. Every variant is returned to the caller; nothing is logged
 /// and ignored.
 #[derive(Debug)]
@@ -214,8 +241,94 @@ impl From<std::io::Error> for StoreError {
 		Self::Io(err)
 	}
 }
-
 pub type StoreResult<T> = Result<T, StoreError>;
+
+/// Read execution rows by id on the caller's connection so a snapshot can copy
+/// provenance inside its read transaction.
+fn executions_by_ids_conn(connection: &Connection, ids: &HashSet<String>) -> StoreResult<Vec<ExecutionRecord>> {
+	let mut statement = connection.prepare(
+		"SELECT seq, execution_id, session_id, branch_id, provider_call_id, tool_name, intent_json, created_at_ms, outcome_json, outcome_at_ms FROM executions WHERE execution_id = ?1",
+	)?;
+	let mut executions = Vec::new();
+	for id in ids {
+		let row = statement.query_row(params![id], |row| {
+			Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?, row.get::<_, String>(3)?, row.get::<_, String>(4)?, row.get::<_, String>(5)?, row.get::<_, String>(6)?, row.get::<_, i64>(7)?, row.get::<_, Option<String>>(8)?, row.get::<_, Option<i64>>(9)?))
+		}).optional()?;
+		let Some((seq, execution_id, session_id, branch_id, provider_call_id, tool_name, intent_json, created_at_ms, outcome_json, outcome_at_ms)) = row else { continue; };
+		executions.push(ExecutionRecord {
+			seq,
+			execution_id,
+			session_id,
+			branch_id,
+			provider_call_id,
+			tool_name,
+			intent: decode_json(&intent_json)?,
+			created_at_ms,
+			outcome: match outcome_json { Some(json) => Some(decode_json(&json)?), None => None },
+			outcome_at_ms,
+		});
+	}
+	Ok(executions)
+}
+
+fn table_exists_conn(connection: &Connection, table: &str) -> rusqlite::Result<bool> {
+	use rusqlite::OptionalExtension as _;
+	connection
+		.query_row(
+			"SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1",
+			params![table],
+			|_| Ok(()),
+		)
+		.optional()
+		.map(|row| row.is_some())
+}
+
+fn fork_provenance_conn(connection: &Connection, session_id: &str) -> StoreResult<Vec<ForkProvenance>> {
+	// A read-only snapshot of a v1/v2 database has no provenance table yet; the
+	// fork path fails closed on missing rows instead of mutating a read-only DB.
+	// A v3 database without the table is damaged and MUST NOT be treated as empty.
+	if !table_exists_conn(connection, "fork_provenance")? {
+		let version: Option<i64> = connection
+			.query_row("SELECT version FROM schema_version WHERE id = 1", [], |row| row.get(0))
+			.optional()?;
+		return match version {
+			Some(version) if version < SCHEMA_VERSION => Ok(Vec::new()),
+			Some(version) => Err(StoreError::Corrupt(format!(
+				"schema version {version} is missing the fork_provenance table"
+			))),
+			None => Err(StoreError::Corrupt(
+				"schema_version row is missing but durable tables exist".to_string(),
+			)),
+		};
+	}
+	let mut statement = connection.prepare(
+		"SELECT message_id, source_execution_id, provider_call_id, outcome_resolved FROM fork_provenance WHERE session_id = ?1 ORDER BY message_id",
+	)?;
+	let rows = statement.query_map(params![session_id], |row| {
+		Ok(ForkProvenance::new(row.get(0)?, row.get(1)?, row.get(2)?, row.get::<_, i64>(3)? != 0))
+	})?;
+	rows.collect::<rusqlite::Result<Vec<_>>>().map_err(StoreError::from)
+}
+
+/// SELECT-only view of one session. Built by [`SqliteStore::load_session_snapshot`]
+/// without recovery or reconcile.
+#[derive(Debug, Clone)]
+pub struct SessionSnapshot {
+	pub session_id: String,
+	pub header_payload: Value,
+	pub branch_id: String,
+	pub leaf: Option<String>,
+	pub session_messages: Vec<MessageRecord>,
+	pub branch_messages: Vec<MessageRecord>,
+	pub projection: Option<StoredProjection>,
+	pub branches: Vec<BranchRecord>,
+	/// Execution rows referenced by `session_messages`, read in the same
+	/// snapshot transaction.
+	pub executions: Vec<ExecutionRecord>,
+	/// Immutable fork classifications keyed by fork message id, read in the same
+	/// snapshot transaction.
+	pub provenance: Vec<ForkProvenance>,
+}
 
 /// A durable session row. `payload` is the session header/state JSON and is
 /// stored exactly once, in `sessions.payload_json`.
@@ -290,6 +403,294 @@ pub struct NewMessage {
 	pub parent_message_id: Option<String>,
 	pub payload: Value,
 }
+/// Messages MUST be supplied in global parent-before-child order, including branch-point ancestors.
+/// Primitive rejects missing prior parents and does not reorder entries.
+/// Complete fork payload committed as one target transaction.
+#[derive(Debug, Clone)]
+pub struct ForkWrite {
+	pub session: NewSession,
+	pub branches: Vec<NewBranch>,
+	pub messages: Vec<NewMessage>,
+	pub active_branch_id: String,
+	pub active_leaf_message_id: Option<String>,
+	pub projection: Option<StoredProjection>,
+}
+
+/// Immutable fork-only classification of a copied tool-result message. Stored
+/// in `fork_provenance`, never in `executions`, so it can never be recovered as
+/// executable work.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ForkProvenance {
+	pub message_id: String,
+	pub source_execution_id: String,
+	pub provider_call_id: String,
+	pub outcome_resolved: bool,
+	/// Seals struct-literal construction outside this module: classification is
+	/// never caller-defined data.
+	_sealed: (),
+}
+
+impl ForkProvenance {
+	fn new(message_id: String, source_execution_id: String, provider_call_id: String, outcome_resolved: bool) -> Self {
+		Self { message_id, source_execution_id, provider_call_id, outcome_resolved, _sealed: () }
+	}
+
+	/// Capture the classification for one source message from the source snapshot,
+	/// proving the association with the actual source payload: the execution row (or
+	/// stored provenance) must name the same provider call id as the source tool
+	/// result. Untrusted target input never supplies this association.
+	pub(crate) fn capture(
+		source_messages: &[MessageRecord],
+		executions: &[ExecutionRecord],
+		provenance: &[ForkProvenance],
+		source_message_id: &str,
+		target_message_id: &str,
+	) -> StoreResult<Vec<Self>> {
+		let source = source_messages.iter().find(|message| message.id == source_message_id).ok_or_else(|| {
+			StoreError::Corrupt(format!("fork provenance source message {source_message_id} is missing"))
+		})?;
+		let referenced = referenced_execution_ids(std::iter::once(&source.payload));
+		if referenced.is_empty() {
+			return Ok(Vec::new());
+		}
+		let call_id = extract_tool_result_call_id(&source.payload).ok_or_else(|| {
+			StoreError::Corrupt(format!("message {source_message_id} references an execution without a toolCallId"))
+		})?;
+		let mut captured = Vec::new();
+		for execution_id in referenced {
+			let owned = executions.iter().find(|execution| execution.execution_id == execution_id);
+			let copied = provenance.iter().find(|entry| entry.message_id == source_message_id && entry.source_execution_id == execution_id);
+			let resolved = match (owned, copied) {
+				(Some(owned), Some(copied)) if owned.outcome.is_some() != copied.outcome_resolved => {
+					return Err(StoreError::Corrupt(format!(
+						"fork provenance conflicts with local execution {execution_id} for message {source_message_id}"
+					)))
+				},
+				(Some(owned), _) => owned.outcome.is_some(),
+				(None, Some(copied)) => copied.outcome_resolved,
+				(None, None) => {
+					return Err(StoreError::Corrupt(format!(
+						"messages reference unknown execution(s): {execution_id}"
+					)))
+				},
+			};
+			if let Some(owned) = owned {
+				if owned.provider_call_id != call_id {
+					return Err(StoreError::Corrupt(format!(
+						"execution {execution_id} provider call id does not match tool result {call_id}"
+					)));
+				}
+			} else if let Some(copied) = copied {
+				if copied.provider_call_id != call_id {
+					return Err(StoreError::Corrupt(format!(
+						"fork provenance for message {source_message_id} names provider call id {} but the tool result is {call_id}",
+						copied.provider_call_id
+					)));
+				}
+			}
+			captured.push(Self::new(target_message_id.to_string(), execution_id, call_id.clone(), resolved));
+		}
+		Ok(captured)
+	}
+}
+
+impl SqliteStore {
+	/// Insert fork session, branch, mapped messages, and projection atomically.
+	/// Classification is derived from local execution rows; a referenced
+	/// execution with no local row is rejected because this public entry point
+	/// cannot supply trusted transitive provenance.
+	pub fn create_fork_atomic(&mut self, fork: ForkWrite) -> StoreResult<()> {
+		self.create_fork_atomic_with_provenance(fork, &[])
+	}
+
+	/// Crate-internal fork write that may carry provenance captured atomically with
+	/// the source snapshot. Supplied classification is authoritative and is never
+	/// re-read or re-derived against mutable execution rows; every referenced
+	/// execution must have an exact (message, execution) captured entry.
+	pub(crate) fn create_fork_atomic_with_provenance(&mut self, fork: ForkWrite, provenance: &[ForkProvenance]) -> StoreResult<()> {
+		validate_id("fork session id", &fork.session.id)?;
+		validate_id("fork active branch id", &fork.active_branch_id)?;
+		if fork.session.parent_session_id.as_deref() == Some(fork.session.id.as_str()) { return Err(StoreError::Validation("fork session cannot parent itself".into())); }
+		if fork.session.initial_branch_id != fork.active_branch_id || fork.branches.is_empty() || !fork.branches.iter().any(|b| b.id == fork.active_branch_id) { return Err(StoreError::Validation("fork active branch is invalid".into())); }
+		let now = now_ms();
+		let tx = self.connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+		let mut payload = fork.session.payload.clone();
+		let header: crate::session::SessionHeader = serde_json::from_value(payload.clone()).map_err(|e| StoreError::Corrupt(format!("invalid fork session header: {e}")))?;
+		if header.id != fork.session.id || header.parent_session != fork.session.parent_session_id { return Err(StoreError::Validation("fork header identity or parent mismatch".into())); }
+		if let Some(projection) = &fork.projection { payload["durableProjection"] = serde_json::to_value(projection)?; } else if let Some(object) = payload.as_object_mut() { object.remove("durableProjection"); }
+		let relational_parent: Option<String> = match fork.session.parent_session_id.as_deref() { Some(id) => tx.query_row("SELECT id FROM sessions WHERE id = ?1", params![id], |r| r.get::<_, String>(0)).optional()?, None => None };
+		tx.execute("INSERT INTO sessions (id,parent_session_id,active_branch_id,payload_json,created_at_ms,updated_at_ms) VALUES (?1,?2,NULL,?3,?4,?4)", params![fork.session.id, relational_parent, encode_json(&payload)?, now])?;
+		let branch_ids: std::collections::HashSet<&str> = fork.branches.iter().map(|b| b.id.as_str()).collect();
+		if branch_ids.len() != fork.branches.len() { return Err(StoreError::Validation("duplicate fork branch id".into())); }
+		let mut pending = fork.branches.clone();
+		let mut inserted = std::collections::HashSet::new();
+		while !pending.is_empty() {
+			let before = pending.len();
+			let mut next = Vec::new();
+			for branch in pending {
+				if branch.parent_branch_id.as_ref().is_some_and(|p| !inserted.contains(p.as_str())) { next.push(branch); continue; }
+				if branch.session_id != fork.session.id || branch.parent_branch_id.as_ref().is_some_and(|p| p == &branch.id || !branch_ids.contains(p.as_str())) { return Err(StoreError::Validation("fork branch parent ownership or cycle invalid".into())); }
+				if branch.parent_branch_id.is_some() != branch.parent_message_id.is_some() { return Err(StoreError::Validation("fork branch parent fields must be supplied together".into())); }
+				tx.execute("INSERT INTO branches (id,session_id,parent_branch_id,parent_message_id,leaf_message_id,payload_json,created_at_ms) VALUES (?1,?2,?3,?4,NULL,?5,?6)", params![branch.id, fork.session.id, branch.parent_branch_id, branch.parent_message_id, encode_json(&branch.payload)?, now])?;
+				inserted.insert(branch.id);
+			}
+			if next.len() == before { return Err(StoreError::Validation("fork branch topology cannot be ordered".into())); }
+			pending = next;
+		}
+        let mut branch_leaf: std::collections::HashMap<String, Option<String>> = fork.branches.iter().map(|b| (b.id.clone(), b.parent_message_id.clone())).collect();
+        for message in &fork.messages {
+            let branch = fork.branches.iter().find(|b| b.id == message.branch_id).ok_or_else(|| StoreError::Validation("fork message branch missing".into()))?;
+            if message.session_id != fork.session.id { return Err(StoreError::Validation("fork message ownership mismatch".into())); }
+            if message.parent_message_id != branch_leaf.get(&message.branch_id).cloned().flatten() { return Err(StoreError::Validation("fork message does not chain from branch leaf".into())); }
+            if message.parent_message_id.as_deref() == Some(message.id.as_str()) { return Err(StoreError::Validation("fork message cannot parent itself".into())); }
+            let parent_in_fork = message.parent_message_id.as_deref().and_then(|id| fork.messages.iter().find(|m| m.id == id));
+            if let Some(parent) = parent_in_fork { if parent.branch_id != message.branch_id && Some(parent.id.as_str()) != branch.parent_message_id.as_deref() { return Err(StoreError::Validation("fork message lineage crosses branch without branch point".into())); } }
+            if message.parent_message_id.is_some() && parent_in_fork.is_none() && message.parent_message_id != branch.parent_message_id { return Err(StoreError::Validation("fork message parent missing".into())); }
+            *branch_leaf.get_mut(&message.branch_id).expect("validated branch") = Some(message.id.clone());
+            let parent_exists = message.parent_message_id.as_deref().map(|id| parent_in_fork.is_some() || Some(id) == branch.parent_message_id.as_deref()).unwrap_or(true);
+            if !parent_exists { return Err(StoreError::Validation("fork message parent missing".into())); }
+            if message.payload.get("type").and_then(Value::as_str) == Some("message") {
+				let entry: crate::session::MessageEntry = serde_json::from_value(message.payload.clone()).map_err(|e| StoreError::Corrupt(format!("invalid fork message payload: {e}")))?;
+				entry.validate_compat().map_err(StoreError::Validation)?;
+				if entry.id != message.id || entry.parent_id != message.parent_message_id { return Err(StoreError::Validation("fork message identity does not match payload".into())); }
+            } else if let Some(payload_id) = message.payload.get("id").and_then(Value::as_str) {
+                if payload_id != message.id { return Err(StoreError::Validation("fork entry identity does not match payload".into())); }
+                if let Some(payload_parent) = message.payload.get("parentId") { if payload_parent.as_str() != message.parent_message_id.as_deref() { return Err(StoreError::Validation("fork entry parent does not match payload".into())); } }
+            }
+            tx.execute("INSERT INTO messages (id,session_id,branch_id,parent_message_id,payload_json,created_at_ms) VALUES (?1,?2,?3,?4,?5,?6)", params![message.id, message.session_id, message.branch_id, message.parent_message_id, encode_json(&message.payload)?, now])?;
+            tx.execute("UPDATE branches SET leaf_message_id = ?1 WHERE id = ?2", params![message.id, message.branch_id])?;
+        }
+		if let Some(leaf) = &fork.active_leaf_message_id {
+			let owns_leaf = fork.messages.iter().any(|m| m.id == *leaf && m.branch_id == fork.active_branch_id) || fork.branches.iter().find(|b| b.id == fork.active_branch_id).and_then(|b| b.parent_message_id.as_ref()).is_some_and(|id| id == leaf);
+			if !owns_leaf { return Err(StoreError::Validation("active leaf does not belong to active branch".into())); }
+			branch_leaf.insert(fork.active_branch_id.clone(), Some(leaf.clone()));
+			tx.execute("UPDATE branches SET leaf_message_id = ?1 WHERE id = ?2", params![leaf, fork.active_branch_id])?;
+		}
+		for branch in &fork.branches {
+			if let (Some(parent), Some(point)) = (&branch.parent_branch_id, &branch.parent_message_id) {
+				let effective_leaf = branch_leaf.get(parent).cloned().flatten();
+				let mut cursor = effective_leaf.as_deref(); let mut reachable = std::collections::HashSet::new();
+				while let Some(id) = cursor { if !reachable.insert(id) { break; } cursor = fork.messages.iter().find(|m| m.id == id).and_then(|m| m.parent_message_id.as_deref()); }
+				if !reachable.contains(point.as_str()) { return Err(StoreError::Validation("fork branch point is not on parent ancestry".into())); }
+			}
+		}
+		if let Some(projection) = &fork.projection {
+			let mut seen = std::collections::HashSet::new();
+			let branch_messages = branch_messages_tx(&tx, &fork.active_branch_id)?;
+			let branch_positions: std::collections::HashMap<&str, usize> = branch_messages.iter().enumerate().map(|(i, m)| (m.id.as_str(), i)).collect();
+			let mut kept_entries = Vec::with_capacity(projection.kept.len());
+			for id in &projection.kept {
+				if !seen.insert(id) { return Err(StoreError::Validation(format!("projection references duplicate message {id}"))); }
+				let row: String = tx.query_row("SELECT payload_json FROM messages WHERE id = ?1", params![id], |r| r.get(0)).optional()?.ok_or_else(|| StoreError::Validation(format!("projection references missing target message {id}")))?;
+				let entry: crate::session::MessageEntry = serde_json::from_str(&row).map_err(|e| StoreError::Corrupt(format!("projection kept entry {id} is not a message entry: {e}")))?;
+				if entry.kind != "message" { return Err(StoreError::Validation(format!("projection kept entry {id} has invalid kind"))); }
+				kept_entries.push(entry);
+			}
+			let kept_on_branch: Vec<usize> = projection.kept.iter().filter_map(|id| branch_positions.get(id.as_str()).copied()).collect();
+			if kept_on_branch.windows(2).any(|pair| pair[0] >= pair[1]) { return Err(StoreError::Validation("fork projection order is invalid".into())); }
+			let mut synthetic_pending = pending_synthetic_call_counts(&projection.synthetic)?;
+			if !projection.kept.is_empty() && !validate_kept_messages_tx(&tx, &fork.session.id, &projection.kept, &branch_messages, &mut synthetic_pending)? { return Err(StoreError::Validation("fork projection lineage is invalid".into())); }
+			let mut runtime_replay = Vec::with_capacity(projection.synthetic.len() + kept_entries.len());
+			for synthetic in &projection.synthetic { runtime_replay.push(serde_json::from_value::<pi_agent::state::Message>(synthetic.clone()).map_err(|e| StoreError::Corrupt(format!("invalid projection synthetic message: {e}")))?); }
+			runtime_replay.extend(crate::runtime::history_messages_from_entries(&kept_entries).map_err(|e| StoreError::Corrupt(format!("invalid projected replay: {e}")))?);
+			crate::durable_session::validate_runtime_replay(&runtime_replay)?;
+			if let Some(anchor) = &projection.anchor { let owner: Option<String> = tx.query_row("SELECT session_id FROM messages WHERE id = ?1", params![anchor], |r| r.get(0)).optional()?; if owner.as_deref() != Some(fork.session.id.as_str()) || !branch_positions.contains_key(anchor.as_str()) { return Err(StoreError::Validation(format!("projection anchor is not on active ancestry: {anchor}"))); } }
+		}
+		let mut seen_provenance = HashSet::new();
+		for entry in provenance {
+			if !seen_provenance.insert(entry.message_id.clone()) { return Err(StoreError::Validation(format!("duplicate fork provenance for {}", entry.message_id))); }
+			let message = fork.messages.iter().find(|m| m.id == entry.message_id).ok_or_else(|| StoreError::Validation("fork provenance references unknown message".into()))?;
+			if !referenced_execution_ids(std::iter::once(&message.payload)).contains(&entry.source_execution_id) { return Err(StoreError::Validation("fork provenance execution does not match the message".into())); }
+			if extract_tool_result_call_id(&message.payload).as_deref() != Some(entry.provider_call_id.as_str()) { return Err(StoreError::Validation(format!("fork provenance provider call id does not match tool result for {}", entry.message_id))); }
+		}
+		let mut effective_provenance = Vec::new();
+		for message in &fork.messages {
+			for execution_id in referenced_execution_ids(std::iter::once(&message.payload)) {
+				let call_id = extract_tool_result_call_id(&message.payload).ok_or_else(|| {
+					StoreError::Validation(format!("fork message {} references an execution without a toolCallId", message.id))
+				})?;
+				if provenance.is_empty() {
+					// Public entry point: derive from the fork's direct source session.
+					// Single consistent read at fork time; there is no supplied value to
+					// contradict, so no target-time re-read race. The execution's provider
+					// call id must match this tool result, otherwise the pairing is forged.
+					let (resolved, provider_call_id): (bool, String) = match fork.session.parent_session_id.as_deref() {
+						Some(parent) => tx
+							.query_row("SELECT outcome_json IS NOT NULL, provider_call_id FROM executions WHERE execution_id = ?1 AND session_id = ?2", params![execution_id, parent], |r| Ok((r.get(0)?, r.get(1)?)))
+							.optional()?
+							.ok_or_else(|| StoreError::Validation(format!(
+								"fork message {} references execution {execution_id} with no local row in the source session",
+								message.id
+							)))?,
+						None => {
+							return Err(StoreError::Validation(format!(
+								"fork message {} references execution {execution_id} without a source session",
+								message.id
+							)))
+						},
+					};
+					if provider_call_id != call_id {
+						return Err(StoreError::Validation(format!(
+							"fork message {} toolCallId {call_id} does not match execution {execution_id} provider call id {provider_call_id}",
+							message.id
+						)));
+					}
+					effective_provenance.push(ForkProvenance::new(message.id.clone(), execution_id, call_id, resolved));
+					continue;
+				}
+				// Crate-internal fork path: the captured source-snapshot classification is
+				// authoritative. It was read atomically with the messages, so a later outcome
+				// change in the source database MUST NOT be re-read here and MUST NOT turn the
+				// captured value into a conflict.
+				let entry = provenance.iter().find(|entry| entry.message_id == message.id && entry.source_execution_id == execution_id).ok_or_else(|| {
+					StoreError::Validation(format!(
+						"fork message {} references execution {execution_id} without a captured provenance entry",
+						message.id
+					))
+				})?;
+				if entry.provider_call_id != call_id {
+					return Err(StoreError::Validation(format!(
+						"fork message {} toolCallId {call_id} does not match captured provider call id {}",
+						message.id, entry.provider_call_id
+					)));
+				}
+				if let Some(parent) = fork.session.parent_session_id.as_deref() {
+					let owned_provider: Option<String> = tx
+						.query_row("SELECT provider_call_id FROM executions WHERE execution_id = ?1 AND session_id = ?2", params![execution_id, parent], |r| r.get(0))
+						.optional()?;
+					if let Some(owned_provider) = owned_provider {
+						if owned_provider != entry.provider_call_id {
+							return Err(StoreError::Conflict(format!(
+								"fork provenance provider call id {} conflicts with execution {execution_id} in the source session",
+								entry.provider_call_id
+							)));
+						}
+					}
+				}
+				effective_provenance.push(entry.clone());
+			}
+		}
+		for entry in &effective_provenance {
+			let existing: Option<(String, String, i64)> = tx.query_row("SELECT source_execution_id, provider_call_id, outcome_resolved FROM fork_provenance WHERE message_id = ?1", params![entry.message_id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?))).optional()?;
+			if let Some((source, provider, resolved)) = existing {
+				if source != entry.source_execution_id || provider != entry.provider_call_id || (resolved != 0) != entry.outcome_resolved { return Err(StoreError::Conflict(format!("fork provenance conflict for {}", entry.message_id))); }
+				continue;
+			}
+			tx.execute("INSERT INTO fork_provenance (message_id, session_id, source_execution_id, provider_call_id, outcome_resolved) VALUES (?1, ?2, ?3, ?4, ?5)", params![entry.message_id, fork.session.id, entry.source_execution_id, entry.provider_call_id, i64::from(entry.outcome_resolved)])?;
+		}
+		let stored_leaf: Option<String> = tx.query_row("SELECT leaf_message_id FROM branches WHERE id = ?1", params![fork.active_branch_id], |r| r.get(0))?;
+		let inherited_leaf = fork.branches.iter().find(|b| b.id == fork.active_branch_id).and_then(|b| b.parent_message_id.clone());
+		let effective_leaf = stored_leaf.clone().or_else(|| inherited_leaf.clone());
+		if let Some(leaf) = &fork.active_leaf_message_id {
+			let owns_leaf: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM messages WHERE id = ?1 AND session_id = ?2 AND branch_id = ?3)", params![leaf, fork.session.id, fork.active_branch_id], |r| r.get(0))?;
+			if !owns_leaf && inherited_leaf.as_deref() != Some(leaf.as_str()) { return Err(StoreError::Validation("active leaf does not belong to active branch".into())); }
+		} else if effective_leaf.is_some() { return Err(StoreError::Validation("active leaf cannot be empty".into())); }
+		if let Some(leaf) = &fork.active_leaf_message_id { let stored = if inherited_leaf.as_deref() == Some(leaf.as_str()) { None } else { Some(leaf.clone()) }; tx.execute("UPDATE branches SET leaf_message_id = ?1 WHERE id = ?2", params![stored, fork.active_branch_id])?; }
+		tx.execute("UPDATE sessions SET active_branch_id = ?1, updated_at_ms = ?2 WHERE id = ?3", params![fork.active_branch_id, now, fork.session.id])?;
+		tx.commit()?; Ok(())
+	}
+}
+
 
 /// A tool execution intent. The execution key is generated by the store and is
 /// deliberately separate from `provider_call_id`.
@@ -430,6 +831,134 @@ impl SqliteStore {
 		Self::from_connection(PathBuf::from(":memory:"), connection)
 	}
 
+	/// Open an existing database for SELECT-only reads. Refuses missing or empty
+	/// paths; never creates directories, never migrates, never switches WAL.
+	pub fn open_read_only(path: impl Into<PathBuf>) -> StoreResult<Self> {
+		let path = path.into();
+		if path.as_os_str().is_empty() {
+			return Err(StoreError::Validation(
+				"session store path must not be empty".to_string(),
+			));
+		}
+		if !path.exists() {
+			return Err(StoreError::NotFound(format!(
+				"session database {} does not exist",
+				path.display()
+			)));
+		}
+		let connection =
+			Connection::open_with_flags(&path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+		connection.busy_timeout(std::time::Duration::from_secs(5))?;
+		connection.pragma_update(None, "foreign_keys", "ON")?;
+		Ok(Self { path, connection })
+	}
+
+	/// One deferred read transaction: session header, active branch leaf, every
+	/// session message row, and the active branch chain. No recovery, no
+	/// reconcile, no writes. Replay validation runs on decoded branch messages.
+	pub fn load_session_snapshot(&self, session_id: &str) -> StoreResult<SessionSnapshot> {
+		validate_id("session id", session_id)?;
+		// Deferred read transaction: subsequent queries on this connection share it.
+		let transaction = self.connection.unchecked_transaction()?;
+		let record = self.session(session_id)?.ok_or_else(|| {
+			StoreError::NotFound(format!("session {session_id} not found"))
+		})?;
+		let branch_id = record.active_branch_id.clone().ok_or_else(|| {
+			StoreError::Corrupt(format!("session {session_id} has no active branch"))
+		})?;
+		let branch = self.branch(&branch_id)?.ok_or_else(|| {
+			StoreError::Corrupt(format!("branch {branch_id} not found"))
+		})?;
+		if branch.session_id != session_id {
+			return Err(StoreError::Corrupt(format!(
+				"active branch {branch_id} belongs to session {}, not {session_id}",
+				branch.session_id
+			)));
+		}
+		let leaf = branch.leaf_message_id.clone();
+		let session_messages = self.session_messages(session_id)?;
+		let branch_messages = self.branch_messages(&branch_id)?;
+		let branches = self.session_branches(session_id)?;
+		let projection = match record.payload.get("durableProjection") {
+			None => None,
+			Some(value) => Some(parse_stored_projection(value)?),
+		};
+		let referenced = referenced_execution_ids(session_messages.iter().map(|m| &m.payload));
+		let executions = executions_by_ids_conn(&self.connection, &referenced)?;
+		let provenance = fork_provenance_conn(&self.connection, session_id)?;
+		// Only the active branch is validated here. Sibling branches that the fork
+		// will prune may legitimately reference external executions (for example a
+		// branch dropped by an older fork); the fork preflight validates exactly the
+		// messages it copies, including kept off-branch ancestry.
+		for message in &branch_messages {
+			for execution_id in referenced_execution_ids(std::iter::once(&message.payload)) {
+				let owned = executions.iter().find(|e| e.execution_id == execution_id && e.session_id == session_id);
+				let copied = provenance.iter().find(|p| p.message_id == message.id && p.source_execution_id == execution_id);
+				if let Some(owned) = owned {
+					if extract_tool_result_call_id(&message.payload).as_deref() != Some(owned.provider_call_id.as_str()) {
+						return Err(StoreError::Corrupt(format!(
+							"tool result for execution {execution_id} does not carry provider call id {}",
+							owned.provider_call_id
+						)));
+					}
+				}
+				match (copied, owned) {
+					(Some(copied), Some(owned)) if copied.outcome_resolved != owned.outcome.is_some() || copied.provider_call_id != owned.provider_call_id => {
+						return Err(StoreError::Corrupt(format!(
+							"fork provenance conflicts with local execution {execution_id} for message {}",
+							message.id
+						)));
+					},
+					(Some(_), _) | (None, Some(_)) => {},
+					(None, None) => {
+						return Err(StoreError::Corrupt(format!(
+							"messages reference unknown execution(s): {execution_id}"
+						)));
+					},
+				}
+			}
+		}
+		for entry in &provenance {
+			let message = session_messages.iter().find(|m| m.id == entry.message_id).ok_or_else(|| {
+				StoreError::Corrupt(format!("fork provenance references unknown message {}", entry.message_id))
+			})?;
+			if !referenced_execution_ids(std::iter::once(&message.payload)).contains(&entry.source_execution_id) {
+				return Err(StoreError::Corrupt(format!(
+					"fork provenance for message {} names execution {} which the message does not reference",
+					entry.message_id, entry.source_execution_id
+				)));
+			}
+			if extract_tool_result_call_id(&message.payload).as_deref() != Some(entry.provider_call_id.as_str()) {
+				return Err(StoreError::Corrupt(format!(
+					"fork provenance for message {} names provider call id {} which the tool result does not carry",
+					entry.message_id, entry.provider_call_id
+				)));
+			}
+		}
+		transaction.commit()?;
+		let mut decoded_branch = Vec::with_capacity(branch_messages.len());
+		for row in &branch_messages {
+			let entry = serde_json::from_value::<crate::session::SessionEntry>(row.payload.clone()).map_err(|error| StoreError::Corrupt(format!("invalid branch entry {}: {error}", row.id)))?;
+			if entry.kind == "message" {
+				let message = serde_json::from_value::<crate::session::MessageEntry>(row.payload.clone()).map_err(|error| StoreError::Corrupt(format!("invalid branch message {}: {error}", row.id)))?;
+				decoded_branch.push(message);
+			}
+		}
+		crate::session::derive_turn_history(&decoded_branch).map_err(StoreError::Corrupt)?;
+		Ok(SessionSnapshot {
+			session_id: session_id.to_string(),
+			header_payload: record.payload,
+			branch_id,
+			leaf,
+			session_messages,
+			branch_messages,
+			projection,
+			branches,
+			executions,
+			provenance,
+		})
+	}
+
 	fn from_connection(path: PathBuf, mut connection: Connection) -> StoreResult<Self> {
 		connection.busy_timeout(std::time::Duration::from_secs(5))?;
 		connection.pragma_update(None, "foreign_keys", "ON")?;
@@ -475,6 +1004,7 @@ impl SqliteStore {
 					)));
 				}
 				transaction.execute_batch(SCHEMA_V1_DDL)?;
+				transaction.execute_batch(SCHEMA_V3_MIGRATION_DDL)?;
 				transaction.execute(
 					"INSERT INTO schema_version (id, version) VALUES (1, ?1)",
 					params![SCHEMA_VERSION],
@@ -482,6 +1012,14 @@ impl SqliteStore {
 			},
 			Some(1) => {
 				transaction.execute_batch(SCHEMA_V2_MIGRATION_DDL)?;
+				transaction.execute_batch(SCHEMA_V3_MIGRATION_DDL)?;
+				transaction.execute(
+					"UPDATE schema_version SET version = ?1 WHERE id = 1",
+					params![SCHEMA_VERSION],
+				)?;
+			},
+			Some(2) => {
+				transaction.execute_batch(SCHEMA_V3_MIGRATION_DDL)?;
 				transaction.execute(
 					"UPDATE schema_version SET version = ?1 WHERE id = 1",
 					params![SCHEMA_VERSION],
@@ -552,6 +1090,7 @@ impl SqliteStore {
 		transaction.commit()?;
 		Ok(())
 	}
+
 
 	/// Load a session by id.
 	pub fn session(&self, id: &str) -> StoreResult<Option<SessionRecord>> {
@@ -1427,7 +1966,7 @@ impl SqliteStore {
 			let Some(branch) = self.branch(&active_branch_id)? else {
 				continue;
 			};
-			let Some(leaf_id) = branch.leaf_message_id else {
+			let Some(leaf_id) = branch.leaf_message_id.clone().or_else(|| branch.parent_message_id.clone()) else {
 				continue;
 			};
 			let Some(leaf_msg) = self.message(&leaf_id)? else {
@@ -1507,6 +2046,217 @@ impl SqliteStore {
 
 		Ok(recovered_count)
 	}
+
+	/// Interrupted-unknown text written for trailing unresolved intents on reopen.
+	/// Knowledge message only — never a durable outcome.
+	pub const INTERRUPTED_UNKNOWN_OUTCOME: &'static str =
+		"Execution interrupted; outcome unknown; not retried.";
+
+	/// Close trailing unanswered tool calls that still have a durable intent but
+	/// no outcome. Writes an error `toolResult` on the active branch only; leaves
+	/// `outcome_json` NULL so the intent stays unresolved. Missing intents and
+	/// calls that already have a result (including filter denials) are unchanged.
+	/// Duplicate call ids inside the trailing assistant batch, or a reused
+	/// `provider_call_id` that an earlier assistant on this branch also declared,
+	/// fail closed — historical unresolved intents must not close a newer
+	/// missing/denied call.
+	pub fn recover_unresolved_intents(&mut self, session_id: &str) -> StoreResult<usize> {
+		validate_id("session id", session_id)?;
+		let now = now_ms();
+		let transaction = self
+			.connection
+			.transaction_with_behavior(TransactionBehavior::Immediate)?;
+
+		let active_branch_id: Option<String> = transaction
+			.query_row(
+				"SELECT active_branch_id FROM sessions WHERE id = ?1",
+				params![session_id],
+				|row| row.get(0),
+			)
+			.optional()?
+			.flatten();
+		let Some(active_branch_id) = active_branch_id else {
+			transaction.commit()?;
+			return Ok(0);
+		};
+
+		let branch_messages = branch_messages_tx(&transaction, &active_branch_id)?;
+		let Some((asst_idx, asst)) = trailing_assistant_batch(&branch_messages) else {
+			transaction.commit()?;
+			return Ok(0);
+		};
+
+		let call_counts = extract_assistant_tool_call_counts(&asst.payload);
+		if call_counts.values().any(|count| *count > 1) {
+			return Err(StoreError::Corrupt(format!(
+				"ambiguous duplicate toolCallId in trailing assistant batch {}",
+				asst.id
+			)));
+		}
+		if call_counts.is_empty() {
+			transaction.commit()?;
+			return Ok(0);
+		}
+
+		let mut answered: HashSet<String> = HashSet::new();
+		for msg in &branch_messages[asst_idx + 1..] {
+			let Some(call_id) = extract_tool_result_call_id(&msg.payload) else {
+				continue;
+			};
+			if !answered.insert(call_id.clone()) {
+				return Err(StoreError::Corrupt(format!(
+					"ambiguous duplicate toolResult for {call_id} after assistant {}",
+					asst.id
+				)));
+			}
+		}
+
+		let mut unresolved_stmt = transaction.prepare(
+			"SELECT execution_id, session_id, branch_id, provider_call_id, tool_name, intent_json, created_at_ms \
+			 FROM executions \
+			 WHERE session_id = ?1 AND branch_id = ?2 AND outcome_json IS NULL \
+			 ORDER BY seq",
+		)?;
+		let unresolved_rows = unresolved_stmt.query_map(params![session_id, active_branch_id], |row| {
+			Ok((
+				row.get::<_, String>(0)?,
+				row.get::<_, String>(1)?,
+				row.get::<_, String>(2)?,
+				row.get::<_, String>(3)?,
+				row.get::<_, String>(4)?,
+				row.get::<_, String>(5)?,
+				row.get::<_, i64>(6)?,
+			))
+		})?;
+		let mut intents_by_call: HashMap<String, Vec<UnresolvedIntent>> = HashMap::new();
+		for row in unresolved_rows {
+			let (execution_id, sess, branch_id, provider_call_id, tool_name, json, created_at_ms) =
+				row?;
+			intents_by_call
+				.entry(provider_call_id.clone())
+				.or_default()
+				.push(UnresolvedIntent {
+					execution_id,
+					session_id: sess,
+					branch_id,
+					provider_call_id,
+					tool_name,
+					payload: decode_json(&json)?,
+					created_at_ms,
+				});
+		}
+		drop(unresolved_stmt);
+
+		let mut recovered_count = 0usize;
+		let mut leaf_id = branch_messages.last().map(|message| message.id.clone()).or_else(|| {
+			transaction.query_row("SELECT parent_message_id FROM branches WHERE id = ?1", params![active_branch_id], |row| row.get::<_, Option<String>>(0)).optional().ok().flatten().flatten()
+		}).unwrap_or_else(|| asst.id.clone());
+
+		// Stable order: assistant declaration order.
+		let ordered_calls: Vec<String> = {
+			let mut seen = HashSet::new();
+			let mut ordered = Vec::new();
+			for part_id in assistant_tool_call_ids_in_order(&asst.payload) {
+				if seen.insert(part_id.clone()) {
+					ordered.push(part_id);
+				}
+			}
+			ordered
+		};
+
+		for call_id in ordered_calls {
+			if answered.contains(&call_id) {
+				continue;
+			}
+			let Some(matches) = intents_by_call.get(&call_id) else {
+				// Missing intent: leave dangling for seed refuse (unchanged).
+				continue;
+			};
+			if matches.len() != 1 {
+				return Err(StoreError::Corrupt(format!(
+					"ambiguous unresolved intents for toolCallId {call_id}"
+				)));
+			}
+			// Reused provider ids across turns are not uniquely attributable to
+			// this trailing batch; never synthesize a result from a historical
+			// unresolved intent onto a newer missing/denied call.
+			if earlier_unanswered_declaration(&transaction, &branch_messages, asst_idx, &call_id)? {
+				return Err(StoreError::Corrupt(format!(
+					"unresolved intent for reused toolCallId {call_id} is not uniquely attributable to trailing assistant {}; recovery refused",
+					asst.id
+				)));
+			}
+			let intent = &matches[0];
+
+			// Recheck: still unresolved inside the write lock.
+			let outcome_still_null: bool = transaction.query_row(
+				"SELECT outcome_json IS NULL FROM executions WHERE execution_id = ?1",
+				params![intent.execution_id],
+				|row| row.get(0),
+			)?;
+			if !outcome_still_null {
+				continue;
+			}
+
+			let msg_id = format!("msg-int-{}", intent.execution_id);
+			let already: bool = transaction.query_row(
+				"SELECT EXISTS(SELECT 1 FROM messages WHERE id = ?1)",
+				params![msg_id],
+				|row| row.get(0),
+			)?;
+			if already {
+				answered.insert(call_id);
+				continue;
+			}
+
+			let (current_leaf, parent_point): (Option<String>, Option<String>) = transaction.query_row("SELECT leaf_message_id, parent_message_id FROM branches WHERE id = ?1", params![active_branch_id], |row| Ok((row.get(0)?, row.get(1)?)))?;
+			if current_leaf.or(parent_point).as_deref() != Some(leaf_id.as_str()) {
+				return Err(StoreError::Corrupt(format!("active branch effective leaf changed during unresolved intent recovery for session {session_id}")));
+			}
+
+			let iso_ts = crate::output::iso8601(SystemTime::now());
+			let sess_msg = json!({
+				"role": "toolResult",
+				"toolCallId": intent.provider_call_id,
+				"toolName": intent.tool_name,
+				"content": Self::INTERRUPTED_UNKNOWN_OUTCOME,
+				"isError": true,
+				"timestamp": now,
+				"details": {
+					"executionId": intent.execution_id,
+					"interruptedUnknown": true,
+				},
+			});
+			let entry = json!({
+				"type": "message",
+				"id": msg_id,
+				"parentId": leaf_id,
+				"timestamp": iso_ts,
+				"message": sess_msg,
+			});
+			let new_msg = NewMessage {
+				id: msg_id.clone(),
+				session_id: session_id.to_string(),
+				branch_id: active_branch_id.clone(),
+				parent_message_id: Some(leaf_id.clone()),
+				payload: entry,
+			};
+			append_message_tx(&transaction, &new_msg, now)?;
+			// Leave durableProjection.kept untouched. A mixed batch may already
+			// have sibling toolResults on the branch that are not yet in kept
+			// (crash after finish_execution, before set_projection). Pushing only
+			// the synthetic leaf into kept would hide those siblings from
+			// reconcile's suffix backfill. `reconcile_durable_projection` runs
+			// next on open and appends every suffix message in branch order.
+			answered.insert(call_id);
+			leaf_id = msg_id;
+			recovered_count += 1;
+		}
+
+		transaction.commit()?;
+		Ok(recovered_count)
+	}
+
 
 	/// Reconcile a session's `durableProjection.kept` with the active branch suffix.
 	///
@@ -2868,76 +3618,137 @@ fn extract_tool_result_call_id(payload: &Value) -> Option<String> {
 		.map(str::to_string)
 }
 
+/// Validates the projection synthetic prefix with the same transition rules as
+/// [`crate::durable_session::validate_runtime_replay`] and returns the calls
+/// still pending, which kept rows may complete.
+fn pending_synthetic_call_counts(messages: &[Value]) -> StoreResult<HashMap<String, usize>> {
+	let mut pending = HashMap::new();
+	for value in messages {
+		let message: pi_agent::state::Message = serde_json::from_value(value.clone())
+			.map_err(|e| StoreError::Corrupt(format!("invalid projection synthetic message: {e}")))?;
+		match message.role {
+			pi_agent::Role::Assistant => {
+				if !pending.is_empty() { return Err(StoreError::Corrupt("synthetic projection assistant interrupts unresolved tool calls".into())); }
+				if !message.tool_calls.is_empty() {
+					for call in &message.tool_calls {
+						*pending.entry(call.id.clone()).or_default() += 1;
+					}
+				} else {
+					for part in &message.parts {
+						if let pi_agent::ContentPart::ToolCall { id, .. } = part {
+							*pending.entry(id.clone()).or_default() += 1;
+						}
+					}
+				}
+			},
+			pi_agent::Role::Tool => {
+				let id = message.tool_call_id.as_deref().ok_or_else(|| StoreError::Corrupt("synthetic projection tool result missing toolCallId".into()))?;
+				let Some(count) = pending.get_mut(id) else { return Err(StoreError::Corrupt(format!("synthetic projection tool result has no pending call {id}"))); };
+				*count -= 1;
+				if *count == 0 {
+					pending.remove(id);
+				}
+			},
+			pi_agent::Role::User if !pending.is_empty() => return Err(StoreError::Corrupt("synthetic projection user message interrupts unresolved tool calls".into())),
+			_ => {},
+		}
+	}
+	Ok(pending)
+}
+
+/// Execution ids referenced by stored message payloads (`details.executionId`
+/// or `details.execution_id`), used to snapshot fork provenance.
+pub(crate) fn referenced_execution_ids<'a>(payloads: impl Iterator<Item = &'a Value>) -> HashSet<String> {
+	let mut ids = HashSet::new();
+	for payload in payloads {
+		let details = payload.get("message").and_then(|m| m.get("details")).or_else(|| payload.get("details"));
+		let Some(details) = details else { continue; };
+		if let Some(id) = details.get("executionId").or_else(|| details.get("execution_id")).and_then(Value::as_str) {
+			ids.insert(id.to_string());
+		}
+	}
+	ids
+}
+
+/// Strict shape for a stored durable projection. Absent `kept`/`synthetic`
+/// arrays are historically valid defaults (empty); present members of the wrong
+/// type are corruption rather than an absent projection.
+pub(crate) fn parse_stored_projection(value: &Value) -> StoreResult<StoredProjection> {
+	let object = value.as_object().ok_or_else(|| StoreError::Corrupt("durableProjection must be an object".to_string()))?;
+	if let Some(kept) = object.get("kept") {
+		for id in kept.as_array().ok_or_else(|| StoreError::Corrupt("durableProjection.kept must be an array".to_string()))? {
+			if id.as_str().is_none() { return Err(StoreError::Corrupt("durableProjection.kept must contain only strings".to_string())); }
+		}
+	}
+	if let Some(synthetic) = object.get("synthetic") {
+		synthetic.as_array().ok_or_else(|| StoreError::Corrupt("durableProjection.synthetic must be an array".to_string()))?;
+	}
+	for key in ["anchor", "firstKeptEntryId"] {
+		if let Some(found) = object.get(key) {
+			if !found.is_null() && found.as_str().is_none() { return Err(StoreError::Corrupt(format!("durableProjection.{key} must be a string or null"))); }
+		}
+	}
+	// Canonical `anchor` wins, including an explicit null; the legacy
+	// `firstKeptEntryId` only fills in when `anchor` is absent. Normalizing
+	// before deserialization keeps both fields legal together.
+	let mut normalized = object.clone();
+	if normalized.contains_key("anchor") {
+		normalized.remove("firstKeptEntryId");
+	} else if let Some(legacy) = normalized.remove("firstKeptEntryId") {
+		normalized.insert("anchor".to_string(), legacy);
+	}
+	serde_json::from_value(Value::Object(normalized)).map_err(|error| StoreError::Corrupt(format!("invalid durableProjection: {error}")))
+}
+
 fn validate_kept_messages_tx(
 	transaction: &Transaction<'_>,
 	session_id: &str,
 	kept_ids: &[String],
 	branch_messages: &[MessageRecord],
+	synthetic_pending: &mut HashMap<String, usize>,
 ) -> StoreResult<bool> {
 	let branch_msg_map: HashMap<&str, &MessageRecord> =
 		branch_messages.iter().map(|m| (m.id.as_str(), m)).collect();
 
 	let mut pending_tool_calls: HashMap<String, usize> = HashMap::new();
-
+	let mut pending_assistant_id: Option<&str> = None;
 	for id in kept_ids {
 		if let Some(msg) = branch_msg_map.get(id.as_str()) {
-			let role = msg
-				.payload
-				.get("message")
-				.and_then(|m| m.get("role"))
-				.or_else(|| msg.payload.get("role"))
-				.and_then(Value::as_str);
-
+			let role = msg.payload.get("message").and_then(|m| m.get("role")).or_else(|| msg.payload.get("role")).and_then(Value::as_str);
 			match role {
-				Some("assistant") => {
-					pending_tool_calls = extract_assistant_tool_call_counts(&msg.payload);
-				},
-				Some("toolResult") => {
-					if let Some(call_id) = extract_tool_result_call_id(&msg.payload) {
-						decrement_call_count(&mut pending_tool_calls, &call_id);
-					}
-				},
-				_ => {
-					pending_tool_calls.clear();
-				},
+				Some("assistant") => { if !synthetic_pending.is_empty() { return Ok(false); } pending_assistant_id = Some(msg.id.as_str()); pending_tool_calls = extract_assistant_tool_call_counts(&msg.payload); },
+				Some("toolResult") => { if let Some(call_id) = extract_tool_result_call_id(&msg.payload) { if pending_assistant_id.is_none() { if let Some(count) = synthetic_pending.get_mut(&call_id) { *count -= 1; if *count == 0 { synthetic_pending.remove(&call_id); } } } else { decrement_call_count(&mut pending_tool_calls, &call_id); } } },
+				Some("user") => { if !synthetic_pending.is_empty() { return Ok(false); } pending_tool_calls.clear(); pending_assistant_id = None; },
+				_ => { pending_tool_calls.clear(); pending_assistant_id = None; }
 			}
 		} else {
-			let row: Option<String> = transaction
-				.query_row(
-					"SELECT payload_json FROM messages WHERE id = ?1 AND session_id = ?2",
-					params![id, session_id],
-					|r| r.get(0),
-				)
-				.optional()?;
-
-			let Some(payload_json) = row else {
-				return Ok(false);
-			};
-
-			let Ok(payload) = decode_json(&payload_json) else {
-				return Ok(false);
-			};
-
-			let role = payload
-				.get("message")
-				.and_then(|m| m.get("role"))
-				.or_else(|| payload.get("role"))
-				.and_then(Value::as_str);
-
-			if role != Some("toolResult") {
-				return Ok(false);
+			let row: Option<(String, Option<String>)> = transaction.query_row("SELECT payload_json, parent_message_id FROM messages WHERE id = ?1 AND session_id = ?2", params![id, session_id], |r| Ok((r.get(0)?, r.get(1)?))).optional()?;
+			let Some((payload_json, mut parent_id)) = row else { return Ok(false); };
+			let Ok(payload) = decode_json(&payload_json) else { return Ok(false); };
+			let role = payload.get("message").and_then(|m| m.get("role")).or_else(|| payload.get("role")).and_then(Value::as_str);
+			if role != Some("toolResult") { return Ok(false); }
+			let Some(call_id) = extract_tool_result_call_id(&payload) else { return Ok(false); };
+			let mut reaches_assistant = false;
+			let mut seen = HashSet::new();
+			while let Some(parent) = parent_id.take() {
+				if !seen.insert(parent.clone()) { return Ok(false); }
+				let ancestor: Option<(String, Option<String>)> = transaction.query_row("SELECT payload_json, parent_message_id FROM messages WHERE id = ?1 AND session_id = ?2", params![parent, session_id], |r| Ok((r.get(0)?, r.get(1)?))).optional()?;
+				let Some((ancestor_payload, ancestor_parent)) = ancestor else { return Ok(false); };
+				let ancestor_value = decode_json(&ancestor_payload).map_err(|_| StoreError::Corrupt("invalid ancestor payload".to_string()))?;
+				let ancestor_role = ancestor_value.get("message").and_then(|m| m.get("role")).or_else(|| ancestor_value.get("role")).and_then(Value::as_str);
+				if ancestor_role == Some("assistant") {
+					let ancestry_calls = extract_assistant_tool_call_counts(&ancestor_value);
+					reaches_assistant = if let Some(pending_id) = pending_assistant_id { pending_id == parent.as_str() } else { synthetic_pending.contains_key(&call_id) && ancestry_calls.contains_key(&call_id) };
+					break;
+				}
+				if ancestor_role != Some("toolResult") { return Ok(false); }
+				parent_id = ancestor_parent;
 			}
-
-			let Some(call_id) = extract_tool_result_call_id(&payload) else {
-				return Ok(false);
-			};
-
-			if !decrement_call_count(&mut pending_tool_calls, &call_id) {
-				return Ok(false);
-			}
+			if !reaches_assistant { return Ok(false); }
+			if pending_assistant_id.is_some() { if !decrement_call_count(&mut pending_tool_calls, &call_id) { return Ok(false); } }
+			else if let Some(count) = synthetic_pending.get_mut(&call_id) { *count -= 1; if *count == 0 { synthetic_pending.remove(&call_id); } }
 		}
 	}
-
 	Ok(true)
 }
 
@@ -2963,49 +3774,50 @@ fn reconcile_durable_projection_tx(
 	let Some(proj_val) = session_payload.get_mut("durableProjection") else {
 		return Ok(0);
 	};
+	parse_stored_projection(proj_val)?;
 	let Some(proj_obj) = proj_val.as_object_mut() else {
-		return Ok(0);
+		return Err(StoreError::Corrupt("durableProjection must be an object".to_string()));
 	};
 	let anchor_id = proj_obj
 		.get("anchor")
 		.or_else(|| proj_obj.get("firstKeptEntryId"))
 		.and_then(Value::as_str)
 		.map(str::to_string);
-	let Some(kept_val) = proj_obj.get_mut("kept") else {
-		return Ok(0);
-	};
-	let Some(kept_arr) = kept_val.as_array_mut() else {
-		return Ok(0);
-	};
-
-	let kept_ids: Vec<String> = kept_arr
-		.iter()
-		.filter_map(Value::as_str)
-		.map(str::to_string)
-		.collect();
+	let synthetic_values = proj_obj
+		.get("synthetic")
+		.and_then(Value::as_array)
+		.cloned()
+		.unwrap_or_default();
+	let kept_ids: Vec<String> = proj_obj
+		.get("kept")
+		.and_then(Value::as_array)
+		.map(|kept| kept.iter().filter_map(Value::as_str).map(str::to_string).collect())
+		.unwrap_or_default();
 
 	let branch_messages = branch_messages_tx(transaction, &active_branch_id)?;
-	if branch_messages.is_empty() {
-		return Ok(0);
-	}
 
 	let last_kept_idx: Option<usize> = if kept_ids.is_empty() {
+		// Synthetic-only projection: the prefix alone must be a valid replay with
+		// no unresolved tool calls, since no kept row can complete them.
+		let replay_messages = synthetic_values
+			.iter()
+			.map(|value| {
+				serde_json::from_value::<pi_agent::state::Message>(value.clone())
+					.map_err(|e| StoreError::Corrupt(format!("invalid projection synthetic message: {e}")))
+			})
+			.collect::<StoreResult<Vec<_>>>()?;
+		crate::durable_session::validate_runtime_replay(&replay_messages)?;
 		// Only recover from an explicit compaction anchor. Never do an un-anchored
 		// fallback scan that could resurrect previously pruned history.
 		anchor_id.as_deref().and_then(|id| {
 			branch_messages.iter().position(|m| m.id == id)
 		})
 	} else {
-		let branch_id_set: HashSet<&str> = branch_messages.iter().map(|m| m.id.as_str()).collect();
-
-		if !validate_kept_messages_tx(transaction, session_id, &kept_ids, &branch_messages)? {
-			session_payload.as_object_mut().unwrap().remove("durableProjection");
-			let updated_json = encode_json(&session_payload)?;
-			transaction.execute(
-				"UPDATE sessions SET payload_json = ?1, updated_at_ms = ?2 WHERE id = ?3",
-				params![updated_json, now, session_id],
-			)?;
-			return Ok(0);
+		let mut synthetic_pending = pending_synthetic_call_counts(&synthetic_values)?;
+		if !validate_kept_messages_tx(transaction, session_id, &kept_ids, &branch_messages, &mut synthetic_pending)? {
+			return Err(StoreError::Corrupt(format!(
+				"durable projection lineage is invalid for session {session_id}"
+			)));
 		}
 		let mut last_idx = None;
 		let kept_set: HashSet<&str> = kept_ids.iter().map(String::as_str).collect();
@@ -3015,20 +3827,20 @@ fn reconcile_durable_projection_tx(
 				last_idx = Some(idx);
 			}
 		}
-		last_idx
+		last_idx.or_else(|| {
+			anchor_id
+				.as_deref()
+				.and_then(|id| branch_messages.iter().position(|m| m.id == id))
+		})
 	};
 
 	let Some(last_kept_idx) = last_kept_idx else {
 		if kept_ids.is_empty() && anchor_id.is_none() {
 			return Ok(0);
 		}
-		session_payload.as_object_mut().unwrap().remove("durableProjection");
-		let updated_json = encode_json(&session_payload)?;
-		transaction.execute(
-			"UPDATE sessions SET payload_json = ?1, updated_at_ms = ?2 WHERE id = ?3",
-			params![updated_json, now, session_id],
-		)?;
-		return Ok(0);
+		return Err(StoreError::Corrupt(format!(
+			"durable projection has no active branch anchor for session {session_id}"
+		)));
 	};
 
 	let suffix = &branch_messages[last_kept_idx + 1..];
@@ -3060,9 +3872,13 @@ fn reconcile_durable_projection_tx(
 		return Ok(0);
 	}
 
-	for id in &backfill_ids {
-		if !kept_arr.iter().any(|v| v.as_str() == Some(id.as_str())) {
-			kept_arr.push(Value::String(id.clone()));
+	{
+		let kept_val = proj_obj.entry("kept".to_string()).or_insert_with(|| Value::Array(Vec::new()));
+		let kept_arr = kept_val.as_array_mut().ok_or_else(|| StoreError::Corrupt("durableProjection.kept must be an array".to_string()))?;
+		for id in &backfill_ids {
+			if !kept_arr.iter().any(|v| v.as_str() == Some(id.as_str())) {
+				kept_arr.push(Value::String(id.clone()));
+			}
 		}
 	}
 
@@ -3073,6 +3889,174 @@ fn reconcile_durable_projection_tx(
 	)?;
 
 	Ok(backfill_ids.len())
+}
+
+fn trailing_assistant_batch(branch_messages: &[MessageRecord]) -> Option<(usize, &MessageRecord)> {
+	let mut idx = branch_messages.len();
+	while idx > 0 {
+		idx -= 1;
+		let record = &branch_messages[idx];
+		if record.payload.get("type").and_then(Value::as_str) != Some("message") {
+			continue;
+		}
+		let role = record
+			.payload
+			.get("message")
+			.and_then(|m| m.get("role"))
+			.or_else(|| record.payload.get("role"))
+			.and_then(Value::as_str);
+		match role {
+			Some("toolResult") => continue,
+			Some("assistant") => return Some((idx, record)),
+			_ => return None,
+		}
+	}
+	None
+}
+
+fn assistant_tool_call_ids_in_order(payload: &Value) -> Vec<String> {
+	let mut ids = Vec::new();
+	let parts = payload
+		.get("message")
+		.and_then(|m| m.get("content"))
+		.or_else(|| payload.get("content"))
+		.or_else(|| payload.get("parts"));
+	if let Some(parts) = parts.and_then(Value::as_array) {
+		for part in parts {
+			let is_tool_call = part
+				.get("type")
+				.or_else(|| part.get("kind"))
+				.and_then(Value::as_str)
+				== Some("toolCall");
+			if is_tool_call {
+				if let Some(id) = part
+					.get("id")
+					.or_else(|| part.get("toolCallId"))
+					.or_else(|| part.get("tool_call_id"))
+					.and_then(Value::as_str)
+				{
+					ids.push(id.to_string());
+				}
+			}
+		}
+	}
+	if !ids.is_empty() {
+		return ids;
+	}
+	let tool_calls = payload
+		.get("message")
+		.and_then(|m| m.get("tool_calls"))
+		.or_else(|| payload.get("tool_calls"))
+		.or_else(|| payload.get("toolCalls"));
+	if let Some(tool_calls) = tool_calls.and_then(Value::as_array) {
+		for call in tool_calls {
+			if let Some(id) = call
+				.get("id")
+				.or_else(|| call.get("toolCallId"))
+				.and_then(Value::as_str)
+			{
+				ids.push(id.to_string());
+			}
+		}
+	}
+	ids
+}
+
+
+/// True when earlier assistant declarations of `call_id` outnumber verified
+/// answers before the trailing assistant. Counts every declaration occurrence
+/// (duplicate ids inside one batch included) and every answer whose durable
+/// execution is resolved; unresolved or unknown executions never answer and an
+/// unknown execution id fails closed. Provider id reuse across answered turns
+/// must not block recovery of a unique trailing unresolved intent.
+fn earlier_unanswered_declaration(
+	transaction: &Transaction<'_>,
+	branch_messages: &[MessageRecord],
+	trailing_asst_idx: usize,
+	call_id: &str,
+) -> StoreResult<bool> {
+	let before = &branch_messages[..trailing_asst_idx];
+	let mut declarations = 0usize;
+	for msg in before {
+		if is_assistant_with_call(&msg.payload, call_id) {
+			declarations += extract_assistant_tool_call_counts(&msg.payload).get(call_id).copied().unwrap_or(1).max(1);
+		}
+	}
+	if declarations == 0 {
+		return Ok(false);
+	}
+	if !table_exists_conn(transaction, "fork_provenance")? {
+		return Err(StoreError::Corrupt(
+			"session store is missing the fork_provenance table".to_string(),
+		));
+	}
+	let mut verified = 0usize;
+	for msg in before {
+		if extract_tool_result_call_id(&msg.payload).as_deref() != Some(call_id) {
+			continue;
+		}
+		let details = msg.payload
+			.get("message")
+			.and_then(|m| m.get("details"))
+			.or_else(|| msg.payload.get("details"));
+		let execution_id = details.and_then(|details| details.get("executionId")).and_then(Value::as_str);
+		match execution_id {
+			// Legacy/manual results carry no durable execution to verify.
+			None => verified += 1,
+			Some(execution_id) => {
+				let owned = transaction
+					.query_row(
+						"SELECT outcome_json IS NOT NULL, provider_call_id FROM executions WHERE execution_id = ?1 AND session_id = ?2",
+						params![execution_id, msg.session_id],
+						|row| Ok((row.get::<_, bool>(0)?, row.get::<_, String>(1)?)),
+					)
+					.optional()?
+					.map(|(resolved, provider_call_id)| {
+						if provider_call_id != call_id {
+							return Err(StoreError::Corrupt(format!(
+								"toolResult for {call_id} does not match execution {execution_id} provider call id {provider_call_id}"
+							)));
+						}
+						Ok(resolved)
+					})
+					.transpose()?;
+				let copied = transaction
+					.query_row(
+						"SELECT outcome_resolved, provider_call_id FROM fork_provenance WHERE message_id = ?1 AND source_execution_id = ?2",
+						params![msg.id, execution_id],
+						|row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)),
+					)
+					.optional()?
+					.map(|(resolved, provider_call_id)| {
+						if provider_call_id != call_id {
+							return Err(StoreError::Corrupt(format!(
+								"fork provenance for {call_id} names provider call id {provider_call_id}"
+							)));
+						}
+						Ok(resolved)
+					})
+					.transpose()?;
+				match (copied, owned) {
+					(Some(copied), Some(owned)) if (copied != 0) != owned => {
+						return Err(StoreError::Corrupt(format!(
+							"toolResult for {call_id} has fork provenance conflicting with execution {execution_id}"
+						)))
+					},
+					(Some(1), _) => verified += 1,
+					(Some(0), _) => {},
+					(Some(_), _) => return Err(StoreError::Corrupt(format!("toolResult for {call_id} has invalid fork provenance"))),
+					(None, Some(true)) => verified += 1,
+					(None, Some(false)) => {},
+					(None, None) => {
+						return Err(StoreError::Corrupt(format!(
+							"toolResult for {call_id} references unknown execution or missing fork provenance {execution_id}"
+						)))
+					},
+				}
+			},
+		}
+	}
+	Ok(declarations > verified)
 }
 
 fn is_assistant_with_call(payload: &Value, provider_call_id: &str) -> bool {
@@ -3283,6 +4267,124 @@ mod tests {
 	use serde_json::json;
 
 	use super::*;
+	#[test]
+	fn fork_atomic_preserves_ancestry_and_projection() {
+		let mut store = SqliteStore::open_in_memory().expect("store");
+		store.create_fork_atomic(ForkWrite {
+			session: NewSession { id: "fork".into(), parent_session_id: Some("source".into()), payload: json!({"type":"session","id":"fork","timestamp":"2026-01-01T00:00:00Z","cwd":"/tmp","parentSession":"source"}), initial_branch_id: "branch".into(), initial_branch_payload: json!({}) },
+			branches: vec![NewBranch { id: "branch".into(), session_id: "fork".into(), parent_branch_id: None, parent_message_id: None, payload: json!({}) }], active_branch_id: "branch".into(), active_leaf_message_id: Some("m2".into()),
+			messages: vec![NewMessage { id: "m1".into(), session_id: "fork".into(), branch_id: "branch".into(), parent_message_id: None, payload: json!({"type":"message","id":"m1","timestamp":"2026-01-01T00:00:00Z","message":{"role":"user","content":"one","timestamp":1}}) }, NewMessage { id: "m2".into(), session_id: "fork".into(), branch_id: "branch".into(), parent_message_id: Some("m1".into()), payload: json!({"type":"message","id":"m2","parentId":"m1","timestamp":"2026-01-01T00:00:01Z","message":{"role":"assistant","content":"two","timestamp":2,"api":"openai","provider":"test","model":"model"}}) }], projection: Some(StoredProjection { kept: vec!["m1".into(), "m2".into()], synthetic: vec![json!({"role":"user","content":"summary","timestamp":3})], anchor: Some("m1".into()) }),
+		}).expect("fork");
+		let branch = store.branch("branch").expect("branch").expect("exists");
+		assert_eq!(branch.leaf_message_id.as_deref(), Some("m2"));
+		assert_eq!(store.session("fork").expect("session").expect("exists").parent_session_id.as_deref(), None);
+		let projection = &store.session("fork").expect("session").expect("exists").payload["durableProjection"];
+		assert_eq!(projection["kept"], json!(["m1", "m2"]));
+		assert_eq!(projection["anchor"], json!("m1"));
+		assert_eq!(projection["synthetic"][0]["role"], json!("user"));
+	}
+
+	#[test]
+	fn fork_atomic_rolls_back_on_mid_insert_failure() {
+		let mut store = SqliteStore::open_in_memory().expect("store");
+		let result = store.create_fork_atomic(ForkWrite {
+			session: NewSession { id: "rollback".into(), parent_session_id: None, payload: json!({"type":"session","id":"rollback","timestamp":"2026-01-01T00:00:00Z","cwd":"/tmp"}), initial_branch_id: "branch".into(), initial_branch_payload: json!({}) },
+			branches: vec![NewBranch { id: "branch".into(), session_id: "rollback".into(), parent_branch_id: None, parent_message_id: None, payload: json!({}) }], active_branch_id: "branch".into(), active_leaf_message_id: None,
+			messages: vec![NewMessage { id: "ok".into(), session_id: "rollback".into(), branch_id: "branch".into(), parent_message_id: None, payload: json!({"type":"metadata","id":"ok"}) }, NewMessage { id: "bad".into(), session_id: "rollback".into(), branch_id: "branch".into(), parent_message_id: Some("missing".into()), payload: json!({"type":"metadata","id":"bad","parentId":"missing"}) }], projection: None,
+		});
+		assert!(result.is_err());
+		assert!(store.session("rollback").expect("query").is_none());
+		assert!(store.session_messages("rollback").expect("query").is_empty());
+	}
+
+	#[test]
+	fn fork_atomic_clears_stale_projection_without_authority() {
+		let mut store = SqliteStore::open_in_memory().expect("store");
+		store.create_fork_atomic(ForkWrite { session: NewSession { id: "none".into(), parent_session_id: None, payload: json!({"type":"session","id":"none","timestamp":"2026-01-01T00:00:00Z","cwd":"/tmp","durableProjection":{"kept":["stale"]}}), initial_branch_id: "b".into(), initial_branch_payload: json!({}) }, branches: vec![NewBranch { id: "b".into(), session_id: "none".into(), parent_branch_id: None, parent_message_id: None, payload: json!({}) }], active_branch_id: "b".into(), active_leaf_message_id: None, messages: vec![], projection: None }).expect("fork");
+		assert!(store.session("none").expect("session").expect("exists").payload.get("durableProjection").is_none());
+	}
+
+	#[test]
+	fn fork_atomic_rejects_self_parent() {
+		let mut store = SqliteStore::open_in_memory().expect("store");
+		let result = store.create_fork_atomic(ForkWrite { session: NewSession { id: "self".into(), parent_session_id: Some("self".into()), payload: json!({}), initial_branch_id: "b".into(), initial_branch_payload: json!({}) }, branches: vec![NewBranch { id: "b".into(), session_id: "self".into(), parent_branch_id: None, parent_message_id: None, payload: json!({}) }], active_branch_id: "b".into(), active_leaf_message_id: None, messages: vec![], projection: None });
+		assert!(result.is_err());
+	}
+
+	#[test]
+	fn fork_atomic_accepts_two_branches_and_rejects_cycle() {
+		let mut store = SqliteStore::open_in_memory().expect("store");
+		let ok = store.create_fork_atomic(ForkWrite {
+			session: NewSession { id: "multi".into(), parent_session_id: None, payload: json!({"type":"session","id":"multi","timestamp":"2026-01-01T00:00:00Z","cwd":"/tmp"}), initial_branch_id: "sibling".into(), initial_branch_payload: json!({}) },
+			branches: vec![NewBranch { id: "root".into(), session_id: "multi".into(), parent_branch_id: None, parent_message_id: None, payload: json!({}) }, NewBranch { id: "sibling".into(), session_id: "multi".into(), parent_branch_id: Some("root".into()), parent_message_id: Some("m1".into()), payload: json!({}) }], active_branch_id: "sibling".into(), active_leaf_message_id: Some("m2".into()),
+			messages: vec![NewMessage { id: "m1".into(), session_id: "multi".into(), branch_id: "root".into(), parent_message_id: None, payload: json!({"type":"metadata","id":"m1"}) }, NewMessage { id: "m2".into(), session_id: "multi".into(), branch_id: "sibling".into(), parent_message_id: Some("m1".into()), payload: json!({"type":"metadata","id":"m2","parentId":"m1"}) }], projection: None,
+		});
+		ok.expect("fork with two branches");
+		let cycle = store.create_fork_atomic(ForkWrite { session: NewSession { id: "cycle".into(), parent_session_id: None, payload: json!({"type":"session","id":"cycle","timestamp":"2026-01-01T00:00:00Z","cwd":"/tmp"}), initial_branch_id: "a".into(), initial_branch_payload: json!({}) }, branches: vec![NewBranch { id: "a".into(), session_id: "cycle".into(), parent_branch_id: Some("b".into()), parent_message_id: Some("x".into()), payload: json!({}) }, NewBranch { id: "b".into(), session_id: "cycle".into(), parent_branch_id: Some("a".into()), parent_message_id: Some("x".into()), payload: json!({}) }], active_branch_id: "a".into(), active_leaf_message_id: None, messages: vec![], projection: None });
+		assert!(cycle.is_err());
+		assert!(store.session("cycle").expect("query").is_none());
+	}
+
+	#[test]
+	fn fork_atomic_accepts_inherited_branch_point() {
+		let mut store = SqliteStore::open_in_memory().expect("store");
+		let result = store.create_fork_atomic(ForkWrite { session: NewSession { id: "inherit".into(), parent_session_id: None, payload: json!({"type":"session","id":"inherit","timestamp":"2026-01-01T00:00:00Z","cwd":"/tmp"}), initial_branch_id: "child".into(), initial_branch_payload: json!({}) }, branches: vec![NewBranch { id: "root".into(), session_id: "inherit".into(), parent_branch_id: None, parent_message_id: None, payload: json!({}) }, NewBranch { id: "child".into(), session_id: "inherit".into(), parent_branch_id: Some("root".into()), parent_message_id: Some("m1".into()), payload: json!({}) }], active_branch_id: "child".into(), active_leaf_message_id: Some("m2".into()), messages: vec![NewMessage { id: "m1".into(), session_id: "inherit".into(), branch_id: "root".into(), parent_message_id: None, payload: json!({"type":"metadata","id":"m1"}) }, NewMessage { id: "m2".into(), session_id: "inherit".into(), branch_id: "child".into(), parent_message_id: Some("m1".into()), payload: json!({"type":"metadata","id":"m2","parentId":"m1"}) }], projection: None });
+		assert!(result.is_ok());
+	}
+
+	#[test]
+	fn fork_atomic_rejects_reverse_projection_order() {
+		let mut store = SqliteStore::open_in_memory().expect("store");
+		let result = store.create_fork_atomic(ForkWrite { session: NewSession { id: "order".into(), parent_session_id: None, payload: json!({"type":"session","id":"order","timestamp":"2026-01-01T00:00:00Z","cwd":"/tmp"}), initial_branch_id: "b".into(), initial_branch_payload: json!({}) }, branches: vec![NewBranch { id: "b".into(), session_id: "order".into(), parent_branch_id: None, parent_message_id: None, payload: json!({}) }], active_branch_id: "b".into(), active_leaf_message_id: Some("m2".into()), messages: vec![NewMessage { id: "m1".into(), session_id: "order".into(), branch_id: "b".into(), parent_message_id: None, payload: json!({"type":"message","id":"m1","timestamp":"2026-01-01T00:00:00Z","message":{"role":"user","content":"one","timestamp":1}}) }, NewMessage { id: "m2".into(), session_id: "order".into(), branch_id: "b".into(), parent_message_id: Some("m1".into()), payload: json!({"type":"message","id":"m2","parentId":"m1","timestamp":"2026-01-01T00:00:01Z","message":{"role":"assistant","content":"two","timestamp":2,"api":"openai","provider":"test","model":"model"}}) }], projection: Some(StoredProjection { kept: vec!["m2".into(), "m1".into()], synthetic: vec![], anchor: None }) });
+		assert!(result.is_err());
+	}
+
+	#[test]
+	fn fork_atomic_accepts_shuffled_branches_with_empty_inherited_leaf() {
+		let mut store = SqliteStore::open_in_memory().expect("store");
+		let result = store.create_fork_atomic(ForkWrite { session: NewSession { id: "shuffled".into(), parent_session_id: None, payload: json!({"type":"session","id":"shuffled","timestamp":"2026-01-01T00:00:00Z","cwd":"/tmp"}), initial_branch_id: "child".into(), initial_branch_payload: json!({}) }, branches: vec![NewBranch { id: "child".into(), session_id: "shuffled".into(), parent_branch_id: Some("root".into()), parent_message_id: Some("m1".into()), payload: json!({}) }, NewBranch { id: "root".into(), session_id: "shuffled".into(), parent_branch_id: None, parent_message_id: None, payload: json!({}) }], active_branch_id: "child".into(), active_leaf_message_id: Some("m1".into()), messages: vec![NewMessage { id: "m1".into(), session_id: "shuffled".into(), branch_id: "root".into(), parent_message_id: None, payload: json!({"type":"message","id":"m1","timestamp":"2026-01-01T00:00:00Z","message":{"role":"user","content":"root","timestamp":1}}) }], projection: None });
+		assert!(result.is_ok());
+	}
+
+	#[test]
+	fn fork_atomic_projection_order_filters_offbranch_entries() {
+		let mut store = SqliteStore::open_in_memory().expect("store");
+		let result = store.create_fork_atomic(ForkWrite { session: NewSession { id: "filtered".into(), parent_session_id: None, payload: json!({"type":"session","id":"filtered","timestamp":"2026-01-01T00:00:00Z","cwd":"/tmp"}), initial_branch_id: "active".into(), initial_branch_payload: json!({}) }, branches: vec![NewBranch { id: "active".into(), session_id: "filtered".into(), parent_branch_id: None, parent_message_id: None, payload: json!({}) }, NewBranch { id: "other".into(), session_id: "filtered".into(), parent_branch_id: None, parent_message_id: None, payload: json!({}) }], active_branch_id: "active".into(), active_leaf_message_id: Some("a2".into()), messages: vec![NewMessage { id: "a1".into(), session_id: "filtered".into(), branch_id: "active".into(), parent_message_id: None, payload: json!({"type":"message","id":"a1","timestamp":"2026-01-01T00:00:00Z","message":{"role":"user","content":"a"}}) }, NewMessage { id: "o1".into(), session_id: "filtered".into(), branch_id: "other".into(), parent_message_id: None, payload: json!({"type":"message","id":"o1","timestamp":"2026-01-01T00:00:00Z","message":{"role":"user","content":"o"}}) }, NewMessage { id: "a2".into(), session_id: "filtered".into(), branch_id: "active".into(), parent_message_id: Some("a1".into()), payload: json!({"type":"message","id":"a2","parentId":"a1","timestamp":"2026-01-01T00:00:01Z","message":{"role":"assistant","content":"a2"}}) }], projection: Some(StoredProjection { kept: vec!["a1".into(), "o1".into(), "a2".into()], synthetic: vec![], anchor: None }) });
+		assert!(result.is_err());
+	}
+
+	#[test]
+	fn fork_atomic_accepts_sibling_tool_result() {
+		let mut store = SqliteStore::open_in_memory().expect("store");
+		let result = store.create_fork_atomic(ForkWrite { session: NewSession { id: "tool-sibling".into(), parent_session_id: None, payload: json!({"type":"session","id":"tool-sibling","timestamp":"2026-01-01T00:00:00Z","cwd":"/tmp"}), initial_branch_id: "active".into(), initial_branch_payload: json!({}) }, branches: vec![NewBranch { id: "sibling".into(), session_id: "tool-sibling".into(), parent_branch_id: Some("active".into()), parent_message_id: Some("a1".into()), payload: json!({}) }, NewBranch { id: "active".into(), session_id: "tool-sibling".into(), parent_branch_id: None, parent_message_id: None, payload: json!({}) }], active_branch_id: "active".into(), active_leaf_message_id: Some("r1".into()), messages: vec![NewMessage { id: "a1".into(), session_id: "tool-sibling".into(), branch_id: "active".into(), parent_message_id: None, payload: json!({"type":"message","id":"a1","timestamp":"2026-01-01T00:00:00Z","message":{"role":"assistant","content":[{"type":"toolCall","id":"call-1","name":"echo","arguments":{}},{"type":"toolCall","id":"call-2","name":"echo","arguments":{}}],"timestamp":1,"api":"openai","provider":"test","model":"model"}}) }, NewMessage { id: "r1".into(), session_id: "tool-sibling".into(), branch_id: "active".into(), parent_message_id: Some("a1".into()), payload: json!({"type":"message","id":"r1","parentId":"a1","timestamp":"2026-01-01T00:00:01Z","message":{"role":"toolResult","content":"one","toolCallId":"call-1","toolName":"echo","isError":false,"timestamp":2}}) }, NewMessage { id: "r2".into(), session_id: "tool-sibling".into(), branch_id: "sibling".into(), parent_message_id: Some("a1".into()), payload: json!({"type":"message","id":"r2","parentId":"a1","timestamp":"2026-01-01T00:00:02Z","message":{"role":"toolResult","content":"two","toolCallId":"call-2","toolName":"echo","isError":false,"timestamp":3}}) }], projection: Some(StoredProjection { kept: vec!["a1".into(), "r1".into(), "r2".into()], synthetic: vec![], anchor: Some("a1".into()) }) });
+		assert!(result.is_ok());
+		assert_eq!(store.branch("active").expect("branch").expect("active").leaf_message_id.as_deref(), Some("r1"));
+	}
+
+	#[test]
+	fn fork_atomic_rejects_anchor_on_sibling_branch() {
+		let mut store = SqliteStore::open_in_memory().expect("store");
+		let result = store.create_fork_atomic(ForkWrite { session: NewSession { id: "anchor-sibling".into(), parent_session_id: None, payload: json!({"type":"session","id":"anchor-sibling","timestamp":"2026-01-01T00:00:00Z","cwd":"/tmp"}), initial_branch_id: "active".into(), initial_branch_payload: json!({}) }, branches: vec![NewBranch { id: "active".into(), session_id: "anchor-sibling".into(), parent_branch_id: None, parent_message_id: None, payload: json!({}) }, NewBranch { id: "sibling".into(), session_id: "anchor-sibling".into(), parent_branch_id: None, parent_message_id: None, payload: json!({}) }], active_branch_id: "active".into(), active_leaf_message_id: Some("a".into()), messages: vec![NewMessage { id: "a".into(), session_id: "anchor-sibling".into(), branch_id: "active".into(), parent_message_id: None, payload: json!({"type":"message","id":"a","timestamp":"2026-01-01T00:00:00Z","message":{"role":"user","content":"a","timestamp":1}}) }, NewMessage { id: "s".into(), session_id: "anchor-sibling".into(), branch_id: "sibling".into(), parent_message_id: None, payload: json!({"type":"message","id":"s","timestamp":"2026-01-01T00:00:00Z","message":{"role":"user","content":"s","timestamp":2}}) }], projection: Some(StoredProjection { kept: vec!["a".into()], synthetic: vec![], anchor: Some("s".into()) }) });
+		let error = result.expect_err("sibling anchor must fail");
+		assert!(error.to_string().contains("anchor"), "unexpected error: {error}");
+	}
+
+	#[test]
+	fn fork_atomic_rolls_back_reversed_message_order() {
+		let mut store = SqliteStore::open_in_memory().expect("store");
+		let result = store.create_fork_atomic(ForkWrite { session: NewSession { id: "reverse-msg".into(), parent_session_id: None, payload: json!({"type":"session","id":"reverse-msg","timestamp":"2026-01-01T00:00:00Z","cwd":"/tmp"}), initial_branch_id: "b".into(), initial_branch_payload: json!({}) }, branches: vec![NewBranch { id: "b".into(), session_id: "reverse-msg".into(), parent_branch_id: None, parent_message_id: None, payload: json!({}) }], active_branch_id: "b".into(), active_leaf_message_id: Some("child".into()), messages: vec![NewMessage { id: "child".into(), session_id: "reverse-msg".into(), branch_id: "b".into(), parent_message_id: Some("parent".into()), payload: json!({"type":"message","id":"child","parentId":"parent","timestamp":"2026-01-01T00:00:01Z","message":{"role":"assistant","content":"child","timestamp":2,"api":"openai","provider":"test","model":"model"}}) }, NewMessage { id: "parent".into(), session_id: "reverse-msg".into(), branch_id: "b".into(), parent_message_id: None, payload: json!({"type":"message","id":"parent","timestamp":"2026-01-01T00:00:00Z","message":{"role":"user","content":"parent","timestamp":1}}) }], projection: None });
+		let error = result.expect_err("reversed parent order must fail");
+		assert!(error.to_string().contains("branch leaf") || error.to_string().contains("parent"), "unexpected error: {error}");
+		assert!(store.session("reverse-msg").expect("query").is_none());
+	}
+
+	#[test]
+	fn fork_atomic_rejects_reverse_active_order_with_valid_sibling() {
+		let mut store = SqliteStore::open_in_memory().expect("store");
+		let result = store.create_fork_atomic(ForkWrite { session: NewSession { id: "order-sibling".into(), parent_session_id: None, payload: json!({"type":"session","id":"order-sibling","timestamp":"2026-01-01T00:00:00Z","cwd":"/tmp"}), initial_branch_id: "active".into(), initial_branch_payload: json!({}) }, branches: vec![NewBranch { id: "active".into(), session_id: "order-sibling".into(), parent_branch_id: None, parent_message_id: None, payload: json!({}) }, NewBranch { id: "sibling".into(), session_id: "order-sibling".into(), parent_branch_id: None, parent_message_id: None, payload: json!({}) }], active_branch_id: "active".into(), active_leaf_message_id: Some("r1".into()), messages: vec![NewMessage { id: "a".into(), session_id: "order-sibling".into(), branch_id: "active".into(), parent_message_id: None, payload: json!({"type":"message","id":"a","timestamp":"2026-01-01T00:00:00Z","message":{"role":"assistant","content":[{"type":"toolCall","id":"c1","name":"echo","arguments":{}}],"timestamp":1,"api":"openai","provider":"test","model":"model"}}) }, NewMessage { id: "r1".into(), session_id: "order-sibling".into(), branch_id: "active".into(), parent_message_id: Some("a".into()), payload: json!({"type":"message","id":"r1","parentId":"a","timestamp":"2026-01-01T00:00:01Z","message":{"role":"toolResult","content":"ok","toolCallId":"c1","toolName":"echo","isError":false,"timestamp":2}}) }, NewMessage { id: "s".into(), session_id: "order-sibling".into(), branch_id: "sibling".into(), parent_message_id: None, payload: json!({"type":"message","id":"s","timestamp":"2026-01-01T00:00:02Z","message":{"role":"user","content":"s","timestamp":3}}) }], projection: Some(StoredProjection { kept: vec!["r1".into(), "s".into(), "a".into()], synthetic: vec![], anchor: Some("a".into()) }) });
+		let error = result.expect_err("reverse active order must fail");
+		assert!(error.to_string().contains("order"), "unexpected error: {error}");
+	}
 
 	fn seeded_store() -> SqliteStore {
 		let mut store = SqliteStore::open_in_memory().expect("open in-memory store");
@@ -3374,7 +4476,7 @@ mod tests {
 	}
 
 	#[test]
-	fn reconcile_removes_projection_when_anchor_missing_from_active_branch() {
+	fn reconcile_fails_closed_when_anchor_missing_from_active_branch() {
 		let (dir, path) = temp_db("absent-anchor");
 		let mut store = SqliteStore::open(&path).expect("open store");
 		store
@@ -3396,13 +4498,13 @@ mod tests {
 
 		store.append_message(message("m1", None)).expect("append m1");
 
-		let reconciled = store.reconcile_durable_projection("s1").expect("reconcile");
-		assert_eq!(reconciled, 0);
+		let error = store.reconcile_durable_projection("s1").expect_err("missing anchor must fail closed");
+		assert!(matches!(error, StoreError::Corrupt(_)), "unexpected error: {error}");
 
 		let session = store.session("s1").expect("load session").expect("session exists");
 		assert!(
-			session.payload.get("durableProjection").is_none(),
-			"durableProjection must be pruned from SQLite payload when anchor missing"
+			session.payload.get("durableProjection").is_some(),
+			"durableProjection must be retained when the anchor is missing"
 		);
 
 		std::fs::remove_dir_all(dir).ok();
@@ -4298,6 +5400,1138 @@ mod tests {
 	}
 
 	#[test]
+	fn recover_unresolved_intents_writes_interrupted_keeps_outcome_null() {
+		let mut store = seeded_store();
+		store
+			.append_message(NewMessage {
+				id: "m_asst".to_string(),
+				session_id: "s1".to_string(),
+				branch_id: "b1".to_string(),
+				parent_message_id: None,
+				payload: json!({
+					"type": "message",
+					"id": "m_asst",
+					"message": {
+						"role": "assistant",
+						"content": [{ "type": "toolCall", "id": "call-u", "name": "bash" }]
+					}
+				}),
+			})
+			.expect("assistant");
+		let execution_id = store
+			.record_intent(NewIntent {
+				session_id: "s1".to_string(),
+				branch_id: "b1".to_string(),
+				provider_call_id: "call-u".to_string(),
+				tool_name: "bash".to_string(),
+				payload: json!({}),
+			})
+			.expect("intent");
+
+		assert_eq!(store.recover_unresolved_intents("s1").expect("recover"), 1);
+		assert_eq!(store.recover_unresolved_intents("s1").expect("idempotent"), 0);
+
+		let unresolved = store.unresolved_intents("s1").expect("unresolved");
+		assert_eq!(unresolved.len(), 1);
+		assert_eq!(unresolved[0].execution_id, execution_id);
+		assert_eq!(store.outcome(&execution_id).expect("outcome"), None);
+
+		let branch = store.branch("b1").expect("branch").expect("b1");
+		let leaf = store
+			.message(&branch.leaf_message_id.expect("leaf"))
+			.expect("leaf")
+			.expect("msg");
+		assert_eq!(leaf.payload["message"]["role"], "toolResult");
+		assert_eq!(leaf.payload["message"]["toolCallId"], "call-u");
+		assert_eq!(
+			leaf.payload["message"]["content"],
+			SqliteStore::INTERRUPTED_UNKNOWN_OUTCOME
+		);
+		assert_eq!(leaf.payload["message"]["isError"], true);
+		assert_eq!(leaf.payload["message"]["details"]["executionId"], execution_id);
+		assert_eq!(leaf.payload["message"]["details"]["interruptedUnknown"], true);
+	}
+
+	#[test]
+	fn recover_unresolved_intents_skips_answered_and_missing_intent() {
+		let mut store = seeded_store();
+		store
+			.append_message(NewMessage {
+				id: "m_asst".to_string(),
+				session_id: "s1".to_string(),
+				branch_id: "b1".to_string(),
+				parent_message_id: None,
+				payload: json!({
+					"type": "message",
+					"id": "m_asst",
+					"message": {
+						"role": "assistant",
+						"content": [
+							{ "type": "toolCall", "id": "call-denied", "name": "bash" },
+							{ "type": "toolCall", "id": "call-missing", "name": "bash" }
+						]
+					}
+				}),
+			})
+			.expect("assistant");
+		// Known denial / answered result already on branch — no intent row.
+		store
+			.append_message(NewMessage {
+				id: "m_denied".to_string(),
+				session_id: "s1".to_string(),
+				branch_id: "b1".to_string(),
+				parent_message_id: Some("m_asst".to_string()),
+				payload: json!({
+					"type": "message",
+					"id": "m_denied",
+					"message": {
+						"role": "toolResult",
+						"toolCallId": "call-denied",
+						"toolName": "bash",
+						"content": "Tool execution denied: approval denied for bash",
+						"isError": true
+					}
+				}),
+			})
+			.expect("denied result");
+
+		assert_eq!(store.recover_unresolved_intents("s1").expect("recover"), 0);
+		assert!(store.unresolved_intents("s1").expect("unresolved").is_empty());
+		let branch = store.branch("b1").expect("branch").expect("b1");
+		assert_eq!(branch.leaf_message_id.as_deref(), Some("m_denied"));
+		assert_eq!(store.branch_messages("b1").expect("msgs").len(), 2);
+	}
+
+	#[test]
+	fn recover_unresolved_intents_fails_closed_on_duplicate_call_ids() {
+		let mut store = seeded_store();
+		store
+			.append_message(NewMessage {
+				id: "m_asst".to_string(),
+				session_id: "s1".to_string(),
+				branch_id: "b1".to_string(),
+				parent_message_id: None,
+				payload: json!({
+					"type": "message",
+					"id": "m_asst",
+					"message": {
+						"role": "assistant",
+						"content": [
+							{ "type": "toolCall", "id": "dup", "name": "bash" },
+							{ "type": "toolCall", "id": "dup", "name": "bash" }
+						]
+					}
+				}),
+			})
+			.expect("assistant");
+		store
+			.record_intent(NewIntent {
+				session_id: "s1".to_string(),
+				branch_id: "b1".to_string(),
+				provider_call_id: "dup".to_string(),
+				tool_name: "bash".to_string(),
+				payload: json!({}),
+			})
+			.expect("intent");
+
+		let err = store
+			.recover_unresolved_intents("s1")
+			.expect_err("duplicate ids fail closed");
+		assert!(
+			err.to_string().contains("ambiguous duplicate toolCallId"),
+			"{err}"
+		);
+		assert_eq!(store.branch_messages("b1").expect("msgs").len(), 1);
+		assert_eq!(store.unresolved_intents("s1").expect("unresolved").len(), 1);
+	}
+
+	#[test]
+	fn snapshot_read_only_tolerates_absent_provenance_table() {
+		let (dir, path) = temp_db("v2-readonly");
+		let mut store = SqliteStore::open(&path).expect("store");
+		store.create_session(NewSession { id: "s1".to_string(), parent_session_id: None, payload: json!({ "cwd": "/tmp/project" }), initial_branch_id: "b1".to_string(), initial_branch_payload: json!({ "kind": "root" }) }).expect("session");
+		store.append_message(message("m1", None)).expect("message");
+		drop(store);
+		let connection = rusqlite::Connection::open(&path).expect("raw");
+		connection.execute_batch("DROP TABLE fork_provenance; UPDATE schema_version SET version = 2;").expect("downgrade");
+		drop(connection);
+
+		let read_only = SqliteStore::open_read_only(&path).expect("read-only open");
+		let snapshot = read_only.load_session_snapshot("s1").expect("v2 snapshot without provenance table");
+		assert!(snapshot.provenance.is_empty());
+		assert_eq!(snapshot.session_id, "s1");
+		std::fs::remove_dir_all(dir).ok();
+	}
+
+	#[test]
+	fn fork_uses_captured_snapshot_classification_not_a_target_time_reread() {
+		let mut store = seeded_store();
+		let exec = store.record_intent(NewIntent { session_id: "s1".to_string(), branch_id: "b1".to_string(), provider_call_id: "shared".to_string(), tool_name: "bash".to_string(), payload: json!({}) }).expect("intent");
+		let fork = |id: &str| {
+			let message_id = format!("m-{id}");
+			ForkWrite {
+				session: NewSession { id: id.to_string(), parent_session_id: Some("s1".to_string()), payload: json!({"type":"session","id":id,"timestamp":"2026-01-01T00:00:00Z","cwd":"/tmp"}), initial_branch_id: "b".to_string(), initial_branch_payload: json!({}) },
+				branches: vec![NewBranch { id: "b".to_string(), session_id: id.to_string(), parent_branch_id: None, parent_message_id: None, payload: json!({}) }],
+				active_branch_id: "b".to_string(),
+				active_leaf_message_id: Some(message_id.clone()),
+				messages: vec![NewMessage { id: message_id.clone(), session_id: id.to_string(), branch_id: "b".to_string(), parent_message_id: None, payload: json!({"type":"message","id":message_id,"message":{"role":"toolResult","toolCallId":"shared","toolName":"bash","details":{"executionId":exec}}}) }],
+				projection: None,
+			}
+		};
+
+		// Captured snapshot said "resolved"; the execution row is still unresolved on
+		// disk. The captured value wins and the write must not conflict.
+		store.create_fork_atomic_with_provenance(fork("f-captured"), &[ForkProvenance::new("m-f-captured".to_string(), exec.clone(), "shared".to_string(), true)]).expect("captured classification is authoritative");
+		let snapshot = store.load_session_snapshot("f-captured").expect("snapshot");
+		assert!(snapshot.provenance[0].outcome_resolved);
+
+		// Public entry point carries no captured classification and derives a single
+		// consistent value at fork time.
+		store.create_fork_atomic(fork("f-public")).expect("public fork derives");
+		let snapshot = store.load_session_snapshot("f-public").expect("public snapshot");
+		assert!(!snapshot.provenance[0].outcome_resolved);
+
+		// A source outcome that changes after the snapshot was read must not turn the
+		// captured "unknown" into a conflict or a resolved row.
+		store.record_outcome(&exec, json!({"content":"done","isError":false})).expect("late outcome");
+		store.create_fork_atomic_with_provenance(fork("f-late"), &[ForkProvenance::new("m-f-late".to_string(), exec.clone(), "shared".to_string(), false)]).expect("late source change must not conflict");
+		let snapshot = store.load_session_snapshot("f-late").expect("late snapshot");
+		assert!(!snapshot.provenance[0].outcome_resolved, "captured unknown must stay unknown");
+	}
+
+	#[test]
+	fn snapshot_rejects_provenance_naming_a_different_execution_than_the_message() {
+		let mut store = seeded_store();
+		let exec = store.record_intent(NewIntent { session_id: "s1".to_string(), branch_id: "b1".to_string(), provider_call_id: "shared".to_string(), tool_name: "bash".to_string(), payload: json!({}) }).expect("intent");
+		store.append_message(NewMessage { id: "a1".to_string(), session_id: "s1".to_string(), branch_id: "b1".to_string(), parent_message_id: None, payload: json!({"type":"message","id":"a1","message":{"role":"assistant","content":[{"type":"toolCall","id":"shared","name":"bash"}]}}) }).expect("assistant");
+		store.append_message(NewMessage { id: "m".to_string(), session_id: "s1".to_string(), branch_id: "b1".to_string(), parent_message_id: Some("a1".to_string()), payload: json!({"type":"message","id":"m","parentId":"a1","message":{"role":"toolResult","toolCallId":"shared","toolName":"bash","details":{"executionId":exec}}}) }).expect("result");
+		store.connection.execute("INSERT INTO fork_provenance (message_id, session_id, source_execution_id, provider_call_id, outcome_resolved) VALUES ('m', 's1', 'exec-other', 'shared', 0)", []).expect("stale provenance row");
+
+		let err = store.load_session_snapshot("s1").expect_err("stale tuple must not authorize");
+		assert!(err.to_string().contains("which the message does not reference"), "{err}");
+	}
+
+	#[test]
+	fn damaged_v3_database_missing_provenance_table_is_corrupt() {
+		let (dir, path) = temp_db("v3-damaged");
+		let mut store = SqliteStore::open(&path).expect("store");
+		store.create_session(NewSession { id: "s1".to_string(), parent_session_id: None, payload: json!({ "cwd": "/tmp/project" }), initial_branch_id: "b1".to_string(), initial_branch_payload: json!({ "kind": "root" }) }).expect("session");
+		store.append_message(message("m1", None)).expect("message");
+		drop(store);
+
+		let connection = rusqlite::Connection::open(&path).expect("raw");
+		connection.execute_batch("DROP TABLE fork_provenance;").expect("damage");
+		drop(connection);
+
+		let read_only = SqliteStore::open_read_only(&path).expect("read-only open");
+		let err = read_only.load_session_snapshot("s1").expect_err("damaged v3 snapshot must fail closed");
+		assert!(err.to_string().contains("missing the fork_provenance table"), "{err}");
+
+		let writable = SqliteStore::open(&path).expect("writable open keeps version 3");
+		let err = writable.load_session_snapshot("s1").expect_err("damaged v3 writable snapshot must fail closed");
+		assert!(err.to_string().contains("missing the fork_provenance table"), "{err}");
+		std::fs::remove_dir_all(dir).ok();
+	}
+
+	#[test]
+	fn fork_rejects_forged_provider_call_pairing_on_every_path() {
+		let mut store = seeded_store();
+		let exec = store.record_intent(NewIntent { session_id: "s1".to_string(), branch_id: "b1".to_string(), provider_call_id: "call-b".to_string(), tool_name: "bash".to_string(), payload: json!({}) }).expect("intent");
+		let fork = |id: &str, tool_call_id: &str| {
+			let message_id = format!("m-{id}");
+			ForkWrite {
+				session: NewSession { id: id.to_string(), parent_session_id: Some("s1".to_string()), payload: json!({"type":"session","id":id,"timestamp":"2026-01-01T00:00:00Z","cwd":"/tmp"}), initial_branch_id: "b".to_string(), initial_branch_payload: json!({}) },
+				branches: vec![NewBranch { id: "b".to_string(), session_id: id.to_string(), parent_branch_id: None, parent_message_id: None, payload: json!({}) }],
+				active_branch_id: "b".to_string(),
+				active_leaf_message_id: Some(message_id.clone()),
+				messages: vec![NewMessage { id: message_id.clone(), session_id: id.to_string(), branch_id: "b".to_string(), parent_message_id: None, payload: json!({"type":"message","id":message_id,"message":{"role":"toolResult","toolCallId":tool_call_id,"toolName":"bash","details":{"executionId":exec}}}) }],
+				projection: None,
+			}
+		};
+
+		// Unknown call "call-a" borrowing execution B must not be classified by B's
+		// captured/resolved status.
+		let err = store
+			.create_fork_atomic_with_provenance(fork("f-forged", "call-a"), &[ForkProvenance::new("m-f-forged".to_string(), exec.clone(), "call-b".to_string(), true)])
+			.expect_err("captured pairing must match the tool result");
+		assert!(matches!(err, StoreError::Validation(_)), "{err:?}");
+
+		// A supplied provider id that matches the message but not the execution is
+		// also rejected by the source-session metadata check.
+		let err = store
+			.create_fork_atomic_with_provenance(fork("f-forged-meta", "call-a"), &[ForkProvenance::new("m-f-forged-meta".to_string(), exec.clone(), "call-a".to_string(), true)])
+			.expect_err("execution provider id must match captured id");
+		assert!(matches!(err, StoreError::Conflict(_)), "{err:?}");
+
+		// Public derivation path rejects the forged pairing too.
+		let err = store.create_fork_atomic(fork("f-forged-public", "call-a")).expect_err("public derivation must match provider id");
+		assert!(matches!(err, StoreError::Validation(_)), "{err:?}");
+		assert!(store.session("f-forged-public").expect("query").is_none(), "rejection must roll back");
+
+		// The same forgery in a live session is rejected before any fork or recovery
+		// classification: a tool result naming call-a cannot borrow execution B.
+		store.append_message(NewMessage { id: "a-src".to_string(), session_id: "s1".to_string(), branch_id: "b1".to_string(), parent_message_id: None, payload: json!({"type":"message","id":"a-src","message":{"role":"assistant","content":[{"type":"toolCall","id":"call-a","name":"bash"}]}}) }).expect("assistant");
+		store.append_message(NewMessage { id: "r-src".to_string(), session_id: "s1".to_string(), branch_id: "b1".to_string(), parent_message_id: Some("a-src".to_string()), payload: json!({"type":"message","id":"r-src","parentId":"a-src","message":{"role":"toolResult","toolCallId":"call-a","toolName":"bash","details":{"executionId":exec}}}) }).expect("result");
+		let err = store.load_session_snapshot("s1").expect_err("snapshot must reject the forged association");
+		assert!(err.to_string().contains("does not carry provider call id"), "{err}");
+
+		store.append_message(NewMessage { id: "a-reuse".to_string(), session_id: "s1".to_string(), branch_id: "b1".to_string(), parent_message_id: Some("r-src".to_string()), payload: json!({"type":"message","id":"a-reuse","message":{"role":"assistant","content":[{"type":"toolCall","id":"call-a","name":"bash"}]}}) }).expect("reuse assistant");
+		let err = store.recover_unresolved_intents("s1").expect_err("recovery must reject the forged association");
+		assert!(err.to_string().contains("provider call id"), "{err}");
+	}
+
+	#[test]
+	fn fork_provenance_cascades_on_message_deletion_without_trigger_block() {
+		let (dir, path) = temp_db("provenance-cascade");
+		let mut store = SqliteStore::open(&path).expect("store");
+		store.create_fork_atomic_with_provenance(
+			ForkWrite {
+				session: NewSession { id: "f".to_string(), parent_session_id: None, payload: json!({"type":"session","id":"f","timestamp":"2026-01-01T00:00:00Z","cwd":"/tmp"}), initial_branch_id: "b".to_string(), initial_branch_payload: json!({}) },
+				branches: vec![NewBranch { id: "b".to_string(), session_id: "f".to_string(), parent_branch_id: None, parent_message_id: None, payload: json!({}) }],
+				active_branch_id: "b".to_string(),
+				active_leaf_message_id: Some("m".to_string()),
+				messages: vec![NewMessage { id: "m".to_string(), session_id: "f".to_string(), branch_id: "b".to_string(), parent_message_id: None, payload: json!({"type":"message","id":"m","message":{"role":"toolResult","toolCallId":"c","toolName":"bash","details":{"executionId":"external"}}}) }],
+				projection: None,
+			},
+			&[ForkProvenance::new("m".to_string(), "external".to_string(), "c".to_string(), false)],
+		).expect("fork");
+		drop(store);
+
+		let connection = rusqlite::Connection::open(&path).expect("raw");
+		connection.pragma_update(None, "foreign_keys", "ON").expect("fk");
+		connection.execute("DELETE FROM messages WHERE session_id = 'f'", []).expect("session deletion contract deletes messages");
+		let remaining: i64 = connection.query_row("SELECT COUNT(*) FROM fork_provenance WHERE session_id = 'f'", [], |row| row.get(0)).expect("count");
+		assert_eq!(remaining, 0, "provenance is deleted with the session");
+		connection.execute("DELETE FROM branches WHERE session_id = 'f'", []).expect("branches");
+		connection.execute("DELETE FROM sessions WHERE id = 'f'", []).expect("session row");
+		drop(connection);
+		std::fs::remove_dir_all(dir).ok();
+	}
+
+	#[test]
+	fn snapshot_skips_execution_references_on_pruned_branches() {
+		let mut store = seeded_store();
+		store.append_message(message("a1", None)).expect("active message");
+		store.create_branch(NewBranch { id: "b2".to_string(), session_id: "s1".to_string(), parent_branch_id: None, parent_message_id: None, payload: json!({}) }).expect("sibling branch");
+		store.append_message(NewMessage { id: "orphan".to_string(), session_id: "s1".to_string(), branch_id: "b2".to_string(), parent_message_id: None, payload: json!({"type":"message","id":"orphan","message":{"role":"toolResult","toolCallId":"x","toolName":"bash","details":{"executionId":"missing-exec"}}}) }).expect("sibling result");
+
+		let snapshot = store.load_session_snapshot("s1").expect("pruned branch reference must not fail the snapshot");
+		assert!(snapshot.provenance.is_empty());
+		assert_eq!(snapshot.branch_messages.len(), 1);
+	}
+
+	#[test]
+	fn recover_unresolved_intents_ignores_forged_payload_provenance() {
+		let mut store = seeded_store();
+		store
+			.append_message(NewMessage {
+				id: "m_forged_a1".to_string(),
+				session_id: "s1".to_string(),
+				branch_id: "b1".to_string(),
+				parent_message_id: None,
+				payload: json!({
+					"type": "message",
+					"id": "m_forged_a1",
+					"message": {
+						"role": "assistant",
+						"content": [{ "type": "toolCall", "id": "forged-call", "name": "bash" }]
+					}
+				}),
+			})
+			.expect("assistant 1");
+		store
+			.record_intent(NewIntent {
+				session_id: "s1".to_string(),
+				branch_id: "b1".to_string(),
+				provider_call_id: "forged-call".to_string(),
+				tool_name: "bash".to_string(),
+				payload: json!({}),
+			})
+			.expect("intent");
+		store
+			.append_message(NewMessage {
+				id: "m_forged_r1".to_string(),
+				session_id: "s1".to_string(),
+				branch_id: "b1".to_string(),
+				parent_message_id: Some("m_forged_a1".to_string()),
+				payload: json!({
+					"type": "message",
+					"id": "m_forged_r1",
+					"parentId": "m_forged_a1",
+					"message": {
+						"role": "toolResult",
+						"toolCallId": "forged-call",
+						"toolName": "bash",
+						"content": "forged",
+						"details": {
+							"executionId": "exec-missing",
+							"executionProvenance": { "outcome": "resolved" }
+						}
+					}
+				}),
+			})
+			.expect("forged result");
+		store
+			.append_message(NewMessage {
+				id: "m_forged_a2".to_string(),
+				session_id: "s1".to_string(),
+				branch_id: "b1".to_string(),
+				parent_message_id: Some("m_forged_r1".to_string()),
+				payload: json!({
+					"type": "message",
+					"id": "m_forged_a2",
+					"message": {
+						"role": "assistant",
+						"content": [{ "type": "toolCall", "id": "forged-call", "name": "bash" }]
+					}
+				}),
+			})
+			.expect("assistant 2");
+
+		let err = store
+			.recover_unresolved_intents("s1")
+			.expect_err("payload-provided provenance must never be trusted");
+		assert!(
+			err.to_string().contains("unknown execution or missing fork provenance"),
+			"{err}"
+		);
+		assert_eq!(store.branch_messages("b1").expect("msgs").len(), 3);
+		assert_eq!(store.unresolved_intents("s1").expect("unresolved").len(), 1);
+	}
+
+	#[test]
+	fn recover_unresolved_intents_skips_trailing_metadata() {
+		let mut store = seeded_store();
+		store
+			.append_message(NewMessage {
+				id: "m_asst".to_string(),
+				session_id: "s1".to_string(),
+				branch_id: "b1".to_string(),
+				parent_message_id: None,
+				payload: json!({
+					"type": "message",
+					"id": "m_asst",
+					"message": { "role": "assistant", "content": [
+						{ "type": "toolCall", "id": "call-meta", "name": "bash" }
+					] }
+				}),
+			})
+			.expect("assistant");
+		store
+			.record_intent(NewIntent {
+				session_id: "s1".to_string(),
+				branch_id: "b1".to_string(),
+				provider_call_id: "call-meta".to_string(),
+				tool_name: "bash".to_string(),
+				payload: json!({}),
+			})
+			.expect("intent");
+		store
+			.append_message(NewMessage {
+				id: "meta".to_string(),
+				session_id: "s1".to_string(),
+				branch_id: "b1".to_string(),
+				parent_message_id: Some("m_asst".to_string()),
+				payload: json!({ "type": "custom", "customType": "advisor" }),
+			})
+			.expect("metadata");
+
+		assert_eq!(store.recover_unresolved_intents("s1").expect("recover"), 1);
+		assert_eq!(store.recover_unresolved_intents("s1").expect("idempotent"), 0);
+		let messages = store.branch_messages("b1").expect("branch");
+		assert_eq!(messages.last().unwrap().payload["message"]["role"], "toolResult");
+		assert_eq!(messages.last().unwrap().parent_message_id.as_deref(), Some("meta"));
+	}
+
+    #[test]
+	fn recover_unresolved_intents_only_touches_active_trailing_batch() {
+		let mut store = seeded_store();
+		store
+			.append_message(NewMessage {
+				id: "m_old".to_string(),
+				session_id: "s1".to_string(),
+				branch_id: "b1".to_string(),
+				parent_message_id: None,
+				payload: json!({
+					"type": "message",
+					"id": "m_old",
+					"message": {
+						"role": "assistant",
+						"content": [{ "type": "toolCall", "id": "call-old", "name": "bash" }]
+					}
+				}),
+			})
+			.expect("old assistant");
+		let old_exec = store
+			.record_intent(NewIntent {
+				session_id: "s1".to_string(),
+				branch_id: "b1".to_string(),
+				provider_call_id: "call-old".to_string(),
+				tool_name: "bash".to_string(),
+				payload: json!({}),
+			})
+			.expect("old intent");
+		store
+			.append_message(NewMessage {
+				id: "m_user".to_string(),
+				session_id: "s1".to_string(),
+				branch_id: "b1".to_string(),
+				parent_message_id: Some("m_old".to_string()),
+				payload: json!({
+					"type": "message",
+					"id": "m_user",
+					"message": { "role": "user", "content": "next" }
+				}),
+			})
+			.expect("user");
+		store
+			.append_message(NewMessage {
+				id: "m_new".to_string(),
+				session_id: "s1".to_string(),
+				branch_id: "b1".to_string(),
+				parent_message_id: Some("m_user".to_string()),
+				payload: json!({
+					"type": "message",
+					"id": "m_new",
+					"message": {
+						"role": "assistant",
+						"content": [{ "type": "toolCall", "id": "call-new", "name": "bash" }]
+					}
+				}),
+			})
+			.expect("new assistant");
+		let new_exec = store
+			.record_intent(NewIntent {
+				session_id: "s1".to_string(),
+				branch_id: "b1".to_string(),
+				provider_call_id: "call-new".to_string(),
+				tool_name: "bash".to_string(),
+				payload: json!({}),
+			})
+			.expect("new intent");
+
+		assert_eq!(store.recover_unresolved_intents("s1").expect("recover"), 1);
+
+		let unresolved = store.unresolved_intents("s1").expect("unresolved");
+		assert_eq!(unresolved.len(), 2, "both intents stay unresolved");
+		assert!(unresolved.iter().any(|u| u.execution_id == old_exec));
+		assert!(unresolved.iter().any(|u| u.execution_id == new_exec));
+
+		let results: Vec<_> = store
+			.branch_messages("b1")
+			.expect("msgs")
+			.into_iter()
+			.filter(|m| m.payload["message"]["role"] == "toolResult")
+			.collect();
+		assert_eq!(results.len(), 1);
+		assert_eq!(results[0].payload["message"]["toolCallId"], "call-new");
+		assert_eq!(store.outcome(&old_exec).expect("old"), None);
+		assert_eq!(store.outcome(&new_exec).expect("new"), None);
+	}
+
+	#[test]
+	fn recover_unresolved_intents_leaves_kept_for_reconcile_mixed_batch() {
+		let mut store = SqliteStore::open_in_memory().expect("open");
+		store
+			.create_session(NewSession {
+				id: "s_mix".to_string(),
+				parent_session_id: None,
+				payload: json!({
+					"cwd": "/tmp",
+					"durableProjection": {
+						"kept": ["m_asst"],
+						"synthetic": []
+					}
+				}),
+				initial_branch_id: "b_mix".to_string(),
+				initial_branch_payload: Value::Null,
+			})
+			.expect("session");
+		store
+			.append_message(NewMessage {
+				id: "m_asst".to_string(),
+				session_id: "s_mix".to_string(),
+				branch_id: "b_mix".to_string(),
+				parent_message_id: None,
+				payload: json!({
+					"type": "message",
+					"id": "m_asst",
+					"message": {
+						"role": "assistant",
+						"content": [
+							{ "type": "toolCall", "id": "call_ok", "name": "bash" },
+							{ "type": "toolCall", "id": "call_fail", "name": "bash" }
+						]
+					}
+				}),
+			})
+			.expect("assistant");
+		// Sibling result already on the branch (finish_execution committed) but
+		// not yet in durableProjection.kept (crash before set_projection).
+		store
+			.append_message(NewMessage {
+				id: "m_ok".to_string(),
+				session_id: "s_mix".to_string(),
+				branch_id: "b_mix".to_string(),
+				parent_message_id: Some("m_asst".to_string()),
+				payload: json!({
+					"type": "message",
+					"id": "m_ok",
+					"message": {
+						"role": "toolResult",
+						"toolCallId": "call_ok",
+						"toolName": "bash",
+						"content": "ok",
+						"isError": false
+					}
+				}),
+			})
+			.expect("ok result");
+		let fail_exec = store
+			.record_intent(NewIntent {
+				session_id: "s_mix".to_string(),
+				branch_id: "b_mix".to_string(),
+				provider_call_id: "call_fail".to_string(),
+				tool_name: "bash".to_string(),
+				payload: json!({}),
+			})
+			.expect("fail intent");
+
+		assert_eq!(store.recover_unresolved_intents("s_mix").expect("recover"), 1);
+		// kept must still end at the assistant so reconcile can see m_ok + synthetic.
+		let kept_before = store
+			.session("s_mix")
+			.expect("session")
+			.expect("s")
+			.payload["durableProjection"]["kept"]
+			.clone();
+		assert_eq!(kept_before, json!(["m_asst"]));
+
+		let backfilled = store
+			.reconcile_durable_projection("s_mix")
+			.expect("reconcile");
+		assert_eq!(backfilled, 2, "sibling result and synthetic interrupted must both backfill");
+
+		let session = store.session("s_mix").expect("session").expect("s");
+		let kept = session.payload["durableProjection"]["kept"]
+			.as_array()
+			.expect("kept")
+			.iter()
+			.filter_map(Value::as_str)
+			.collect::<Vec<_>>();
+		assert_eq!(kept[0], "m_asst");
+		assert_eq!(kept[1], "m_ok");
+		assert!(
+			kept[2].starts_with("msg-int-"),
+			"synthetic interrupted id: {}",
+			kept[2]
+		);
+		assert_eq!(kept[2], format!("msg-int-{fail_exec}"));
+		assert_eq!(store.outcome(&fail_exec).expect("outcome"), None);
+	}
+
+
+	#[test]
+	fn recover_unresolved_intents_refuses_reused_call_id_from_earlier_unresolved() {
+		let mut store = seeded_store();
+		// Older trailing batch admitted an intent for "shared", then conversation continued.
+		store
+			.append_message(NewMessage {
+				id: "m_old".to_string(),
+				session_id: "s1".to_string(),
+				branch_id: "b1".to_string(),
+				parent_message_id: None,
+				payload: json!({
+					"type": "message",
+					"id": "m_old",
+					"message": {
+						"role": "assistant",
+						"content": [{ "type": "toolCall", "id": "shared", "name": "bash" }]
+					}
+				}),
+			})
+			.expect("old assistant");
+		let old_exec = store
+			.record_intent(NewIntent {
+				session_id: "s1".to_string(),
+				branch_id: "b1".to_string(),
+				provider_call_id: "shared".to_string(),
+				tool_name: "bash".to_string(),
+				payload: json!({}),
+			})
+			.expect("old intent");
+		store
+			.append_message(NewMessage {
+				id: "m_user".to_string(),
+				session_id: "s1".to_string(),
+				branch_id: "b1".to_string(),
+				parent_message_id: Some("m_old".to_string()),
+				payload: json!({
+					"type": "message",
+					"id": "m_user",
+					"message": { "role": "user", "content": "next" }
+				}),
+			})
+			.expect("user");
+		// Newer trailing call reuses the same provider id but never admitted an intent
+		// (crash before begin_execution, or filter denial without a persisted result).
+		store
+			.append_message(NewMessage {
+				id: "m_new".to_string(),
+				session_id: "s1".to_string(),
+				branch_id: "b1".to_string(),
+				parent_message_id: Some("m_user".to_string()),
+				payload: json!({
+					"type": "message",
+					"id": "m_new",
+					"message": {
+						"role": "assistant",
+						"content": [{ "type": "toolCall", "id": "shared", "name": "bash" }]
+					}
+				}),
+			})
+			.expect("new assistant");
+
+		let err = store
+			.recover_unresolved_intents("s1")
+			.expect_err("reused id must fail closed");
+		assert!(
+			err.to_string().contains("not uniquely attributable"),
+			"{err}"
+		);
+
+		// No synthetic toolResult; historical unresolved intent untouched.
+		assert!(
+			store
+				.branch_messages("b1")
+				.expect("msgs")
+				.iter()
+				.all(|m| m.payload["message"]["role"] != "toolResult"),
+			"must not synthesize a result for the newer missing-intent call"
+		);
+		let unresolved = store.unresolved_intents("s1").expect("unresolved");
+		assert_eq!(unresolved.len(), 1);
+		assert_eq!(unresolved[0].execution_id, old_exec);
+		assert_eq!(store.outcome(&old_exec).expect("outcome"), None);
+		assert_eq!(
+			store.branch("b1").expect("branch").expect("b1").leaf_message_id.as_deref(),
+			Some("m_new")
+		);
+	}
+
+
+	#[test]
+	fn recover_unresolved_intents_refuses_reused_call_id_closed_by_interrupted_result() {
+		let mut store = seeded_store();
+		store
+			.append_message(NewMessage {
+				id: "m_a1".to_string(),
+				session_id: "s1".to_string(),
+				branch_id: "b1".to_string(),
+				parent_message_id: None,
+				payload: json!({
+					"type": "message",
+					"id": "m_a1",
+					"message": {
+						"role": "assistant",
+						"content": [{ "type": "toolCall", "id": "shared", "name": "bash" }]
+					}
+				}),
+			})
+			.expect("assistant 1");
+		let exec = store
+			.record_intent(NewIntent {
+				session_id: "s1".to_string(),
+				branch_id: "b1".to_string(),
+				provider_call_id: "shared".to_string(),
+				tool_name: "bash".to_string(),
+				payload: json!({}),
+			})
+			.expect("intent");
+		assert_eq!(store.recover_unresolved_intents("s1").expect("first recovery"), 1);
+		assert_eq!(store.outcome(&exec).expect("outcome"), None, "interrupted recovery keeps the outcome unresolved");
+		let leaf_id = store
+			.branch("b1")
+			.expect("branch")
+			.expect("b1")
+			.leaf_message_id
+			.expect("recovered leaf");
+
+		// Newer call reuses the provider id but was never admitted (no intent row).
+		store
+			.append_message(NewMessage {
+				id: "m_a2".to_string(),
+				session_id: "s1".to_string(),
+				branch_id: "b1".to_string(),
+				parent_message_id: Some(leaf_id),
+				payload: json!({
+					"type": "message",
+					"id": "m_a2",
+					"message": {
+						"role": "assistant",
+						"content": [{ "type": "toolCall", "id": "shared", "name": "bash" }]
+					}
+				}),
+			})
+			.expect("assistant 2");
+
+		let err = store
+			.recover_unresolved_intents("s1")
+			.expect_err("recovery-synthesized result must not answer the historical unresolved intent");
+		assert!(err.to_string().contains("not uniquely attributable"), "{err}");
+
+		let results = store
+			.branch_messages("b1")
+			.expect("msgs")
+			.iter()
+			.filter(|m| m.payload["message"]["role"] == json!("toolResult"))
+			.count();
+		assert_eq!(results, 1, "no second recovered result may be appended");
+		let unresolved = store.unresolved_intents("s1").expect("unresolved");
+		assert_eq!(unresolved.len(), 1);
+		assert_eq!(unresolved[0].execution_id, exec);
+		assert_eq!(store.outcome(&exec).expect("outcome"), None);
+		assert_eq!(
+			store.branch("b1").expect("branch").expect("b1").leaf_message_id.as_deref(),
+			Some("m_a2")
+		);
+	}
+
+	#[test]
+	fn recover_unresolved_intents_refuses_duplicate_declarations_with_partial_answers() {
+		let mut store = seeded_store();
+		store
+			.append_message(NewMessage {
+				id: "m_a1".to_string(),
+				session_id: "s1".to_string(),
+				branch_id: "b1".to_string(),
+				parent_message_id: None,
+				payload: json!({
+					"type": "message",
+					"id": "m_a1",
+					"message": {
+						"role": "assistant",
+						"content": [
+							{ "type": "toolCall", "id": "dup", "name": "bash" },
+							{ "type": "toolCall", "id": "dup", "name": "bash" }
+						]
+					}
+				}),
+			})
+			.expect("assistant with duplicate declarations");
+		let old_exec = store
+			.record_intent(NewIntent {
+				session_id: "s1".to_string(),
+				branch_id: "b1".to_string(),
+				provider_call_id: "dup".to_string(),
+				tool_name: "bash".to_string(),
+				payload: json!({}),
+			})
+			.expect("old intent");
+		store
+			.append_message(NewMessage {
+				id: "m_res".to_string(),
+				session_id: "s1".to_string(),
+				branch_id: "b1".to_string(),
+				parent_message_id: Some("m_a1".to_string()),
+				payload: json!({
+					"type": "message",
+					"id": "m_res",
+					"message": { "role": "toolResult", "toolCallId": "dup", "toolName": "bash", "content": "done" }
+				}),
+			})
+			.expect("one of two answers");
+		store
+			.append_message(NewMessage {
+				id: "m_a2".to_string(),
+				session_id: "s1".to_string(),
+				branch_id: "b1".to_string(),
+				parent_message_id: Some("m_res".to_string()),
+				payload: json!({
+					"type": "message",
+					"id": "m_a2",
+					"message": { "role": "assistant", "content": [{ "type": "toolCall", "id": "dup", "name": "bash" }] }
+				}),
+			})
+			.expect("trailing assistant");
+
+		let err = store
+			.recover_unresolved_intents("s1")
+			.expect_err("one answer cannot cover two earlier declarations");
+		assert!(err.to_string().contains("not uniquely attributable"), "{err}");
+		assert_eq!(
+			store.branch_messages("b1").expect("msgs").iter().filter(|m| m.payload["message"]["role"] == json!("toolResult")).count(),
+			1,
+			"no synthetic result may be appended"
+		);
+		assert_eq!(store.unresolved_intents("s1").expect("unresolved")[0].execution_id, old_exec);
+		assert_eq!(store.outcome(&old_exec).expect("outcome"), None);
+	}
+
+	#[test]
+	fn recover_unresolved_intents_refuses_when_older_declaration_remains_unanswered() {
+		let mut store = seeded_store();
+		store
+			.append_message(NewMessage {
+				id: "m_a1".to_string(),
+				session_id: "s1".to_string(),
+				branch_id: "b1".to_string(),
+				parent_message_id: None,
+				payload: json!({
+					"type": "message",
+					"id": "m_a1",
+					"message": { "role": "assistant", "content": [{ "type": "toolCall", "id": "shared", "name": "bash" }] }
+				}),
+			})
+			.expect("oldest unresolved declaration");
+		let old_exec = store
+			.record_intent(NewIntent {
+				session_id: "s1".to_string(),
+				branch_id: "b1".to_string(),
+				provider_call_id: "shared".to_string(),
+				tool_name: "bash".to_string(),
+				payload: json!({}),
+			})
+			.expect("old intent");
+		store
+			.append_message(NewMessage {
+				id: "m_a2".to_string(),
+				session_id: "s1".to_string(),
+				branch_id: "b1".to_string(),
+				parent_message_id: Some("m_a1".to_string()),
+				payload: json!({
+					"type": "message",
+					"id": "m_a2",
+					"message": { "role": "assistant", "content": [{ "type": "toolCall", "id": "shared", "name": "bash" }] }
+				}),
+			})
+			.expect("answered declaration");
+		store
+			.append_message(NewMessage {
+				id: "m_res".to_string(),
+				session_id: "s1".to_string(),
+				branch_id: "b1".to_string(),
+				parent_message_id: Some("m_a2".to_string()),
+				payload: json!({
+					"type": "message",
+					"id": "m_res",
+					"message": { "role": "toolResult", "toolCallId": "shared", "toolName": "bash", "content": "done" }
+				}),
+			})
+			.expect("answer for the newer declaration");
+		store
+			.append_message(NewMessage {
+				id: "m_a3".to_string(),
+				session_id: "s1".to_string(),
+				branch_id: "b1".to_string(),
+				parent_message_id: Some("m_res".to_string()),
+				payload: json!({
+					"type": "message",
+					"id": "m_a3",
+					"message": { "role": "assistant", "content": [{ "type": "toolCall", "id": "shared", "name": "bash" }] }
+				}),
+			})
+			.expect("trailing assistant");
+
+		let err = store
+			.recover_unresolved_intents("s1")
+			.expect_err("the answer belongs to the newer declaration, not the oldest");
+		assert!(err.to_string().contains("not uniquely attributable"), "{err}");
+		assert_eq!(store.unresolved_intents("s1").expect("unresolved")[0].execution_id, old_exec);
+		assert_eq!(store.outcome(&old_exec).expect("outcome"), None);
+	}
+
+	#[test]
+	fn recover_unresolved_intents_allows_reuse_after_resolved_execution_result() {
+		let mut store = seeded_store();
+		store
+			.append_message(NewMessage {
+				id: "m_a1".to_string(),
+				session_id: "s1".to_string(),
+				branch_id: "b1".to_string(),
+				parent_message_id: None,
+				payload: json!({
+					"type": "message",
+					"id": "m_a1",
+					"message": { "role": "assistant", "content": [{ "type": "toolCall", "id": "shared", "name": "bash" }] }
+				}),
+			})
+			.expect("old assistant");
+		let old_exec = store
+			.record_intent(NewIntent {
+				session_id: "s1".to_string(),
+				branch_id: "b1".to_string(),
+				provider_call_id: "shared".to_string(),
+				tool_name: "bash".to_string(),
+				payload: json!({}),
+			})
+			.expect("old intent");
+		store
+			.record_outcome(&old_exec, json!({ "content": "done", "isError": false }))
+			.expect("old outcome");
+		store
+			.append_message(NewMessage {
+				id: "m_res".to_string(),
+				session_id: "s1".to_string(),
+				branch_id: "b1".to_string(),
+				parent_message_id: Some("m_a1".to_string()),
+				payload: json!({
+					"type": "message",
+					"id": "m_res",
+					"message": {
+						"role": "toolResult",
+						"toolCallId": "shared",
+						"toolName": "bash",
+						"content": "done",
+						"details": { "executionId": old_exec }
+					}
+				}),
+			})
+			.expect("verified answer");
+		store
+			.append_message(NewMessage {
+				id: "m_a2".to_string(),
+				session_id: "s1".to_string(),
+				branch_id: "b1".to_string(),
+				parent_message_id: Some("m_res".to_string()),
+				payload: json!({
+					"type": "message",
+					"id": "m_a2",
+					"message": { "role": "assistant", "content": [{ "type": "toolCall", "id": "shared", "name": "bash" }] }
+				}),
+			})
+			.expect("trailing assistant");
+		let new_exec = store
+			.record_intent(NewIntent {
+				session_id: "s1".to_string(),
+				branch_id: "b1".to_string(),
+				provider_call_id: "shared".to_string(),
+				tool_name: "bash".to_string(),
+				payload: json!({}),
+			})
+			.expect("new intent");
+
+		assert_eq!(store.recover_unresolved_intents("s1").expect("recover"), 1);
+		let leaf_id = store
+			.branch("b1")
+			.expect("branch")
+			.expect("b1")
+			.leaf_message_id
+			.expect("recovered leaf");
+		let leaf = store.message(&leaf_id).expect("message").expect("leaf");
+		assert_eq!(leaf.payload["message"]["details"]["executionId"], new_exec);
+		assert_eq!(store.outcome(&old_exec).expect("old outcome").is_some(), true);
+		assert_eq!(store.outcome(&new_exec).expect("new outcome"), None);
+	}
+
+	#[test]
+	fn recover_unresolved_intents_allows_answered_earlier_reuse() {
+		let mut store = seeded_store();
+		// Earlier turn declared "shared" and got a toolResult.
+		store
+			.append_message(NewMessage {
+				id: "m_old".to_string(),
+				session_id: "s1".to_string(),
+				branch_id: "b1".to_string(),
+				parent_message_id: None,
+				payload: json!({
+					"type": "message",
+					"id": "m_old",
+					"message": {
+						"role": "assistant",
+						"content": [{ "type": "toolCall", "id": "shared", "name": "bash" }]
+					}
+				}),
+			})
+			.expect("old assistant");
+		let old_exec = store
+			.record_intent(NewIntent {
+				session_id: "s1".to_string(),
+				branch_id: "b1".to_string(),
+				provider_call_id: "shared".to_string(),
+				tool_name: "bash".to_string(),
+				payload: json!({}),
+			})
+			.expect("old intent");
+		store
+			.record_outcome(
+				&old_exec,
+				json!({ "content": "done", "isError": false }),
+			)
+			.expect("old outcome");
+		store
+			.append_message(NewMessage {
+				id: "m_old_res".to_string(),
+				session_id: "s1".to_string(),
+				branch_id: "b1".to_string(),
+				parent_message_id: Some("m_old".to_string()),
+				payload: json!({
+					"type": "message",
+					"id": "m_old_res",
+					"message": {
+						"role": "toolResult",
+						"toolCallId": "shared",
+						"toolName": "bash",
+						"content": "done"
+					}
+				}),
+			})
+			.expect("old result");
+		store
+			.append_message(NewMessage {
+				id: "m_user".to_string(),
+				session_id: "s1".to_string(),
+				branch_id: "b1".to_string(),
+				parent_message_id: Some("m_old_res".to_string()),
+				payload: json!({
+					"type": "message",
+					"id": "m_user",
+					"message": { "role": "user", "content": "next" }
+				}),
+			})
+			.expect("user");
+		// Trailing assistant reuses provider id; unique unresolved intent belongs here.
+		store
+			.append_message(NewMessage {
+				id: "m_new".to_string(),
+				session_id: "s1".to_string(),
+				branch_id: "b1".to_string(),
+				parent_message_id: Some("m_user".to_string()),
+				payload: json!({
+					"type": "message",
+					"id": "m_new",
+					"message": {
+						"role": "assistant",
+						"content": [{ "type": "toolCall", "id": "shared", "name": "bash" }]
+					}
+				}),
+			})
+			.expect("new assistant");
+		let new_exec = store
+			.record_intent(NewIntent {
+				session_id: "s1".to_string(),
+				branch_id: "b1".to_string(),
+				provider_call_id: "shared".to_string(),
+				tool_name: "bash".to_string(),
+				payload: json!({}),
+			})
+			.expect("new intent");
+
+		assert_eq!(store.recover_unresolved_intents("s1").expect("recover"), 1);
+		let msgs = store.branch_messages("b1").expect("msgs");
+		let tool = msgs.last().expect("leaf");
+		assert_eq!(tool.payload["message"]["role"], "toolResult");
+		assert_eq!(tool.payload["message"]["toolCallId"], "shared");
+		assert_eq!(
+			tool.payload["message"]["content"],
+			SqliteStore::INTERRUPTED_UNKNOWN_OUTCOME
+		);
+		assert_eq!(store.outcome(&new_exec).expect("outcome"), None);
+	}
+
+
+
+	#[test]
 	fn recover_unmessaged_outcomes_refuses_when_branch_moved_past() {
 		let mut store = seeded_store();
 		store
@@ -4362,6 +6596,61 @@ mod tests {
 		// Branch leaf remains untouched at m_user_next.
 		let branch = store.branch("b1").expect("branch").expect("b1");
 		assert_eq!(branch.leaf_message_id.as_deref(), Some("m_user_next"));
+	}
+
+	#[test]
+	fn recover_unmessaged_outcomes_uses_inherited_parent_point_for_child_branch() {
+		let mut store = seeded_store();
+		store
+			.append_message(NewMessage {
+				id: "m_asst".to_string(),
+				session_id: "s1".to_string(),
+				branch_id: "b1".to_string(),
+				parent_message_id: None,
+				payload: json!({
+					"type": "message",
+					"id": "m_asst",
+					"message": {
+						"role": "assistant",
+						"content": [{ "type": "toolCall", "id": "call-A", "name": "bash" }]
+					}
+				}),
+			})
+			.expect("append assistant");
+		store
+			.create_branch(NewBranch {
+				id: "b2".to_string(),
+				session_id: "s1".to_string(),
+				parent_branch_id: Some("b1".to_string()),
+				parent_message_id: Some("m_asst".to_string()),
+				payload: json!({}),
+			})
+			.expect("child branch inheriting parent point");
+		store
+			.set_active_branch("s1", "b2")
+			.expect("activate child branch");
+
+		let exec = store
+			.record_intent(NewIntent {
+				session_id: "s1".to_string(),
+				branch_id: "b2".to_string(),
+				provider_call_id: "call-A".to_string(),
+				tool_name: "bash".to_string(),
+				payload: json!({}),
+			})
+			.expect("intent");
+		store
+			.record_outcome(&exec, json!({ "content": "ok", "isError": false }))
+			.expect("outcome");
+
+		let recovered = store.recover_unmessaged_outcomes("s1").expect("recover");
+		assert_eq!(recovered, 1, "child branch leaf is NULL but inherits m_asst as effective leaf");
+
+		let child = store.branch("b2").expect("branch").expect("b2");
+		let leaf_id = child.leaf_message_id.expect("recovered leaf recorded on child branch");
+		let leaf = store.message(&leaf_id).expect("message").expect("leaf");
+		assert_eq!(leaf.parent_message_id.as_deref(), Some("m_asst"));
+		assert_eq!(leaf.payload["message"]["toolCallId"], "call-A");
 	}
 
 	#[test]
@@ -4628,7 +6917,8 @@ mod tests {
 				payload: json!({
 					"cwd": "/tmp",
 					"durableProjection": {
-						"kept": ["m_asst"]
+						"kept": ["m_asst"],
+						"synthetic": []
 					}
 				}),
 				initial_branch_id: "b1".to_string(),
@@ -4700,7 +6990,8 @@ mod tests {
 				parent_session_id: None,
 				payload: json!({
 					"durableProjection": {
-						"kept": ["m_asst"]
+						"kept": ["m_asst"],
+						"synthetic": []
 					}
 				}),
 				initial_branch_id: "b1".to_string(),
@@ -4797,7 +7088,7 @@ mod tests {
 	}
 
 	#[test]
-	fn reconcile_durable_projection_discards_stale_diverged_projection_preserving_history() {
+	fn reconcile_durable_projection_fails_closed_on_stale_diverged_projection_preserving_history() {
 		let mut store = SqliteStore::open_in_memory().expect("open store");
 		store
 			.create_session(NewSession {
@@ -4805,7 +7096,8 @@ mod tests {
 				parent_session_id: None,
 				payload: json!({
 					"durableProjection": {
-						"kept": ["m_user", "m_stale_branch1_msg"]
+						"kept": ["m_user", "m_stale_branch1_msg"],
+						"synthetic": []
 					}
 				}),
 				initial_branch_id: "b_active".to_string(),
@@ -4828,13 +7120,13 @@ mod tests {
 			})
 			.expect("m_user");
 
-		let backfilled = store
+		let error = store
 			.reconcile_durable_projection("s_diverge")
-			.expect("must safely discard stale projection without failing session");
-		assert_eq!(backfilled, 0);
+			.expect_err("stale diverged projection must fail closed");
+		assert!(matches!(error, StoreError::Corrupt(_)), "unexpected error: {error}");
 
 		let session = store.session("s_diverge").expect("session").expect("s_diverge");
-		assert!(session.payload.get("durableProjection").is_none());
+		assert!(session.payload.get("durableProjection").is_some());
 
 		// History is preserved: reading branch messages remains valid
 		let branch_msgs = store.branch_messages("b_active").expect("branch messages");
@@ -4925,6 +7217,259 @@ mod tests {
 		assert!(projection.is_some(), "durableProjection must be preserved for valid sibling toolResult");
 		let kept = projection.unwrap()["kept"].as_array().expect("kept array");
 		assert_eq!(kept, json!(["m_asst", "m_tool_offbranch"]).as_array().unwrap());
+	}
+
+
+	#[test]
+	fn reconcile_durable_projection_rejects_reused_call_id_from_unrelated_branch() {
+		let mut store = SqliteStore::open_in_memory().expect("open store");
+		store.create_session(NewSession { id: "s_reuse".into(), parent_session_id: None, payload: json!({"durableProjection":{"kept":["a1","r1"]}}), initial_branch_id: "b1".into(), initial_branch_payload: json!({}) }).expect("session");
+		store.append_message(NewMessage { id: "a1".into(), session_id: "s_reuse".into(), branch_id: "b1".into(), parent_message_id: None, payload: json!({"message":{"role":"assistant","content":[{"type":"toolCall","id":"same"}]}}) }).expect("assistant");
+		store.create_branch(NewBranch { id: "b2".into(), session_id: "s_reuse".into(), parent_branch_id: Some("b1".into()), parent_message_id: Some("a1".into()), payload: json!({}) }).expect("branch");
+		store.append_message(NewMessage { id: "a2".into(), session_id: "s_reuse".into(), branch_id: "b2".into(), parent_message_id: Some("a1".into()), payload: json!({"message":{"role":"assistant","content":[{"type":"toolCall","id":"same"}]}}) }).expect("unrelated assistant");
+		store.append_message(NewMessage { id: "r1".into(), session_id: "s_reuse".into(), branch_id: "b2".into(), parent_message_id: Some("a2".into()), payload: json!({"message":{"role":"toolResult","toolCallId":"same"}}) }).expect("result");
+		let error = store.reconcile_durable_projection("s_reuse").expect_err("reused call id must fail closed");
+		assert!(matches!(error, StoreError::Corrupt(_)), "unexpected error: {error}");
+		assert!(store.session("s_reuse").expect("get").expect("session").payload.get("durableProjection").is_some());
+	}
+
+	#[test]
+	fn reconcile_durable_projection_requires_synthetic_pending_call_for_offbranch_result() {
+		let seed_offbranch = |store: &mut SqliteStore, id: &str, synthetic: Value| {
+			store.create_session(NewSession { id: id.into(), parent_session_id: None, payload: json!({"durableProjection":{"kept":["r1","u1"],"synthetic":synthetic}}), initial_branch_id: "b1".into(), initial_branch_payload: json!({}) }).expect("session");
+			store.append_message(NewMessage { id: "a1".into(), session_id: id.into(), branch_id: "b1".into(), parent_message_id: None, payload: json!({"message":{"role":"assistant","content":[{"type":"toolCall","id":"same"}]}}) }).expect("assistant");
+			store.append_message(NewMessage { id: "u1".into(), session_id: id.into(), branch_id: "b1".into(), parent_message_id: Some("a1".into()), payload: json!({"message":{"role":"user","content":"next"}}) }).expect("user");
+			store.create_branch(NewBranch { id: "b2".into(), session_id: id.into(), parent_branch_id: Some("b1".into()), parent_message_id: Some("a1".into()), payload: json!({}) }).expect("branch");
+			store.append_message(NewMessage { id: "r1".into(), session_id: id.into(), branch_id: "b2".into(), parent_message_id: Some("a1".into()), payload: json!({"message":{"role":"toolResult","toolCallId":"same"}}) }).expect("result");
+		};
+		let synthetic_call = serde_json::to_value(pi_agent::Message::assistant_with_tools("prefix", vec![pi_agent::ToolCall { id: "same".into(), name: "bash".into(), arguments: json!({}) }])).expect("synthetic");
+
+		let mut absent = SqliteStore::open_in_memory().expect("open");
+		seed_offbranch(&mut absent, "s_no_synthetic", json!([]));
+		let error = absent.reconcile_durable_projection("s_no_synthetic").expect_err("off-branch result without a pending synthetic call must fail closed");
+		assert!(matches!(error, StoreError::Corrupt(_)), "unexpected error: {error}");
+		assert!(absent.session("s_no_synthetic").expect("get").expect("session").payload.get("durableProjection").is_some());
+
+		let mut present = SqliteStore::open_in_memory().expect("open");
+		seed_offbranch(&mut present, "s_synthetic", json!([synthetic_call]));
+		present.reconcile_durable_projection("s_synthetic").expect("reconcile");
+		let session = present.session("s_synthetic").expect("get").expect("session");
+		assert_eq!(session.payload["durableProjection"]["kept"], json!(["r1", "u1"]), "pending synthetic call must authorize the off-branch result");
+	}
+
+	#[test]
+	fn reconcile_durable_projection_consumes_synthetic_call_by_onbranch_result() {
+		let mut store = SqliteStore::open_in_memory().expect("open");
+		let synthetic_call = serde_json::to_value(pi_agent::Message::assistant_with_tools("prefix", vec![pi_agent::ToolCall { id: "same".into(), name: "bash".into(), arguments: json!({}) }])).expect("synthetic");
+		store.create_session(NewSession { id: "s_dup_synth".into(), parent_session_id: None, payload: json!({"durableProjection":{"kept":["r1","r2"],"synthetic":[synthetic_call]}}), initial_branch_id: "b1".into(), initial_branch_payload: json!({}) }).expect("session");
+		store.append_message(NewMessage { id: "a1".into(), session_id: "s_dup_synth".into(), branch_id: "b1".into(), parent_message_id: None, payload: json!({"message":{"role":"assistant","content":[{"type":"toolCall","id":"same"}]}}) }).expect("assistant");
+		store.append_message(NewMessage { id: "r1".into(), session_id: "s_dup_synth".into(), branch_id: "b1".into(), parent_message_id: Some("a1".into()), payload: json!({"message":{"role":"toolResult","toolCallId":"same"}}) }).expect("on-branch result");
+		store.create_branch(NewBranch { id: "b2".into(), session_id: "s_dup_synth".into(), parent_branch_id: Some("b1".into()), parent_message_id: Some("a1".into()), payload: json!({}) }).expect("branch");
+		store.append_message(NewMessage { id: "r2".into(), session_id: "s_dup_synth".into(), branch_id: "b2".into(), parent_message_id: Some("a1".into()), payload: json!({"message":{"role":"toolResult","toolCallId":"same"}}) }).expect("off-branch result");
+		let error = store.reconcile_durable_projection("s_dup_synth").expect_err("one pending synthetic call must not authorize two tool results");
+		assert!(matches!(error, StoreError::Corrupt(_)), "unexpected error: {error}");
+		assert!(store.session("s_dup_synth").expect("get").expect("session").payload.get("durableProjection").is_some());
+	}
+
+	#[test]
+	fn reconcile_durable_projection_rejects_offbranch_result_after_synthetic_interruption() {
+		let mut store = SqliteStore::open_in_memory().expect("open");
+		let synthetic_call = serde_json::to_value(pi_agent::Message::assistant_with_tools("prefix", vec![pi_agent::ToolCall { id: "same".into(), name: "bash".into(), arguments: json!({}) }])).expect("synthetic");
+		store.create_session(NewSession { id: "s_interrupt".into(), parent_session_id: None, payload: json!({"durableProjection":{"kept":["u1","r2"],"synthetic":[synthetic_call]}}), initial_branch_id: "b1".into(), initial_branch_payload: json!({}) }).expect("session");
+		store.append_message(NewMessage { id: "a1".into(), session_id: "s_interrupt".into(), branch_id: "b1".into(), parent_message_id: None, payload: json!({"message":{"role":"assistant","content":[{"type":"toolCall","id":"same"}]}}) }).expect("assistant");
+		store.append_message(NewMessage { id: "u1".into(), session_id: "s_interrupt".into(), branch_id: "b1".into(), parent_message_id: Some("a1".into()), payload: json!({"message":{"role":"user","content":"next"}}) }).expect("user interruption");
+		store.create_branch(NewBranch { id: "b2".into(), session_id: "s_interrupt".into(), parent_branch_id: Some("b1".into()), parent_message_id: Some("a1".into()), payload: json!({}) }).expect("branch");
+		store.append_message(NewMessage { id: "r2".into(), session_id: "s_interrupt".into(), branch_id: "b2".into(), parent_message_id: Some("a1".into()), payload: json!({"message":{"role":"toolResult","toolCallId":"same"}}) }).expect("off-branch result");
+		let error = store.reconcile_durable_projection("s_interrupt").expect_err("a user interruption invalidates pending synthetic calls");
+		assert!(matches!(error, StoreError::Corrupt(_)), "unexpected error: {error}");
+		assert!(store.session("s_interrupt").expect("get").expect("session").payload.get("durableProjection").is_some());
+	}
+
+	#[test]
+	fn reconcile_durable_projection_rejects_synthetic_prefix_with_unmatched_tool_result() {
+		let mut store = SqliteStore::open_in_memory().expect("open");
+		let call = serde_json::to_value(pi_agent::Message::assistant_with_tools("prefix", vec![pi_agent::ToolCall { id: "same".into(), name: "bash".into(), arguments: json!({}) }])).expect("synthetic call");
+		let orphan_result = serde_json::to_value(pi_agent::Message::tool_with_status("other", "bash", "ok", false)).expect("synthetic result");
+		let header = json!({"durableProjection":{"kept":["r1","u1"],"synthetic":[call, orphan_result]}});
+		store.create_session(NewSession { id: "s_bad_prefix".into(), parent_session_id: None, payload: header.clone(), initial_branch_id: "b1".into(), initial_branch_payload: json!({}) }).expect("session");
+		store.append_message(NewMessage { id: "a1".into(), session_id: "s_bad_prefix".into(), branch_id: "b1".into(), parent_message_id: None, payload: json!({"message":{"role":"assistant","content":[{"type":"toolCall","id":"same"}]}}) }).expect("assistant");
+		store.append_message(NewMessage { id: "u1".into(), session_id: "s_bad_prefix".into(), branch_id: "b1".into(), parent_message_id: Some("a1".into()), payload: json!({"message":{"role":"user","content":"next"}}) }).expect("user");
+		store.create_branch(NewBranch { id: "b2".into(), session_id: "s_bad_prefix".into(), parent_branch_id: Some("b1".into()), parent_message_id: Some("a1".into()), payload: json!({}) }).expect("branch");
+		store.append_message(NewMessage { id: "r1".into(), session_id: "s_bad_prefix".into(), branch_id: "b2".into(), parent_message_id: Some("a1".into()), payload: json!({"message":{"role":"toolResult","toolCallId":"same"}}) }).expect("result");
+		let error = store.reconcile_durable_projection("s_bad_prefix").expect_err("unmatched synthetic tool result must fail closed");
+		assert!(matches!(error, StoreError::Corrupt(_)), "unexpected error: {error}");
+		let session = store.session("s_bad_prefix").expect("get").expect("session");
+		assert_eq!(session.payload.get("durableProjection"), header.get("durableProjection"), "failed validation must not mutate the projection or header");
+	}
+
+	#[test]
+	fn reconcile_durable_projection_rejects_synthetic_only_prefix_with_dangling_call() {
+		let mut store = SqliteStore::open_in_memory().expect("open");
+		let call = serde_json::to_value(pi_agent::Message::assistant_with_tools("prefix", vec![pi_agent::ToolCall { id: "dangling".into(), name: "bash".into(), arguments: json!({}) }])).expect("synthetic call");
+		let header = json!({"durableProjection":{"kept":[],"synthetic":[call],"anchor":"m_user"}});
+		store.create_session(NewSession { id: "s_empty_kept".into(), parent_session_id: None, payload: header.clone(), initial_branch_id: "b1".into(), initial_branch_payload: json!({}) }).expect("session");
+		store.append_message(NewMessage { id: "m_user".into(), session_id: "s_empty_kept".into(), branch_id: "b1".into(), parent_message_id: None, payload: json!({"message":{"role":"user","content":"hi"}}) }).expect("user");
+		let error = store.reconcile_durable_projection("s_empty_kept").expect_err("synthetic-only prefix with a dangling call must fail closed");
+		assert!(matches!(error, StoreError::Corrupt(_)), "unexpected error: {error}");
+		let session = store.session("s_empty_kept").expect("get").expect("session");
+		assert_eq!(session.payload.get("durableProjection"), header.get("durableProjection"), "failed validation must not mutate the projection or header");
+	}
+
+	#[test]
+	fn stored_projection_accepts_missing_arrays_and_legacy_anchor() {
+		let empty = parse_stored_projection(&json!({})).expect("absent arrays use defaults");
+		assert!(empty.kept.is_empty());
+		assert!(empty.synthetic.is_empty());
+		assert!(empty.anchor.is_none());
+
+		let legacy = parse_stored_projection(&json!({"firstKeptEntryId": "m1"})).expect("legacy anchor alias");
+		assert_eq!(legacy.anchor.as_deref(), Some("m1"));
+
+		let explicit = parse_stored_projection(&json!({"anchor": "a", "firstKeptEntryId": "b"})).expect("explicit anchor");
+		assert_eq!(explicit.anchor.as_deref(), Some("a"), "explicit anchor must win over the legacy alias");
+
+		let reordered = parse_stored_projection(&json!({"firstKeptEntryId": "b", "anchor": "a"})).expect("both fields regardless of order");
+		assert_eq!(reordered.anchor.as_deref(), Some("a"));
+
+		let null_wins = parse_stored_projection(&json!({"anchor": null, "firstKeptEntryId": "b"})).expect("explicit null anchor");
+		assert_eq!(null_wins.anchor, None, "an explicit null anchor must not be filled from the legacy field");
+
+		assert!(parse_stored_projection(&json!({"kept": "nope"})).is_err(), "wrong present type must fail");
+		assert!(parse_stored_projection(&json!({"synthetic": 5})).is_err(), "wrong present type must fail");
+		assert!(parse_stored_projection(&json!({"firstKeptEntryId": 5})).is_err(), "wrong legacy anchor type must fail");
+	}
+
+	#[test]
+	fn snapshot_reads_legacy_anchor_alias_without_rewriting_header() {
+		let mut store = SqliteStore::open_in_memory().expect("open");
+		let header = json!({"durableProjection": {"firstKeptEntryId": "m1"}});
+		store.create_session(NewSession { id: "s_legacy_anchor".into(), parent_session_id: None, payload: header.clone(), initial_branch_id: "b1".into(), initial_branch_payload: json!({}) }).expect("session");
+		store.append_message(NewMessage { id: "m1".into(), session_id: "s_legacy_anchor".into(), branch_id: "b1".into(), parent_message_id: None, payload: json!({"type":"message","id":"m1","message":{"role":"user","content":"hi"}}) }).expect("message");
+		let snapshot = store.load_session_snapshot("s_legacy_anchor").expect("snapshot");
+		assert_eq!(snapshot.projection.expect("projection").anchor.as_deref(), Some("m1"));
+		let session = store.session("s_legacy_anchor").expect("get").expect("session");
+		assert_eq!(session.payload, header, "snapshot read must not rewrite the header");
+	}
+
+	#[test]
+	fn reconcile_accepts_projection_with_missing_arrays() {
+		let mut store = SqliteStore::open_in_memory().expect("open");
+		let header = json!({"durableProjection": {"anchor": "m1"}});
+		store.create_session(NewSession { id: "s_missing_arrays".into(), parent_session_id: None, payload: header.clone(), initial_branch_id: "b1".into(), initial_branch_payload: json!({}) }).expect("session");
+		store.append_message(NewMessage { id: "m1".into(), session_id: "s_missing_arrays".into(), branch_id: "b1".into(), parent_message_id: None, payload: json!({"type":"message","id":"m1","message":{"role":"user","content":"one"}}) }).expect("m1");
+		assert_eq!(store.reconcile_durable_projection("s_missing_arrays").expect("reconcile"), 0);
+		assert_eq!(store.session("s_missing_arrays").expect("get").expect("session").payload, header, "nothing to backfill must not rewrite the header");
+
+		store.append_message(NewMessage { id: "m2".into(), session_id: "s_missing_arrays".into(), branch_id: "b1".into(), parent_message_id: Some("m1".into()), payload: json!({"type":"message","id":"m2","parentId":"m1","message":{"role":"user","content":"two"}}) }).expect("m2");
+		assert_eq!(store.reconcile_durable_projection("s_missing_arrays").expect("reconcile"), 1);
+		let session = store.session("s_missing_arrays").expect("get").expect("session");
+		assert_eq!(session.payload["durableProjection"]["kept"], json!(["m2"]));
+		assert_eq!(session.payload["durableProjection"]["anchor"], json!("m1"));
+	}
+
+	#[test]
+	fn malformed_durable_projection_shapes_fail_closed() {
+		let cases = [
+			json!({"durableProjection": "not-an-object"}),
+			json!({"durableProjection": null}),
+			json!({"durableProjection": {"kept": "nope", "synthetic": []}}),
+			json!({"durableProjection": {"synthetic": []}}),
+			json!({"durableProjection": {"kept": [], "synthetic": "nope"}}),
+			json!({"durableProjection": {"kept": [1], "synthetic": []}}),
+			json!({"durableProjection": {"kept": [], "synthetic": [], "anchor": 5}}),
+		];
+		for (index, payload) in cases.iter().enumerate() {
+			let mut store = SqliteStore::open_in_memory().expect("open");
+			let id = format!("s_shape_{index}");
+			store.create_session(NewSession { id: id.clone(), parent_session_id: None, payload: payload.clone(), initial_branch_id: "b1".into(), initial_branch_payload: json!({}) }).expect("session");
+			store.append_message(NewMessage { id: "m1".into(), session_id: id.clone(), branch_id: "b1".into(), parent_message_id: None, payload: json!({"type":"message","id":"m1","message":{"role":"user","content":"hi"}}) }).expect("message");
+			let error = store.reconcile_durable_projection(&id).expect_err("malformed projection must fail closed");
+			assert!(matches!(error, StoreError::Corrupt(_)), "case {index}: unexpected error {error}");
+			let session = store.session(&id).expect("get").expect("session");
+			assert_eq!(session.payload.get("durableProjection"), payload.get("durableProjection"), "case {index}: header must be unchanged");
+		}
+	}
+
+	#[test]
+	fn snapshot_rejects_malformed_durable_projection() {
+		let mut store = SqliteStore::open_in_memory().expect("open");
+		store.create_session(NewSession { id: "s_snap".into(), parent_session_id: None, payload: json!({"durableProjection": {"kept": "nope", "synthetic": []}}), initial_branch_id: "b1".into(), initial_branch_payload: json!({}) }).expect("session");
+		store.append_message(NewMessage { id: "m1".into(), session_id: "s_snap".into(), branch_id: "b1".into(), parent_message_id: None, payload: json!({"type":"message","id":"m1","message":{"role":"user","content":"hi"}}) }).expect("message");
+		let error = store.load_session_snapshot("s_snap").expect_err("snapshot must fail closed on malformed projection");
+		assert!(matches!(error, StoreError::Corrupt(_)), "unexpected error: {error}");
+	}
+
+	#[test]
+	fn reconcile_durable_projection_completes_trailing_synthetic_call_from_kept() {
+		let mut store = SqliteStore::open_in_memory().expect("open");
+		let calls = serde_json::to_value(pi_agent::Message::assistant_with_tools("prefix", vec![
+			pi_agent::ToolCall { id: "same1".into(), name: "bash".into(), arguments: json!({}) },
+			pi_agent::ToolCall { id: "same2".into(), name: "bash".into(), arguments: json!({}) },
+		])).expect("synthetic calls");
+		let answered = serde_json::to_value(pi_agent::Message::tool_with_status("same1", "bash", "ok", false)).expect("synthetic result");
+		store.create_session(NewSession { id: "s_trailing".into(), parent_session_id: None, payload: json!({"durableProjection":{"kept":["r2","u1"],"synthetic":[calls, answered]}}), initial_branch_id: "b1".into(), initial_branch_payload: json!({}) }).expect("session");
+		store.append_message(NewMessage { id: "a1".into(), session_id: "s_trailing".into(), branch_id: "b1".into(), parent_message_id: None, payload: json!({"message":{"role":"assistant","content":[{"type":"toolCall","id":"same2"}]}}) }).expect("assistant");
+		store.append_message(NewMessage { id: "u1".into(), session_id: "s_trailing".into(), branch_id: "b1".into(), parent_message_id: Some("a1".into()), payload: json!({"message":{"role":"user","content":"next"}}) }).expect("user");
+		store.create_branch(NewBranch { id: "b2".into(), session_id: "s_trailing".into(), parent_branch_id: Some("b1".into()), parent_message_id: Some("a1".into()), payload: json!({}) }).expect("branch");
+		store.append_message(NewMessage { id: "r2".into(), session_id: "s_trailing".into(), branch_id: "b2".into(), parent_message_id: Some("a1".into()), payload: json!({"message":{"role":"toolResult","toolCallId":"same2"}}) }).expect("result");
+		store.reconcile_durable_projection("s_trailing").expect("reconcile");
+		let session = store.session("s_trailing").expect("get").expect("session");
+		assert_eq!(session.payload["durableProjection"]["kept"], json!(["r2", "u1"]), "in-prefix result is matched and the trailing call is completed by the kept result");
+	}
+
+	#[test]
+	fn reconcile_durable_projection_uses_anchor_for_offbranch_only_kept_rows() {
+		let mut store = SqliteStore::open_in_memory().expect("open");
+		let synthetic_call = serde_json::to_value(pi_agent::Message::assistant_with_tools("prefix", vec![pi_agent::ToolCall { id: "same".into(), name: "bash".into(), arguments: json!({}) }])).expect("synthetic");
+		store.create_session(NewSession { id: "s_anchor_off".into(), parent_session_id: None, payload: json!({"durableProjection":{"kept":["r_off"],"synthetic":[synthetic_call],"anchor":"a1"}}), initial_branch_id: "b1".into(), initial_branch_payload: json!({}) }).expect("session");
+		store.append_message(NewMessage { id: "a1".into(), session_id: "s_anchor_off".into(), branch_id: "b1".into(), parent_message_id: None, payload: json!({"type":"message","id":"a1","message":{"role":"assistant","content":[{"type":"toolCall","id":"same"}]}}) }).expect("assistant");
+		store.append_message(NewMessage { id: "x1".into(), session_id: "s_anchor_off".into(), branch_id: "b1".into(), parent_message_id: Some("a1".into()), payload: json!({"type":"message","id":"x1","parentId":"a1","message":{"role":"user","content":"after anchor"}}) }).expect("suffix");
+		store.create_branch(NewBranch { id: "b2".into(), session_id: "s_anchor_off".into(), parent_branch_id: Some("b1".into()), parent_message_id: Some("a1".into()), payload: json!({}) }).expect("branch");
+		store.append_message(NewMessage { id: "r_off".into(), session_id: "s_anchor_off".into(), branch_id: "b2".into(), parent_message_id: Some("a1".into()), payload: json!({"type":"message","id":"r_off","parentId":"a1","message":{"role":"toolResult","toolCallId":"same"}}) }).expect("off-branch result");
+		let backfilled = store.reconcile_durable_projection("s_anchor_off").expect("reconcile");
+		assert_eq!(backfilled, 1, "suffix after the validated anchor is backfilled");
+		let session = store.session("s_anchor_off").expect("get").expect("session");
+		assert_eq!(session.payload["durableProjection"]["kept"], json!(["r_off", "x1"]), "off-branch-only projection is preserved and extended");
+	}
+
+	#[test]
+	fn reconcile_durable_projection_fails_closed_without_anchor_for_offbranch_only_kept_rows() {
+		let mut store = SqliteStore::open_in_memory().expect("open");
+		let synthetic_call = serde_json::to_value(pi_agent::Message::assistant_with_tools("prefix", vec![pi_agent::ToolCall { id: "same".into(), name: "bash".into(), arguments: json!({}) }])).expect("synthetic");
+		let header = json!({"durableProjection":{"kept":["r_off"],"synthetic":[synthetic_call]}});
+		store.create_session(NewSession { id: "s_no_anchor".into(), parent_session_id: None, payload: header.clone(), initial_branch_id: "b1".into(), initial_branch_payload: json!({}) }).expect("session");
+		store.append_message(NewMessage { id: "a1".into(), session_id: "s_no_anchor".into(), branch_id: "b1".into(), parent_message_id: None, payload: json!({"type":"message","id":"a1","message":{"role":"assistant","content":[{"type":"toolCall","id":"same"}]}}) }).expect("assistant");
+		store.create_branch(NewBranch { id: "b2".into(), session_id: "s_no_anchor".into(), parent_branch_id: Some("b1".into()), parent_message_id: Some("a1".into()), payload: json!({}) }).expect("branch");
+		store.append_message(NewMessage { id: "r_off".into(), session_id: "s_no_anchor".into(), branch_id: "b2".into(), parent_message_id: Some("a1".into()), payload: json!({"type":"message","id":"r_off","parentId":"a1","message":{"role":"toolResult","toolCallId":"same"}}) }).expect("off-branch result");
+		let error = store.reconcile_durable_projection("s_no_anchor").expect_err("no active anchor must fail closed");
+		assert!(matches!(error, StoreError::Corrupt(_)), "unexpected error: {error}");
+		let session = store.session("s_no_anchor").expect("get").expect("session");
+		assert_eq!(session.payload.get("durableProjection"), header.get("durableProjection"), "failed validation must not delete the projection");
+	}
+
+	#[test]
+	fn reconcile_durable_projection_validates_synthetic_prefix_on_empty_branch() {
+		let mut store = SqliteStore::open_in_memory().expect("open");
+		let dangling = serde_json::to_value(pi_agent::Message::assistant_with_tools("prefix", vec![pi_agent::ToolCall { id: "dangling".into(), name: "bash".into(), arguments: json!({}) }])).expect("synthetic");
+		let header = json!({"durableProjection":{"kept":[],"synthetic":[dangling]}});
+		store.create_session(NewSession { id: "s_empty_branch".into(), parent_session_id: None, payload: header.clone(), initial_branch_id: "b1".into(), initial_branch_payload: json!({}) }).expect("session");
+		let error = store.reconcile_durable_projection("s_empty_branch").expect_err("empty branch must still validate the synthetic prefix");
+		assert!(matches!(error, StoreError::Corrupt(_)), "unexpected error: {error}");
+		let session = store.session("s_empty_branch").expect("get").expect("session");
+		assert_eq!(session.payload.get("durableProjection"), header.get("durableProjection"), "failed validation must not delete the projection");
+	}
+
+	#[test]
+	fn reconcile_durable_projection_rejects_result_after_user_ancestor() {
+		let mut store = SqliteStore::open_in_memory().expect("open store");
+		store.create_session(NewSession { id: "s_gap".into(), parent_session_id: None, payload: json!({"durableProjection":{"kept":["a","r"]}}), initial_branch_id: "b1".into(), initial_branch_payload: json!({}) }).expect("session");
+		store.append_message(NewMessage { id: "a".into(), session_id: "s_gap".into(), branch_id: "b1".into(), parent_message_id: None, payload: json!({"message":{"role":"assistant","content":[{"type":"toolCall","id":"call"}]}}) }).expect("assistant");
+		store.create_branch(NewBranch { id: "b2".into(), session_id: "s_gap".into(), parent_branch_id: Some("b1".into()), parent_message_id: Some("a".into()), payload: json!({}) }).expect("branch");
+		store.append_message(NewMessage { id: "u".into(), session_id: "s_gap".into(), branch_id: "b2".into(), parent_message_id: Some("a".into()), payload: json!({"message":{"role":"user","content":"gap"}}) }).expect("user gap");
+		store.append_message(NewMessage { id: "r".into(), session_id: "s_gap".into(), branch_id: "b2".into(), parent_message_id: Some("u".into()), payload: json!({"message":{"role":"toolResult","toolCallId":"call"}}) }).expect("result");
+		let error = store.reconcile_durable_projection("s_gap").expect_err("result after a user ancestor must fail closed");
+		assert!(matches!(error, StoreError::Corrupt(_)), "unexpected error: {error}");
+		assert!(store.session("s_gap").expect("get").expect("session").payload.get("durableProjection").is_some());
 	}
 
 	#[test]
@@ -5094,12 +7639,12 @@ mod tests {
 			})
 			.expect("append m_tool_unmatched");
 
-		// Must safely discard projection because call-WRONG was not called by m_asst:
-		let backfilled = store.reconcile_durable_projection("s_unmatched").expect("reconcile");
-		assert_eq!(backfilled, 0);
+		// Must fail closed because call-WRONG was not called by m_asst:
+		let error = store.reconcile_durable_projection("s_unmatched").expect_err("unmatched tool call id must fail closed");
+		assert!(matches!(error, StoreError::Corrupt(_)), "unexpected error: {error}");
 
 		let session = store.session("s_unmatched").expect("get").expect("s");
-		assert!(session.payload.get("durableProjection").is_none(), "projection with unmatched tool call id must be discarded");
+		assert!(session.payload.get("durableProjection").is_some(), "projection with unmatched tool call id must be retained");
 	}
 
 	#[test]
@@ -5163,7 +7708,8 @@ mod tests {
 				parent_session_id: None,
 				payload: json!({
 					"durableProjection": {
-						"kept": ["m_asst"]
+						"kept": ["m_asst"],
+						"synthetic": []
 					}
 				}),
 				initial_branch_id: "b1".to_string(),

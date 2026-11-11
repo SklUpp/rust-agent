@@ -414,7 +414,10 @@ async fn reopened_unresolved_intent_is_not_replayed() {
 	};
 	let execution = session.begin_execution(&call).await.expect("intent");
 	// No finish: this models a crash after admission and before a durable
-	// outcome. Reopening must surface the intent, not run the tool again.
+	// outcome. Drop the owner first so reopen can take the exclusive lease.
+	// Reopening recovers a synthetic interrupted toolResult but keeps the
+	// intent unresolved so the tool is not run again.
+	drop(session);
 	let reopened = DurableSession::open(db.clone(), "s3", header("s3", &dir))
 		.expect("reopen")
 		.0;
@@ -425,7 +428,7 @@ async fn reopened_unresolved_intent_is_not_replayed() {
 }
 
 #[tokio::test]
-async fn finish_execution_failure_leaves_unresolved_intent_and_refuses_replay() {
+async fn finish_execution_failure_leaves_unresolved_intent_and_recovers_with_ownership_gate() {
 	let dir = temp_dir("finish-fail-reopen");
 	let db = dir.join("sessions.db");
 	let session = Arc::new(
@@ -472,8 +475,6 @@ async fn finish_execution_failure_leaves_unresolved_intent_and_refuses_replay() 
 	assert!(matches!(error, AgentError::Durable(_)), "{error:?}");
 	assert_eq!(runs.load(Ordering::SeqCst), 2, "both tools ran before second finish failed");
 
-	// In-memory state messages must NOT have synthetic toolResult for call_fail,
-	// but MUST preserve completed outcome call_ok:
 	let tool_msgs: Vec<_> = state
 		.messages
 		.iter()
@@ -485,34 +486,67 @@ async fn finish_execution_failure_leaves_unresolved_intent_and_refuses_replay() 
 	drop(agent);
 	drop(session);
 
-	// Reopen session from disk:
+	// Exclusive reopen recovers the unanswered call with a synthetic interrupted
+	// toolResult while leaving the intent open (no durable outcome).
 	let (reopened, loaded) =
 		DurableSession::open(db.clone(), "s-ffail", header("s-ffail", &dir)).expect("reopen");
 	let loaded = loaded.expect("loaded session");
 
-	// 1. Unresolved intents must surface call_fail (not masked by synthetic toolResult!):
 	let unresolved = reopened.unresolved_intents().expect("read unresolved");
 	assert_eq!(unresolved.len(), 1);
 	assert_eq!(unresolved[0].provider_call_id, "call_fail");
+	assert!(
+		reopened
+			.execution(&unresolved[0].execution_id)
+			.expect("execution")
+			.expect("row")
+			.outcome
+			.is_none()
+	);
 
-	// 2. Completed outcome call_ok was persisted; call_fail has NO toolResult message:
+	let interrupted = "Execution interrupted; outcome unknown; not retried.";
 	let tool_results: Vec<_> = loaded
 		.branch_messages
 		.iter()
 		.filter(|e| e.message.role == "toolResult")
 		.collect();
-	assert_eq!(tool_results.len(), 1);
+	assert_eq!(tool_results.len(), 2);
 	assert_eq!(tool_results[0].message.tool_call_id.as_deref(), Some("call_ok"));
+	assert_eq!(tool_results[1].message.tool_call_id.as_deref(), Some("call_fail"));
+	assert_eq!(tool_results[1].message.content.text(), interrupted);
+	assert_eq!(tool_results[1].message.is_error, Some(true));
 
-	// 3. Replay fails closed: next turn is refused because call_fail is an unresolvable dangling call:
-	let replay_err = reopened
-		.persist_messages(&[Message::user("next turn")])
-		.await
-		.expect_err("dangling unresolvable call must refuse replay");
-	assert!(
-		replay_err.to_string().contains("call_fail"),
-		"error must cite call_fail: {replay_err}"
+	// Second exclusive open is idempotent: no extra toolResult rows.
+	drop(reopened);
+	{
+		let mut store = SqliteStore::open(&db).expect("store");
+		assert_eq!(store.recover_unresolved_intents("s-ffail").expect("idempotent"), 0);
+	}
+	let (reopened, loaded) =
+		DurableSession::open(db.clone(), "s-ffail", header("s-ffail", &dir)).expect("reopen again");
+	let loaded = loaded.expect("loaded");
+	assert_eq!(
+		loaded
+			.branch_messages
+			.iter()
+			.filter(|e| e.message.role == "toolResult")
+			.count(),
+		2
 	);
+
+	reopened
+		.persist_messages(&[
+			Message::user("go"),
+			Message::assistant_with_tools("calling two tools", vec![
+				ToolCall { id: "call_ok".to_string(), name: "effect".to_string(), arguments: json!({}) },
+				ToolCall { id: "call_fail".to_string(), name: "effect".to_string(), arguments: json!({}) },
+			]),
+			Message::tool_with_status("call_ok", "effect", "effect ran", false),
+			Message::tool_with_status("call_fail", "effect", interrupted, true),
+			Message::assistant("recovered next turn"),
+		])
+		.await
+		.expect("recovered interrupted result must unblock replay");
 
 	std::fs::remove_dir_all(dir).ok();
 }
@@ -647,6 +681,7 @@ fn session_store_uses_one_sqlite_authority_and_no_jsonl_journal() {
 		SessionMessage::user(MessageContent::Text("hello".to_string()), 1),
 	);
 	store.append_message(&entry).expect("append to sqlite");
+	drop(store);
 	let reopened = SessionStore::open(&options);
 	assert!(reopened.enabled());
 	assert_eq!(reopened.messages().len(), 1);
@@ -1900,12 +1935,11 @@ async fn finish_execution_validates_call_id_linkage() {
 }
 
 #[tokio::test]
-async fn reopen_with_unresolved_intent_refuses_dangling_replay_fail_closed() {
+async fn ownership_gated_recovery_writes_interrupted_and_keeps_intent_open() {
 	let dir = temp_dir("fail-closed");
 	let db = dir.join("sessions.db");
 	let session = DurableSession::create(db.clone(), header("s-fail", &dir)).expect("create");
 
-	// Persist an assistant message with a tool call.
 	let asst_msg = Message::assistant_with_tools(
 		"calling tool",
 		vec![ToolCall {
@@ -1919,7 +1953,6 @@ async fn reopen_with_unresolved_intent_refuses_dangling_replay_fail_closed() {
 		.await
 		.expect("persist assistant");
 
-	// Record intent, but NO outcome (simulating crash during effect).
 	let call = ToolCall {
 		id: "call-dangling".to_string(),
 		name: "effect".to_string(),
@@ -1928,29 +1961,152 @@ async fn reopen_with_unresolved_intent_refuses_dangling_replay_fail_closed() {
 	let execution_id = session.begin_execution(&call).await.expect("begin");
 	drop(session);
 
-	// Reopen session.
+	let interrupted = "Execution interrupted; outcome unknown; not retried.";
+	// Exclusive lease open recovers once; intent stays open (no outcome).
 	let (reopened, loaded) =
-		DurableSession::open(db, "s-fail", header("s-fail", &dir)).expect("reopen");
-	assert!(loaded.is_some());
+		DurableSession::open(db.clone(), "s-fail", header("s-fail", &dir)).expect("reopen");
+	let loaded = loaded.expect("loaded");
+	{
+		let store = SqliteStore::open(&db).expect("store");
+		assert_eq!(store.outcome(&execution_id).expect("outcome"), None);
+	}
 
-	// Intent remains Unknown in unresolved_intents.
 	let unresolved = reopened.unresolved_intents().expect("unresolved");
 	assert_eq!(unresolved.len(), 1);
 	assert_eq!(unresolved[0].execution_id, execution_id);
 
-	// Reading stays available: load succeeds and returns the raw branch messages.
-	let loaded_again = reopened.load().expect("raw read of branch must stay available");
-	assert_eq!(loaded_again.branch_messages.len(), 2);
+	let tool_results: Vec<_> = loaded
+		.branch_messages
+		.iter()
+		.filter(|entry| entry.message.role == "toolResult")
+		.collect();
+	assert_eq!(tool_results.len(), 1);
+	assert_eq!(tool_results[0].message.tool_call_id.as_deref(), Some("call-dangling"));
+	assert_eq!(tool_results[0].message.content.text(), interrupted);
 
-	// But write boundary fails closed on dangling unresolvable tool call!
-	let err = reopened
-		.persist_messages(&[Message::user("next turn")])
+	reopened
+		.persist_messages(&[
+			Message::user("hi"),
+			Message::assistant_with_tools("calling tool", vec![ToolCall {
+				id: "call-dangling".to_string(),
+				name: "effect".to_string(),
+				arguments: json!({}),
+			}]),
+			Message::tool_with_status("call-dangling", "effect", interrupted, true),
+			Message::assistant("next turn"),
+		])
 		.await
-		.expect_err("write boundary must fail closed on dangling call");
-	assert!(err.to_string().contains("dangling tool call call-dangling"));
+		.expect("interrupted recovery must permit resume");
 
 	std::fs::remove_dir_all(dir).ok();
 }
+
+#[tokio::test]
+async fn ownership_gated_recovery_is_session_scoped_and_idempotent() {
+	let dir = temp_dir("unresolved-interrupted");
+	let db = dir.join("sessions.db");
+	let session =
+		DurableSession::create(db.clone(), header("s-unresolved", &dir)).expect("create");
+
+	let asst_msg = Message::assistant_with_tools(
+		"calling tool",
+		vec![ToolCall {
+			id: "call-unresolved".to_string(),
+			name: "effect".to_string(),
+			arguments: json!({}),
+		}],
+	);
+	session
+		.persist_messages(&[Message::user("hi"), asst_msg])
+		.await
+		.expect("persist assistant");
+	let call = ToolCall {
+		id: "call-unresolved".to_string(),
+		name: "effect".to_string(),
+		arguments: json!({}),
+	};
+	let execution_id = session.begin_execution(&call).await.expect("begin");
+	drop(session);
+
+	{
+		let _other = DurableSession::create(db.clone(), header("s-other", &dir)).expect("other");
+	}
+
+	let interrupted = "Execution interrupted; outcome unknown; not retried.";
+	let (reopened, loaded) = DurableSession::open(
+		db.clone(),
+		"s-unresolved",
+		header("s-unresolved", &dir),
+	)
+	.expect("reopen");
+	let loaded = loaded.expect("loaded session");
+	let recovered_id = {
+		let mut store = SqliteStore::open(&db).expect("store");
+		assert_eq!(store.recover_unresolved_intents("s-unresolved").expect("idempotent"), 0);
+		assert!(
+			store
+				.session_messages("s-other")
+				.expect("other messages")
+				.is_empty(),
+			"foreign session must not receive recovered toolResult"
+		);
+		store
+			.branch("s-unresolved.main")
+			.expect("branch")
+			.expect("main")
+			.leaf_message_id
+			.expect("leaf")
+	};
+
+	let tool_results: Vec<_> = loaded
+		.branch_messages
+		.iter()
+		.filter(|entry| entry.message.role == "toolResult")
+		.collect();
+	assert_eq!(tool_results.len(), 1);
+	assert_eq!(tool_results[0].id, recovered_id);
+	assert_eq!(tool_results[0].message.tool_call_id.as_deref(), Some("call-unresolved"));
+	assert_eq!(tool_results[0].message.tool_name.as_deref(), Some("effect"));
+	assert_eq!(tool_results[0].message.is_error, Some(true));
+	assert_eq!(tool_results[0].message.content.text(), interrupted);
+
+	let unresolved = reopened.unresolved_intents().expect("unresolved");
+	assert_eq!(unresolved.len(), 1);
+	assert_eq!(unresolved[0].execution_id, execution_id);
+	assert_eq!(unresolved[0].session_id, "s-unresolved");
+	assert_eq!(unresolved[0].provider_call_id, "call-unresolved");
+	assert!(
+		reopened
+			.execution(&execution_id)
+			.expect("execution")
+			.expect("row")
+			.outcome
+			.is_none()
+	);
+	assert!(reopened.executions_needing_recovery().expect("needing").is_empty());
+
+	drop(reopened);
+
+	let (again, loaded_again) = DurableSession::open(
+		db.clone(),
+		"s-unresolved",
+		header("s-unresolved", &dir),
+	)
+	.expect("second reopen");
+	let loaded_again = loaded_again.expect("loaded again");
+	assert_eq!(
+		loaded_again
+			.branch_messages
+			.iter()
+			.filter(|entry| entry.message.role == "toolResult")
+			.count(),
+		1
+	);
+	assert_eq!(again.unresolved_intents().expect("unresolved again").len(), 1);
+
+	std::fs::remove_dir_all(dir).ok();
+}
+
 
 #[tokio::test]
 async fn reopen_with_missing_intent_refuses_dangling_replay_and_creates_no_execution() {
@@ -2033,6 +2189,201 @@ async fn reopen_with_missing_intent_refuses_dangling_replay_and_creates_no_execu
 
 	std::fs::remove_dir_all(dir).ok();
 }
+
+#[tokio::test]
+async fn ownership_gated_recovery_fails_closed_on_duplicate_call_ids() {
+	let dir = temp_dir("dup-call-ids");
+	let db = dir.join("sessions.db");
+	let session = DurableSession::create(db.clone(), header("s-dup", &dir)).expect("create");
+
+	let asst_msg = Message::assistant_with_tools(
+		"duplicate ids",
+		vec![
+			ToolCall {
+				id: "dup".to_string(),
+				name: "effect".to_string(),
+				arguments: json!({}),
+			},
+			ToolCall {
+				id: "dup".to_string(),
+				name: "effect".to_string(),
+				arguments: json!({}),
+			},
+		],
+	);
+	session
+		.persist_messages(&[Message::user("hi"), asst_msg])
+		.await
+		.expect("persist assistant");
+	let call = ToolCall {
+		id: "dup".to_string(),
+		name: "effect".to_string(),
+		arguments: json!({}),
+	};
+	let _execution_id = session.begin_execution(&call).await.expect("begin");
+	drop(session);
+
+	// Exclusive open recovers on lease; ambiguous trailing batch fails closed and
+	// aborts the writer open (no synthetic toolResult written).
+	let err = DurableSession::open(db.clone(), "s-dup", header("s-dup", &dir))
+		.expect_err("ambiguous trailing batch must fail closed on exclusive open");
+	assert!(
+		err.to_string().contains("ambiguous duplicate toolCallId"),
+		"{err}"
+	);
+	let store = SqliteStore::open(&db).expect("store");
+	assert_eq!(store.branch_messages("s-dup.main").expect("msgs").len(), 2);
+	assert_eq!(store.unresolved_intents("s-dup").expect("unresolved").len(), 1);
+
+	std::fs::remove_dir_all(dir).ok();
+}
+
+#[tokio::test]
+async fn reopen_known_denial_result_is_left_unchanged() {
+	let dir = temp_dir("known-denial");
+	let db = dir.join("sessions.db");
+	let session =
+		DurableSession::create(db.clone(), header("s-denied", &dir)).expect("create");
+
+	let asst_msg = Message::assistant_with_tools(
+		"calling tool",
+		vec![ToolCall {
+			id: "call-denied".to_string(),
+			name: "effect".to_string(),
+			arguments: json!({}),
+		}],
+	);
+	session
+		.persist_messages(&[
+			Message::user("hi"),
+			asst_msg,
+			Message::tool_with_status(
+				"call-denied",
+				"effect",
+				"Tool execution denied: approval denied for effect",
+				true,
+			),
+		])
+		.await
+		.expect("persist denial");
+	drop(session);
+
+	{
+		let mut store = SqliteStore::open(&db).expect("store");
+		assert_eq!(store.recover_unresolved_intents("s-denied").expect("recover"), 0);
+	}
+
+	let (reopened, loaded) =
+		DurableSession::open(db, "s-denied", header("s-denied", &dir)).expect("reopen");
+	let loaded = loaded.expect("loaded");
+	assert!(reopened.unresolved_intents().expect("unresolved").is_empty());
+	assert_eq!(loaded.branch_messages.len(), 3);
+	let tool = loaded
+		.branch_messages
+		.iter()
+		.find(|entry| entry.message.role == "toolResult")
+		.expect("denial result");
+	assert_eq!(tool.message.tool_call_id.as_deref(), Some("call-denied"));
+	assert!(tool.message.content.text().contains("approval denied"));
+	assert_eq!(tool.message.is_error, Some(true));
+
+	std::fs::remove_dir_all(dir).ok();
+}
+
+#[tokio::test]
+async fn ownership_gated_recovery_refuses_reused_call_id_with_earlier_unresolved() {
+	let dir = temp_dir("reused-call-id");
+	let db = dir.join("sessions.db");
+	let session =
+		DurableSession::create(db.clone(), header("s-reuse", &dir)).expect("create");
+
+	let old_asst = Message::assistant_with_tools(
+		"old call",
+		vec![ToolCall {
+			id: "shared".to_string(),
+			name: "effect".to_string(),
+			arguments: json!({}),
+		}],
+	);
+	session
+		.persist_messages(&[Message::user("first"), old_asst])
+		.await
+		.expect("persist old");
+	let old_call = ToolCall {
+		id: "shared".to_string(),
+		name: "effect".to_string(),
+		arguments: json!({}),
+	};
+	let old_exec = session.begin_execution(&old_call).await.expect("old intent");
+	drop(session);
+
+	{
+		let mut store = SqliteStore::open(&db).expect("raw");
+		let branch = store.branch("s-reuse.main").expect("branch").expect("main");
+		let leaf = branch.leaf_message_id.expect("leaf");
+		store
+			.append_message(omp_cli::session_store::NewMessage {
+				id: "m-user-next".to_string(),
+				session_id: "s-reuse".to_string(),
+				branch_id: "s-reuse.main".to_string(),
+				parent_message_id: Some(leaf.clone()),
+				payload: json!({
+					"type": "message",
+					"id": "m-user-next",
+					"parentId": leaf,
+					"timestamp": "2026-11-09T00:00:00.000Z",
+					"message": { "role": "user", "content": "continue" }
+				}),
+			})
+			.expect("user next");
+		store
+			.append_message(omp_cli::session_store::NewMessage {
+				id: "m-new-asst".to_string(),
+				session_id: "s-reuse".to_string(),
+				branch_id: "s-reuse.main".to_string(),
+				parent_message_id: Some("m-user-next".to_string()),
+				payload: json!({
+					"type": "message",
+					"id": "m-new-asst",
+					"parentId": "m-user-next",
+					"timestamp": "2026-11-09T00:00:01.000Z",
+					"message": {
+						"role": "assistant",
+						"content": [{
+							"type": "toolCall",
+							"id": "shared",
+							"name": "effect",
+							"arguments": {}
+						}]
+					}
+				}),
+			})
+			.expect("new asst");
+
+		let err = store
+			.recover_unresolved_intents("s-reuse")
+			.expect_err("reused provider id must fail closed");
+		assert!(
+			err.to_string().contains("not uniquely attributable"),
+			"{err}"
+		);
+		assert!(
+			store
+				.branch_messages("s-reuse.main")
+				.expect("msgs")
+				.iter()
+				.all(|m| m.payload["message"]["role"] != "toolResult"),
+			"no synthetic result for missing-intent reuse"
+		);
+		assert_eq!(store.unresolved_intents("s-reuse").expect("unresolved").len(), 1);
+		assert_eq!(store.outcome(&old_exec).expect("outcome"), None);
+	}
+
+	std::fs::remove_dir_all(dir).ok();
+}
+
+
+
 
 #[tokio::test]
 async fn multiple_outcomes_keep_distinct_execution_ids_and_call_ids() {
@@ -2313,7 +2664,7 @@ async fn reopened_session_with_compaction_backfills_unprojected_branch_suffix() 
 }
 
 #[tokio::test]
-async fn reopened_session_with_diverged_projection_discards_stale_projection_and_resumes() {
+async fn reopened_session_with_diverged_projection_fails_closed_and_preserves_header() {
 	let dir = temp_dir("compact-corrupt-branch");
 	let db = dir.join("sessions.db");
 	let session = DurableSession::create(db.clone(), header("s-corrupt", &dir)).expect("create");
@@ -2336,27 +2687,21 @@ async fn reopened_session_with_diverged_projection_discards_stale_projection_and
 		store.update_session_payload("s-corrupt", payload).expect("update payload");
 	}
 
-	// 1. Safe readability: opening the session succeeds, stale projection is discarded!
-	let (reopened, loaded) = DurableSession::open(db, "s-corrupt", header("s-corrupt", &dir))
-		.expect("reopen must succeed for safe readability even with diverged projection");
-	let loaded = loaded.expect("loaded session");
-	assert_eq!(loaded.branch_messages.len(), 2, "history messages must be fully preserved and readable");
-	assert_eq!(loaded.branch_messages[0].message.role, "user");
-	assert_eq!(loaded.branch_messages[1].message.role, "assistant");
-	assert!(loaded.projection.is_none(), "stale diverged projection must be discarded, not exposed to reader");
+	// A diverged projection must fail closed on open instead of silently falling back
+	// to the raw branch or discarding the stored header.
+	let error = DurableSession::open(db.clone(), "s-corrupt", header("s-corrupt", &dir))
+		.expect_err("diverged projection must fail closed");
+	assert!(matches!(error, StoreError::Corrupt(_)), "unexpected error: {error}");
 
-	let load_again = reopened.load().expect("load must succeed for reading");
-	assert_eq!(load_again.branch_messages.len(), 2);
-	assert!(load_again.projection.is_none());
-
-	// 2. Writing resumes against the real active branch without duplicating rows:
-	reopened
-		.persist_messages(&[Message::user("first"), Message::assistant("first answer"), Message::user("new turn")])
-		.await
-		.expect("write must succeed by aligning against the real branch");
-	let final_loaded = reopened.load().expect("read final");
-	assert_eq!(final_loaded.branch_messages.len(), 3, "must append exactly 1 new turn, not duplicate history");
-	assert_eq!(final_loaded.branch_messages[2].message.content.text(), "new turn");
+	let store = SqliteStore::open(&db).expect("open store");
+	let payload = store.session("s-corrupt").expect("session").expect("s-corrupt").payload;
+	assert_eq!(
+		payload["durableProjection"]["kept"],
+		json!(["msg-nonexistent-unrelated-branch"]),
+		"failed open must preserve the stored header"
+	);
+	let branch_messages = store.branch_messages("s-corrupt.main").expect("branch messages");
+	assert_eq!(branch_messages.len(), 2, "branch history remains readable after the failed open");
 
 	std::fs::remove_dir_all(dir).ok();
 }
@@ -2938,9 +3283,14 @@ async fn durable_worker_projection_saved_and_survives_crash_before_assistant() {
 	});
 	child.complete(completion, delivery).expect("complete child");
 
-	// 3. Drop session, and directly consume delivery via raw SqliteStore
-	// without set_projection (modeling crash immediately after consume_delivery)
+	// 3. Crash: drop every owner (session, factory Arc, child/completion handles)
+	// so the root writer lease releases before reopen.
+	drop(child);
+	drop(factory);
 	drop(session);
+
+	// Directly consume delivery via raw SqliteStore without set_projection
+	// (modeling crash immediately after consume_delivery).
 	let delivery_msg = Message::user("<task-result id=\"w-proj\">ok</task-result>");
 	let session_msg = SessionMessage::user(
 		MessageContent::Text("<task-result id=\"w-proj\">ok</task-result>".to_string()),
@@ -3169,5 +3519,221 @@ async fn cut_branch_rejects_foreign_session_point() {
 		"error must mention foreign session: {err_msg}"
 	);
 
+	std::fs::remove_dir_all(dir).ok();
+}
+
+#[test]
+fn second_independent_open_of_live_session_is_refused_and_release_permits_reopen() {
+	let dir = temp_dir("session-writer-lease");
+	let db = dir.join("sessions.db");
+	let id = "s-lease";
+	let owner = DurableSession::create(db.clone(), header(id, &dir)).expect("create owner");
+
+	let refused = DurableSession::open(db.clone(), id, header(id, &dir));
+	assert!(
+		refused.is_err(),
+		"second independent open must not own the writer while the first is live"
+	);
+
+	let canonical = std::fs::canonicalize(&db).expect("canonicalize db");
+	assert!(
+		DurableSession::open(canonical, id, header(id, &dir)).is_err(),
+		"canonical path alias must resolve to the same live writer ownership"
+	);
+
+	owner
+		.load()
+		.expect("owner must stay usable while an independent contender is refused");
+
+	drop(owner);
+
+	let (reopened, loaded) = DurableSession::open(db, id, header(id, &dir))
+		.expect("release must permit reopen of the same session");
+	assert!(loaded.is_some(), "reopen after release must load the stored session");
+	drop(reopened);
+
+	std::fs::remove_dir_all(dir).ok();
+}
+
+#[test]
+fn different_session_ids_on_same_db_remain_independent_writers() {
+	let dir = temp_dir("session-writer-independent");
+	let db = dir.join("sessions.db");
+	let a = DurableSession::create(db.clone(), header("s-a", &dir)).expect("create a");
+	let b = DurableSession::create(db.clone(), header("s-b", &dir)).expect("create b");
+
+	a.load().expect("session a usable");
+	b.load().expect("session b usable");
+
+	assert!(
+		DurableSession::open(db.clone(), "s-a", header("s-a", &dir)).is_err(),
+		"same session id stays exclusive even when another session on the db is live"
+	);
+
+	drop(a);
+	let (reopened_a, _) = DurableSession::open(db, "s-a", header("s-a", &dir))
+		.expect("releasing a must permit reopen while b remains live");
+	reopened_a.load().expect("reopened a usable");
+	b.load().expect("b still usable beside reopened a");
+	drop(reopened_a);
+	drop(b);
+
+	std::fs::remove_dir_all(dir).ok();
+}
+
+
+#[test]
+fn queued_job_arc_retains_child_lease_after_handle_drop() {
+	use omp_cli::durable_session::SessionWriterLease;
+
+	let dir = temp_dir("child-lease-arc");
+	let db = dir.join("sessions.db");
+	std::fs::write(&db, []).unwrap();
+	let lock_root = dir.join("locks");
+	std::fs::create_dir_all(&lock_root).unwrap();
+	let lease = std::sync::Arc::new(
+		SessionWriterLease::acquire_in(&lock_root, &db, "child-1").expect("lease"),
+	);
+	let job_hold = std::sync::Arc::clone(&lease);
+	let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+	let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+	let worker = std::thread::spawn(move || {
+		ready_tx.send(()).unwrap();
+		release_rx.recv().unwrap();
+		drop(job_hold);
+	});
+	ready_rx.recv().unwrap();
+	drop(lease);
+	let contended = SessionWriterLease::acquire_in(&lock_root, &db, "child-1");
+	assert!(
+		matches!(contended, Err(omp_cli::session_store::StoreError::Conflict(_))),
+		"child lease must remain held while queued-job Arc is alive: {contended:?}"
+	);
+	release_tx.send(()).unwrap();
+	worker.join().unwrap();
+	SessionWriterLease::acquire_in(&lock_root, &db, "child-1").expect("unlocked after job Arc drop");
+	std::fs::remove_dir_all(dir).ok();
+}
+
+#[test]
+fn durable_open_occupied_when_lease_held() {
+	use omp_cli::durable_session::SessionWriterLease;
+
+	let dir = temp_dir("open-occupied");
+	let db = dir.join("sessions.db");
+	let session = DurableSession::create(db.clone(), header("s-occ", &dir)).expect("create");
+	let err = DurableSession::open(db.clone(), "s-occ", header("s-occ", &dir))
+		.expect_err("second writer must be occupied");
+	assert!(
+		err.to_string().contains("already owned by another writer"),
+		"{err}"
+	);
+	drop(session);
+	DurableSession::open(db, "s-occ", header("s-occ", &dir)).expect("reopen after drop");
+	std::fs::remove_dir_all(dir).ok();
+}
+
+
+#[test]
+fn session_store_open_sets_occupied_when_lease_held() {
+	use omp_cli::session::{SessionOptions, SessionStore};
+
+	let dir = temp_dir("store-occupied");
+	let db_dir = dir.join("project");
+	std::fs::create_dir_all(&db_dir).unwrap();
+	let live = DurableSession::create(
+		omp_cli::durable_session::database_path(&db_dir),
+		header("s-store", &db_dir),
+	)
+	.expect("create");
+	let store = SessionStore::open(&SessionOptions {
+		enabled: true,
+		cwd: db_dir.clone(),
+		model: None,
+		provider: None,
+		dir: Some(db_dir.clone()),
+		id: Some("s-store".to_string()),
+		continue_latest: false,
+		parent_session: None,
+		no_title: true,
+	});
+	assert!(!store.enabled(), "occupied open must not enable persistence");
+	assert!(
+		store.occupied().is_some_and(|msg| msg.contains("already owned")),
+		"occupied message missing: {:?}",
+		store.occupied()
+	);
+	drop(live);
+	let store = SessionStore::open(&SessionOptions {
+		enabled: true,
+		cwd: db_dir.clone(),
+		model: None,
+		provider: None,
+		dir: Some(db_dir),
+		id: Some("s-store".to_string()),
+		continue_latest: false,
+		parent_session: None,
+		no_title: true,
+	});
+	assert!(store.enabled(), "reopen after release must enable");
+	assert!(store.occupied().is_none());
+	std::fs::remove_dir_all(dir).ok();
+}
+
+
+#[test]
+fn namespaced_child_session_id_acquires_lease() {
+	use omp_cli::durable_session::SessionWriterLease;
+	let dir = temp_dir("ns-child-lease");
+	let db = dir.join("sessions.db");
+	std::fs::write(&db, []).unwrap();
+	let lock_root = dir.join("locks");
+	std::fs::create_dir_all(&lock_root).unwrap();
+	let id = "omp-owner-ns:task-1";
+	let first = SessionWriterLease::acquire_in(&lock_root, &db, id).expect("namespaced id must lock");
+	let second = SessionWriterLease::acquire_in(&lock_root, &db, id);
+	assert!(
+		matches!(second, Err(omp_cli::session_store::StoreError::Conflict(_))),
+		"{second:?}"
+	);
+	drop(first);
+	SessionWriterLease::acquire_in(&lock_root, &db, id).expect("reacquire");
+	// Distinct child ids stay independent.
+	let other = SessionWriterLease::acquire_in(&lock_root, &db, "omp-owner-ns:task-2").expect("peer");
+	drop(other);
+	std::fs::remove_dir_all(dir).ok();
+}
+
+#[tokio::test]
+async fn namespaced_child_durable_open_succeeds() {
+	use pi_agent::ChildDurabilityFactory;
+	let dir = temp_dir("ns-child-open");
+	let db = dir.join("sessions.db");
+	let root = DurableSession::create(db.clone(), header("root-ns", &dir)).expect("root");
+	let factory = root.durable_child_factory();
+	let child = factory
+		.open_child("omp-root-ns:task-1")
+		.expect("namespaced child open must accept ':'");
+	drop(child);
+	drop(root);
+	std::fs::remove_dir_all(dir).ok();
+}
+
+
+#[test]
+fn path_unsafe_session_id_refused_for_lease() {
+	use omp_cli::durable_session::SessionWriterLease;
+	let dir = temp_dir("unsafe-id");
+	let db = dir.join("sessions.db");
+	std::fs::write(&db, []).unwrap();
+	let lock_root = dir.join("locks");
+	std::fs::create_dir_all(&lock_root).unwrap();
+	for bad in ["a/b", "a\\b", "x\ny", ""] {
+		let err = SessionWriterLease::acquire_in(&lock_root, &db, bad).expect_err("unsafe");
+		assert!(
+			matches!(err, omp_cli::session_store::StoreError::Validation(_)),
+			"{bad:?} => {err:?}"
+		);
+	}
 	std::fs::remove_dir_all(dir).ok();
 }

@@ -1469,6 +1469,9 @@ pub struct SessionStore {
 	is_v1: bool,
 	title_slot: Option<TitleSlot>,
 	corrupt_reason: Option<String>,
+	/// Exclusive writer lease contention. Distinct from corruption: persistence
+	/// was refused because another cooperative writer owns this session.
+	occupied: Option<String>,
 	/// Per-invocation auto-title suppression; not persisted.
 	no_title: bool,
 	/// Route stamp from [`SessionOptions`] — real configured values only.
@@ -1487,8 +1490,10 @@ pub struct SessionStore {
 }
 
 impl SessionStore {
-	/// Open (or resume) a session. Never fails: IO problems disable persistence
-	/// and surface through [`take_warnings`](Self::take_warnings).
+	/// Open (or resume) a session. IO/corruption disable persistence and
+	/// surface through [`take_warnings`](Self::take_warnings). Writer lease
+	/// contention sets [`occupied`](Self::occupied) and leaves the store
+	/// disabled — never an in-memory durable substitute.
 	pub fn open(options: &SessionOptions) -> Self {
 		if !options.enabled {
 			return Self::default();
@@ -1645,10 +1650,153 @@ impl SessionStore {
 				store
 			},
 			Err(err) => {
-				store.warn(format!("cannot open durable session store {}: {err}", db_path.display()));
+				let message = err.to_string();
+				if matches!(
+					&err,
+					crate::session_store::StoreError::Conflict(_)
+				) || message.contains("already owned by another writer")
+				{
+					store.occupied = Some(message.clone());
+					store.warn(format!(
+						"session writer occupied for {}: {message}",
+						db_path.display()
+					));
+					return store;
+				}
+				store.warn(format!(
+					"cannot open durable session store {}: {message}",
+					db_path.display()
+				));
 				store
 			},
 		}
+	}
+
+	/// Read-only durable snapshot for export/stats/fork-source/history. Takes no
+	/// writer lease, runs no recovery/reconcile, and leaves `durable` unset so
+	/// appends fail closed.
+	pub fn open_snapshot(options: &SessionOptions) -> Self {
+		if !options.enabled {
+			return Self::default();
+		}
+		let sessions_root = options
+			.dir
+			.clone()
+			.unwrap_or_else(SessionOptions::default_sessions_root);
+		let mut store = Self {
+			enabled: false,
+			model: options.model.clone(),
+			provider: options.provider.clone(),
+			no_title: options.no_title,
+			..Self::default()
+		};
+		let dir = match &options.dir {
+			Some(dir) => dir.clone(),
+			None => compute_default_session_dir(&options.cwd, Some(&sessions_root)),
+		};
+		let db_path = crate::durable_session::database_path(&dir);
+		let id = match options.id.as_ref() {
+			Some(id) if !valid_session_id(id) => {
+				store.warn(format!(
+					"invalid session id `{id}`: allowed characters are [A-Za-z0-9._-] and the id may \
+					 not be `.`/`..`; snapshot open refused"
+				));
+				return store;
+			},
+			Some(id) => id.clone(),
+			None if options.continue_latest => match crate::durable_session::latest_session_id(&db_path) {
+				Ok(Some(id)) => id,
+				Ok(None) => {
+					store.warn("no session available for snapshot".to_string());
+					return store;
+				},
+				Err(err) => {
+					store.warn(format!("cannot find latest session: {err}"));
+					return store;
+				},
+			},
+			None => {
+				store.warn("snapshot open requires an explicit session id".to_string());
+				return store;
+			},
+		};
+		let identity_file = dir.join(format!("{id}.{LOG_EXTENSION}"));
+		let snapshot = match crate::session_store::SqliteStore::open_read_only(&db_path)
+			.and_then(|sqlite| sqlite.load_session_snapshot(&id))
+		{
+			Ok(snapshot) => snapshot,
+			Err(err) => {
+				let missing_db = matches!(
+					&err,
+					crate::session_store::StoreError::NotFound(_)
+				) || !db_path.exists()
+					|| matches!(&err, crate::session_store::StoreError::Io(io) if io.kind() == std::io::ErrorKind::NotFound);
+				if missing_db && identity_file.is_file() {
+					return store.open_legacy_read_only(identity_file);
+				}
+				store.warn(format!(
+					"cannot open read-only session snapshot {}: {err}",
+					db_path.display()
+				));
+				return store;
+			},
+		};
+		let header = match serde_json::from_value::<SessionHeader>(snapshot.header_payload.clone()) {
+			Ok(header) => header,
+			Err(err) => {
+				store.corrupt_reason = Some(format!("corrupt session header: {err}"));
+				store.warn(format!("corrupt session header in {}: {err}", db_path.display()));
+				return store;
+			},
+		};
+		let mut messages = Vec::with_capacity(snapshot.session_messages.len());
+		let mut entries = Vec::with_capacity(snapshot.session_messages.len());
+		for row in &snapshot.session_messages {
+			if let Ok(entry) = serde_json::from_value::<SessionEntry>(row.payload.clone()) {
+				entries.push(entry);
+			}
+			if let Ok(message) = serde_json::from_value::<MessageEntry>(row.payload.clone()) {
+				messages.push(message);
+			}
+		}
+		let mut branch_messages = Vec::with_capacity(snapshot.branch_messages.len());
+		for row in &snapshot.branch_messages {
+			if let Ok(message) = serde_json::from_value::<MessageEntry>(row.payload.clone()) {
+				branch_messages.push(message);
+			}
+		}
+		store.id = id;
+		store.file = Some(identity_file);
+		store.header = Some(header);
+		store.entries = entries;
+		store.messages = messages;
+		store.leaf = snapshot.leaf;
+		store.projection = snapshot.projection;
+		store.is_v1 = false;
+		store.enabled = true;
+		store.legacy_read_only = true; // appends must fail; no writer attached
+		store.history = derive_turn_history(&branch_messages).unwrap_or_else(|err| {
+			store.warn(format!("cannot rebuild session history: {err}"));
+			Vec::new()
+		});
+		store.title_slot = store
+			.header
+			.as_ref()
+			.and_then(|header| header.title.clone())
+			.map(|title| TitleSlot {
+				title,
+				source: store
+					.header
+					.as_ref()
+					.and_then(|header| header.title_source.clone()),
+				updated_at: store
+					.header
+					.as_ref()
+					.map(|header| header.timestamp.clone())
+					.unwrap_or_default(),
+			});
+		store.refresh_title_from_entries();
+		store
 	}
 
 	/// Open a legacy JSONL log for reads. Appends return an explicit error:
@@ -2638,6 +2786,13 @@ impl SessionStore {
 		self.corrupt_reason.as_deref()
 	}
 
+	/// Writer lease contention message, if open refused because another
+	/// cooperative writer owns this session.
+	#[must_use]
+	pub fn occupied(&self) -> Option<&str> {
+		self.occupied.as_deref()
+	}
+
 	#[cfg(test)]
 	pub fn set_corrupt_for_test(&mut self, reason: &str) {
 		self.corrupt_reason = Some(reason.to_string());
@@ -2646,6 +2801,9 @@ impl SessionStore {
 	/// Append one raw/custom entry (`custom`, `title_change`, ...) to the SQLite
 	/// authority. A failed write leaves the in-memory view untouched.
 	pub fn append_entry(&mut self, entry: SessionEntry) -> Result<(), String> {
+		if let Some(reason) = &self.occupied {
+			return Err(format!("cannot append: session writer occupied: {reason}"));
+		}
 		if let Some(reason) = &self.corrupt_reason {
 			return Err(format!("cannot append to corrupted session log: {reason}"));
 		}
@@ -4757,28 +4915,107 @@ pub fn fork_session(
 	new_cwd: Option<&Path>,
 	target_dir: Option<&Path>,
 ) -> Result<PathBuf, String> {
-	let source_dir = source_path
-		.parent()
-		.map(Path::to_path_buf)
-		.unwrap_or_else(|| PathBuf::from("."));
-	let source_id = source_path
-		.file_stem()
-		.and_then(|stem| stem.to_str())
-		.map(str::to_string);
-	let db_path = crate::durable_session::database_path(&source_dir);
-	let durable = source_id.as_deref().is_some_and(|id| {
-		crate::durable_session::session_exists(&db_path, id).unwrap_or(false)
-	});
-	if !durable && !source_path.is_file() {
-		return Err(format!("cannot read source session {}", source_path.display()));
+	let source_dir = source_path.parent().unwrap_or_else(|| Path::new("."));
+	let source_id = source_path.file_stem().and_then(|stem| stem.to_str());
+	let db_path = crate::durable_session::database_path(source_dir);
+	if let Some(id) = source_id.filter(|id| crate::durable_session::session_exists(&db_path, id).unwrap_or(false)) {
+		return fork_durable_atomic(&db_path, id, new_cwd, target_dir);
 	}
-	let mut source = SessionStore::open(&SessionOptions {
+	return fork_legacy_session(source_path, new_cwd, target_dir);
+}
+
+fn fork_durable_atomic(db_path: &Path, source_id: &str, new_cwd: Option<&Path>, target_dir: Option<&Path>) -> Result<PathBuf, String> {
+	use crate::session_store::{ForkWrite, NewBranch, NewMessage, NewSession, SqliteStore};
+	let source = SqliteStore::open_read_only(db_path).map_err(|e| e.to_string())?;
+	let snapshot = source.load_session_snapshot(source_id).map_err(|e| e.to_string())?;
+	let header: SessionHeader = serde_json::from_value(snapshot.header_payload.clone()).map_err(|e| e.to_string())?;
+	let new_id = output::session_id();
+	let new_dir = target_dir.map(PathBuf::from).unwrap_or_else(|| db_path.parent().unwrap_or_else(|| Path::new(".")).to_path_buf());
+	fs::create_dir_all(&new_dir).map_err(|e| e.to_string())?;
+	let mut fork_header = header.clone();
+	fork_header.id = new_id.clone();
+	fork_header.parent_session = Some(source_id.to_string());
+	fork_header.provider_prompt_cache_key = fork_header.provider_prompt_cache_key.take().or_else(|| Some(source_id.to_string()));
+	fork_header.timestamp = output::iso8601(SystemTime::now());
+	if let Some(cwd) = new_cwd { fork_header.cwd = cwd.display().to_string(); }
+	let effective_leaf = snapshot.leaf.clone().or_else(|| snapshot.branches.iter().find(|b| b.id == snapshot.branch_id).and_then(|b| b.parent_message_id.clone()));
+	let mut projected_entries = Vec::new();
+	let mut synthetic_messages = Vec::new();
+	if let Some(projection) = &snapshot.projection {
+		for synthetic in &projection.synthetic { synthetic_messages.push(serde_json::from_value::<pi_agent::Message>(synthetic.clone()).map_err(|error| format!("cannot fork session {source_id}: invalid synthetic projection: {error}"))?); }
+		let by_id: HashMap<&str, &crate::session_store::MessageRecord> = snapshot.session_messages.iter().map(|row| (row.id.as_str(), row)).collect();
+		for id in &projection.kept { let row = by_id.get(id.as_str()).ok_or_else(|| format!("cannot fork session {source_id}: projection references missing message {id}"))?; let entry: SessionEntry = serde_json::from_value(row.payload.clone()).map_err(|error| format!("cannot fork session {source_id}: invalid projected entry {id}: {error}"))?; if entry.kind == "message" { projected_entries.push(serde_json::from_value::<MessageEntry>(row.payload.clone()).map_err(|error| format!("cannot fork session {source_id}: invalid projected message {id}: {error}"))?); } }
+	} else {
+		for row in &snapshot.branch_messages { let entry: SessionEntry = serde_json::from_value(row.payload.clone()).map_err(|error| format!("cannot fork session {source_id}: invalid entry {}: {error}", row.id))?; if entry.kind == "message" { projected_entries.push(serde_json::from_value::<MessageEntry>(row.payload.clone()).map_err(|error| format!("cannot fork session {source_id}: invalid message {}: {error}", row.id))?); } }
+	}
+	let mut runtime_replay = synthetic_messages;
+	runtime_replay.extend(crate::runtime::history_messages_from_entries(&projected_entries).map_err(|error| format!("cannot fork session {source_id}: {error}"))?);
+	crate::durable_session::validate_runtime_replay(&runtime_replay).map_err(|error| format!("cannot fork session {source_id}: {error}"))?;
+	crate::durable_session::validate_replay_seed(&projected_entries).map_err(|error| format!("cannot fork session {source_id}: {error}"))?;
+	let mut keep_ids = HashSet::new();
+	for row in &snapshot.branch_messages { keep_ids.insert(row.id.clone()); }
+	if let Some(projection) = &snapshot.projection { for id in &projection.kept { let mut cursor = Some(id.clone()); while let Some(id) = cursor { if !keep_ids.insert(id.clone()) { break; } cursor = snapshot.session_messages.iter().find(|m| m.id == id).and_then(|m| m.parent_message_id.clone()); } } }
+	let mut keep_branches = HashSet::new();
+	let mut branch_cursor = Some(snapshot.branch_id.clone());
+	while let Some(id) = branch_cursor { if !keep_branches.insert(id.clone()) { break; } branch_cursor = snapshot.branches.iter().find(|b| b.id == id).and_then(|b| b.parent_branch_id.clone()); }
+	for message in &snapshot.session_messages { if keep_ids.contains(&message.id) { let mut branch_cursor = Some(message.branch_id.clone()); while let Some(id) = branch_cursor { if !keep_branches.insert(id.clone()) { break; } branch_cursor = snapshot.branches.iter().find(|b| b.id == id).and_then(|b| b.parent_branch_id.clone()); } } }
+	let branch_map: HashMap<String, String> = snapshot.branches.iter().filter(|b| keep_branches.contains(&b.id)).map(|b| (b.id.clone(), format!("branch-{}", output::session_id()))).collect();
+	let id_map: HashMap<String, String> = snapshot.session_messages.iter().filter(|m| keep_ids.contains(&m.id)).map(|m| (m.id.clone(), format!("entry-{}", output::session_id()))).collect();
+	let remap = |id: &str| id_map.get(id).cloned().unwrap_or_else(|| id.to_string());
+	let branches: Vec<NewBranch> = snapshot.branches.iter().filter(|b| keep_branches.contains(&b.id)).map(|b| NewBranch { id: branch_map[&b.id].clone(), session_id: new_id.clone(), parent_branch_id: b.parent_branch_id.as_ref().map(|id| branch_map.get(id).cloned()).flatten(), parent_message_id: b.parent_message_id.as_ref().map(|id| remap(id)), payload: b.payload.clone() }).collect();
+	let messages = snapshot.session_messages.iter().filter(|m| keep_ids.contains(&m.id)).map(|m| {
+		let id = remap(&m.id);
+		let mut payload = m.payload.clone();
+		if let Some(obj) = payload.as_object_mut() {
+			obj.insert("id".into(), serde_json::json!(id));
+			if let Some(parent) = &m.parent_message_id { obj.insert("parentId".into(), serde_json::json!(remap(parent))); }
+			if let Some(from) = obj.get("fromId").and_then(|v| v.as_str()).map(remap) { obj.insert("fromId".into(), serde_json::json!(from)); }
+		}
+		NewMessage { id, session_id: new_id.clone(), branch_id: branch_map[&m.branch_id].clone(), parent_message_id: m.parent_message_id.as_ref().map(|id| remap(id)), payload }
+	}).collect();
+	let projection = snapshot.projection.map(|mut p| { p.kept = p.kept.into_iter().map(|id| remap(&id)).collect(); p.anchor = p.anchor.map(|id| remap(&id)); p });
+	let active_branch_id = branch_map[&snapshot.branch_id].clone();
+	let active_leaf_message_id = effective_leaf.as_ref().map(|id| remap(id));
+	let mut fork_provenance = Vec::new();
+	for source_message in snapshot.session_messages.iter().filter(|message| keep_ids.contains(&message.id)) {
+		let fork_message_id = id_map.get(&source_message.id).cloned().ok_or_else(|| format!("cannot fork session {source_id}: message mapping missing for {}", source_message.id))?;
+		fork_provenance.extend(crate::session_store::ForkProvenance::capture(&snapshot.session_messages, &snapshot.executions, &snapshot.provenance, &source_message.id, &fork_message_id).map_err(|error| format!("cannot fork session {source_id}: {error}"))?);
+	}
+	let fork_header_payload = serde_json::to_value(&fork_header).map_err(|e| e.to_string())?;
+	let published_path = crate::durable_session::session_path(&new_dir, &new_id);
+	let target_art = artifacts_directory_for(&published_path);
+	if target_art.as_ref().is_some_and(|path| path.exists()) { return Err(format!("fork artifacts already exist: {}", target_art.as_ref().unwrap().display())); }
+	let stage_art = target_art.as_ref().map(|path| path.with_file_name(format!(".fork-artifacts-{}", new_id)));
+	let mut owns_artifacts = false;
+	let mut owns_stage = false;
+	if let (Some(source_art), Some(stage)) = (artifacts_directory_for(&crate::durable_session::session_path(db_path.parent().unwrap_or_else(|| Path::new(".")), source_id)), &stage_art) && source_art.is_dir() {
+		fs::create_dir(stage).map_err(|error| format!("cannot claim fork artifact staging path {}: {error}", stage.display()))?;
+		owns_stage = true;
+		if let Err(error) = copy_dir_recursive(&source_art, stage) { let _ = fs::remove_dir_all(stage); return Err(error); }
+	}
+	if let (Some(stage), Some(target)) = (&stage_art, &target_art) && owns_stage {
+		if let Err(error) = fs::create_dir(target) { let _ = fs::remove_dir_all(stage); return Err(format!("cannot claim fork artifact path {}: {error}", target.display())); }
+		owns_artifacts = true;
+		if let Err(error) = copy_dir_recursive(stage, target) { let _ = fs::remove_dir_all(stage); let _ = fs::remove_dir_all(target); return Err(error); }
+		fs::remove_dir_all(stage).map_err(|error| { let _ = fs::remove_dir_all(target); error.to_string() })?;
+	}
+	let target_db = crate::durable_session::database_path(&new_dir);
+	let mut target = SqliteStore::open(&target_db).map_err(|e| { if owns_artifacts { if let Some(path) = &target_art { let _ = fs::remove_dir_all(path); } } e.to_string() })?;
+	let result = target.create_fork_atomic_with_provenance(ForkWrite { session: NewSession { id: new_id.clone(), parent_session_id: Some(source_id.to_string()), payload: fork_header_payload, initial_branch_id: active_branch_id.clone(), initial_branch_payload: snapshot.branches.iter().find(|b| b.id == snapshot.branch_id).map(|b| b.payload.clone()).unwrap_or_default() }, branches, messages, active_branch_id, active_leaf_message_id, projection }, &fork_provenance);
+	if let Err(error) = result { if owns_artifacts { if let Some(path) = &target_art { let _ = fs::remove_dir_all(path); } } return Err(error.to_string()); }
+	Ok(published_path)
+}
+
+fn fork_legacy_session(source_path: &Path, new_cwd: Option<&Path>, target_dir: Option<&Path>) -> Result<PathBuf, String> {
+	let source_dir = source_path.parent().unwrap_or_else(|| Path::new("."));
+	let source_id = source_path.file_stem().and_then(|stem| stem.to_str()).map(str::to_string);
+	let mut source = SessionStore::open_snapshot(&SessionOptions {
 		enabled: true,
 		cwd: new_cwd.map(Path::to_path_buf).unwrap_or_else(|| PathBuf::from(".")),
 		model: None,
 		provider: None,
-		dir: Some(source_dir.clone()),
-		id: source_id.clone(),
+		dir: Some(source_dir.to_path_buf()),
+		id: source_id,
 		continue_latest: false,
 		no_title: true,
 		parent_session: None,
@@ -4786,23 +5023,24 @@ pub fn fork_session(
 	if !source.enabled() {
 		return Err(source
 			.corrupt_reason()
+			.or_else(|| source.occupied())
 			.unwrap_or("cannot open source session")
 			.to_string());
 	}
-	// Fork copies this branch into a new session and continues it. Opening is a
-	// read (a corrupt branch stays readable), so the replay check must happen
-	// here, before the target row exists: otherwise a fork would persist an
-	// unreplayable copy and only the next turn would fail.
-	let branch_replay: Vec<MessageEntry> =
-		source.branch_messages().into_iter().cloned().collect();
+    // Fork copies this branch into a new session and continues it. Opening is a
+    // read (a corrupt branch stays readable), so replay validation must happen
+    // here, before the target row exists.
+	let branch_replay: Vec<MessageEntry> = source.branch_messages().into_iter().cloned().collect();
 	crate::runtime::history_messages_from_entries(&branch_replay)
 		.map_err(|error| format!("cannot fork session {}: {error}", source.id()))?;
-	let original_id = source.id().to_string();
-	let mut header = source
-		.header()
-		.cloned()
-		.ok_or_else(|| "source session has no header".to_string())?;
-	let branch_entries: Vec<SessionEntry> = source.branch_entries().into_iter().cloned().collect();
+	crate::durable_session::validate_replay_seed(&branch_replay)
+		.map_err(|error| format!("cannot fork session {}: {error}", source.id()))?;
+    let original_id = source.id().to_string();
+    let mut header = source
+        .header()
+        .cloned()
+        .ok_or_else(|| "source session has no header".to_string())?;
+    let branch_entries: Vec<SessionEntry> = source.branch_entries().into_iter().cloned().collect();
 
 	let new_id = output::session_id();
 	let now = output::iso8601(SystemTime::now());
@@ -4836,7 +5074,8 @@ pub fn fork_session(
 	});
 	if !target.enabled() {
 		return Err(target
-			.corrupt_reason()
+			.occupied()
+			.or_else(|| target.corrupt_reason())
 			.unwrap_or("cannot open fork target")
 			.to_string());
 	}
@@ -4850,42 +5089,27 @@ pub fn fork_session(
 			.update_header(&header)
 			.map_err(|error| format!("cannot persist forked session header: {error}"))?;
 	}
-	for entry in branch_entries {
-		let parent = target.leaf_id().map(str::to_string);
-		if entry.kind == "message" {
-			let message: MessageEntry =
-				serde_json::from_value(serde_json::to_value(&entry).map_err(|e| e.to_string())?)
-					.map_err(|e| e.to_string())?;
-			let forked = MessageEntry::new(
-				format!("msg-{}", output::session_id()),
-				parent,
-				now.clone(),
-				message.message,
-			);
-			target.append_message_compat(&forked)?;
-		} else {
-			let mut value = serde_json::to_value(&entry).map_err(|e| e.to_string())?;
-			value["id"] = serde_json::json!(format!("entry-{}", output::session_id()));
-			value["timestamp"] = serde_json::json!(now);
-			if entry.kind == "branch_summary" {
-				// The branch point is re-keyed with the fork: a summary cut keeps
-				// its origin (a root cut stays root), and `fromId` follows it.
-				let from = if entry.parent_id.is_some() {
-					parent.clone()
-				} else {
-					None
-				};
-				value["fromId"] =
-					serde_json::json!(from.clone().unwrap_or_else(|| "root".to_string()));
-				value["parentId"] = serde_json::json!(from);
-			} else {
-				value["parentId"] = serde_json::json!(parent);
-			}
-			let forked: SessionEntry =
-				serde_json::from_value(value).map_err(|e| e.to_string())?;
-			target.append_entry(forked)?;
-		}
-	}
+    for entry in branch_entries {
+        let parent = target.leaf_id().map(str::to_string);
+        if entry.kind == "message" {
+            let message: MessageEntry = serde_json::from_value(serde_json::to_value(&entry).map_err(|e| e.to_string())?).map_err(|e| e.to_string())?;
+            let forked = MessageEntry::new(format!("msg-{}", output::session_id()), parent, now.clone(), message.message);
+            target.append_message_compat(&forked)?;
+        } else {
+            let mut value = serde_json::to_value(&entry).map_err(|e| e.to_string())?;
+            value["id"] = serde_json::json!(format!("entry-{}", output::session_id()));
+            value["timestamp"] = serde_json::json!(now);
+            if entry.kind == "branch_summary" {
+                let from = if entry.parent_id.is_some() { parent.clone() } else { None };
+                value["fromId"] = serde_json::json!(from.clone().unwrap_or_else(|| "root".to_string()));
+                value["parentId"] = serde_json::json!(from);
+            } else {
+                value["parentId"] = serde_json::json!(parent);
+            }
+            let forked: SessionEntry = serde_json::from_value(value).map_err(|e| e.to_string())?;
+            target.append_entry(forked)?;
+        }
+    }
 
 	if let (Some(old_art), Some(new_art)) = (
 		artifacts_directory_for(source_path),
@@ -4900,6 +5124,7 @@ pub fn fork_session(
 		.map(Path::to_path_buf)
 		.ok_or_else(|| "fork target has no stable path".to_string())
 }
+
 
 /// Recursive directory copy (TS `fs.cp(..., { recursive: true })`).
 fn copy_dir_recursive(source: &Path, dest: &Path) -> Result<(), String> {
@@ -5120,6 +5345,8 @@ pub fn import_legacy_v1(
 	durable
 		.append_message_entries(&entries)
 		.map_err(|error| error.to_string())?;
+	// Release the exclusive writer lease before the validation reopen.
+	drop(durable);
 
 	let mut store = SessionStore::open(&SessionOptions {
 		enabled: true,
@@ -5749,6 +5976,7 @@ mod tests {
 				.append_custom(BACKGROUND_USAGE_CUSTOM_TYPE, Some(entry.clone()))
 				.expect("append background usage");
 		}
+		drop(store);
 		let reopened = SessionStore::open(&options(dir.clone(), Some("aborted-ledger")));
 		let counted = reopened.session_usage();
 		assert_eq!(
@@ -6461,6 +6689,7 @@ mod tests {
 		assert_eq!(store.history(), history_before.as_slice(), "history must not mutate");
 		assert_eq!(store.messages(), messages_before.as_slice(), "messages must not mutate");
 		assert_eq!(store.entries.len(), entries_before, "entries must not mutate");
+		drop(store);
 
 		let reopened = SessionStore::open(&options(dir.clone(), Some("sqlite-atomic")));
 		assert!(reopened.enabled());
@@ -6944,6 +7173,7 @@ mod tests {
 			&& part.mime_type.as_deref() == Some("image/png")));
 
 		// 2. Reopen session and check history
+		drop(store);
 		let reopened = SessionStore::open(&options(dir.clone(), Some("tool-image-roundtrip")));
 		assert!(reopened.enabled());
 		let history = reopened.history();
@@ -7065,6 +7295,7 @@ mod tests {
 		let dir = temp_dir();
 		let mut store = SessionStore::open(&options(dir.clone(), Some("todo-details")));
 		store.append_turn(&record).expect("append turn");
+		drop(store);
 
 		let reopened = SessionStore::open(&options(dir.clone(), Some("todo-details")));
 		assert!(reopened.enabled());
@@ -7159,6 +7390,7 @@ mod tests {
 		assert_eq!(store.latest_todo_phases()[0].tasks[0].content, "from later tool");
 
 		let file = store.file().expect("session file").to_path_buf();
+		drop(store);
 		let resumed = SessionStore::open(&options(dir.clone(), Some("todo-custom")));
 		assert_eq!(resumed.latest_todo_phases()[0].tasks[0].content, "from later tool");
 
@@ -7393,5 +7625,47 @@ mod tests {
 		assert_eq!(reopened.header().unwrap().title.as_deref(), Some("resume prompt"));
 
 		fs::remove_dir_all(dir).ok();
+	}
+	fn fork_rejects_dangling_replay_before_target_creation() {
+		let dir = temp_dir();
+		let mut store = SessionStore::open(&options(dir.clone(), Some("fork-dangling")));
+		assert!(store.enabled());
+		store
+			.append_message(&MessageEntry::new(
+				"dangling-user",
+				None,
+				output::iso8601(SystemTime::now()),
+				SessionMessage::user(MessageContent::Text("run tool".to_string()), 1),
+			))
+			.expect("append user");
+		let assistant = SessionMessage::assistant(
+			MessageContent::Parts(vec![ContentPart {
+				kind: "toolCall".to_string(),
+				text: None,
+				data: None,
+				mime_type: None,
+				extra: serde_json::Map::from_iter([
+					("id".to_string(), json!("missing-result")),
+					("name".to_string(), json!("bash")),
+					("arguments".to_string(), json!({"command":"true"})),
+				]),
+			}]),
+			"", "", "", None, "toolUse", 2,
+		);
+		store
+			.append_message(&MessageEntry::new(
+				"dangling-assistant",
+				Some("dangling-user".to_string()),
+				output::iso8601(SystemTime::now()),
+				assistant,
+			))
+			.expect("append dangling assistant");
+		let source_file = store.file().expect("source path").to_path_buf();
+		let fork_dir = temp_dir();
+		let error = fork_session(&source_file, None, Some(&fork_dir)).expect_err("reject dangling call");
+		assert!(error.contains("unresolvable dangling tool call"), "{error}");
+		assert!(!fork_dir.join("sessions.db").exists(), "preflight must precede target creation");
+		fs::remove_dir_all(dir).ok();
+		fs::remove_dir_all(fork_dir).ok();
 	}
 }

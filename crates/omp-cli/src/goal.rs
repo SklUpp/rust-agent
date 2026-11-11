@@ -1738,10 +1738,12 @@ mod tests {
 			plan_restore(&reopened, true),
 			RestorePlan::Restore { enabled: false, goal: paused.clone() }
 		);
+		let file_for_fork = file.clone();
+		drop(reopened);
 
 		// Fork copies the log; the files then diverge independently.
 		let fork_dir = temp_dir();
-		let fork_file = fork_session(&file, None, Some(&fork_dir)).expect("fork session");
+		let fork_file = fork_session(&file_for_fork, None, Some(&fork_dir)).expect("fork session");
 		let fork_stem = fork_file
 			.file_stem()
 			.and_then(std::ffi::OsStr::to_str)
@@ -1755,6 +1757,7 @@ mod tests {
 		);
 		forked.append_mode_change(MODE_NONE, None).expect("clear in fork");
 		assert_eq!(plan_restore(&forked, true), RestorePlan::Idle);
+		drop(forked);
 
 		let mut parent = SessionStore::open(&options(dir.clone(), "goal-mode"));
 		assert_eq!(

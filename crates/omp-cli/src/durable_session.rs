@@ -12,11 +12,14 @@
 
 use std::{
 	collections::{HashMap, HashSet, VecDeque},
+	fs::{File, OpenOptions},
+	io,
 	path::{Path, PathBuf},
 	sync::{
 		Arc, Mutex,
 		mpsc::{self, Sender},
 	},
+	thread::JoinHandle,
 	time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -44,30 +47,282 @@ use crate::{
 	},
 };
 
+/// Stable same-UID coordination root for session writer leases. Shared across
+/// every program of this UID; not split by runtime env overrides. Tests use
+/// [`SessionWriterLease::acquire_in`] with an explicit private root.
+fn default_session_lock_root() -> io::Result<PathBuf> {
+	if let Some(home) = std::env::var_os("HOME").filter(|value| !value.is_empty()) {
+		return Ok(PathBuf::from(home).join(".omp").join("run").join("session-writer"));
+	}
+	if let Some(home) = std::env::var_os("USERPROFILE").filter(|value| !value.is_empty()) {
+		return Ok(PathBuf::from(home).join(".omp").join("run").join("session-writer"));
+	}
+	Err(io::Error::new(
+		io::ErrorKind::NotFound,
+		"cannot resolve session writer lock root; HOME is unset",
+	))
+}
+
+fn canonical_db_identity(db_path: &Path) -> PathBuf {
+	pi_agent::workspace_writer::canonical_identity(db_path)
+}
+
+fn lock_key_hash(canonical_db: &Path) -> String {
+	#[cfg(unix)]
+	{
+		use std::os::unix::ffi::OsStrExt;
+		format!("{:016x}", xxh64(canonical_db.as_os_str().as_bytes(), 0))
+	}
+	#[cfg(not(unix))]
+	{
+		format!("{:016x}", xxh64(canonical_db.to_string_lossy().as_bytes(), 0))
+	}
+}
+
+fn ensure_private_lock_dir(dir: &Path) -> io::Result<()> {
+	std::fs::create_dir_all(dir)?;
+	let metadata = std::fs::symlink_metadata(dir)?;
+	if metadata.file_type().is_symlink() {
+		return Err(io::Error::new(
+			io::ErrorKind::PermissionDenied,
+			format!("{} is a symlink; refusing to use it as a lock root", dir.display()),
+		));
+	}
+	if !metadata.is_dir() {
+		return Err(io::Error::new(
+			io::ErrorKind::NotADirectory,
+			format!("{} is not a directory", dir.display()),
+		));
+	}
+	#[cfg(unix)]
+	{
+		use std::os::unix::fs::{MetadataExt, PermissionsExt};
+		// SAFETY: geteuid has no preconditions.
+		let uid = unsafe { libc::geteuid() };
+		if metadata.uid() != uid {
+			return Err(io::Error::new(
+				io::ErrorKind::PermissionDenied,
+				format!(
+					"{} is owned by uid {} not the current user",
+					dir.display(),
+					metadata.uid()
+				),
+			));
+		}
+		let mut permissions = metadata.permissions();
+		if permissions.mode() & 0o777 != 0o700 {
+			permissions.set_mode(0o700);
+			std::fs::set_permissions(dir, permissions)?;
+		}
+	}
+	Ok(())
+}
+
+/// Refuse symlink leaves and hard-linked databases. WAL sidecars are
+/// path-dependent; multi-link names are outside the cooperative contract.
+fn assert_cooperative_db_path(db_path: &Path) -> StoreResult<()> {
+	if db_path.as_os_str().is_empty() {
+		return Err(StoreError::Validation(
+			"session store path must not be empty".to_string(),
+		));
+	}
+	match std::fs::symlink_metadata(db_path) {
+		Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+		Err(error) => Err(StoreError::Io(error)),
+		Ok(metadata) => {
+			if metadata.file_type().is_symlink() {
+				return Err(StoreError::Validation(format!(
+					"session database {} is a symlink; refusing cooperative writer open",
+					db_path.display()
+				)));
+			}
+			if !metadata.is_file() {
+				return Err(StoreError::Validation(format!(
+					"session database {} is not a regular file",
+					db_path.display()
+				)));
+			}
+			#[cfg(unix)]
+			{
+				use std::os::unix::fs::MetadataExt;
+				if metadata.nlink() > 1 {
+					return Err(StoreError::Validation(format!(
+						"session database {} has multiple hard links; WAL aliases are unsafe",
+						db_path.display()
+					)));
+				}
+			}
+			Ok(())
+		},
+	}
+}
+
+fn validate_writer_session_id(session_id: &str) -> StoreResult<()> {
+	// Lock keys must accept namespaced child ids (`owner:task-1`). Path safety
+	// only: empty, `.`/`..`, and separator/control bytes are refused. The lock
+	// *filename* is always a hash of the id (never the raw id).
+	if session_id.is_empty() || session_id == "." || session_id == ".." {
+		return Err(StoreError::Validation(format!(
+			"invalid session id `{session_id}` for writer lease"
+		)));
+	}
+	if session_id.bytes().any(|b| b == 0 || b == b'/' || b == b'\\' || b == b'\n' || b == b'\r') {
+		return Err(StoreError::Validation(format!(
+			"session id `{session_id}` contains path-unsafe bytes; writer lease refused"
+		)));
+	}
+	Ok(())
+}
+
+fn session_lock_file_name(session_id: &str) -> String {
+	format!("{:016x}.lock", xxh64(session_id.as_bytes(), 0))
+}
+
+/// Exclusive cooperative writer lease for one (canonical database, session id).
+///
+/// Lock files are permanent (never unlinked). External rename/replace of the
+/// database path while owned is outside this guarantee; cooperators that share
+/// the same canonical pathname still contend on this lock namespace.
+pub struct SessionWriterLease {
+	file: File,
+	canonical_db: PathBuf,
+	session_id: String,
+}
+
+impl std::fmt::Debug for SessionWriterLease {
+	fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		formatter
+			.debug_struct("SessionWriterLease")
+			.field("canonical_db", &self.canonical_db)
+			.field("session_id", &self.session_id)
+			.finish_non_exhaustive()
+	}
+}
+
+impl SessionWriterLease {
+	pub fn canonical_db(&self) -> &Path {
+		&self.canonical_db
+	}
+
+	pub fn session_id(&self) -> &str {
+		&self.session_id
+	}
+
+	/// Acquire under the process-wide same-UID lock root.
+	pub fn acquire(db_path: &Path, session_id: &str) -> StoreResult<Self> {
+		let root = default_session_lock_root().map_err(StoreError::Io)?;
+		Self::acquire_in(&root, db_path, session_id)
+	}
+
+	/// Test seam: acquire under an explicit private lock root.
+	pub fn acquire_in(lock_root: &Path, db_path: &Path, session_id: &str) -> StoreResult<Self> {
+		validate_writer_session_id(session_id)?;
+		assert_cooperative_db_path(db_path)?;
+		let canonical_db = canonical_db_identity(db_path);
+		ensure_private_lock_dir(lock_root).map_err(StoreError::Io)?;
+		let db_dir = lock_root.join(lock_key_hash(&canonical_db));
+		ensure_private_lock_dir(&db_dir).map_err(StoreError::Io)?;
+		let lock_path = db_dir.join(session_lock_file_name(session_id));
+		let file = open_session_lock_file(&lock_path).map_err(StoreError::Io)?;
+		match try_lock_exclusive(&file) {
+			Ok(()) => Ok(Self {
+				file,
+				canonical_db,
+				session_id: session_id.to_string(),
+			}),
+			Err(error) if error.kind() == io::ErrorKind::WouldBlock => Err(StoreError::Conflict(
+				format!(
+					"session {session_id} in {} is already owned by another writer",
+					canonical_db.display()
+				),
+			)),
+			Err(error) => Err(StoreError::Io(error)),
+		}
+	}
+}
+
+impl Drop for SessionWriterLease {
+	fn drop(&mut self) {
+		#[cfg(unix)]
+		{
+			use std::os::unix::io::AsRawFd;
+			// SAFETY: descriptor valid until `file` drops below.
+			unsafe {
+				libc::flock(self.file.as_raw_fd(), libc::LOCK_UN);
+			}
+		}
+	}
+}
+
+fn open_session_lock_file(path: &Path) -> io::Result<File> {
+	let mut options = OpenOptions::new();
+	options.read(true).write(true).create(true);
+	#[cfg(unix)]
+	{
+		use std::os::unix::fs::OpenOptionsExt;
+		options.mode(0o600).custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
+	}
+	options.open(path)
+}
+
+#[cfg(unix)]
+fn try_lock_exclusive(file: &File) -> io::Result<()> {
+	use std::os::unix::io::AsRawFd;
+	// SAFETY: descriptor owned by `file`.
+	if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+		Ok(())
+	} else {
+		Err(io::Error::last_os_error())
+	}
+}
+
+#[cfg(not(unix))]
+fn try_lock_exclusive(_file: &File) -> io::Result<()> {
+	Err(io::Error::new(
+		io::ErrorKind::Unsupported,
+		"session writer leases need POSIX flock on this platform",
+	))
+}
+
 /// One job on the writer thread. The reply channel is already captured by the
 /// closure, so sending or awaiting the reply can never reorder a write.
 type Job = Box<dyn FnOnce(&mut SqliteStore) + Send>;
 
 /// Handle to the dedicated SQLite writer thread.
+///
+/// The root session lease lives here so every child/completion Arc keeps
+/// exclusivity until queued jobs drain. [`Drop`] joins the writer thread on a
+/// non-writer thread, then field teardown releases the lease.
 pub struct DurableWriter {
 	/// `mpsc::Sender` is not guaranteed `Sync` on every toolchain; the mutex
 	/// makes the handle explicitly shareable by concurrent tool tasks.
-	sender: Mutex<Sender<Job>>,
+	sender: Mutex<Option<Sender<Job>>>,
+	join: Mutex<Option<JoinHandle<()>>>,
+	/// Root session exclusivity. Held for the writer lifetime; children share
+	/// this Arc and must not reacquire the same lock file.
+	root_lease: Arc<SessionWriterLease>,
+	db_path: PathBuf,
 }
 
 impl std::fmt::Debug for DurableWriter {
 	fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-		formatter.debug_struct("DurableWriter").finish_non_exhaustive()
+		formatter
+			.debug_struct("DurableWriter")
+			.field("db_path", &self.db_path)
+			.finish_non_exhaustive()
 	}
 }
 
 impl DurableWriter {
-	/// Open the database and start its writer thread. The thread keeps the
-	/// connection until every handle is dropped; queued jobs still run.
-	pub fn open(path: impl Into<PathBuf>) -> StoreResult<Self> {
-		let mut store = SqliteStore::open(path)?;
+	/// Open the database after the caller has acquired the root session lease.
+	/// The lease is stored inside this writer so drain completes before unlock.
+	pub fn open(path: impl Into<PathBuf>, root_lease: SessionWriterLease) -> StoreResult<Self> {
+		let path = path.into();
+		assert_cooperative_db_path(&path)?;
+		let mut store = SqliteStore::open(&path)?;
 		let (sender, receiver) = mpsc::channel::<Job>();
-		std::thread::Builder::new()
+		// Writer thread captures only store/receiver — never joins itself.
+		let join = std::thread::Builder::new()
 			.name("omp-session-store".to_string())
 			.spawn(move || {
 				while let Ok(job) = receiver.recv() {
@@ -80,11 +335,33 @@ impl DurableWriter {
 					format!("cannot spawn session store writer: {error}"),
 				))
 			})?;
-		Ok(Self { sender: Mutex::new(sender) })
+		Ok(Self {
+			sender: Mutex::new(Some(sender)),
+			join: Mutex::new(Some(join)),
+			root_lease: Arc::new(root_lease),
+			db_path: path,
+		})
+	}
+
+	#[must_use]
+	pub fn db_path(&self) -> &Path {
+		&self.db_path
+	}
+
+	#[must_use]
+	pub fn root_lease(&self) -> Arc<SessionWriterLease> {
+		Arc::clone(&self.root_lease)
 	}
 
 	fn send(&self, job: Job) -> StoreResult<()> {
-		lock(&self.sender).send(job).map_err(|_| {
+		let sender = lock(&self.sender);
+		let Some(sender) = sender.as_ref() else {
+			return Err(StoreError::Io(std::io::Error::new(
+				std::io::ErrorKind::BrokenPipe,
+				"session store writer stopped",
+			)));
+		};
+		sender.send(job).map_err(|_| {
 			StoreError::Io(std::io::Error::new(
 				std::io::ErrorKind::BrokenPipe,
 				"session store writer stopped",
@@ -128,6 +405,21 @@ impl DurableWriter {
 	}
 }
 
+impl Drop for DurableWriter {
+	fn drop(&mut self) {
+		// Close the channel so the writer thread exits after draining. Must not
+		// run on the writer thread (it does not hold DurableWriter).
+		{
+			let mut sender = lock(&self.sender);
+			*sender = None;
+		}
+		if let Some(join) = lock(&self.join).take() {
+			let _ = join.join();
+		}
+		// `root_lease` drops after join: exclusivity covers queued jobs.
+	}
+}
+
 /// Mutable cursor shared by the loop boundary and the synchronous manager.
 #[derive(Debug, Clone)]
 struct Cursor {
@@ -139,6 +431,11 @@ struct Cursor {
 
 /// One session's durable handle. Cloning is cheap: all clones share the writer,
 /// branch cursor, and message cursor.
+///
+/// Field order matters: `writer` is declared before `child_lease` so Drop
+/// releases the writer Arc (and drains/joins on last ref) before this handle's
+/// child-lease Arc. Queued async jobs clone that Arc so exclusivity survives
+/// cancel/drop until the writer thread finishes the operation.
 #[derive(Debug)]
 pub struct DurableSession {
 	writer: Arc<DurableWriter>,
@@ -168,6 +465,37 @@ pub struct DurableSession {
 	/// Last persisted assistant message id on the active branch, updated by
 	/// `persist_messages` and amended on terminal abort by `finish_turn`.
 	last_assistant_id: Arc<Mutex<Option<String>>>,
+	/// Per-child exclusivity when this handle is a worker session. Root sessions
+	/// leave this `None`; root exclusivity lives inside [`DurableWriter`].
+	/// Shared as Arc so every queued writer job retains ownership until the
+	/// operation completes — dropping the DurableSession alone must not unlock
+	/// while a cancelled child's job is still pending.
+	/// Declared last so Drop releases this Arc after the writer Arc.
+	child_lease: Option<Arc<SessionWriterLease>>,
+}
+
+fn empty_session_fields(
+	writer: Arc<DurableWriter>,
+	session_id: String,
+	branch: String,
+	leaf: Option<String>,
+	child_lease: Option<Arc<SessionWriterLease>>,
+	projection: Option<StoredProjection>,
+	resume_seed: Option<StoreResult<Vec<(u64, Option<String>)>>>,
+) -> DurableSession {
+	DurableSession {
+		writer,
+		session_id,
+		cursor: Arc::new(Mutex::new(Cursor { branch, leaf })),
+		written_tools: Arc::new(Mutex::new(HashMap::new())),
+		written_tool_ids: Arc::new(Mutex::new(HashMap::new())),
+		tracked: Arc::new(Mutex::new(Vec::new())),
+		tracked_ids: Arc::new(Mutex::new(Vec::new())),
+		projection: Arc::new(Mutex::new(projection)),
+		resume_seed: Arc::new(Mutex::new(resume_seed)),
+		last_assistant_id: Arc::new(Mutex::new(None)),
+		child_lease,
+	}
 }
 
 /// The selected compressed conversation: archive rows referenced by id plus
@@ -192,7 +520,6 @@ pub(crate) struct LoadedParts {
 	pub branch_messages: Vec<MessageEntry>,
 	pub header: Option<SessionHeader>,
 	pub projection: Option<StoredProjection>,
-	pub projection_error: Option<StoreError>,
 }
 
 /// Session state loaded from the authoritative database.
@@ -212,13 +539,15 @@ pub struct LoadedSession {
 
 impl DurableSession {
 	/// Open the writer and create a new session plus its root branch in one
-	/// transaction.
+	/// transaction. Acquires the exclusive cooperative writer lease first.
 	pub fn create(
 		db_path: impl Into<PathBuf>,
 		header: SessionHeader,
 	) -> StoreResult<Self> {
-		let writer = Arc::new(DurableWriter::open(db_path)?);
+		let db_path = db_path.into();
 		let session_id = header.id.clone();
+		let lease = SessionWriterLease::acquire(&db_path, &session_id)?;
+		let writer = Arc::new(DurableWriter::open(db_path, lease)?);
 		let branch_id = root_branch_id(&session_id);
 		let payload = serde_json::to_value(&header)?;
 		let parent_session_id = header.parent_session.clone();
@@ -237,78 +566,79 @@ impl DurableSession {
 			});
 			store.create_session(NewSession { parent_session_id: parent, ..session })
 		})?;
-		Ok(Self {
+		Ok(empty_session_fields(
 			writer,
 			session_id,
-			cursor: Arc::new(Mutex::new(Cursor { branch: branch_id, leaf: None })),
-			written_tools: Arc::new(Mutex::new(HashMap::new())),
-			written_tool_ids: Arc::new(Mutex::new(HashMap::new())),
-			tracked: Arc::new(Mutex::new(Vec::new())),
-			tracked_ids: Arc::new(Mutex::new(Vec::new())),
-			projection: Arc::new(Mutex::new(None)),
-			resume_seed: Arc::new(Mutex::new(None)),
-			last_assistant_id: Arc::new(Mutex::new(None)),
-		})
+			branch_id,
+			None,
+			None,
+			None,
+			None,
+		))
 	}
 
 	/// Open an existing session or a new one. `None` means the row was absent
-	/// and the header was inserted.
+	/// and the header was inserted. Acquires exclusivity before any recovery
+	/// or mutation; contention returns [`StoreError::Conflict`].
 	pub fn open(
 		db_path: impl Into<PathBuf>,
 		session_id: &str,
 		header: SessionHeader,
 	) -> StoreResult<(Self, Option<LoadedSession>)> {
-		let writer = Arc::new(DurableWriter::open(db_path)?);
+		let db_path = db_path.into();
+		let lease = SessionWriterLease::acquire(&db_path, session_id)?;
+		let writer = Arc::new(DurableWriter::open(db_path, lease)?);
 		Self::open_with_writer(writer, session_id, header)
 	}
 
 	/// Open on an existing writer thread. Used by the child factory so every
-	/// child session shares the root's single SQLite writer.
+	/// child session shares the root's single SQLite writer. Acquires a
+	/// distinct lease for the child session id; never reacquires the root lock.
 	fn open_with_writer(
 		writer: Arc<DurableWriter>,
 		session_id: &str,
 		header: SessionHeader,
 	) -> StoreResult<(Self, Option<LoadedSession>)> {
 		let id = session_id.to_string();
+		let child_lease = if writer.root_lease().session_id() == id {
+			None
+		} else {
+			Some(Arc::new(SessionWriterLease::acquire(writer.db_path(), &id)?))
+		};
 		let existing = {
 			let id = id.clone();
 			writer.call(move |store| store.session(&id))?
 		};
 		match existing {
 			Some(_) => {
+				// Exclusive ownership is proven: recover trailing unresolved
+				// intents once, then load. Failure is fatal to writer open.
 				let parts = {
 					let id = id.clone();
-					writer.call(move |store| load_parts(store, &id))?
+					writer.call(move |store| {
+						store.recover_unresolved_intents(&id)?;
+						load_parts(store, &id)
+					})?
 				};
 				let mut header = header;
 				if let Some(stored) = parts.header {
 					header = stored;
 				}
-				let seed = if let Some(err) = parts.projection_error {
-					Err(err)
-				} else {
-					seed_entries(
-						&parts.branch_messages,
-						parts.projection.as_ref(),
-						&parts.messages,
-					)
-				};
+				let seed = seed_entries(
+					&parts.branch_messages,
+					parts.projection.as_ref(),
+					&parts.messages,
+				);
 				Ok((
-					Self {
+					empty_session_fields(
 						writer,
-						session_id: id,
-						cursor: Arc::new(Mutex::new(Cursor {
-							branch: parts.branch_id.clone(),
-							leaf: parts.leaf.clone(),
-						})),
-						written_tools: Arc::new(Mutex::new(HashMap::new())),
-						written_tool_ids: Arc::new(Mutex::new(HashMap::new())),
-						projection: Arc::new(Mutex::new(parts.projection.clone())),
-						resume_seed: Arc::new(Mutex::new(Some(seed))),
-						tracked: Arc::new(Mutex::new(Vec::new())),
-						tracked_ids: Arc::new(Mutex::new(Vec::new())),
-						last_assistant_id: Arc::new(Mutex::new(None)),
-					},
+						id,
+						parts.branch_id.clone(),
+						parts.leaf.clone(),
+						child_lease,
+						parts.projection.clone(),
+						Some(seed),
+					),
 					Some(LoadedSession {
 						header,
 						branch_id: parts.branch_id,
@@ -316,7 +646,7 @@ impl DurableSession {
 						entries: parts.entries,
 						messages: parts.messages,
 						branch_messages: parts.branch_messages,
-						projection: parts.projection,
+						projection: parts.projection.clone(),
 					}),
 				))
 			},
@@ -338,18 +668,7 @@ impl DurableSession {
 					})
 				})?;
 				Ok((
-					Self {
-						writer,
-						session_id: id,
-						cursor: Arc::new(Mutex::new(Cursor { branch: branch_id, leaf: None })),
-						written_tools: Arc::new(Mutex::new(HashMap::new())),
-						written_tool_ids: Arc::new(Mutex::new(HashMap::new())),
-						tracked: Arc::new(Mutex::new(Vec::new())),
-						tracked_ids: Arc::new(Mutex::new(Vec::new())),
-						projection: Arc::new(Mutex::new(None)),
-						resume_seed: Arc::new(Mutex::new(None)),
-						last_assistant_id: Arc::new(Mutex::new(None)),
-					},
+					empty_session_fields(writer, id, branch_id, None, child_lease, None, None),
 					None,
 				))
 			},
@@ -388,15 +707,11 @@ impl DurableSession {
 		lock(&self.written_tool_ids).clear();
 		*lock(&self.projection) = parts.projection.clone();
 		if lock(&self.tracked).is_empty() {
-			let seed = if let Some(err) = parts.projection_error {
-				Err(err)
-			} else {
-				seed_entries(
-					&parts.branch_messages,
-					parts.projection.as_ref(),
-					&parts.messages,
-				)
-			};
+			let seed = seed_entries(
+				&parts.branch_messages,
+				parts.projection.as_ref(),
+				&parts.messages,
+			);
 			*lock(&self.resume_seed) = Some(seed);
 		}
 		Ok(LoadedSession {
@@ -406,7 +721,7 @@ impl DurableSession {
 			entries: parts.entries,
 			messages: parts.messages,
 			branch_messages: parts.branch_messages,
-			projection: parts.projection,
+			projection: parts.projection.clone(),
 		})
 	}
 
@@ -597,13 +912,9 @@ impl DurableSession {
 		// replay projection the incoming view carries.
 		let session_id = self.session_id.clone();
 		let parts = self
-			.writer
-			.call_async(move |store| load_parts(store, &session_id))
+			.call_async_owned(move |store| load_parts(store, &session_id))
 			.await
 			.map_err(|error| DurableError::new(error.to_string()))?;
-		if let Some(err) = parts.projection_error {
-			return Err(DurableError::new(err.to_string()));
-		}
 		{
 			let mut cursor = lock(&self.cursor);
 			cursor.branch = parts.branch_id;
@@ -627,10 +938,26 @@ impl DurableSession {
 		Ok(boundary)
 	}
 
-	async fn set_projection(&self, projection: Option<StoredProjection>) -> Result<(), DurableError> {
-		let session_id = self.session_id.clone();
+	/// Enqueue an async writer job that retains child exclusivity until the
+	/// operation finishes on the writer thread (even if the await is cancelled).
+	async fn call_async_owned<T: Send + 'static>(
+		&self,
+		operation: impl FnOnce(&mut SqliteStore) -> StoreResult<T> + Send + 'static,
+	) -> StoreResult<T> {
+		let lease = self.child_lease.clone();
 		self.writer
 			.call_async(move |store| {
+				let result = operation(store);
+				drop(lease);
+				result
+			})
+			.await
+	}
+
+	async fn set_projection(&self, projection: Option<StoredProjection>) -> Result<(), DurableError> {
+		let session_id = self.session_id.clone();
+		self
+			.call_async_owned(move |store| {
 				let mut payload = store
 					.session(&session_id)?
 					.ok_or_else(|| {
@@ -1072,8 +1399,7 @@ impl DurableBoundary for DurableSession {
 		let session_id = self.session_id.clone();
 		let branch = lock(&self.cursor).branch.clone();
 		self
-			.writer
-			.call_async(move |store| {
+			.call_async_owned(move |store| {
 				let mut batch = Vec::with_capacity(entries.len());
 				let mut previous = lock(&cursor).leaf.clone();
 				for mut entry in entries {
@@ -1192,13 +1518,9 @@ impl DurableBoundary for DurableSession {
 	async fn resync_messages(&self, messages: &[Message]) -> Result<(), DurableError> {
 		let session_id = self.session_id.clone();
 		let parts = self
-			.writer
-			.call_async(move |store| load_parts(store, &session_id))
+			.call_async_owned(move |store| load_parts(store, &session_id))
 			.await
 			.map_err(|error| DurableError::new(error.to_string()))?;
-		if let Some(err) = parts.projection_error {
-			return Err(DurableError::new(err.to_string()));
-		}
 		{
 			let mut cursor = lock(&self.cursor);
 			cursor.branch = parts.branch_id;
@@ -1231,8 +1553,7 @@ impl DurableBoundary for DurableSession {
 			"providerCallId": provider_call_id.clone(),
 		});
 		self
-			.writer
-			.call_async(move |store| {
+			.call_async_owned(move |store| {
 				store.record_intent(NewIntent {
 					session_id,
 					branch_id,
@@ -1271,8 +1592,7 @@ impl DurableBoundary for DurableSession {
 		let branch = lock(&cursor).branch.clone();
 		let projection_arc = Arc::clone(&self.projection);
 		self
-			.writer
-			.call_async(move |store| {
+			.call_async_owned(move |store| {
 				let mut state = lock(&cursor);
 				let mut tool_entry = tool_entry;
 				tool_entry.parent_id = state.leaf.clone();
@@ -1314,8 +1634,7 @@ impl DurableBoundary for DurableSession {
 		let stop_reason = stop_reason.to_string();
 		let error_message = error_message.map(str::to_string);
 		let target_id = self
-			.writer
-			.call_async(move |store| {
+			.call_async_owned(move |store| {
 				store.update_message_terminal(
 					&session_id,
 					&branch_id,
@@ -1344,8 +1663,7 @@ impl DurableBoundary for DurableSession {
 		let ids = delivery_ids.to_vec();
 		let now = unix_ms();
 		self
-			.writer
-			.call_async(move |store| {
+			.call_async_owned(move |store| {
 				for id in &ids {
 					store.mark_delivery_delivered(id, now)?;
 				}
@@ -1365,8 +1683,7 @@ impl DurableBoundary for DurableSession {
 		let ids = delivery_ids.to_vec();
 		let now = unix_ms();
 		self
-			.writer
-			.call_async(move |store| {
+			.call_async_owned(move |store| {
 				for id in &ids {
 					store.mark_delivery_processed(id, now)?;
 				}
@@ -1386,8 +1703,7 @@ impl DurableBoundary for DurableSession {
 		let projection_slot = Arc::clone(&self.projection);
 
 		let pending_items: Vec<(String, Value, i64)> = self
-			.writer
-			.call_async({
+			.call_async_owned({
 				let session_id = session_id.clone();
 				move |store| {
 					let records = store.pending_worker_deliveries(&session_id)?;
@@ -1468,8 +1784,8 @@ impl DurableBoundary for DurableSession {
 			let message_id_clone = message_id.clone();
 			let now = unix_ms();
 
-			self.writer
-				.call_async(move |store| {
+			self
+				.call_async_owned(move |store| {
 					store.consume_delivery(
 						&delivery_id_clone,
 						NewMessage {
@@ -1528,8 +1844,7 @@ impl DurableBoundary for DurableSession {
 		let session_id = self.session_id.clone();
 		let active_branch = lock(&self.cursor).branch.clone();
 		let unconfirmed: Vec<String> = self
-			.writer
-			.call_async(move |store| {
+			.call_async_owned(move |store| {
 				let records = store.unprocessed_deliveries(&session_id)?;
 				let parts = load_parts(store, &session_id)?;
 				if parts.branch_id != active_branch {
@@ -1563,9 +1878,10 @@ impl DurableBoundary for DurableSession {
 /// frozen here, at spawn, so a later branch cut cannot redirect the parent
 /// notification.
 struct StoreChildDurabilityFactory {
-	writer:     Arc<DurableWriter>,
+	writer: Arc<DurableWriter>,
 	session_id: String,
-	cursor:     Arc<Mutex<Cursor>>,
+	cursor: Arc<Mutex<Cursor>>,
+	gates: Arc<Mutex<HashMap<String, Arc<Mutex<()>>>>>,
 }
 
 impl std::fmt::Debug for StoreChildDurabilityFactory {
@@ -1578,71 +1894,75 @@ impl std::fmt::Debug for StoreChildDurabilityFactory {
 }
 
 impl StoreChildDurabilityFactory {
-	fn open_session(
-		&self,
-		worker_id: &str,
-	) -> Result<(DurableSession, WorkerIdentity), DurableError> {
-		if worker_id.is_empty() {
-			return Err(DurableError::new("worker id must not be empty"));
-		}
+	fn gate(&self, worker_id: &str) -> Arc<Mutex<()>> {
+		let mut gates = lock(&self.gates);
+		Arc::clone(gates.entry(worker_id.to_string()).or_insert_with(|| Arc::new(Mutex::new(()))))
+	}
+
+	fn open_session(&self, worker_id: &str) -> Result<(DurableSession, WorkerIdentity, Option<LoadedSession>), DurableError> {
+		if worker_id.is_empty() { return Err(DurableError::new("worker id must not be empty")); }
 		let origin_branch_id = lock(&self.cursor).branch.clone();
-		let parent = self.session_id.clone();
 		let header = SessionHeader {
-			kind: "session".to_string(),
-			version: 3,
-			id: worker_id.to_string(),
-			timestamp: output::iso8601(SystemTime::now()),
-			cwd: std::env::current_dir()
-				.map(|path| path.display().to_string())
-				.unwrap_or_default(),
-			model: None,
-			provider: None,
-			title: None,
-			title_source: None,
-			additional_directories: Vec::new(),
-			parent_session: Some(parent),
-			previous_session_files: Vec::new(),
-			provider_prompt_cache_key: None,
+			kind: "session".to_string(), version: 3, id: worker_id.to_string(), timestamp: output::iso8601(SystemTime::now()),
+			cwd: std::env::current_dir().map(|path| path.display().to_string()).unwrap_or_default(), model: None, provider: None,
+			title: None, title_source: None, additional_directories: Vec::new(), parent_session: Some(self.session_id.clone()),
+			previous_session_files: Vec::new(), provider_prompt_cache_key: None,
 		};
-		let writer = Arc::clone(&self.writer);
-		let child_id = worker_id.to_string();
-		let (child, _) = run_blocking(move || {
-			DurableSession::open_with_writer(writer, &child_id, header)
-		})
-		.map_err(|error| DurableError::new(error.to_string()))?;
-		let identity = WorkerIdentity {
-			worker_id: worker_id.to_string(),
-			session_id: self.session_id.clone(),
-			origin_branch_id,
-		};
-		Ok((child, identity))
+		let writer = Arc::clone(&self.writer); let child_id = worker_id.to_string();
+		let (child, loaded) = run_blocking(move || DurableSession::open_with_writer(writer, &child_id, header)).map_err(|error| DurableError::new(error.to_string()))?;
+		let identity = WorkerIdentity { worker_id: worker_id.to_string(), session_id: self.session_id.clone(), origin_branch_id };
+		Ok((child, identity, loaded))
 	}
 
 	fn handle(child: DurableSession, identity: WorkerIdentity) -> ChildDurability {
-		let completion = Arc::new(StoreWorkerCompletion {
-			writer: Arc::clone(&child.writer),
-			identity: identity.clone(),
-		});
-		ChildDurability::new(
-			identity,
-			Arc::new(child) as Arc<dyn DurableBoundary>,
-			completion,
-		)
+		let completion = Arc::new(StoreWorkerCompletion { writer: Arc::clone(&child.writer), identity: identity.clone() });
+		ChildDurability::new(identity, Arc::new(child) as Arc<dyn DurableBoundary>, completion)
 	}
 }
 
+fn replay_loaded_session(loaded: &LoadedSession) -> StoreResult<Vec<Message>> {
+	let Some(projection) = &loaded.projection else {
+		return crate::runtime::history_messages_from_entries(&loaded.branch_messages)
+			.map_err(|error| StoreError::Corrupt(error.to_string()));
+	};
+	let by_id: HashMap<&str, &MessageEntry> = loaded.messages.iter().map(|entry| (entry.id.as_str(), entry)).collect();
+	let mut restored = Vec::with_capacity(projection.kept.len() + projection.synthetic.len());
+	for value in &projection.synthetic {
+		restored.push(serde_json::from_value::<Message>(value.clone()).map_err(|error| StoreError::Corrupt(format!("child synthetic message: {error}")))?);
+	}
+	let mut kept = Vec::with_capacity(projection.kept.len());
+	for kept_id in &projection.kept {
+		let Some(entry) = by_id.get(kept_id.as_str()) else {
+			return Err(StoreError::Corrupt(format!("child compaction projection references missing message {kept_id}")));
+		};
+		kept.push((*entry).clone());
+	}
+	restored.extend(crate::runtime::history_messages_from_entries(&kept).map_err(|error| StoreError::Corrupt(error.to_string()))?);
+	Ok(restored)
+}
 impl ChildDurabilityFactory for StoreChildDurabilityFactory {
 	fn open_child(&self, worker_id: &str) -> Result<ChildDurability, DurableError> {
-		let (child, identity) = self.open_session(worker_id)?;
+		let gate = self.gate(worker_id);
+		let _guard = lock(&gate);
+		let (child, identity, _) = self.open_session(worker_id)?;
 		Ok(Self::handle(child, identity))
 	}
 
-	fn import_legacy_child(
-		&self,
-		worker_id: &str,
-		messages: &[Message],
-	) -> Result<ChildDurability, DurableError> {
-		let (child, identity) = self.open_session(worker_id)?;
+	fn open_child_with_replay(&self, worker_id: &str) -> Result<(ChildDurability, Option<Vec<Message>>), DurableError> {
+		let gate = self.gate(worker_id);
+		let _guard = lock(&gate);
+		let (child, identity, loaded) = self.open_session(worker_id)?;
+		let replay = loaded.as_ref().map(replay_loaded_session).transpose()
+			.map_err(|e| DurableError::new(e.to_string()))?;
+		Ok((Self::handle(child, identity), replay))
+	}
+
+    fn import_legacy_child(
+        &self,
+        worker_id: &str,
+        messages: &[Message],
+    ) -> Result<ChildDurability, DurableError> {
+		let (child, identity, _) = self.open_session(worker_id)?;
 		let id = worker_id.to_string();
 		let existing = writer_call(&self.writer, move |store| {
 			let Some(session) = store.session(&id)? else {
@@ -1665,20 +1985,40 @@ impl ChildDurabilityFactory for StoreChildDurabilityFactory {
 
 	fn load_child_messages(&self, worker_id: &str) -> Result<Option<Vec<Message>>, DurableError> {
 		let id = worker_id.to_string();
-		let messages = writer_call(&self.writer, move |store| {
+		let db_path = self.writer.db_path().to_path_buf();
+		// History revive is read-only: never take a writer lease and never run
+		// load_parts (recover/reconcile).
+		let messages = run_blocking(move || -> StoreResult<Option<Vec<Message>>> {
+			let store = SqliteStore::open_read_only(&db_path)?;
 			if store.session(&id)?.is_none() {
 				return Ok(None);
 			}
-			let parts = load_parts(store, &id)?;
-			let Some(projection) = parts.projection else {
-				return crate::runtime::history_messages_from_entries(&parts.branch_messages)
-					.map(Some)
-					.map_err(|error| StoreError::Corrupt(error.to_string()));
-			};
-			// A compacted child must revive from the same synthetic prefix plus
-			// retained-entry order the root build uses, not from the raw branch.
+			let snapshot = store.load_session_snapshot(&id)?;
+            let mut branch_messages = Vec::new();
+            for row in &snapshot.branch_messages {
+                let entry: SessionEntry = serde_json::from_value(row.payload.clone())
+                    .map_err(|error| StoreError::Corrupt(error.to_string()))?;
+                if entry.kind == "message" {
+                    branch_messages.push(serde_json::from_value::<MessageEntry>(row.payload.clone())
+                        .map_err(|error| StoreError::Corrupt(error.to_string()))?);
+                }
+            }
+            let Some(projection) = snapshot.projection else {
+                return crate::runtime::history_messages_from_entries(&branch_messages)
+                    .map(Some)
+                    .map_err(|error| StoreError::Corrupt(error.to_string()));
+            };
+            let mut session_messages = Vec::new();
+            for row in &snapshot.session_messages {
+                let entry: SessionEntry = serde_json::from_value(row.payload.clone())
+                    .map_err(|error| StoreError::Corrupt(error.to_string()))?;
+                if entry.kind == "message" {
+                    session_messages.push(serde_json::from_value::<MessageEntry>(row.payload.clone())
+                        .map_err(|error| StoreError::Corrupt(error.to_string()))?);
+                }
+            }
 			let by_id: HashMap<&str, &MessageEntry> =
-				parts.messages.iter().map(|entry| (entry.id.as_str(), entry)).collect();
+				session_messages.iter().map(|entry| (entry.id.as_str(), entry)).collect();
 			let mut restored = Vec::with_capacity(projection.kept.len() + projection.synthetic.len());
 			for value in &projection.synthetic {
 				restored.push(serde_json::from_value::<Message>(value.clone()).map_err(
@@ -1817,6 +2157,7 @@ impl DurableSession {
 			writer: Arc::clone(&self.writer),
 			session_id: self.session_id.clone(),
 			cursor: Arc::clone(&self.cursor),
+			gates: Arc::new(Mutex::new(HashMap::new())),
 		})
 	}
 }
@@ -1826,22 +2167,17 @@ fn load_parts(
 	session_id: &str,
 ) -> StoreResult<LoadedParts> {
 	store.recover_unmessaged_outcomes(session_id)?;
-	let projection_error = match store.reconcile_durable_projection(session_id) {
-		Ok(_) => None,
-		Err(StoreError::Corrupt(msg)) => Some(StoreError::Corrupt(msg)),
-		Err(err) => return Err(err),
-	};
+	// Unresolved-intent recovery runs only from open_with_writer after the
+	// exclusive cooperative lease is held. load_parts stays callable for live
+	// reloads and must not recover again (would race a peer if called without
+	// ownership). recover_unmessaged_outcomes remains idempotent repair here.
+	store.reconcile_durable_projection(session_id)?;
 	let record: SessionRecord = store
 		.session(session_id)?
 		.ok_or_else(|| StoreError::NotFound(format!("session {session_id} not found")))?;
-	let projection = if projection_error.is_some() {
-		None
-	} else {
-		record
-			.payload
-			.get("durableProjection")
-			.cloned()
-			.and_then(|value| serde_json::from_value::<StoredProjection>(value).ok())
+	let projection = match record.payload.get("durableProjection") {
+		None => None,
+		Some(value) => Some(crate::session_store::parse_stored_projection(value)?),
 	};
 	let header = serde_json::from_value::<SessionHeader>(record.payload.clone()).ok();
 	let branch_id = record
@@ -1877,7 +2213,6 @@ fn load_parts(
 		branch_messages,
 		header,
 		projection,
-		projection_error,
 	})
 }
 
@@ -2016,6 +2351,68 @@ fn seed_entries(
 		.collect()
 }
 
+/// Validate branch replay with the durable resume-seed pairing rules.
+pub fn validate_replay_seed(branch: &[MessageEntry]) -> StoreResult<()> {
+	seed_entries(branch, None, branch).map(|_| ())
+}
+
+
+#[cfg(test)]
+mod runtime_replay_validation_tests {
+	use super::validate_runtime_replay;
+	use pi_agent::{Message, ToolCall};
+
+	#[test]
+	fn synthetic_tool_call_pairs_with_kept_tool_result() {
+		let synthetic = Message::assistant_with_tools("call", vec![ToolCall { id: "c1".into(), name: "tool".into(), arguments: serde_json::json!({}) }]);
+		let result = Message::tool_with_status("c1", "tool", "ok", false);
+		assert!(validate_runtime_replay(&[synthetic, result]).is_ok());
+	}
+
+	#[test]
+	fn synthetic_dangling_tool_call_fails_closed() {
+		let synthetic = Message::assistant_with_tools("call", vec![ToolCall { id: "missing".into(), name: "tool".into(), arguments: serde_json::json!({}) }]);
+		assert!(validate_runtime_replay(&[synthetic]).is_err());
+	}
+	#[test]
+	fn duplicate_call_ids_require_matching_result_count() {
+		let calls = Message::assistant_with_tools("call", vec![ToolCall { id: "same".into(), name: "tool".into(), arguments: serde_json::json!({}) }, ToolCall { id: "same".into(), name: "tool".into(), arguments: serde_json::json!({}) }]);
+		let result = || Message::tool_with_status("same", "tool", "ok", false);
+		assert!(validate_runtime_replay(&[calls.clone(), result()]).is_err());
+		assert!(validate_runtime_replay(&[calls, result(), result()]).is_ok());
+	}
+
+	#[test]
+	fn runtime_tool_call_representation_uses_single_canonical_source() {
+		let mut message = Message::assistant_with_tools("call", vec![ToolCall { id: "same".into(), name: "tool".into(), arguments: serde_json::json!({}) }]);
+		message.parts.push(pi_agent::ContentPart::tool_call("same", "tool", serde_json::json!({})));
+		let result = Message::tool_with_status("same", "tool", "ok", false);
+		assert!(validate_runtime_replay(&[message, result]).is_ok());
+	}
+}
+
+pub fn validate_runtime_replay(messages: &[pi_agent::Message]) -> StoreResult<()> {
+	let mut pending: HashMap<String, usize> = HashMap::new();
+	for message in messages {
+		match message.role {
+			pi_agent::Role::Assistant => {
+				if !pending.is_empty() { return Err(StoreError::Corrupt(format!("unresolvable dangling tool call(s): {}", pending.keys().cloned().collect::<Vec<_>>().join(", ")))); }
+				if !message.tool_calls.is_empty() { for call in &message.tool_calls { *pending.entry(call.id.clone()).or_default() += 1; } }
+				else { for part in &message.parts { if let pi_agent::ContentPart::ToolCall { id, .. } = part { *pending.entry(id.clone()).or_default() += 1; } } }
+			},
+			pi_agent::Role::Tool => {
+				let id = message.tool_call_id.as_deref().ok_or_else(|| StoreError::Corrupt("tool result missing toolCallId".into()))?;
+				let Some(count) = pending.get_mut(id) else { return Err(StoreError::Corrupt(format!("tool result has no pending call {id}"))); };
+				*count -= 1; if *count == 0 { pending.remove(id); }
+			},
+			pi_agent::Role::User if !pending.is_empty() => return Err(StoreError::Corrupt("user message interrupts unresolved tool calls".into())),
+			_ => {},
+		}
+	}
+	if !pending.is_empty() { return Err(StoreError::Corrupt(format!("unresolvable dangling tool call(s): {}", pending.keys().cloned().collect::<Vec<_>>().join(", ")))); }
+	Ok(())
+}
+
 /// Revision of a stored row as the live loop will see it after replay.
 ///
 /// Storage writers are not byte-compatible: TS/imported logs keep plain text
@@ -2095,13 +2492,13 @@ pub struct StoredSessionSummary {
 }
 
 /// List every session in one project's database, newest first. Returns an
-/// empty list when the database does not exist; read-only.
+/// empty list when the database does not exist; read-only (no writer lease).
 pub fn list_session_summaries(dir: &Path) -> StoreResult<Vec<StoredSessionSummary>> {
 	let db_path = database_path(dir);
 	if !db_path.exists() {
 		return Ok(Vec::new());
 	}
-	let store = SqliteStore::open(&db_path)?;
+	let store = SqliteStore::open_read_only(&db_path)?;
 	let mut summaries = Vec::new();
 	for record in store.list_sessions()? {
 		let header = serde_json::from_value::<SessionHeader>(record.payload.clone()).ok();
@@ -2162,6 +2559,7 @@ pub fn latest_session_id(db_path: &Path) -> StoreResult<Option<String>> {
 	}
 	let connection =
 		rusqlite::Connection::open_with_flags(db_path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+	connection.busy_timeout(std::time::Duration::from_secs(5))?;
 	let id = connection
 		.query_row(
 			"SELECT id FROM sessions ORDER BY updated_at_ms DESC, created_at_ms DESC LIMIT 1",
@@ -2260,6 +2658,84 @@ mod tests {
 		let _ = std::fs::remove_dir_all(dir);
 	}
 
+	#[test]
+	fn open_fails_closed_on_invalid_durable_projection() {
+		let (dir, path) = temp_db("corrupt-projection");
+		{
+			let mut store = SqliteStore::open(&path).expect("store");
+			store
+				.create_session(NewSession {
+					id: "corrupt".to_string(),
+					parent_session_id: None,
+					payload: serde_json::json!({"durableProjection": {"kept": ["missing"]}}),
+					initial_branch_id: "corrupt.main".to_string(),
+					initial_branch_payload: Value::Null,
+				})
+				.expect("session");
+			store
+				.append_message(NewMessage {
+					id: "m1".to_string(),
+					session_id: "corrupt".to_string(),
+					branch_id: "corrupt.main".to_string(),
+					parent_message_id: None,
+					payload: serde_json::json!({"type": "message", "id": "m1", "message": {"role": "user", "content": "hi"}}),
+				})
+				.expect("message");
+		}
+
+		let error = DurableSession::open(&path, "corrupt", header("corrupt", None))
+			.expect_err("invalid durable projection must fail closed, not fall back to the raw branch");
+		assert!(matches!(error, StoreError::Corrupt(_)), "unexpected error: {error}");
+
+		let store = SqliteStore::open(&path).expect("store");
+		let session = store.session("corrupt").expect("session").expect("exists");
+		assert_eq!(
+			session.payload["durableProjection"]["kept"],
+			serde_json::json!(["missing"]),
+			"failed open must not delete or rewrite the stored header"
+		);
+		let _ = std::fs::remove_dir_all(dir);
+	}
+
+	#[test]
+	fn open_fails_closed_on_malformed_projection_shape() {
+		let (dir, path) = temp_db("malformed-projection-shape");
+		{
+			let mut store = SqliteStore::open(&path).expect("store");
+			store
+				.create_session(NewSession {
+					id: "malformed".to_string(),
+					parent_session_id: None,
+					payload: serde_json::json!({"durableProjection": {"kept": "nope", "synthetic": []}}),
+					initial_branch_id: "malformed.main".to_string(),
+					initial_branch_payload: Value::Null,
+				})
+				.expect("session");
+			store
+				.append_message(NewMessage {
+					id: "m1".to_string(),
+					session_id: "malformed".to_string(),
+					branch_id: "malformed.main".to_string(),
+					parent_message_id: None,
+					payload: serde_json::json!({"type": "message", "id": "m1", "message": {"role": "user", "content": "hi"}}),
+				})
+				.expect("message");
+		}
+
+		let error = DurableSession::open(&path, "malformed", header("malformed", None))
+			.expect_err("malformed durable projection must fail closed");
+		assert!(matches!(error, StoreError::Corrupt(_)), "unexpected error: {error}");
+
+		let store = SqliteStore::open(&path).expect("store");
+		let session = store.session("malformed").expect("session").expect("exists");
+		assert_eq!(
+			session.payload["durableProjection"]["kept"],
+			serde_json::json!("nope"),
+			"failed open must not rewrite the stored header"
+		);
+		let _ = std::fs::remove_dir_all(dir);
+	}
+
 	#[tokio::test]
 	async fn imported_legacy_child_second_load_sees_appended_turns() {
 		let (dir, path) = temp_db("legacy-second");
@@ -2288,6 +2764,87 @@ mod tests {
 		);
 		let _ = std::fs::remove_dir_all(dir);
 	}
+    #[tokio::test]
+    async fn child_revive_skips_metadata_rows() {
+        let (dir, path) = temp_db("child-metadata-revive");
+        let root = Arc::new(DurableSession::create(&path, header("root", None)).expect("create root"));
+        let factory = root.durable_child_factory();
+        let child = factory.open_child("mixed-child").expect("open child");
+        child.boundary().persist_messages(&[Message::user("history")]).await.expect("persist history");
+        let mut store = SqliteStore::open(&path).expect("open store");
+        let parent = store
+            .branch_messages("mixed-child.main")
+            .expect("load branch")
+            .last()
+            .expect("history row")
+            .id
+            .clone();
+        store.append_message(NewMessage {
+            id: "meta-1".to_string(),
+            session_id: "mixed-child".to_string(),
+            branch_id: "mixed-child.main".to_string(),
+            parent_message_id: Some(parent.clone()),
+            payload: serde_json::json!({ "type": "model_change", "id": "meta-1", "parentId": parent, "timestamp": "2026-01-01T00:00:00Z", "model": "fixture" }),
+        }).expect("append metadata");
+        drop(store);
+        let revived = factory.load_child_messages("mixed-child").expect("revive").expect("exists");
+        assert_eq!(revived.len(), 1);
+        assert_eq!(revived[0].content, "history");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+
+    #[tokio::test]
+    async fn fresh_child_replay_fails_closed_on_corrupt_projection() {
+        let (dir, path) = temp_db("child-corrupt-projection");
+        let root = Arc::new(
+            DurableSession::create(&path, header("root", None)).expect("create root session"),
+        );
+        let factory = root.durable_child_factory();
+        let child = factory
+            .open_child("corrupt-child")
+            .expect("open child scope");
+        child
+            .boundary()
+            .persist_messages(&[Message::user("durable history")])
+            .await
+            .expect("persist child history");
+        // Keep projection references valid so reconciliation preserves projection;
+        // corrupt synthetic payload must fail during fresh-child replay.
+        let mut store = SqliteStore::open(&path).expect("open fixture store");
+        let message_id = store
+            .branch_messages("corrupt-child.main")
+            .expect("load child branch")
+            .first()
+            .expect("child history row")
+            .id
+            .clone();
+        let mut payload = store
+            .session("corrupt-child")
+            .expect("load child session")
+            .expect("child session exists")
+            .payload;
+        payload["durableProjection"] = serde_json::json!({
+            "kept": [message_id],
+            "synthetic": [{"not": "a message"}],
+            "anchor": null,
+        });
+        store
+            .update_session_payload("corrupt-child", payload)
+            .expect("persist corrupt projection");
+        drop(store);
+        drop(child);
+
+        let error = factory
+            .open_child_with_replay("corrupt-child")
+            .expect_err("fresh-child replay must fail on corrupt projection");
+        let message = error.to_string();
+        assert!(
+            message.contains("synthetic") || message.contains("missing field role"),
+            "replay error must identify invalid synthetic projection data: {message}"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
 
 	#[tokio::test]
 	async fn corrupt_resume_seed_stays_readable_and_fails_every_write() {

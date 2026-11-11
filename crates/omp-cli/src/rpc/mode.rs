@@ -924,6 +924,9 @@ impl RpcMode {
 				self.sink.send(frame);
 			}
 		}
+		// EOF ends this RPC session's durable writer lease, even when runner is
+		// process-scoped and reused by a later transport session.
+		runner.close_session(session_id.as_deref(), session_file.as_deref());
 	}
 
 	fn lock_session(&self) -> MutexGuard<'_, RpcSession> {

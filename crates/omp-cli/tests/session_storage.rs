@@ -2,6 +2,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use omp_cli::dirs;
+use omp_cli::durable_session::StoredProjection;
 use omp_cli::session::{
 	ContentPart, MessageContent, MessageEntry, SessionMessage, SessionOptions, SessionStore,
 	ToolCallRecord, TurnRecord, compute_default_session_dir, continue_recent_with_breadcrumb,
@@ -9,6 +10,8 @@ use omp_cli::session::{
 	parse_title_slot, read_terminal_breadcrumb, resolve_resumable_session, serialize_title_slot,
 	session_matches_resume_arg, write_terminal_breadcrumb,
 };
+use omp_cli::session_store::{ForkWrite, NewBranch, NewIntent, NewMessage, NewSession, SqliteStore};
+use serde_json::json;
 
 static COUNTER: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 
@@ -422,6 +425,169 @@ fn fork_session_creates_new_session_with_parent_reference() {
 }
 
 #[test]
+fn durable_fork_preserves_offbranch_tool_result_projection() {
+	let temp = temp_dir("durable-sibling");
+	let source_dir = temp.join("source"); let target_dir = temp.join("target"); fs::create_dir_all(&source_dir).expect("source");
+	let mut store = SqliteStore::open(source_dir.join("sessions.db")).expect("store");
+	let message = |id: &str, branch: &str, parent: Option<&str>, role: &str, content: &str| NewMessage { id: id.into(), session_id: "source".into(), branch_id: branch.into(), parent_message_id: parent.map(str::to_string), payload: json!({"type":"message","id":id,"parentId":parent,"timestamp":"2026-01-01T00:00:00Z","message":{"role":role,"content":content,"timestamp":1}}) };
+	let user = message("m1", "active", None, "user", "request");
+	let assistant = NewMessage { id: "a1".into(), session_id: "source".into(), branch_id: "active".into(), parent_message_id: Some("m1".into()), payload: json!({"type":"message","id":"a1","parentId":"m1","timestamp":"2026-01-01T00:00:01Z","message":{"role":"assistant","timestamp":2,"content":[{"type":"text","text":"call"},{"type":"toolCall","id":"c1","name":"one","arguments":{}},{"type":"toolCall","id":"c2","name":"two","arguments":{}}],"api":"openai-completions","provider":"test","model":"model","usage":{"input":1,"output":1,"cacheRead":0,"cacheWrite":0,"totalTokens":2,"cost":{"input":0,"output":0,"cacheRead":0,"cacheWrite":0,"total":0}},"stopReason":"toolUse"}}) };
+	let result = |id: &str, branch: &str, content: &str, call: &str, parent: &str| NewMessage { id: id.into(), session_id: "source".into(), branch_id: branch.into(), parent_message_id: Some(parent.into()), payload: json!({"type":"message","id":id,"parentId":parent,"timestamp":"2026-01-01T00:00:02Z","message":{"role":"toolResult","toolCallId":call,"toolName":call,"content":[{"type":"text","text":content}],"isError":false,"timestamp":3}}) };
+	store.create_fork_atomic(ForkWrite { session: NewSession { id: "source".into(), parent_session_id: None, payload: json!({"type":"session","version":3,"id":"source","timestamp":"2026-01-01T00:00:00Z","cwd":"/tmp"}), initial_branch_id: "active".into(), initial_branch_payload: json!({}) }, branches: vec![NewBranch { id: "active".into(), session_id: "source".into(), parent_branch_id: None, parent_message_id: None, payload: json!({}) }, NewBranch { id: "sibling".into(), session_id: "source".into(), parent_branch_id: Some("active".into()), parent_message_id: Some("a1".into()), payload: json!({}) }, NewBranch { id: "unrelated".into(), session_id: "source".into(), parent_branch_id: None, parent_message_id: None, payload: json!({"name":"unrelated"}) }], messages: vec![user, assistant, result("r1", "active", "one", "c1", "a1"), result("r2", "sibling", "two", "c2", "a1"), message("u1", "unrelated", None, "user", "unrelated")], active_branch_id: "active".into(), active_leaf_message_id: Some("r1".into()), projection: Some(StoredProjection { kept: vec!["a1".into(), "r1".into(), "r2".into()], synthetic: vec![], anchor: Some("r1".into()) }) }).expect("seed"); drop(store);
+	let forked = fork_session(&source_dir.join("source.jsonl"), None, Some(&target_dir)).expect("fork"); let id = forked.file_stem().unwrap().to_str().unwrap(); let target_db = target_dir.join("sessions.db"); let target = SqliteStore::open(&target_db).expect("target");
+	let messages = target.session_messages(id).expect("messages"); assert_eq!(messages.len(), 4); assert!(messages.iter().any(|m| m.payload["message"]["content"].as_array().is_some_and(|parts| parts.iter().any(|part| part["text"] == json!("two"))))); assert!(messages.iter().any(|m| m.payload["message"]["role"] == json!("assistant") && m.payload["message"]["content"].is_array())); assert!(!messages.iter().any(|m| m.payload["message"]["content"] == json!("unrelated")));
+	let projection = target.session(id).expect("session").expect("target").payload["durableProjection"].clone(); let anchor = messages.iter().find(|m| m.payload["message"]["role"] == json!("toolResult") && m.payload["message"]["toolCallId"] == json!("c1")).expect("active result"); assert_eq!(projection["anchor"], json!(anchor.id)); assert_eq!(projection["kept"].as_array().expect("kept").len(), 3);
+	let source_store = SqliteStore::open(source_dir.join("sessions.db")).expect("source reopen"); let source_rows = source_store.session_messages("source").expect("source rows"); let source_projection = source_store.session("source").expect("source session").expect("source").payload["durableProjection"].clone(); let source_kept = source_projection["kept"].as_array().expect("source kept").iter().map(|id| source_rows.iter().find(|row| row.id == id.as_str().unwrap()).unwrap().payload.clone()).collect::<Vec<_>>(); let source_entries = source_kept.iter().map(|payload| serde_json::from_value(payload.clone()).expect("source entry")).collect::<Vec<omp_cli::session::MessageEntry>>(); let source_replay = omp_cli::runtime::history_messages_from_entries(&source_entries).expect("source projected replay"); let target_kept = projection["kept"].as_array().expect("target kept").iter().map(|id| messages.iter().find(|row| row.id == id.as_str().unwrap()).unwrap().payload.clone()).collect::<Vec<_>>(); let target_entries = target_kept.iter().map(|payload| serde_json::from_value(payload.clone()).expect("target entry")).collect::<Vec<omp_cli::session::MessageEntry>>(); let target_replay = omp_cli::runtime::history_messages_from_entries(&target_entries).expect("target projected replay"); assert_eq!(source_replay, target_replay); drop(target);
+	let mut next = SqliteStore::open(&target_db).expect("reopen"); let leaf = anchor; next.append_message(NewMessage { id: "next".into(), session_id: id.into(), branch_id: leaf.branch_id.clone(), parent_message_id: Some(leaf.id.clone()), payload: json!({"type":"message","id":"next","parentId":leaf.id,"timestamp":"2026-01-01T00:00:03Z","message":{"role":"user","content":"next","timestamp":4}}) }).expect("next write"); assert!(next.session_messages(id).unwrap().iter().any(|m| m.id == "next"));
+	fs::remove_dir_all(temp).ok();
+}
+
+#[test]
+fn durable_fork_validates_synthetic_call_with_offbranch_result() {
+	let temp = temp_dir("synthetic-call"); let source_dir = temp.join("source"); let target_dir = temp.join("target"); fs::create_dir_all(&source_dir).expect("source");
+	let mut store = SqliteStore::open(source_dir.join("sessions.db")).expect("store");
+	let assistant = NewMessage { id: "a1".into(), session_id: "source".into(), branch_id: "root".into(), parent_message_id: None, payload: json!({"type":"message","id":"a1","timestamp":"2026-01-01T00:00:00Z","message":{"role":"assistant","content":[{"type":"toolCall","id":"c1","name":"tool","arguments":{}}],"timestamp":1,"api":"openai-completions","provider":"test","model":"model","stopReason":"toolUse"}}) };
+	let result = NewMessage { id: "r1".into(), session_id: "source".into(), branch_id: "sibling".into(), parent_message_id: Some("a1".into()), payload: json!({"type":"message","id":"r1","parentId":"a1","timestamp":"2026-01-01T00:00:01Z","message":{"role":"toolResult","toolCallId":"c1","toolName":"tool","content":[{"type":"text","text":"ok"}],"isError":false,"timestamp":2}}) };
+	let synthetic_call = serde_json::to_value(pi_agent::Message::assistant_with_tools("prefix", vec![pi_agent::ToolCall { id: "c1".into(), name: "tool".into(), arguments: json!({}) }])).expect("runtime synthetic");
+	store.create_fork_atomic(ForkWrite { session: NewSession { id: "source".into(), parent_session_id: None, payload: json!({"type":"session","version":3,"id":"source","timestamp":"2026-01-01T00:00:00Z","cwd":"/tmp"}), initial_branch_id: "active".into(), initial_branch_payload: json!({}) }, branches: vec![NewBranch { id: "root".into(), session_id: "source".into(), parent_branch_id: None, parent_message_id: None, payload: json!({}) }, NewBranch { id: "active".into(), session_id: "source".into(), parent_branch_id: Some("root".into()), parent_message_id: Some("a1".into()), payload: json!({}) }, NewBranch { id: "sibling".into(), session_id: "source".into(), parent_branch_id: Some("root".into()), parent_message_id: Some("a1".into()), payload: json!({}) }], messages: vec![assistant, result], active_branch_id: "active".into(), active_leaf_message_id: Some("a1".into()), projection: Some(StoredProjection { kept: vec!["r1".into()], synthetic: vec![synthetic_call], anchor: None }) }).expect("seed"); drop(store);
+	let forked = fork_session(&source_dir.join("source.jsonl"), None, Some(&target_dir)).expect("fork"); let id = forked.file_stem().unwrap().to_str().unwrap(); let target = SqliteStore::open(target_dir.join("sessions.db")).expect("target"); let session = target.session(id).expect("session").expect("fork"); let projection = serde_json::from_value::<StoredProjection>(session.payload["durableProjection"].clone()).expect("projection"); let rows = target.session_messages(id).expect("rows"); let kept = projection.kept.iter().map(|id| serde_json::from_value::<MessageEntry>(rows.iter().find(|row| row.id == *id).expect("kept row").payload.clone()).expect("entry")).collect::<Vec<_>>(); let mut replay = projection.synthetic.iter().map(|value| serde_json::from_value::<pi_agent::Message>(value.clone()).expect("synthetic")).collect::<Vec<_>>(); replay.extend(omp_cli::runtime::history_messages_from_entries(&kept).expect("kept replay")); assert!(omp_cli::durable_session::validate_runtime_replay(&replay).is_ok());
+	fs::remove_dir_all(temp).ok();
+}
+
+#[test]
+fn durable_fork_rejects_projected_tool_result_without_matching_ancestor() {
+	let temp = temp_dir("synthetic-unmatched"); let source_dir = temp.join("source"); let target_dir = temp.join("target"); fs::create_dir_all(&source_dir).expect("source");
+	let mut store = SqliteStore::open(source_dir.join("sessions.db")).expect("store");
+	let result = NewMessage { id: "r1".into(), session_id: "source".into(), branch_id: "sibling".into(), parent_message_id: Some("a1".into()), payload: json!({"type":"message","id":"r1","parentId":"a1","timestamp":"2026-01-01T00:00:01Z","message":{"role":"toolResult","toolCallId":"real","toolName":"tool","content":"ok","isError":false,"timestamp":2}}) };
+	let assistant = NewMessage { id: "a1".into(), session_id: "source".into(), branch_id: "root".into(), parent_message_id: None, payload: json!({"type":"message","id":"a1","timestamp":"2026-01-01T00:00:00Z","message":{"role":"assistant","content":[{"type":"toolCall","id":"real","name":"tool","arguments":{}}],"timestamp":1,"api":"openai-completions","provider":"test","model":"model","stopReason":"toolUse"}}) };
+	store.create_fork_atomic(ForkWrite { session: NewSession { id: "source".into(), parent_session_id: None, payload: json!({"type":"session","version":3,"id":"source","timestamp":"2026-01-01T00:00:00Z","cwd":"/tmp"}), initial_branch_id: "active".into(), initial_branch_payload: json!({}) }, branches: vec![NewBranch { id: "root".into(), session_id: "source".into(), parent_branch_id: None, parent_message_id: None, payload: json!({}) }, NewBranch { id: "active".into(), session_id: "source".into(), parent_branch_id: Some("root".into()), parent_message_id: Some("a1".into()), payload: json!({}) }, NewBranch { id: "sibling".into(), session_id: "source".into(), parent_branch_id: Some("root".into()), parent_message_id: Some("a1".into()), payload: json!({}) }], messages: vec![assistant, result], active_branch_id: "active".into(), active_leaf_message_id: Some("a1".into()), projection: None }).expect("valid source seed");
+	store.update_session_payload("source", json!({"type":"session","version":3,"id":"source","timestamp":"2026-01-01T00:00:00Z","cwd":"/tmp","durableProjection":{"kept":["r1"],"synthetic":[{"role":"assistant","content":"prefix","tool_calls":[{"id":"wrong","name":"tool","arguments":{}}]}],"anchor":null}})).expect("corrupt projection only"); drop(store);
+	assert!(fork_session(&source_dir.join("source.jsonl"), None, Some(&target_dir)).is_err());
+	let target_db = target_dir.join("sessions.db"); if target_db.exists() { let target = SqliteStore::open(target_db).expect("target store"); assert!(target.list_sessions().expect("sessions").iter().all(|session| session.id != "source")); }
+	fs::remove_dir_all(temp).ok();
+}
+
+#[test]
+fn fork_of_fork_retains_immutable_unknown_provenance_after_source_outcome_change() {
+	let temp = temp_dir("provenance-transitive");
+	let source_dir = temp.join("source");
+	let first_dir = temp.join("first");
+	let second_dir = temp.join("second");
+	fs::create_dir_all(&source_dir).expect("source");
+	let mut store = SqliteStore::open(source_dir.join("sessions.db")).expect("store");
+	store.create_session(NewSession { id: "source".into(), parent_session_id: None, payload: json!({"type":"session","version":3,"id":"source","timestamp":"2026-01-01T00:00:00Z","cwd":"/tmp"}), initial_branch_id: "source.main".into(), initial_branch_payload: json!({}) }).expect("session");
+	store.append_message(NewMessage { id: "a1".into(), session_id: "source".into(), branch_id: "source.main".into(), parent_message_id: None, payload: json!({"type":"message","id":"a1","message":{"role":"assistant","content":[{"type":"toolCall","id":"shared","name":"bash"}]}}) }).expect("assistant");
+	let exec = store.record_intent(NewIntent { session_id: "source".into(), branch_id: "source.main".into(), provider_call_id: "shared".into(), tool_name: "bash".into(), payload: json!({}) }).expect("intent");
+	store.append_message(NewMessage { id: "r1".into(), session_id: "source".into(), branch_id: "source.main".into(), parent_message_id: Some("a1".into()), payload: json!({"type":"message","id":"r1","parentId":"a1","message":{"role":"toolResult","toolCallId":"shared","toolName":"bash","content":"interrupted","isError":true,"details":{"executionId":exec}}}) }).expect("result");
+	drop(store);
+
+	let first = fork_session(&source_dir.join("source.jsonl"), None, Some(&first_dir)).expect("first fork");
+	let first_id = first.file_stem().unwrap().to_str().unwrap().to_string();
+	let mut first_store = SqliteStore::open(first_dir.join("sessions.db")).expect("first store");
+	assert!(!first_store.load_session_snapshot(&first_id).expect("first snapshot").provenance[0].outcome_resolved);
+	drop(first_store);
+
+	let mut store = SqliteStore::open(source_dir.join("sessions.db")).expect("source reopen");
+	store.record_outcome(&exec, json!({"content":"done","isError":false})).expect("late source outcome");
+	drop(store);
+
+	let second = fork_session(&first_dir.join(format!("{first_id}.jsonl")), None, Some(&second_dir)).expect("fork of fork");
+	let second_id = second.file_stem().unwrap().to_str().unwrap().to_string();
+	let mut second_store = SqliteStore::open(second_dir.join("sessions.db")).expect("second store");
+	let provenance = second_store.load_session_snapshot(&second_id).expect("second snapshot").provenance;
+	assert_eq!(provenance.len(), 1, "transitive fork keeps exactly one classification");
+	assert!(!provenance[0].outcome_resolved, "late source resolution must not mutate the fork classification");
+	assert!(second_store.unresolved_intents(&second_id).expect("unresolved").is_empty());
+
+	let branch = second_store.session(&second_id).expect("session").expect("fork").active_branch_id.expect("branch");
+	let result_row = second_store.session_messages(&second_id).expect("rows").into_iter().find(|row| row.payload["message"]["role"] == json!("toolResult")).expect("result");
+	second_store.append_message(NewMessage { id: "a2".into(), session_id: second_id.clone(), branch_id: branch.clone(), parent_message_id: Some(result_row.id), payload: json!({"type":"message","id":"a2","message":{"role":"assistant","content":[{"type":"toolCall","id":"shared","name":"bash"}]}}) }).expect("reuse");
+	let new_exec = second_store.record_intent(NewIntent { session_id: second_id.clone(), branch_id: branch.clone(), provider_call_id: "shared".into(), tool_name: "bash".into(), payload: json!({}) }).expect("new intent");
+	let error = second_store.recover_unresolved_intents(&second_id).expect_err("transitive unknown provenance stays non-operational");
+	assert!(error.to_string().contains("not uniquely attributable"), "{error}");
+	assert_eq!(second_store.outcome(&new_exec).expect("outcome"), None);
+
+	let same = fork_session(&first_dir.join(format!("{first_id}.jsonl")), None, Some(&first_dir)).expect("same-db fork of fork");
+	let same_id = same.file_stem().unwrap().to_str().unwrap().to_string();
+	let mut first_store = SqliteStore::open(first_dir.join("sessions.db")).expect("first store");
+	let same_provenance = first_store.load_session_snapshot(&same_id).expect("same snapshot").provenance;
+	assert_eq!(same_provenance.len(), 1);
+	assert!(!same_provenance[0].outcome_resolved, "same-db fork of fork keeps the immutable classification");
+	drop(first_store);
+
+	// Fork of fork into the original source database: the late-resolved source
+	// execution row is owned by the grandparent, so the immutable unknown
+	// classification still wins.
+	let into_source = fork_session(&first_dir.join(format!("{first_id}.jsonl")), None, Some(&source_dir)).expect("fork of fork into source db");
+	let into_source_id = into_source.file_stem().unwrap().to_str().unwrap().to_string();
+	let source_store = SqliteStore::open(source_dir.join("sessions.db")).expect("source store");
+	let into_source_provenance = source_store.load_session_snapshot(&into_source_id).expect("source-db snapshot").provenance;
+	assert_eq!(into_source_provenance.len(), 1);
+	assert!(!into_source_provenance[0].outcome_resolved, "late source resolution must not mutate a transitive fork");
+	fs::remove_dir_all(temp).ok();
+}
+
+#[test]
+fn fork_rejects_message_referencing_missing_execution_before_publication() {
+	let temp = temp_dir("provenance-missing");
+	let source_dir = temp.join("source");
+	let target_dir = temp.join("target");
+	fs::create_dir_all(&source_dir).expect("source");
+	let mut store = SqliteStore::open(source_dir.join("sessions.db")).expect("store");
+	store.create_session(NewSession { id: "source".into(), parent_session_id: None, payload: json!({"type":"session","version":3,"id":"source","timestamp":"2026-01-01T00:00:00Z","cwd":"/tmp"}), initial_branch_id: "source.main".into(), initial_branch_payload: json!({}) }).expect("session");
+	store.append_message(NewMessage { id: "a1".into(), session_id: "source".into(), branch_id: "source.main".into(), parent_message_id: None, payload: json!({"type":"message","id":"a1","message":{"role":"assistant","content":[{"type":"toolCall","id":"shared","name":"bash"}]}}) }).expect("assistant");
+	store.append_message(NewMessage { id: "r1".into(), session_id: "source".into(), branch_id: "source.main".into(), parent_message_id: Some("a1".into()), payload: json!({"type":"message","id":"r1","parentId":"a1","message":{"role":"toolResult","toolCallId":"shared","toolName":"bash","content":"x","details":{"executionId":"exec-missing"}}}) }).expect("dangling result");
+	drop(store);
+
+	let error = fork_session(&source_dir.join("source.jsonl"), None, Some(&target_dir)).expect_err("missing provenance must fail closed");
+	assert!(error.to_string().contains("unknown execution"), "{error}");
+	assert!(!target_dir.exists() || fs::read_dir(&target_dir).expect("target dir").next().is_none(), "failed preflight must not publish artifacts");
+	fs::remove_dir_all(temp).ok();
+}
+
+#[test]
+fn fork_prunes_sibling_branch_with_dangling_execution_reference() {
+	let temp = temp_dir("provenance-pruned");
+	let source_dir = temp.join("source");
+	let target_dir = temp.join("target");
+	fs::create_dir_all(&source_dir).expect("source");
+	let mut store = SqliteStore::open(source_dir.join("sessions.db")).expect("store");
+	store.create_session(NewSession { id: "source".into(), parent_session_id: None, payload: json!({"type":"session","version":3,"id":"source","timestamp":"2026-01-01T00:00:00Z","cwd":"/tmp"}), initial_branch_id: "source.main".into(), initial_branch_payload: json!({}) }).expect("session");
+	store.append_message(NewMessage { id: "a1".into(), session_id: "source".into(), branch_id: "source.main".into(), parent_message_id: None, payload: json!({"type":"message","id":"a1","message":{"role":"assistant","content":[{"type":"toolCall","id":"kept","name":"bash"}]}}) }).expect("active message");
+	store.create_branch(NewBranch { id: "source.sibling".into(), session_id: "source".into(), parent_branch_id: None, parent_message_id: None, payload: json!({}) }).expect("sibling branch");
+	store.append_message(NewMessage { id: "pruned".into(), session_id: "source".into(), branch_id: "source.sibling".into(), parent_message_id: None, payload: json!({"type":"message","id":"pruned","message":{"role":"toolResult","toolCallId":"kept","toolName":"bash","content":"x","details":{"executionId":"exec-missing"}}}) }).expect("sibling result");
+	drop(store);
+
+	let forked = fork_session(&source_dir.join("source.jsonl"), None, Some(&target_dir)).expect("fork prunes the unrelated branch");
+	let fork_id = forked.file_stem().unwrap().to_str().unwrap().to_string();
+	let mut target = SqliteStore::open(target_dir.join("sessions.db")).expect("target");
+	let snapshot = target.load_session_snapshot(&fork_id).expect("fork snapshot");
+	assert!(snapshot.provenance.is_empty());
+	let rows = target.session_messages(&fork_id).expect("rows");
+	assert_eq!(rows.len(), 1, "pruned sibling message must not be copied");
+	assert_eq!(rows[0].payload["id"], json!(rows[0].id));
+	fs::remove_dir_all(temp).ok();
+}
+
+#[test]
+fn fork_remaps_legacy_anchor_alias() {
+	let temp = temp_dir("legacy-anchor"); let source_dir = temp.join("source"); let target_dir = temp.join("target"); fs::create_dir_all(&source_dir).expect("source");
+	let mut store = SqliteStore::open(source_dir.join("sessions.db")).expect("store");
+	store.create_fork_atomic(ForkWrite { session: NewSession { id: "source".into(), parent_session_id: None, payload: json!({"type":"session","version":3,"id":"source","timestamp":"2026-01-01T00:00:00Z","cwd":"/tmp"}), initial_branch_id: "active".into(), initial_branch_payload: json!({}) }, branches: vec![NewBranch { id: "active".into(), session_id: "source".into(), parent_branch_id: None, parent_message_id: None, payload: json!({}) }], messages: vec![NewMessage { id: "m1".into(), session_id: "source".into(), branch_id: "active".into(), parent_message_id: None, payload: json!({"type":"message","id":"m1","message":{"role":"user","content":"one"}}) }], active_branch_id: "active".into(), active_leaf_message_id: None, projection: None }).expect("seed");
+	store.update_session_payload("source", json!({"type":"session","version":3,"id":"source","timestamp":"2026-01-01T00:00:00Z","cwd":"/tmp","durableProjection":{"firstKeptEntryId":"m1"}})).expect("legacy anchor"); drop(store);
+	let forked = fork_session(&source_dir.join("source.jsonl"), None, Some(&target_dir)).expect("fork");
+	let id = forked.file_stem().unwrap().to_str().unwrap();
+	let target = SqliteStore::open(target_dir.join("sessions.db")).expect("target");
+	let projection = &target.session(id).expect("session").expect("fork").payload["durableProjection"];
+	let anchor = projection["anchor"].as_str().expect("legacy alias must surface as anchor");
+	assert_ne!(anchor, "m1", "anchor must be remapped to the fork id space");
+	let rows = target.session_messages(id).expect("rows");
+	assert!(rows.iter().any(|row| row.id == anchor && row.payload["message"]["content"] == json!("one")), "anchor must point at the fork's copied message");
+	assert_eq!(projection["kept"], json!([]));
+	fs::remove_dir_all(temp).ok();
+}
+
+#[test]
 fn moved_worktree_continue_reroots_and_resume_prefix_matches() {
 	let temp = temp_dir("moved-wt");
 	let sessions_dir = temp.join("sessions");
@@ -446,6 +612,7 @@ fn moved_worktree_continue_reroots_and_resume_prefix_matches() {
 	assert!(seed.enabled(), "seed durable session");
 	seed.set_title("Moved", Some("auto")).expect("title");
 	let session_file = sessions_dir.join(format!("{id}.jsonl"));
+	drop(seed);
 
 	let crumb = temp.join("term-crumb");
 	write_terminal_breadcrumb(&old_cwd, &session_file, false, Some(&crumb)).expect("write crumb");
@@ -639,6 +806,7 @@ fn append_turn_titles_and_appends_entries_and_reopens_cleanly() {
 	assert_eq!(store.header().expect("header").title.as_deref(), Some("initial prompt"));
 	assert!(store.messages().len() > messages_before);
 	assert!(!file.exists(), "durable sessions never create a JSONL journal");
+	drop(store);
 
 	// Reopening loads the title slot and turn history cleanly.
 	let reopened = SessionStore::open(&SessionOptions {
@@ -701,6 +869,7 @@ fn slotless_v3_log_imports_read_only_and_reopens_untitled() {
 
 	// The old file is byte-identical: migration never mutates it.
 	assert_eq!(fs::read(&file).expect("read legacy"), original);
+	drop(legacy);
 
 	// Explicit import creates the SQLite authority; no slot is invented.
 	import_v3_session(&file, &temp).expect("import slotless v3");
@@ -718,6 +887,7 @@ fn slotless_v3_log_imports_read_only_and_reopens_untitled() {
 			parts: Vec::new(),
 		})
 		.expect("append to imported slotless session");
+	drop(store);
 
 	let reopened = SessionStore::open(&SessionOptions { no_title: true, ..options });
 	assert!(reopened.enabled(), "imported session must reopen");
@@ -950,6 +1120,7 @@ fn stop_reason_canonicalized_in_persisted_v3_log() {
 		.filter_map(|entry| entry.message.stop_reason.as_deref())
 		.collect();
 	assert_eq!(stored, vec!["stop", "toolUse"]);
+	drop(store);
 
 	// Reopen and verify resumed history records canonical stop reasons
 	let reopened = SessionStore::open(&SessionOptions {
@@ -1021,6 +1192,7 @@ fn session_storage_preserves_and_replays_tool_result_images() {
 	assert!(parts.iter().any(|part| part.is_image()
 		&& part.data.as_deref() == Some("aW1nMQ==")
 		&& part.mime_type.as_deref() == Some("image/png")));
+	drop(store);
 
 	// Reopen session and check history
 	let reopened = SessionStore::open(&SessionOptions {
@@ -1580,4 +1752,80 @@ fn signed_reasoning_and_length_terminal_survive_session_resume_and_replay() {
 	assert!(wire.contains("\"tool_calls\""));
 
 	fs::remove_dir_all(dir).ok();
+}
+
+#[test]
+fn fork_copies_resolved_provenance_and_allows_new_reuse_cross_db() {
+	let temp = temp_dir("provenance-cross");
+	let source_dir = temp.join("source");
+	let target_dir = temp.join("target");
+	fs::create_dir_all(&source_dir).expect("source");
+	let mut store = SqliteStore::open(source_dir.join("sessions.db")).expect("store");
+	store.create_session(NewSession { id: "source".into(), parent_session_id: None, payload: json!({"type":"session","version":3,"id":"source","timestamp":"2026-01-01T00:00:00Z","cwd":"/tmp"}), initial_branch_id: "source.main".into(), initial_branch_payload: json!({}) }).expect("session");
+	store.append_message(NewMessage { id: "a1".into(), session_id: "source".into(), branch_id: "source.main".into(), parent_message_id: None, payload: json!({"type":"message","id":"a1","message":{"role":"assistant","content":[{"type":"toolCall","id":"shared","name":"bash"}]}}) }).expect("assistant");
+	let exec = store.record_intent(NewIntent { session_id: "source".into(), branch_id: "source.main".into(), provider_call_id: "shared".into(), tool_name: "bash".into(), payload: json!({}) }).expect("intent");
+	store.record_outcome(&exec, json!({"content":"done","isError":false})).expect("outcome");
+	store.append_message(NewMessage { id: "r1".into(), session_id: "source".into(), branch_id: "source.main".into(), parent_message_id: Some("a1".into()), payload: json!({"type":"message","id":"r1","parentId":"a1","message":{"role":"toolResult","toolCallId":"shared","toolName":"bash","content":"done","details":{"executionId":exec}}}) }).expect("result");
+	drop(store);
+
+	let forked = fork_session(&source_dir.join("source.jsonl"), None, Some(&target_dir)).expect("fork");
+	let fork_id = forked.file_stem().unwrap().to_str().unwrap().to_string();
+	let mut target = SqliteStore::open(target_dir.join("sessions.db")).expect("target");
+	let rows = target.session_messages(&fork_id).expect("rows");
+	let result_row = rows.iter().find(|row| row.payload["message"]["role"] == json!("toolResult")).expect("result row");
+	let provenance = target.load_session_snapshot(&fork_id).expect("snapshot").provenance;
+	assert_eq!(provenance.len(), 1, "fork provenance row must be stored out of band");
+	assert_eq!(provenance[0].message_id, result_row.id);
+	assert!(provenance[0].outcome_resolved);
+	assert!(result_row.payload["message"]["details"].get("executionProvenance").is_none(), "no trust in payload markers");
+	assert!(target.unresolved_intents(&fork_id).expect("unresolved").is_empty(), "fork provenance must not become an operational intent");
+
+	let branch = target.session(&fork_id).expect("session").expect("fork").active_branch_id.expect("branch");
+	target.append_message(NewMessage { id: "a2".into(), session_id: fork_id.clone(), branch_id: branch.clone(), parent_message_id: Some(result_row.id.clone()), payload: json!({"type":"message","id":"a2","message":{"role":"assistant","content":[{"type":"toolCall","id":"shared","name":"bash"}]}}) }).expect("reuse assistant");
+	let new_exec = target.record_intent(NewIntent { session_id: fork_id.clone(), branch_id: branch.clone(), provider_call_id: "shared".into(), tool_name: "bash".into(), payload: json!({}) }).expect("new intent");
+	assert_eq!(target.recover_unresolved_intents(&fork_id).expect("recovery"), 1);
+	let leaf_id = target.branch(&branch).expect("branch").expect("branch").leaf_message_id.expect("leaf");
+	let leaf = target.message(&leaf_id).expect("message").expect("leaf");
+	assert_eq!(leaf.payload["message"]["details"]["executionId"], new_exec);
+	assert_eq!(target.outcome(&new_exec).expect("new outcome"), None);
+	fs::remove_dir_all(temp).ok();
+}
+
+#[test]
+fn fork_same_db_unknown_provenance_is_immutable_and_not_operational() {
+	let temp = temp_dir("provenance-same");
+	let dir = temp.join("db");
+	fs::create_dir_all(&dir).expect("dir");
+	let db = dir.join("sessions.db");
+	let mut store = SqliteStore::open(&db).expect("store");
+	store.create_session(NewSession { id: "source".into(), parent_session_id: None, payload: json!({"type":"session","version":3,"id":"source","timestamp":"2026-01-01T00:00:00Z","cwd":"/tmp"}), initial_branch_id: "source.main".into(), initial_branch_payload: json!({}) }).expect("session");
+	store.append_message(NewMessage { id: "a1".into(), session_id: "source".into(), branch_id: "source.main".into(), parent_message_id: None, payload: json!({"type":"message","id":"a1","message":{"role":"assistant","content":[{"type":"toolCall","id":"shared","name":"bash"}]}}) }).expect("assistant");
+	let exec = store.record_intent(NewIntent { session_id: "source".into(), branch_id: "source.main".into(), provider_call_id: "shared".into(), tool_name: "bash".into(), payload: json!({}) }).expect("intent");
+	store.append_message(NewMessage { id: "r1".into(), session_id: "source".into(), branch_id: "source.main".into(), parent_message_id: Some("a1".into()), payload: json!({"type":"message","id":"r1","parentId":"a1","message":{"role":"toolResult","toolCallId":"shared","toolName":"bash","content":"interrupted","isError":true,"details":{"executionId":exec,"interruptedUnknown":true}}}) }).expect("interrupted result");
+	drop(store);
+
+	let forked = fork_session(&dir.join("source.jsonl"), None, Some(&dir)).expect("same-db fork");
+	let fork_id = forked.file_stem().unwrap().to_str().unwrap().to_string();
+	let mut target = SqliteStore::open(&db).expect("target");
+	let rows = target.session_messages(&fork_id).expect("rows");
+	let result_row = rows.iter().find(|row| row.payload["message"]["role"] == json!("toolResult")).expect("fork result");
+	let provenance = target.load_session_snapshot(&fork_id).expect("snapshot").provenance;
+	assert_eq!(provenance.len(), 1);
+	assert!(!provenance[0].outcome_resolved, "unknown status must stay unknown");
+	assert!(result_row.payload["message"]["details"].get("executionProvenance").is_none(), "payload carries no trusted marker");
+	assert!(target.load_session_snapshot("source").expect("source snapshot").provenance.is_empty(), "source has no fork provenance");
+	assert!(target.unresolved_intents(&fork_id).expect("unresolved").is_empty(), "unknown provenance must not become an operational intent");
+	assert_eq!(target.unresolved_intents("source").expect("source unresolved").len(), 1, "source intent stays unresolved");
+
+	let branch = target.session(&fork_id).expect("session").expect("fork").active_branch_id.expect("branch");
+	target.append_message(NewMessage { id: "a2".into(), session_id: fork_id.clone(), branch_id: branch.clone(), parent_message_id: Some(result_row.id.clone()), payload: json!({"type":"message","id":"a2","message":{"role":"assistant","content":[{"type":"toolCall","id":"shared","name":"bash"}]}}) }).expect("reuse assistant");
+	assert_eq!(target.recover_unresolved_intents(&fork_id).expect("no intent to recover"), 0, "historical source intent must never be attributed to the fork");
+	let new_exec = target.record_intent(NewIntent { session_id: fork_id.clone(), branch_id: branch.clone(), provider_call_id: "shared".into(), tool_name: "bash".into(), payload: json!({}) }).expect("new intent");
+	let error = target.recover_unresolved_intents(&fork_id).expect_err("unknown copied provenance must fail closed on reuse");
+	assert!(error.to_string().contains("not uniquely attributable"), "{error}");
+	assert!(!error.to_string().contains("unknown execution"), "provenance marker must answer classification without a copied execution row: {error}");
+	assert_eq!(target.branch(&branch).expect("branch").expect("branch").leaf_message_id.as_deref(), Some("a2"), "no recovered result may be appended");
+	assert_eq!(target.outcome(&new_exec).expect("new outcome"), None);
+	assert_eq!(target.outcome(&exec).expect("source outcome"), None, "fork must never resolve the source execution");
+	fs::remove_dir_all(temp).ok();
 }

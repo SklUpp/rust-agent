@@ -140,6 +140,9 @@ pub struct RpcLaunch {
 	pub service_tier_explicit: bool,
 	pub provider_session_id: Option<String>,
 	pub store_options: SessionOptions,
+	/// Preopened writer store transferred from CLI preflight. When set,
+	/// [`RpcSession::open`] reuses it instead of acquiring a second lease.
+	pub preopened_store: Option<SessionStore>,
 	/// Present when the host installed a live steering channel.
 	pub steer: Option<SteerFn>,
 }
@@ -401,6 +404,7 @@ impl RpcSession {
 			prompt_cache_key_inherited,
 			provider_session_id,
 			store_options,
+			preopened_store,
 			steer,
 			service_tier_explicit,
 		} = launch;
@@ -422,7 +426,10 @@ impl RpcSession {
 			return Err(Error::new(error));
 		}
 
-		let mut store = SessionStore::open(&store_options);
+		let mut store = match preopened_store {
+			Some(store) => store,
+			None => SessionStore::open(&store_options),
+		};
 		for warning in store.take_warnings() {
 			eprintln!("warning: {warning}");
 		}
@@ -430,6 +437,16 @@ impl RpcSession {
 			return Err(Error::new(
 				"cannot run RPC on a legacy JSONL session: read-only; import it into the SQLite store first",
 			));
+		}
+		// Requested persistence must never silently become ephemeral.
+		if store_options.enabled && !store.enabled() {
+			let reason = store
+				.occupied()
+				.or_else(|| store.corrupt_reason())
+				.unwrap_or("session store unavailable");
+			return Err(Error::new(format!(
+				"cannot open session store: {reason}"
+			)));
 		}
 		let base_service_tiers = if store.has_service_tier_entry() {
 			store.service_tier_by_family()
@@ -1381,6 +1398,13 @@ impl RpcSession {
 		for warning in store.take_warnings() {
 			eprintln!("warning: {warning}");
 		}
+		if options.enabled && !store.enabled() {
+			let reason = store
+				.occupied()
+				.or_else(|| store.corrupt_reason())
+				.unwrap_or("session store unavailable");
+			return Err(Error::new(format!("cannot create session: {reason}")));
+		}
 		if store.is_v1() {
 			return Err(Error::new("cannot start a new session from a legacy v1 log"));
 		}
@@ -1440,9 +1464,28 @@ impl RpcSession {
 			return Err(Error::new(format!("Session not found: {}", path.display())));
 		}
 		let mut options = self.store_options.clone();
-		options.dir = dir;
-		options.id = id;
+		options.dir = dir.clone();
+		options.id = id.clone();
 		options.continue_latest = false;
+		// Same canonical DB + session id: reuse live store (no second writer lease).
+		// Compare against the live store path — store_options.dir may be None
+		// (no --session-dir) or stale after new_session.
+		if self.store.enabled()
+			&& !self.store.legacy_read_only()
+			&& id.as_deref() == Some(self.store.id())
+			&& dir.as_ref().is_some_and(|target_dir| {
+				self.store.file().and_then(|file| file.parent().map(Path::to_path_buf)).is_some_and(
+					|live_dir| {
+						let live = crate::durable_session::database_path(&live_dir);
+						let want = crate::durable_session::database_path(target_dir);
+						live == want
+							|| std::fs::canonicalize(&live).ok() == std::fs::canonicalize(&want).ok()
+					},
+				)
+			})
+		{
+			return Ok(());
+		}
 		let mut store = SessionStore::open(&options);
 		for warning in store.take_warnings() {
 			eprintln!("warning: {warning}");
@@ -1456,8 +1499,12 @@ impl RpcSession {
 		// store that failed to open must not silently run in memory where its
 		// entries would be lost on exit.
 		if !store.enabled() {
+			let reason = store
+				.occupied()
+				.or_else(|| store.corrupt_reason())
+				.unwrap_or("the session log cannot be persisted");
 			return Err(Error::new(format!(
-				"cannot switch to {}: the session log cannot be persisted",
+				"cannot switch to {}: {reason}",
 				path.display()
 			)));
 		}
@@ -3851,6 +3898,7 @@ mod tests {
 					parent_session: None,
 					no_title: true,
 				},
+			preopened_store: None,
 				steer: None,
 			},
 			Approvals::new(ApprovalMode::Yolo, Vec::new()),
@@ -3927,6 +3975,7 @@ mod tests {
 					parent_session: None,
 					no_title: true,
 				},
+			preopened_store: None,
 				steer: None,
 			},
 			Approvals::new(ApprovalMode::Yolo, Vec::new()),
@@ -4185,6 +4234,7 @@ mod tests {
 				parent_session: None,
 				no_title: true,
 			},
+			preopened_store: None,
 			steer: None,
 		};
 
@@ -4387,6 +4437,7 @@ mod tests {
 				parent_session: None,
 				no_title: true,
 			},
+			preopened_store: None,
 			steer: None,
 		};
 
@@ -4549,6 +4600,7 @@ mod tests {
 				parent_session: None,
 				no_title: true,
 			},
+			preopened_store: None,
 			steer: None,
 		};
 
@@ -4623,6 +4675,7 @@ mod tests {
 				parent_session: None,
 				no_title: true,
 			},
+			preopened_store: None,
 			steer: None,
 		};
 

@@ -5,7 +5,7 @@ use std::time::SystemTime;
 use omp_cli::output;
 use omp_cli::session::{
 	ContentPart, MessageContent, MessageEntry, SessionMessage, SessionOptions, SessionStore,
-	TurnRecord, create_session_log_exclusive, import_legacy_v1, sanitize_terminal_id,
+	TurnRecord, create_session_log_exclusive, fork_session, import_legacy_v1, sanitize_terminal_id,
 };
 
 static COUNTER: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
@@ -314,6 +314,7 @@ fn import_legacy_v1_refuses_overwrite() {
 
 	fs::remove_dir_all(temp).ok();
 }
+
 
 #[test]
 fn session_create_new_collision_refuses_overwrite_and_leaves_victim_intact() {
@@ -957,6 +958,7 @@ fn direct_append_message_with_malformed_text_and_image_fails_preflight_and_prese
 			.all(|entry| entry.id != "msg-bad-text"),
 		"rejected entry must never enter the in-memory view"
 	);
+	drop(store);
 
 	// A fresh read of the same authority must also miss the rejected entry.
 	let reopened = SessionStore::open(&SessionOptions {

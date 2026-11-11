@@ -1316,33 +1316,30 @@ impl SubagentLifecycleManager {
 			));
 		}
 
-		let durable_messages = if contract.durable {
-			let worker_id = contract.result_key.as_deref().ok_or_else(|| {
-				format!(
-					"cannot revive agent \"{id}\": durable child has no spawn-time result key"
-				)
-			})?;
-			supervisor
-				.load_child_messages(worker_id)
-				.map_err(|error| format!("cannot reopen agent \"{id}\" durable session: {error}"))?
-		} else {
-			// A prior revive may have imported this legacy child and appended
-			// turns there. Prefer that SQLite history over the stale JSONL tail.
-			let worker_id = contract
-				.result_key
-				.clone()
-				.unwrap_or_else(|| format!("legacy-{id}"));
-			supervisor
-				.load_child_messages(&worker_id)
-				.map_err(|error| format!("cannot reopen agent \"{id}\" durable session: {error}"))?
-		};
+        let (owned_durability, fresh_open, fresh_replay) = if contract.durable {
+            let worker_id = contract.result_key.as_deref().ok_or_else(|| format!("cannot revive agent \"{id}\": durable child has no spawn-time result key"))?;
+            let opened = supervisor.open_child_durable_with_freshness(id, Some(worker_id))
+                .map_err(|error| format!("cannot reopen agent \"{id}\" durable session: {error}"))?;
+            opened.map_or((None, false, None), |(child, fresh, replay)| (Some(child), fresh, replay))
+        } else { (None, false, None) };
+        let durable_messages = if fresh_open {
+            fresh_replay
+        } else if let Some(child) = owned_durability.as_ref() {
+            supervisor.load_child_messages_owned(&child.identity().worker_id, child)
+                .map_err(|error| format!("cannot reopen agent \"{id}\" durable session: {error}"))?
+        } else { None };
 		let replayed = match durable_messages {
 			Some(messages) => messages,
 			None => load_transcript(&session_file).map_err(|error| {
 				format!("cannot reopen agent \"{id}\" transcript: {error}")
 			})?,
 		};
-		let revived = self.reviver.revive(&contract, replayed, Some(supervisor))?;
+		let revived = self.reviver.revive_with_durability(
+			&contract,
+			replayed,
+			Some(supervisor),
+			owned_durability,
+		)?;
 		let (inbound, receiver) = mpsc::channel(64);
 		inbound
 			.try_send(text)

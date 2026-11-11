@@ -552,6 +552,7 @@ fn public_reasoning_stays_apart_and_never_replays() {
 	assert_eq!(parts[0].thinking_text(), Some("weigh options"));
 	assert_eq!(parts[1].kind, "text");
 	assert_eq!(parts[1].text.as_deref(), Some("answer"));
+	drop(store);
 
 	// Resumed turn replays the history but never the reasoning.
 	run_omp_raw(
@@ -661,6 +662,7 @@ fn text_first_reasoning_keeps_block_order_on_resume() {
 	assert_eq!(parts[0].text.as_deref(), Some("answer"));
 	assert_eq!(parts[1].kind, "thinking");
 	assert_eq!(parts[1].thinking_text(), Some("weigh options"));
+	drop(store);
 	// Resumed turn: history replays in the recorded order and the new stream is
 	// still indexed from zero with one kind per block.
 	let resumed = run_omp_raw(
