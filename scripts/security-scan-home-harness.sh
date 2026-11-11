@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Black-box CLI harness for the native security scan pipeline.
 #
-# Requires a built `omp` binary (`OMP_BIN`). Runs the real CLI against a real git
+# Requires a built `arag` binary (`OMP_BIN`). Runs the real CLI against a real git
 # fixture under an isolated `$HOME` and a deterministic localhost
 # OpenAI-compatible mock provider — no external account, no network beyond
 # 127.0.0.1.
@@ -23,13 +23,13 @@
 # Nothing is written outside `$HOME`, and the harness never deletes a tree it
 # did not create: it prints `$ROOT` and leaves it for inspection.
 #
-# Invoked by `crates/omp-cli/tests/security_scan_runtime_harness.rs` with
+# Invoked by `crates/aragent/tests/security_scan_runtime_harness.rs` with
 # `OMP_BIN`/`HOME`/`OMP_SECURITY_HARNESS_ROOT` set; it can also be run by hand
 # with the same variables.
 
 set -euo pipefail
 
-: "${OMP_BIN:?set OMP_BIN to the built omp binary}"
+: "${OMP_BIN:?set OMP_BIN to the built arag binary}"
 command -v python3 >/dev/null 2>&1 || { echo "harness: python3 required" >&2; exit 1; }
 command -v git >/dev/null 2>&1 || { echo "harness: git required" >&2; exit 1; }
 

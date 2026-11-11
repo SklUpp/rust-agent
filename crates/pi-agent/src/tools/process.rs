@@ -893,7 +893,7 @@ fn ready_regex(spec: &ProcessSpec) -> Option<Regex> {
 
 /// Resolve the secure per-user, per-profile, per-runner log root.
 ///
-/// Mirrors `omp-cli::dirs` (`PI_CONFIG_DIR` > `~/.omp`, named profile
+/// Mirrors `aragent::dirs` (`PI_CONFIG_DIR` > `~/.omp`, named profile
 /// `<base>/profiles/<profile>/agent`, `PI_CODING_AGENT_DIR` override) without
 /// depending on the CLI crate, then appends `processes/<pid>` so two runners
 /// never share daemon names or logs. Never falls back to ambient `/tmp`.

@@ -1,6 +1,6 @@
 //! Atomic no-clobber publication of an already complete staging file.
 //!
-//! Extracted from `crates/omp-cli/src/eval_host.rs`, where spilled eval
+//! Extracted from `crates/aragent/src/eval_host.rs`, where spilled eval
 //! artifacts and agent outputs both need the same guarantee: a public name is
 //! only ever created by [`publish_staged_file`], so a reader can never observe
 //! a partial file, and an existing file is never replaced. The staged payload

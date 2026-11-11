@@ -2568,7 +2568,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "omp-cli"
+name = "aragent"
 version = "18.0.9"
 dependencies = [
  "async-trait",

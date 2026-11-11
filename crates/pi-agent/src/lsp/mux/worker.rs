@@ -1,11 +1,11 @@
-//! Hidden LSP mux worker entry (`omp __omp_worker_lsp_mux`).
+//! Hidden LSP mux worker entry (`arag __omp_worker_lsp_mux`).
 //!
 //! Startup selector contract:
-//! - invoked as `omp __omp_worker_lsp_mux` (no additional arguments);
+//! - invoked as `arag __omp_worker_lsp_mux` (no additional arguments);
 //! - environment [`SOCKET_ENV`] carries the socket endpoint to bind, and
 //!   [`PROJECT_DIR_ENV`] the canonical project directory the mux serves;
 //! - stdout receives exactly one readiness line,
-//!   `omp lsp mux listening on <endpoint>`, once the socket accepts links;
+//!   `arag lsp mux listening on <endpoint>`, once the socket accepts links;
 //! - the worker exits after 15 idle minutes, or on `SIGTERM`/`SIGINT`.
 //!
 //! The CLI dispatches this before clap/config/session boot (the same seam as

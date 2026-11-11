@@ -50,7 +50,7 @@ pub struct ServerToolUsage {
 ///
 /// Absence of a report is `None` on the carrying [`Message`] — never a
 /// zero-filled stand-in for "the provider said nothing".
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
 pub struct TokenUsage {
 	#[serde(default)]
 	pub input: u64,
@@ -63,9 +63,9 @@ pub struct TokenUsage {
 	#[serde(default, rename = "totalTokens")]
 	pub total_tokens: u64,
 	/// Provider-reported reasoning/thinking tokens, a subset of `output`
-	/// (OpenAI `completion_tokens_details.reasoning_tokens`). Absent when the
-	/// provider reports none — `None` means unknown, not zero (TS
-	/// `calculateOpenAIUsageAccounting` adds the key only when positive).
+	/// (OpenAI `completion_tokens_details.reasoning_tokens`). Domain/wire keeps
+	/// the prior positive-only filter: `None` means absent or a provider zero.
+	/// `presence.reasoning` distinguishes those two cases for live diagnostics.
 	#[serde(default, rename = "reasoningTokens", skip_serializing_if = "Option::is_none")]
 	pub reasoning_tokens: Option<u64>,
 	/// Anthropic cache-creation breakdown. Present only when the provider
@@ -75,7 +75,50 @@ pub struct TokenUsage {
 	/// Anthropic server-side tool usage (web search/fetch).
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub server: Option<ServerToolUsage>,
+	/// Live per-counter provider presence, used by local diagnostics to store
+	/// unknown counters as `NULL` and explicit zeros as `0`. Skipped in
+	/// persistence so existing session files and JSON stay compatible; a
+	/// reloaded historical usage is indistinguishable from "presence unknown".
+	#[serde(skip)]
+	pub presence: UsagePresence,
 }
+
+/// Which counters the provider actually reported for one usage snapshot.
+/// `false` means omitted/unknown, not zero.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct UsagePresence {
+	pub input:       bool,
+	pub output:      bool,
+	pub cache_read:  bool,
+	pub cache_write: bool,
+	pub reasoning:   bool,
+}
+
+impl UsagePresence {
+	/// OR two snapshots' presence so aggregation retains every reported field.
+	pub fn merge(&mut self, other: Self) {
+		self.input |= other.input;
+		self.output |= other.output;
+		self.cache_read |= other.cache_read;
+		self.cache_write |= other.cache_write;
+		self.reasoning |= other.reasoning;
+	}
+}
+
+impl PartialEq for TokenUsage {
+	fn eq(&self, other: &Self) -> bool {
+		self.input == other.input
+			&& self.output == other.output
+			&& self.cache_read == other.cache_read
+			&& self.cache_write == other.cache_write
+			&& self.total_tokens == other.total_tokens
+			&& self.reasoning_tokens == other.reasoning_tokens
+			&& self.cttl == other.cttl
+			&& self.server == other.server
+	}
+}
+
+impl Eq for TokenUsage {}
 
 fn add_optional(left: Option<u64>, right: Option<u64>) -> Option<u64> {
 	match (left, right) {
@@ -118,6 +161,7 @@ impl TokenUsage {
 			}),
 			(total, reported) => total.or(reported),
 		};
+		self.presence.merge(usage.presence);
 	}
 }
 

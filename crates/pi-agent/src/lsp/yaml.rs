@@ -1,6 +1,6 @@
 //! YAML reader shared with the CLI config parser.
 //!
-//! Moved from `crates/omp-cli/src/yaml.rs` so the LSP config reader does not
+//! Moved from `crates/aragent/src/yaml.rs` so the LSP config reader does not
 //! carry a second dialect. This is **not** full YAML: it supports block
 //! mappings, block sequences, `key:` with a nested block at the same indent,
 //! flow sequences (`[a, b]`), block scalars (`|`/`>` with chomping),
@@ -590,7 +590,7 @@ providers:
     baseUrl: "https://api.openai.com/v1"
     apiKey: OPENAI_API_KEY
     headers:
-      X-Title: omp
+      X-Title: arag
   local:
     api: openai-completions
 approvalMode: write
@@ -611,7 +611,7 @@ cwd: /tmp/work
 				.get("headers")
 				.and_then(|h| h.get("X-Title"))
 				.and_then(Value::as_str),
-			Some("omp")
+			Some("arag")
 		);
 		let allow = value.get("allow").and_then(Value::as_list).expect("allow");
 		assert_eq!(allow.len(), 2);

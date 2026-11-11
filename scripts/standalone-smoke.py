@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
-"""End-to-end smoke for the standalone `omp` binary.
+"""End-to-end smoke for the standalone `arag` binary.
 
 The script starts a local OpenAI-compatible fixture server, points a throwaway
-OMP config at it, and runs the real CLI in print mode. The fixture streams a
+Aragent config at it, and runs the real CLI in print mode. The fixture streams a
 `read` tool call, receives the CLI's tool result, and streams the final answer.
 No external network and no real credentials are involved: the fixture accepts
 exactly one explicit local key.
 
 Usage:
-    python3 scripts/standalone-smoke.py --binary target/debug/omp
+    python3 scripts/standalone-smoke.py --binary target/debug/arag
 
 Exit 0 means the CLI completed the streamed tool roundtrip and printed the
 payload that only the tool result contained.
@@ -309,8 +309,8 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--binary",
-        default="target/debug/omp",
-        help="path to the built omp binary (default: target/debug/omp)",
+        default="target/debug/arag",
+        help="path to the built arag binary (default: target/debug/arag)",
     )
     parser.add_argument(
         "--timeout",
@@ -337,7 +337,7 @@ def main() -> int:
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
 
-    with tempfile.TemporaryDirectory(prefix="omp-standalone-smoke-") as raw_root:
+    with tempfile.TemporaryDirectory(prefix="arag-standalone-smoke-") as raw_root:
         root = Path(raw_root)
         work, home, agent_dir = write_fixture(root, port)
         env = {

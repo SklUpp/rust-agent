@@ -2301,8 +2301,8 @@ fn combine_start_errors(command: &str, start: &DapError, configuration: &DapErro
 
 fn initialize_arguments(adapter: &ResolvedAdapter) -> Value {
 	json!({
-		"clientID": "omp",
-		"clientName": "Oh My Pi",
+		"clientID": "arag",
+		"clientName": "Aragent",
 		"adapterID": adapter.name,
 		"locale": "en-US",
 		"linesStartAt1": true,

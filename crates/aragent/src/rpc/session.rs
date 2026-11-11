@@ -1,0 +1,4709 @@
+//! Long-lived RPC session: model/config state, transcript, and turn pump.
+//!
+//! The session mirrors `AgentSession` as far as the native backend allows and
+//! owns everything the RPC transport needs between commands. It is deliberately
+//! independent of the wire transport (frames go through [`FrameSink`]) and of
+//! process-wide state, so another transport (ACP) can drive the same session.
+//!
+//! Native gaps are never papered over. A feature whose backend is missing
+//! returns a precise error naming the seam (see `[RpcError]`); nothing reports
+//! success for work that did not happen, and no token usage is invented.
+
+use std::{
+	collections::VecDeque,
+	path::{Path, PathBuf},
+	sync::{Arc, Mutex, MutexGuard},
+	time::{Duration, Instant, SystemTime},
+};
+
+use pi_agent::{
+	CancellationToken, TurnAck,
+	state::{ContentPart as AgentContentPart, Message},
+	supervisor::SubagentObserver,
+	tools::{
+		internal_urls::{InternalUrlRouter, UrlScope},
+		task_catalog::EFFORT_SELECTORS,
+		todo::TodoPhase,
+	},
+};
+use serde_json::{Value, json};
+
+use crate::{
+	service_tier::{family as service_tier_family, realizes_priority},
+	Error, Result,
+	agent::{AgentRunner, Event as AgentEvent, RunRequest},
+	approve::{ApprovalMode, Approvals},
+	catalog::Catalog,
+	config::Config,
+	output::{self, OutputMode},
+	prompts::Prompts,
+	runtime,
+	session::{
+		self, ContentPart, MessageContent, MessageEntry, SessionEntry, SessionMessage, SessionOptions,
+		SessionStore, TurnBuilder, TurnRecord,
+	},
+	session_checkpoint::CheckpointHost,
+	skills::{LoadOptions, SkillSnapshot},
+};
+
+use super::{
+	host_tools::HostToolBridge,
+	host_uris::HostUriBridge,
+	types::{
+		InterruptMode, QueueMode, RpcImage, RpcResponse, RpcSessionState,
+		SubagentSubscriptionLevel,
+	},
+};
+
+/// A precise prerequisite error: the native backend for this operation is absent.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Prerequisite {
+	pub code: &'static str,
+	pub message: String,
+}
+
+impl Prerequisite {
+	pub(super) fn new(code: &'static str, message: impl Into<String>) -> Self {
+		Self { code, message: message.into() }
+	}
+}
+
+/// Frame destination. Implemented by the JSONL writer and by other transports.
+pub trait FrameSink: Send + Sync {
+	fn send(&self, frame: Value);
+
+	/// Send a response error that could not be produced synchronously.
+	fn send_response(&self, response: RpcResponse) {
+		self.send(response.into_value());
+	}
+}
+
+/// One steering message carrying the exact user parts the client sent.
+///
+/// The native steering channel injects a message into the live conversation, so
+/// images travel with it instead of being rejected. The wiring is
+/// `RpcLaunch.steer` -> `PiAgentRunner::steer(Vec<pi_agent::ContentPart>)` ->
+/// `SignalDispatcher` -> `SteeringEvent::InjectMessage(Vec<ContentPart>)`; the
+/// parts are rebuilt by the CLI entry point, which is the only place that may
+/// know both types.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SteeringMessage {
+	pub text:   String,
+	pub images: Vec<RpcImage>,
+}
+
+/// Steer hook supplied by the runner owner once `PiAgentRunner::steer` exists.
+pub type SteerFn = Arc<dyn Fn(&SteeringMessage) -> bool + Send + Sync>;
+
+/// Everything one RPC process needs that the CLI entry point has already resolved.
+///
+/// The approval surface is a *recipe*, not a built [`Approvals`]: [`RpcMode`]
+/// constructs the [`ExtensionUiBridge`] first and installs it as both the
+/// approval input and the `ask` channel before the session opens, so a headless
+/// host answers permission prompts over `extension_ui_request` and never reads
+/// the process terminal.
+///
+/// [`RpcMode`]: super::mode::RpcMode
+/// [`ExtensionUiBridge`]: super::input::ExtensionUiBridge
+pub struct RpcLaunch {
+	pub runner:   Arc<dyn AgentRunner>,
+	pub config:   Config,
+	pub cwd:      PathBuf,
+	pub prompts:  Prompts,
+	/// One snapshot for this top-level session; tools and `skill://` share it.
+	pub skill_snapshot: SkillSnapshot,
+	pub skill_options:  LoadOptions,
+	pub catalog:  Arc<Catalog>,
+	/// Resolved credential-store path (`<agent dir>/agent.db`), resolved once by
+	/// the CLI so no hidden default can pick a different store here.
+	pub agent_db: PathBuf,
+	pub approval_mode: ApprovalMode,
+	pub allow:    Vec<String>,
+	pub model:    Option<String>,
+	pub provider: Option<String>,
+	pub api_key:  Option<String>,
+	pub thinking: Option<runtime::CliThinking>,
+	/// No explicit `--model` and an existing session: restore the recorded
+	/// branch model/role (TS `sdk.ts:1505-1545`).
+	pub restore_model: bool,
+	/// Armed prewalk target for this session; `None` leaves it disabled.
+	pub prewalk: Option<crate::prewalk::PrewalkArm>,
+	/// Explicit plan-yolo target; armed before the first prompt.
+	pub plan_yolo: Option<crate::plan_yolo::PlanYoloArm>,
+	pub max_time: Option<Duration>,
+	pub max_turns: usize,
+	pub tools_enabled: bool,
+	pub prompt_cache_key: Option<String>,
+	pub prompt_cache_key_inherited: bool,
+	/// `--service-tier` was supplied at launch: it rearms the selection ahead
+	/// of any recorded entry (TS precedence).
+	pub service_tier_explicit: bool,
+	pub provider_session_id: Option<String>,
+	pub store_options: SessionOptions,
+	/// Preopened writer store transferred from CLI preflight. When set,
+	/// [`RpcSession::open`] reuses it instead of acquiring a second lease.
+	pub preopened_store: Option<SessionStore>,
+	/// Present when the host installed a live steering channel.
+	pub steer: Option<SteerFn>,
+}
+
+/// Cancellation and steering surface for the turn currently running.
+#[derive(Default)]
+pub struct ActiveTurn {
+	inner: Mutex<ActiveState>,
+}
+
+#[derive(Default)]
+struct ActiveState {
+	/// Run that currently owns this surface. A worker from an older run must not
+	/// clear the steering hook of the run that replaced it.
+	generation:  u64,
+	cancel:      Option<CancellationToken>,
+	steer:       Option<SteerFn>,
+	bash:        std::collections::BTreeMap<u64, CancellationToken>,
+	next_bash_id: u64,
+}
+
+impl ActiveTurn {
+	#[must_use]
+	pub fn steer_hook(&self) -> Option<SteerFn> {
+		self.lock().steer.clone()
+	}
+
+	/// Inject a steering message (text and images) into the live turn.
+	pub fn steer(&self, message: &SteeringMessage) -> std::result::Result<(), Prerequisite> {
+		let guard = self.lock();
+		if guard.cancel.is_none() {
+			return Err(Prerequisite::new(
+				"not_streaming",
+				"cannot steer: no turn is streaming",
+			));
+		}
+		let Some(hook) = guard.steer.as_ref() else {
+			return Err(Prerequisite::new(
+				"steer_unavailable",
+				"steering is unavailable: this host installed no steering channel for the session",
+			));
+		};
+		if hook(message) {
+			Ok(())
+		} else {
+			Err(Prerequisite::new(
+				"steer_unavailable",
+				"steering is unavailable: the live turn closed its steering channel",
+			))
+		}
+	}
+
+	pub fn register_bash(&self) -> (u64, CancellationToken) {
+		let token = CancellationToken::new();
+		let mut guard = self.lock();
+		guard.next_bash_id += 1;
+		let id = guard.next_bash_id;
+		guard.bash.insert(id, token.clone());
+		(id, token)
+	}
+
+	pub fn clear_bash(&self, id: u64) {
+		self.lock().bash.remove(&id);
+	}
+
+	/// Cancel every live bash run; a second concurrent run must not make the
+	/// first uncancellable.
+	#[must_use]
+	pub fn abort_bash(&self) -> bool {
+		let guard = self.lock();
+		let mut cancelled = false;
+		for token in guard.bash.values() {
+			token.cancel();
+			cancelled = true;
+		}
+		cancelled
+	}
+
+	fn lock(&self) -> MutexGuard<'_, ActiveState> {
+		self.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+	}
+
+	pub(super) fn begin(
+		&self,
+		generation: u64,
+		token: CancellationToken,
+		steer: Option<SteerFn>,
+	) {
+		let mut guard = self.lock();
+		guard.generation = generation;
+		guard.cancel = Some(token);
+		guard.steer = steer;
+	}
+
+	/// Release the surface only for the run that owns it; a superseded worker's
+	/// `end` is a no-op so it cannot wipe the new run's steering hook.
+	#[must_use]
+	pub(super) fn end_if(&self, generation: u64) -> bool {
+		let mut guard = self.lock();
+		if guard.generation != generation {
+			return false;
+		}
+		guard.cancel = None;
+		guard.steer = None;
+		true
+	}
+}
+
+/// One user message entering a turn.
+#[derive(Debug, Clone)]
+pub struct TurnInput {
+	pub text:         String,
+	pub images:       Vec<RpcImage>,
+	/// Detached plan continuation: no caller message, no goal window.
+	pub continuation: bool,
+}
+
+/// Long-lived session state owned by the RPC transport.
+pub struct RpcSession {
+	pub(crate) runner:   Arc<dyn AgentRunner>,
+	/// Credential store shared with the RPC auth bridge; every request this
+	/// session builds resolves keys through it.
+	pub(crate) resolver: Arc<dyn crate::rpc::auth::CredentialResolver>,
+	pub(crate) config:   Config,
+	pub(crate) cwd:      PathBuf,
+	pub(crate) prompts:  Prompts,
+	/// One snapshot per top-level session; discovery settings feed refreshes.
+	pub(crate) skill_snapshot: SkillSnapshot,
+	pub(crate) skill_options:  LoadOptions,
+	pub(crate) catalog:  Arc<Catalog>,
+	pub(crate) approvals: Approvals,
+	pub(crate) store:    SessionStore,
+	pub(crate) store_options: SessionOptions,
+	pub(crate) history:  Vec<TurnRecord>,
+	/// Exact provider-ready context override (after compaction or rewind).
+	pub(crate) history_messages: Option<Vec<Message>>,
+	/// Live conversation in wire form (`AgentMessage` JSON), oldest first.
+	pub(crate) messages: Vec<Value>,
+	/// Wire mirror replacement queued by a turn-end rewind cut. Applied after
+	/// the settled turn's own `turn_end` frame, so that frame still describes
+	/// the turn that actually ran, and before `agent_end`, so the abandoned
+	/// tail never reaches the host.
+	pub(crate) pending_wire: Option<Vec<Value>>,
+	pub(crate) model:    Option<String>,
+	pub(crate) provider: Option<String>,
+	pub(crate) api_key:  Option<String>,
+	/// Effective endpoint the active root credential belongs to.
+	pub(crate) root_base_url: Option<String>,
+	pub(crate) thinking: Option<runtime::CliThinking>,
+	pub(crate) thinking_level: Option<String>,
+	pub(crate) prompt_cache_key: Option<String>,
+	pub(crate) prompt_cache_key_inherited: bool,
+	/// One-way prewalk state machine for this session.
+	pub(crate) prewalk: crate::prewalk::PrewalkState,
+	pub(crate) provider_session_id: Option<String>,
+	pub(crate) max_time: Option<Duration>,
+	pub(crate) max_turns: usize,
+	pub(crate) tools_enabled: bool,
+	pub(crate) checkpoint_host: CheckpointHost,
+	/// `--no-session` mirror of the live branch (no leading system message).
+	pub(crate) in_memory_messages: Option<Vec<Message>>,
+	pub(crate) is_streaming: bool,
+	pub(crate) is_compacting: bool,
+	pub(crate) auto_compaction: bool,
+	pub(crate) auto_retry: bool,
+	pub(crate) retry_abort: Option<CancellationToken>,
+	pub(crate) steering_mode: QueueMode,
+	pub(crate) follow_up_mode: QueueMode,
+	pub(crate) interrupt_mode: InterruptMode,
+	pub(crate) queued: VecDeque<TurnInput>,
+	pub(crate) todo_phases: Vec<TodoPhase>,
+	pub(crate) session_name: Option<String>,
+	/// Per-provider-family priority selection (TS `ServiceTierByFamily`).
+	/// Authoritative effective selection (TS `ServiceTierByFamily`, string
+	/// values). Fast mode is a derived view, never a second map.
+	pub(crate) service_tiers: std::collections::BTreeMap<String, String>,
+	pub(crate) last_assistant_text: Option<String>,
+	pub(crate) tokens_per_second: Option<f64>,
+	pub(crate) steer: Option<SteerFn>,
+	pub(crate) host_tools: Arc<HostToolBridge>,
+	pub(crate) host_uris: Arc<HostUriBridge>,
+	pub(crate) subagent_level: SubagentSubscriptionLevel,
+	pub(crate) protocol_version: u8,
+	/// One router for every turn: the host URI bridge mounts its validated
+	/// schemes here, and the runner hands the same handle to root and child
+	/// `read`/`write` tools.
+	pub(crate) internal_urls: Arc<InternalUrlRouter>,
+	/// Observer fed to `RunRequest.subagent_observer` so the runner subscribes
+	/// the registry to whichever supervisor it builds.
+	pub(crate) observer: Arc<dyn SubagentObserver>,
+	/// Session goal/budget controller (Goal Mode accounting + `+Nk` window).
+	pub(crate) goal:     Arc<crate::goal::GoalRuntime>,
+	/// ACP client reverse bridge installed by the ACP transport; copied into
+	/// every `RunRequest` so native tools can call the client. `None` for RPC.
+	pub(crate) acp_bridge: Option<crate::agent::AcpBridgeHandle>,
+	/// ACP client-supplied MCP servers for this session (validated by the
+	/// adapter); merged with file discovery by the runner's existing gate.
+	pub(crate) mcp_servers: Vec<crate::config::DiscoveredMcpServer>,
+	/// Host plan-mode wiring installed by the ACP transport: the write guard,
+	/// the `xd://propose` handler and the plan reminder policy.
+	pub(crate) plan_mode: crate::agent::PlanModeHooks,
+	/// Live plan-mode probe handed to the hidden `goal` tool, which refuses
+	/// `create`/`resume` while plan mode holds the exclusive mode slot.
+	pub(crate) plan_mode_probe: Option<crate::goal_tool::PlanModeProbe>,
+	/// Plan-yolo gate/pending shared with the host; `None` when the flag is off.
+	pub(crate) plan_yolo: Option<Arc<crate::plan_yolo::PlanYoloShared>>,
+	/// Planning tool selection to restore after approval or a failed arm.
+	pub(crate) plan_yolo_tools: Option<crate::plan_yolo::PlanYoloToolSelection>,
+	/// Failed approved switch surfaced to the turn owner instead of silently
+	/// ending the run.
+	pub(crate) plan_yolo_commit_error: Option<String>,
+	/// Advisor cards queued by the active turn's sink; the transport drains
+	/// them, persists one `custom_message`, and emits the wire frames.
+	pub(crate) advisor_cards_tx: std::sync::mpsc::Sender<(String, serde_json::Value)>,
+	pub(crate) advisor_cards_rx: std::sync::mpsc::Receiver<(String, serde_json::Value)>,
+	/// Wakes the RPC card pump so an idle session publishes a settled card
+	/// immediately instead of waiting for the next turn boundary.
+	pub(crate) advisor_wake: Option<std::sync::mpsc::Sender<()>>,
+}
+
+impl RpcSession {
+	/// Open the session described by the launch inputs.
+	pub fn open(
+		launch: RpcLaunch,
+		approvals: Approvals,
+		host_tools: Arc<HostToolBridge>,
+		host_uris: Arc<HostUriBridge>,
+		internal_urls: Arc<InternalUrlRouter>,
+		observer: Arc<dyn SubagentObserver>,
+		resolver: Arc<dyn crate::rpc::auth::CredentialResolver>,
+	) -> Result<Self> {
+		if launch.prewalk.is_some() && launch.plan_yolo.is_some() {
+			return Err(Error::new(
+				"--plan-yolo cannot be combined with an effective prewalk arm; choose one startup switch",
+			));
+		}
+		let RpcLaunch {
+			runner,
+			config,
+			cwd,
+			prompts,
+			skill_snapshot,
+			skill_options,
+			catalog,
+			agent_db: _,
+			approval_mode: _,
+			allow: _,
+			model,
+			provider,
+			api_key,
+			thinking,
+			restore_model,
+			prewalk,
+			plan_yolo,
+			max_time,
+			max_turns,
+			tools_enabled,
+			prompt_cache_key,
+			prompt_cache_key_inherited,
+			provider_session_id,
+			store_options,
+			preopened_store,
+			steer,
+			service_tier_explicit,
+		} = launch;
+
+		// Mount `skill://` on this session's router before any turn can read it;
+		// the handler resolves only against this session's snapshot.
+		if let Err(error) = internal_urls.register(Arc::new(
+			crate::skill_protocol::SkillUrlHandler::new(skill_snapshot.clone()),
+		)) {
+			return Err(Error::new(error));
+		}
+		let memory_agent_dir = skill_options
+			.agent_dir
+			.clone()
+			.unwrap_or_else(crate::dirs::agent_dir);
+		if let Err(error) = internal_urls.register(Arc::new(
+			crate::memory_protocol::MemoryUrlHandler::new(memory_agent_dir, config.memory_backend()),
+		)) {
+			return Err(Error::new(error));
+		}
+
+		let mut store = match preopened_store {
+			Some(store) => store,
+			None => SessionStore::open(&store_options),
+		};
+		for warning in store.take_warnings() {
+			eprintln!("warning: {warning}");
+		}
+		if store.legacy_read_only() {
+			return Err(Error::new(
+				"cannot run RPC on a legacy JSONL session: read-only; import it into the SQLite store first",
+			));
+		}
+		// Requested persistence must never silently become ephemeral.
+		if store_options.enabled && !store.enabled() {
+			let reason = store
+				.occupied()
+				.or_else(|| store.corrupt_reason())
+				.unwrap_or("session store unavailable");
+			return Err(Error::new(format!(
+				"cannot open session store: {reason}"
+			)));
+		}
+		let base_service_tiers = if store.has_service_tier_entry() {
+			store.service_tier_by_family()
+		} else {
+			config.configured_service_tiers()
+		};
+		// `--service-tier` is the OpenAI-only override; other families survive.
+		let live_service_tiers = crate::service_tier::overlay_openai(
+			if service_tier_explicit {
+				config.service_tier.as_deref()
+			} else {
+				None
+			},
+			&base_service_tiers,
+		);
+		if service_tier_explicit
+			&& store.enabled()
+			&& let Err(err) = store.append_service_tier_change(&live_service_tiers)
+		{
+			eprintln!("warning: cannot record service tier change: {err}");
+		}
+		// Every persisted session owns a `local://` artifact directory. Tools
+		// may be configured without eval, so its creation cannot depend on the
+		// eval mount; plan writes fail without this root.
+		if store.enabled()
+			&& let Some(artifacts) = store.file().and_then(session::artifacts_directory_for)
+			&& let Err(err) = std::fs::create_dir_all(&artifacts)
+		{
+			return Err(Error::new(format!(
+				"cannot create session artifacts directory {}: {err}",
+				artifacts.display()
+			)));
+		}
+		let thinking_level = thinking.and_then(|level| match level {
+			runtime::CliThinking::Off => Some("off".to_string()),
+			runtime::CliThinking::Auto => None,
+			runtime::CliThinking::Effort(effort) => Some(effort.to_string()),
+		});
+		let history = if store.has_branch_context() {
+			store.branch_history().map_err(Error::new)?
+		} else {
+			store.history().to_vec()
+		};
+		let messages = if store.enabled() {
+			branch_wire_messages(&store)
+		} else {
+			Vec::new()
+		};
+		let session_name = store
+			.title_slot()
+			.map(|slot| slot.title.clone())
+			.or_else(|| store.header().and_then(|header| header.title.clone()));
+		let last_assistant_text = history
+			.last()
+			.map(|turn| turn.assistant.clone())
+			.filter(|text| !text.is_empty());
+		let mut checkpoint_host = CheckpointHost::new();
+		checkpoint_host.rehydrate(&store);
+		let todo_phases = store.branch_todo_phases();
+		let (advisor_cards_tx, advisor_cards_rx) = std::sync::mpsc::channel();
+		let mut session = Self {
+			runner,
+			resolver,
+			config,
+			cwd,
+			prompts,
+			skill_snapshot,
+			skill_options,
+			catalog,
+			approvals,
+			store,
+			store_options,
+			history,
+			history_messages: None,
+			messages,
+			pending_wire: None,
+			model,
+			provider,
+			api_key,
+			root_base_url: None,
+			thinking,
+			thinking_level,
+			prompt_cache_key,
+			prompt_cache_key_inherited,
+			prewalk: crate::prewalk::PrewalkState::new(prewalk),
+			provider_session_id,
+			max_time,
+			max_turns: max_turns.max(1),
+			tools_enabled,
+			checkpoint_host,
+			in_memory_messages: None,
+			is_streaming: false,
+			is_compacting: false,
+			auto_compaction: false,
+			auto_retry: false,
+			retry_abort: None,
+			steering_mode: QueueMode::All,
+			follow_up_mode: QueueMode::OneAtATime,
+			interrupt_mode: InterruptMode::Immediate,
+			queued: VecDeque::new(),
+			todo_phases,
+			session_name,
+			service_tiers: live_service_tiers,
+			last_assistant_text,
+			tokens_per_second: None,
+			steer,
+			host_tools,
+			host_uris,
+			subagent_level: SubagentSubscriptionLevel::Off,
+			protocol_version: 1,
+			internal_urls,
+			observer,
+			goal: Arc::new(crate::goal::GoalRuntime::new()),
+			acp_bridge: None,
+			mcp_servers: Vec::new(),
+			plan_mode: crate::agent::PlanModeHooks::default(),
+			plan_mode_probe: None,
+			plan_yolo: None,
+			plan_yolo_tools: None,
+			plan_yolo_commit_error: None,
+			advisor_cards_tx,
+			advisor_cards_rx,
+			advisor_wake: None,
+		};
+		if let Some(arm) = plan_yolo {
+			// Explicit `--plan-yolo` is the grant: TS `armPlanYoloIfNeeded`
+			// publishes `enabled: true` independently of `plan.enabled`.
+			let gate =
+				Arc::new(std::sync::Mutex::new(crate::acp::plan::PlanGate::new(true)));
+			session.set_plan_yolo(Arc::new(crate::plan_yolo::PlanYoloShared::new(
+				gate, arm,
+			)));
+		}
+		session.refresh_root_endpoint();
+		if restore_model
+			&& let Some(restored) = session.restore_persisted_model(thinking.is_none())
+		{
+			eprintln!("Restored session model: {restored}");
+		}
+		session.refresh_root_endpoint();
+		session.reconcile_goal_mode();
+		Ok(session)
+	}
+
+	/// Shared by RPC and ACP: the branch's recorded model/role picks the route
+	/// when the host supplied no explicit model. Authorization is required, as
+	/// upstream `hasModelAuth` gates each restore candidate.
+	fn restore_persisted_model(&mut self, restore_thinking: bool) -> Option<String> {
+		let candidates = self
+			.store
+			.restorable_models(self.config.default_model.as_deref());
+		for candidate in candidates {
+			let Some((provider, rest)) = candidate.split_once('/') else {
+				continue;
+			};
+			if provider.is_empty() {
+				continue;
+			}
+			let (id, _) = runtime::split_effort(rest);
+			if id.is_empty()
+				|| !self
+					.catalog
+					.providers
+					.get(provider)
+					.is_some_and(|models| models.contains_key(id))
+			{
+				continue;
+			}
+			let candidate_endpoint = runtime::effective_endpoint(
+				&self.catalog,
+				&self.config,
+				provider,
+				id,
+			)
+			.ok();
+			let same_route = self.provider.as_deref() == Some(provider)
+				&& candidate_endpoint.is_some()
+				&& candidate_endpoint.as_deref() == self.root_base_url.as_deref()
+				&& self.api_key.as_deref().is_some_and(|key| !key.trim().is_empty());
+			let stored_auth = self
+				.resolver
+				.peek_api_key(provider)
+				.ok()
+				.flatten()
+				.is_some_and(|key| !key.trim().is_empty());
+			if !same_route
+				&& !stored_auth
+				&& !runtime::provider_has_configured_auth(
+					&self.catalog,
+					&self.config,
+					provider,
+					None,
+				)
+			{
+				continue;
+			}
+			let api_key = if same_route {
+				self.api_key.clone()
+			} else {
+				self.config.resolve_api_key(provider)
+			};
+			self.provider = Some(provider.to_string());
+			self.model = Some(id.to_string());
+			self.api_key = api_key;
+			if restore_thinking
+				&& let Some(level) = runtime::thinking_suffix(rest)
+			{
+				self.thinking = Some(level);
+				self.thinking_level = match level {
+					runtime::CliThinking::Off => Some("off".to_string()),
+					runtime::CliThinking::Auto => None,
+					runtime::CliThinking::Effort(effort) => Some(effort.to_string()),
+				};
+			}
+			self.refresh_root_endpoint();
+			return Some(candidate);
+		}
+		None
+	}
+
+	/// Recompute the effective endpoint of the active route. Called whenever
+	/// provider/model changes; the prewalk switch guard compares it with the
+	/// target endpoint before reusing the root credential.
+	fn refresh_root_endpoint(&mut self) {
+		self.root_base_url = self
+			.provider
+			.as_deref()
+			.zip(self.model.as_deref())
+			.and_then(|(provider, model)| {
+				runtime::effective_endpoint(&self.catalog, &self.config, provider, model).ok()
+			});
+	}
+
+	// ---------------------------------------------------------------- state --
+
+	/// Model selector currently in effect (`provider/model[:effort]` form).
+	#[must_use]
+	pub fn model_selector(&self) -> Option<String> {
+		let model = self.model.as_deref()?;
+		match self.thinking {
+			Some(level) => Some(runtime::apply_thinking(model, level)),
+			None => Some(model.to_string()),
+		}
+	}
+
+	/// Wire `Model` object for the active model, built from catalog data only.
+	#[must_use]
+	pub fn model_object(&self) -> Option<Value> {
+		let raw = self.model.as_deref()?;
+		let (base, _) = runtime::split_effort(raw);
+		let provider = self
+			.provider
+			.clone()
+			.or_else(|| self.catalog.provider_of(base).map(str::to_string))?;
+		let info = self.catalog.providers.get(&provider).and_then(|models| models.get(base));
+		let connection = self.catalog.connections.get(&provider);
+		let mut model = json!({
+			"id": base,
+			"name": info.and_then(|i| i.name.clone()).unwrap_or_else(|| base.to_string()),
+			"api": connection.and_then(|c| c.api.clone()).unwrap_or_default(),
+			"provider": provider,
+			"baseUrl": connection
+				.and_then(|c| c.base_url.clone())
+				.unwrap_or_default(),
+			"reasoning": info.is_some_and(|i| i.reasoning),
+			"input": info
+				.and_then(|i| i.input.clone())
+				.unwrap_or_else(|| vec!["text".to_string()]),
+			"cost": info
+				.and_then(|i| i.cost.clone())
+				.unwrap_or_else(|| json!({})),
+			"contextWindow": info.and_then(|i| i.context_window).unwrap_or(0),
+			"maxTokens": info.and_then(|i| i.max_tokens).unwrap_or(0),
+		});
+		if let Some(efforts) = info.and_then(|i| i.efforts.clone()) {
+			model["thinking"] = json!({ "efforts": efforts });
+		}
+		Some(model)
+	}
+
+	/// All catalog models in wire form, sorted by provider then id.
+	#[must_use]
+	pub fn available_models(&self) -> Vec<Value> {
+		let mut models = Vec::new();
+		for (provider, entries) in &self.catalog.providers {
+			for id in entries.keys() {
+				let connection = self.catalog.connections.get(provider);
+				let info = entries.get(id).expect("entry exists");
+				let mut model = json!({
+					"id": id,
+					"name": info.name.clone().unwrap_or_else(|| id.clone()),
+					"api": connection.and_then(|c| c.api.clone()).unwrap_or_default(),
+					"provider": provider,
+					"baseUrl": connection.and_then(|c| c.base_url.clone()).unwrap_or_default(),
+					"reasoning": info.reasoning,
+					"input": info.input.clone().unwrap_or_else(|| vec!["text".to_string()]),
+					"cost": info.cost.clone().unwrap_or_else(|| json!({})),
+					"contextWindow": info.context_window.unwrap_or(0),
+					"maxTokens": info.max_tokens.unwrap_or(0),
+				});
+				if let Some(efforts) = &info.efforts {
+					model["thinking"] = json!({ "efforts": efforts });
+				}
+				models.push(model);
+			}
+		}
+		models
+	}
+
+	/// Efforts the active model advertises, or `None` when it has no thinking
+	/// surface at all.
+	#[must_use]
+	pub fn available_efforts(&self) -> Option<Vec<String>> {
+		let raw = self.model.as_deref()?;
+		let (base, _) = runtime::split_effort(raw);
+		let provider = self
+			.provider
+			.clone()
+			.or_else(|| self.catalog.provider_of(base).map(str::to_string))?;
+		self.catalog
+			.providers
+			.get(&provider)
+			.and_then(|models| models.get(base))
+			.and_then(|info| info.efforts.clone())
+	}
+
+	/// `get_state` payload.
+	pub fn state(&self, system_prompt: Option<Vec<String>>) -> RpcSessionState {
+		RpcSessionState {
+			model: self.model_object(),
+			thinking_level: self.thinking_level.clone(),
+			is_streaming: self.is_streaming,
+			is_compacting: self.is_compacting,
+			steering_mode: self.steering_mode.as_str(),
+			follow_up_mode: self.follow_up_mode.as_str(),
+			interrupt_mode: self.interrupt_mode.as_str(),
+			session_file: self.store_file_string(),
+			session_id: self.session_id(),
+			session_name: self.session_name.clone(),
+			auto_compaction_enabled: self.auto_compaction,
+			queued_message_count: self.queued.len(),
+			todo_phases: serde_json::to_value(&self.todo_phases).unwrap_or_else(|_| json!([])),
+			fast_mode_enabled: self.fast_mode_enabled(),
+			tokens_per_second: self.tokens_per_second,
+			fast_mode_active: self.fast_mode_active(),
+			message_count: self.messages.len(),
+			system_prompt,
+			dump_tools: self.dump_tools(),
+			context_usage: self.context_usage(),
+		}
+	}
+
+	/// `dumpTools`: registry schemas in the shape clients display.
+	///
+	/// The native registry exposes OpenAI `tools` entries, so each one is
+	/// unwrapped to `{name, description, parameters}`. `examples` is absent
+	/// because native tools carry none.
+	fn dump_tools(&self) -> Option<Vec<Value>> {
+		if !self.tools_enabled {
+			return Some(Vec::new());
+		}
+		let registry = runtime::build_registry(&[]).ok()?;
+		Some(
+			registry
+				.schemas()
+				.into_iter()
+				.filter_map(|schema| {
+					let function = schema.get("function")?;
+					Some(json!({
+						"name": function.get("name")?.clone(),
+						"description": function.get("description")?.clone(),
+						"parameters": function.get("parameters")?.clone(),
+					}))
+				})
+				.collect(),
+		)
+	}
+
+	/// Context occupancy of the newest provider request on the active branch.
+	///
+	/// Reads the persisted prompt-side counters (`input + cacheRead +
+	/// cacheWrite`, `totalTokens` fallback) through
+	/// [`SessionStore::latest_context_tokens`]; it never sums events, so a turn
+	/// with several provider requests cannot double-count. `None` means no
+	/// request on the branch reported usage.
+	#[must_use]
+	pub fn context_usage(&self) -> Option<Value> {
+		let tokens = match self.store.latest_context_tokens() {
+			Some(tokens) => tokens,
+			// `--no-session` never appends to the store, so read the last
+			// assistant usage mirrored from the loop: the reported occupancy,
+			// never a zero stand-in.
+			None => self.in_memory_context_tokens()?,
+		};
+		let limit = self.context_limit()?;
+		Some(json!({
+			"tokens": tokens,
+			"contextWindow": limit,
+			"percent": if limit == 0 {
+				0.0
+			} else {
+				(tokens as f64 / limit as f64) * 100.0
+			},
+		}))
+	}
+
+	/// Occupancy of the newest reported request in the in-memory mirror.
+	///
+	/// Same formula as [`SessionStore::latest_context_tokens`] (`contextTokens`,
+	/// then the prompt counters, then `totalTokens`), minus the provider-side
+	/// orchestration subtraction that only TS-written logs carry. `None` when no
+	/// mirrored assistant message reported usage.
+	fn in_memory_context_tokens(&self) -> Option<u64> {
+		self
+			.in_memory_messages
+			.as_ref()?
+			.iter()
+			.rev()
+			.filter(|message| message.role == pi_agent::Role::Assistant)
+			.find_map(|message| message.usage.as_ref())
+			.map(|usage| {
+				let usage = session::Usage::from(*usage);
+				if let Some(context) = usage.context_tokens {
+					return context;
+				}
+				let prompt = usage.input + usage.cache_read + usage.cache_write;
+				if prompt > 0 {
+					return prompt;
+				}
+				let total = usage.total_tokens;
+				if total > 0 {
+					total
+				} else {
+					usage.input + usage.output + usage.cache_read + usage.cache_write
+				}
+			})
+	}
+
+	fn context_limit(&self) -> Option<usize> {
+		let raw = self.model.as_deref()?;
+		let (base, _) = runtime::split_effort(raw);
+		let provider = self
+			.provider
+			.clone()
+			.or_else(|| self.catalog.provider_of(base).map(str::to_string))?;
+		self.catalog.context_window(&provider, base)
+	}
+
+	#[must_use]
+	pub fn session_id(&self) -> String {
+		if self.store.enabled() {
+			self.store.id().to_string()
+		} else {
+			self.store_options
+				.id
+				.clone()
+				.unwrap_or_else(|| "in-memory".to_string())
+		}
+	}
+
+	#[must_use]
+	pub fn store_file_string(&self) -> Option<String> {
+		self.store.file().map(|path| path.display().to_string())
+	}
+
+	/// The same `(session_id, session_file)` pair a `RunRequest` carries for this
+	/// store: persisted, non-v1 logs only. Used to close exactly the scope the
+	/// runs used, never the ACP client id.
+	pub(crate) fn session_scope_identity(&self) -> (Option<String>, Option<PathBuf>) {
+		let persisted = self.store.enabled() && !self.store.is_v1();
+		if !persisted {
+			return (None, None);
+		}
+		(
+			Some(self.store.id().to_string()),
+			self.store.file().map(Path::to_path_buf),
+		)
+	}
+
+	/// `get_session_stats` payload. Token totals come from the store's
+	/// cumulative usage index (one contribution per persisted assistant entry);
+	/// reasoning/cost/premium figures are read from the same persisted usage
+	/// objects without touching the token totals.
+	#[must_use]
+	pub fn stats(&self) -> Value {
+		let usage = self.store.session_usage();
+		let mut reasoning = 0u64;
+		let mut cost = 0.0f64;
+		let mut premium_requests = 0u64;
+		for entry in self.store.messages() {
+			if entry.message.role != "assistant" {
+				continue;
+			}
+			let Some(usage) = &entry.message.usage else {
+				continue;
+			};
+			reasoning = reasoning.saturating_add(usage.reasoning_tokens.unwrap_or(0));
+			if let Some(entry_cost) = &usage.cost {
+				cost += entry_cost.total;
+			}
+			premium_requests = premium_requests.saturating_add(
+				usage
+					.extra
+					.get("premiumRequests")
+					.and_then(Value::as_u64)
+					.unwrap_or(0),
+			);
+		}
+		let mut stats = json!({
+			"sessionId": self.session_id(),
+			"userMessages": self
+				.messages
+				.iter()
+				.filter(|message| message.get("role").and_then(Value::as_str) == Some("user"))
+				.count(),
+			"assistantMessages": self
+				.messages
+				.iter()
+				.filter(|message| message.get("role").and_then(Value::as_str) == Some("assistant"))
+				.count(),
+			"toolCalls": self
+				.messages
+				.iter()
+				.filter_map(|message| message.get("content").and_then(Value::as_array))
+				.flatten()
+				.filter(|part| part.get("type").and_then(Value::as_str) == Some("toolCall"))
+				.count(),
+			"toolResults": self
+				.messages
+				.iter()
+				.filter(|message| message.get("role").and_then(Value::as_str) == Some("toolResult"))
+				.count(),
+			"totalMessages": self.messages.len(),
+			"tokens": {
+				"input": usage.input,
+				"output": usage.output,
+				"reasoning": reasoning,
+				"cacheRead": usage.cache_read,
+				"cacheWrite": usage.cache_write,
+				"total": usage.total_tokens,
+			},
+			"premiumRequests": premium_requests,
+			"cost": cost,
+		});
+		if let Some(file) = self.store_file_string() {
+			stats["sessionFile"] = json!(file);
+		}
+		if let Some(context) = self.context_usage() {
+			stats["contextUsage"] = context;
+		}
+		stats
+	}
+
+	// ------------------------------------------------------------ fast mode --
+
+	/// Provider family whose service-tier knob governs the active model, or
+	/// `None` when the model exposes no serving-priority control.
+	///
+	/// Port of TS `serviceTierFamily` (`packages/ai/src/types.ts`): OpenRouter
+	/// ids are classified by namespace, `anthropic-messages` models belong to
+	/// the Anthropic family on any provider, and custom OpenAI-compatible relays
+	/// serving OpenAI ids are OpenAI family unless the provider owns a separate
+	/// control (Fireworks) or rejects the field (GitHub Copilot).
+	fn service_tier_family(&self) -> Option<&'static str> {
+		let (provider, api, id) = self.active_model_parts()?;
+		service_tier_family(&provider, api.as_deref(), &id)
+	}
+
+	/// TS `ServiceTierByFamily` view of the RPC owner's boolean selection:
+	/// `true` becomes `"priority"`, absent families stay absent.
+	pub(crate) fn service_tier_by_family(&self) -> std::collections::BTreeMap<String, String> {
+		self.service_tiers.clone()
+	}
+
+	/// Whether the user selected priority for the active model's family
+	/// (TS `isFastModeEnabled`).
+	#[must_use]
+	pub fn fast_mode_enabled(&self) -> bool {
+		self
+			.service_tier_family()
+			.is_some_and(|family| {
+				self.service_tiers.get(family).map(String::as_str) == Some("priority")
+			})
+	}
+
+	/// Whether priority will actually be realized on the wire for the active
+	/// model (TS `isFastModeActive`). Until the runner forwards
+	/// `RunRequest.service_tier_by_family`, the selection is stored but not realized, so
+	/// this stays `false` instead of claiming a wire effect that did not happen.
+	#[must_use]
+	pub fn fast_mode_active(&self) -> bool {
+		let Some((provider, api, id)) = self.active_model_parts() else {
+			return false;
+		};
+		self.fast_mode_enabled() && realizes_priority(&provider, api.as_deref(), &id)
+	}
+
+	/// Apply `set_fast_mode`; returns whether the model has a service-tier knob
+	/// (TS `setFastMode` return value).
+	pub fn set_fast_mode(&mut self, enabled: bool) -> bool {
+		let Some(family) = self.service_tier_family() else {
+			return false;
+		};
+		if enabled {
+			self.service_tiers
+				.insert(family.to_string(), "priority".to_string());
+		} else {
+			self.service_tiers.remove(family);
+		}
+		// TS `setServiceTierFamily` journals the whole effective map, so an
+		// explicit toggle survives resume and fork.
+		if self.store.enabled()
+			&& let Err(err) = self.store.append_service_tier_change(&self.service_tiers)
+		{
+			eprintln!("warning: cannot record service tier change: {err}");
+		}
+		true
+	}
+
+	/// Provider, wire api and bare model id of the active selection.
+	fn active_model_parts(&self) -> Option<(String, Option<String>, String)> {
+		let raw = self.model.as_deref()?;
+		let (base, _) = runtime::split_effort(raw);
+		let provider = self
+			.provider
+			.clone()
+			.or_else(|| self.catalog.provider_of(base).map(str::to_string))?;
+		let api = self
+			.catalog
+			.connections
+			.get(&provider)
+			.and_then(|connection| connection.api.clone())
+			.or_else(|| {
+				self.config
+					.providers
+					.get(&provider)
+					.and_then(|connection| connection.api.clone())
+			});
+		Some((provider, api, base.to_string()))
+	}
+
+	// ------------------------------------------------------------------ acp --
+
+	/// Install the ACP client reverse bridge this session's turns hand to the
+	/// native tools. The ACP driver calls this once per session; RPC leaves it
+	/// `None`.
+	pub fn set_acp_bridge(
+		&mut self,
+		bridge: Option<std::sync::Arc<dyn pi_agent::AcpClientBridge>>,
+	) {
+		self.acp_bridge = bridge.map(crate::agent::AcpBridgeHandle);
+	}
+
+	/// Replace the ACP-supplied MCP servers this session merges into each run.
+	pub fn set_mcp_servers(&mut self, servers: Vec<crate::config::DiscoveredMcpServer>) {
+		self.mcp_servers = servers;
+	}
+
+	/// Install the host plan-mode wiring (write guard, `xd://propose` handler,
+	/// reminder policy) copied into every later `RunRequest`.
+	pub fn set_plan_mode(&mut self, hooks: crate::agent::PlanModeHooks) {
+		self.plan_mode = hooks;
+	}
+
+	/// Install the plan-yolo gate shared with the host and derive its hooks.
+	pub fn set_plan_yolo(
+		&mut self,
+		shared: Arc<crate::plan_yolo::PlanYoloShared>,
+	) {
+		// The hooks are published by `arm_plan_yolo` only after the gate and
+		// tool selection are provably usable, so a failed arm leaves the
+		// ordinary/default hooks in place.
+		self.plan_yolo = Some(shared);
+	}
+
+	fn plan_artifacts(&self) -> Option<PathBuf> {
+		self.store
+			.file()
+			.filter(|_| self.store.enabled())
+			.and_then(crate::session::artifacts_directory_for)
+	}
+
+	/// Install the live plan-mode probe the hidden `goal` tool consults.
+	pub fn set_plan_mode_probe(&mut self, probe: Option<crate::goal_tool::PlanModeProbe>) {
+		self.plan_mode_probe = probe;
+	}
+
+	/// Take a failed approved plan-yolo switch so the turn owner can fail the
+	/// run instead of reporting success after implementing nothing.
+	#[must_use]
+	pub fn take_plan_yolo_commit_error(&mut self) -> Option<String> {
+		self.plan_yolo_commit_error.take()
+	}
+
+	/// Drain advisor cards queued since the last boundary. Each card is written
+	/// once as a `custom_message` (resume replays it); the caller emits the
+	/// returned `(content, details)` pairs as frames, never a second card.
+	pub fn take_advisor_cards(&mut self) -> Vec<(String, serde_json::Value)> {
+		let mut cards = Vec::new();
+		while let Ok(card) = self.advisor_cards_rx.try_recv() {
+			cards.push(card);
+		}
+		if self.store.enabled() {
+			for (content, details) in &cards {
+				if let Err(err) = self.store.append_custom_message(
+					crate::advisor_runtime::CARD_CUSTOM_TYPE,
+					content,
+					true,
+					details.clone(),
+				) {
+					eprintln!("warning: {err}");
+				}
+			}
+		}
+		cards
+	}
+
+	/// Install the wake sender used by the RPC card pump before any turn.
+	pub fn set_advisor_wake(&mut self, wake: std::sync::mpsc::Sender<()>) {
+		self.advisor_wake = Some(wake);
+	}
+
+	/// Scope tuple the runner keys advisor state by.
+	pub(crate) fn advisor_scope(&self) -> (Option<String>, Option<PathBuf>) {
+		(
+			self.store.enabled().then(|| self.store.id().to_string()),
+			self.store.file().map(Path::to_path_buf),
+		)
+	}
+
+	/// Conversation boundary: re-prime advisor state for the new transcript.
+	pub fn reset_advisor_boundary(&self) {
+		let (id, file) = self.advisor_scope();
+		self
+			.runner
+			.advisor_reset_boundary(id.as_deref(), file.as_deref(), &[]);
+	}
+
+	/// Rendered advisor status for the live scope, if a manager exists.
+	#[must_use]
+	pub fn advisor_status(&self) -> Option<String> {
+		let (id, file) = self.advisor_scope();
+		self
+			.runner
+			.advisor_status(id.as_deref(), file.as_deref())
+	}
+
+	/// Journal the failed cutover so a resumed session sees the turn was not a
+	/// successful implementation; the live error frame is not durable.
+	pub fn record_plan_yolo_commit_failure(&mut self, error: &str) -> Option<String> {
+		if !self.store.enabled() {
+			return None;
+		}
+		match self.store.append_plan_yolo_switch_failure(error) {
+			Ok(id) => Some(id),
+			Err(err) => {
+				eprintln!("warning: cannot record plan-yolo switch failure: {err}");
+				None
+			},
+		}
+	}
+
+	/// Persist the shared exclusive `mode_change` slot (`"plan"`, `"none"`, or
+	/// the goal modes). Plan and Goal cannot hold it at once.
+	pub fn append_mode_change(&mut self, mode: &str, data: Option<Value>) -> Result<()> {
+		self.store.append_mode_change(mode, data).map(|_| ()).map_err(Error::new)
+	}
+
+	/// Last `mode_change` on the active branch, cloned for callers that must
+	/// not borrow the store.
+	#[must_use]
+	pub fn latest_mode_change(&self) -> Option<(String, Option<Value>)> {
+		self
+			.store
+			.latest_mode_change()
+			.map(|(mode, data)| (mode.to_string(), data.cloned()))
+	}
+
+	// --------------------------------------------------------------- models --
+
+	/// Set the active model by provider id and model id.
+	pub fn set_model(&mut self, provider: &str, model_id: &str) -> Result<()> {
+		let Some(models) = self.catalog.providers.get(provider) else {
+			return Err(Error::new(format!("Unknown provider: {provider}")));
+		};
+		if !models.contains_key(model_id) {
+			return Err(Error::new(format!("Unknown model for provider {provider}: {model_id}")));
+		}
+		// An inherited prompt-cache key dies on a model switch, exactly like the
+		// one-shot CLI path.
+		let provider_changed = self.provider.as_deref() != Some(provider)
+			|| self.model.as_deref() != Some(model_id);
+		if provider_changed {
+			self.prompt_cache_key = None;
+		}
+		self.model = Some(model_id.to_string());
+		self.provider = Some(provider.to_string());
+		self.api_key = self.config.resolve_api_key(provider);
+		self.refresh_root_endpoint();
+		self.thinking_level = match self.thinking {
+			Some(runtime::CliThinking::Effort(effort)) => Some(effort.to_string()),
+			Some(runtime::CliThinking::Off) => Some("off".to_string()),
+			Some(runtime::CliThinking::Auto) | None => None,
+		};
+		if self.available_efforts().is_none() {
+			self.thinking = None;
+			self.thinking_level = None;
+		}
+		Ok(())
+	}
+
+	/// Next model in catalog order (`cycle_model`).
+	pub fn cycle_model(&mut self) -> Option<Value> {
+		let models = self.available_models();
+		if models.is_empty() {
+			return None;
+		}
+		let current_id = self.model.clone();
+		let current_provider = self.provider.clone();
+		let position = models.iter().position(|model| {
+			model.get("id").and_then(Value::as_str) == current_id.as_deref()
+				&& model.get("provider").and_then(Value::as_str) == current_provider.as_deref()
+		});
+		let next = models
+			.get(position.map_or(0, |index| (index + 1) % models.len()))
+			.cloned()?;
+		let provider = next.get("provider").and_then(Value::as_str)?.to_string();
+		let id = next.get("id").and_then(Value::as_str)?.to_string();
+		self.set_model(&provider, &id).ok()?;
+		Some(json!({ "model": next, "thinkingLevel": self.thinking_level, "isScoped": false }))
+	}
+
+	/// Set an explicit thinking level. The level must be a valid selector and,
+	/// when the model advertises efforts, one of them.
+	pub fn set_thinking_level(&mut self, level: &str) -> Result<()> {
+		let Some(parsed) = runtime::parse_cli_thinking(level) else {
+			return Err(Error::new(format!(
+				"Unknown thinking level: {level} (valid: {}, auto)",
+				EFFORT_SELECTORS.join(", ")
+			)));
+		};
+		if let runtime::CliThinking::Effort(effort) = parsed {
+			if let Some(efforts) = self.available_efforts() {
+				if !efforts.iter().any(|candidate| candidate == effort) {
+					return Err(Error::new(format!(
+						"Model does not support thinking level \"{effort}\" (valid: {})",
+						efforts.join(", ")
+					)));
+				}
+			}
+		}
+		// TS `setThinkingLevel` clears the inherited prompt-cache identity only
+		// when the effective selection actually changes: entering auto from a
+		// fixed level, or a different resolved level. Re-applying the same level
+		// (and rejected input, which returns above) keeps the inherited key.
+		let was_auto = self.thinking == Some(runtime::CliThinking::Auto);
+		// TS stores and compares the *resolved* level (`model-controls.ts:541-552`).
+		// A restored raw suffix such as `max` may resolve to `high`, and a
+		// non-reasoning target resolves every raw effort to `None`; comparing the
+		// raw identifier would report a false change and drop the inherited key.
+		let previous_effective = match self.thinking {
+			Some(runtime::CliThinking::Off) => Some("off".to_string()),
+			Some(thinking @ runtime::CliThinking::Effort(_)) => {
+				self.model.as_deref().and_then(|model| {
+					let provider = self
+						.provider
+						.as_deref()
+						.or_else(|| self.catalog.provider_of(model))
+						.unwrap_or_default();
+					runtime::resolve_thinking_effort(
+						&self.catalog,
+						provider,
+						model,
+						Some(thinking),
+					)
+				})
+			},
+			_ => None,
+		};
+		let changed = match parsed {
+			runtime::CliThinking::Auto => !was_auto,
+			runtime::CliThinking::Off => {
+				was_auto || previous_effective.as_deref() != Some("off")
+			},
+			runtime::CliThinking::Effort(_) => {
+				let provider = self
+					.provider
+					.as_deref()
+					.or_else(|| self.model.as_deref().and_then(|id| self.catalog.provider_of(id)))
+					.unwrap_or_default();
+				let effective = self.model.as_deref().and_then(|model| {
+					runtime::resolve_thinking_effort(
+						&self.catalog,
+						provider,
+						model,
+						Some(parsed),
+					)
+				});
+				was_auto || effective.as_deref() != previous_effective.as_deref()
+			},
+		};
+		self.thinking = Some(parsed);
+		self.thinking_level = match parsed {
+			runtime::CliThinking::Off => Some("off".to_string()),
+			runtime::CliThinking::Auto => None,
+			runtime::CliThinking::Effort(effort) => Some(effort.to_string()),
+		};
+		if changed && self.prompt_cache_key_inherited {
+			self.prompt_cache_key = None;
+			self.prompt_cache_key_inherited = false;
+		}
+		Ok(())
+	}
+
+	/// Cycle `off` -> advertised efforts -> `off`. `Value::Null` means the
+	/// model advertises no levels (upstream answers `null`, not an error).
+	pub fn cycle_thinking_level(&mut self) -> Result<Value> {
+		let efforts = self.available_efforts().unwrap_or_default();
+		if efforts.is_empty() {
+			return Ok(Value::Null);
+		}
+		let mut levels = vec!["off".to_string()];
+		levels.extend(efforts);
+		let current = self.thinking_level.clone().unwrap_or_else(|| "off".to_string());
+		let next = levels
+			.iter()
+			.position(|level| *level == current)
+			.map_or(0, |index| (index + 1) % levels.len());
+		let level = levels[next].clone();
+		self.set_thinking_level(&level)?;
+		Ok(json!({ "level": self.thinking_level }))
+	}
+
+	// ------------------------------------------------------------- sessions --
+
+	/// Start a fresh session log, keeping the prompt inputs and route.
+	pub fn new_session(&mut self, parent_session: Option<&str>) -> Result<()> {
+		let old_scope = self.session_scope_identity();
+		let mut options = self.store_options.clone();
+		options.id = None;
+		options.continue_latest = false;
+		options.parent_session = parent_session.map(str::to_string);
+		options.dir = self
+			.store
+			.file()
+			.and_then(|path| path.parent().map(Path::to_path_buf))
+			.or(options.dir);
+		let mut store = SessionStore::open(&options);
+		for warning in store.take_warnings() {
+			eprintln!("warning: {warning}");
+		}
+		if options.enabled && !store.enabled() {
+			let reason = store
+				.occupied()
+				.or_else(|| store.corrupt_reason())
+				.unwrap_or("session store unavailable");
+			return Err(Error::new(format!("cannot create session: {reason}")));
+		}
+		if store.is_v1() {
+			return Err(Error::new("cannot start a new session from a legacy v1 log"));
+		}
+		// `parent_session` is persisted in `SessionHeader` at creation, so the
+		// lineage survives a reload of the new log.
+		self.store = store;
+		self.restore_service_tiers();
+		self.history.clear();
+		self.history_messages = None;
+		self.messages.clear();
+		self.pending_wire = None;
+		self.in_memory_messages = None;
+		self.todo_phases.clear();
+		self.session_name = None;
+		self.last_assistant_text = None;
+		self.tokens_per_second = None;
+		self.checkpoint_host = CheckpointHost::new();
+		self.checkpoint_host.rehydrate(&self.store);
+		self.reset_advisor_boundary();
+		self.restore_service_tiers();
+		let target = self.session_scope_identity();
+		self.runner
+			.reopen_session(target.0.as_deref(), target.1.as_deref());
+		let old_identified = old_scope.0.is_some() || old_scope.1.is_some();
+		if old_identified && target != old_scope {
+			if let Some(ticket) = self
+				.runner
+				.close_session(old_scope.0.as_deref(), old_scope.1.as_deref())
+			{
+				self.runner.release_session_scope(
+					old_scope.0.as_deref(),
+					old_scope.1.as_deref(),
+					ticket,
+				);
+			}
+		}
+		Ok(())
+	}
+
+	/// Switch to an existing session log.
+	pub fn switch_session(&mut self, path: &Path) -> Result<()> {
+		let old_scope = self.session_scope_identity();
+		let dir = path.parent().map(Path::to_path_buf);
+		let id = path
+			.file_stem()
+			.and_then(|stem| stem.to_str())
+			.map(str::to_string);
+		let durable_exists = match (&dir, &id) {
+			(Some(dir), Some(id)) => crate::durable_session::session_exists(
+				&crate::durable_session::database_path(dir),
+				id,
+			)
+			.unwrap_or(false),
+			_ => false,
+		};
+		if !durable_exists && !path.is_file() {
+			return Err(Error::new(format!("Session not found: {}", path.display())));
+		}
+		let mut options = self.store_options.clone();
+		options.dir = dir.clone();
+		options.id = id.clone();
+		options.continue_latest = false;
+		// Same canonical DB + session id: reuse live store (no second writer lease).
+		// Compare against the live store path — store_options.dir may be None
+		// (no --session-dir) or stale after new_session.
+		if self.store.enabled()
+			&& !self.store.legacy_read_only()
+			&& id.as_deref() == Some(self.store.id())
+			&& dir.as_ref().is_some_and(|target_dir| {
+				self.store.file().and_then(|file| file.parent().map(Path::to_path_buf)).is_some_and(
+					|live_dir| {
+						let live = crate::durable_session::database_path(&live_dir);
+						let want = crate::durable_session::database_path(target_dir);
+						live == want
+							|| std::fs::canonicalize(&live).ok() == std::fs::canonicalize(&want).ok()
+					},
+				)
+			})
+		{
+			return Ok(());
+		}
+		let mut store = SessionStore::open(&options);
+		for warning in store.take_warnings() {
+			eprintln!("warning: {warning}");
+		}
+		if store.legacy_read_only() {
+			return Err(Error::new(
+				"cannot switch to a legacy JSONL session: read-only; import it into the SQLite store first",
+			));
+		}
+		// Switching targets an existing log, so persistence was requested: a
+		// store that failed to open must not silently run in memory where its
+		// entries would be lost on exit.
+		if !store.enabled() {
+			let reason = store
+				.occupied()
+				.or_else(|| store.corrupt_reason())
+				.unwrap_or("the session log cannot be persisted");
+			return Err(Error::new(format!(
+				"cannot switch to {}: {reason}",
+				path.display()
+			)));
+		}
+		self.history = if store.has_branch_context() {
+			store.branch_history().map_err(Error::new)?
+		} else {
+			store.history().to_vec()
+		};
+		self.messages = branch_wire_messages(&store);
+		self.pending_wire = None;
+		self.session_name = store
+			.title_slot()
+			.map(|slot| slot.title.clone())
+			.or_else(|| store.header().and_then(|header| header.title.clone()));
+		self.todo_phases = store.branch_todo_phases();
+		self.history_messages = None;
+		self.in_memory_messages = None;
+		self.last_assistant_text = self
+			.history
+			.last()
+			.map(|turn| turn.assistant.clone())
+			.filter(|text| !text.is_empty());
+		self.store = store;
+		self.restore_service_tiers();
+		self.checkpoint_host = CheckpointHost::new();
+		self.checkpoint_host.rehydrate(&self.store);
+		self.reset_advisor_boundary();
+		self.restore_service_tiers();
+		let target = self.session_scope_identity();
+		self.runner
+			.reopen_session(target.0.as_deref(), target.1.as_deref());
+		let old_identified = old_scope.0.is_some() || old_scope.1.is_some();
+		if old_identified && target != old_scope {
+			if let Some(ticket) = self
+				.runner
+				.close_session(old_scope.0.as_deref(), old_scope.1.as_deref())
+			{
+				self.runner.release_session_scope(
+					old_scope.0.as_deref(),
+					old_scope.1.as_deref(),
+					ticket,
+				);
+			}
+		}
+		Ok(())
+	}
+
+	/// Rename the session: append the `title_change` entry to the durable
+	/// authority so list views and resumes see the same name.
+	pub fn set_session_name(&mut self, name: &str) -> Result<()> {
+		let title = clean_title(name);
+		if title.is_empty() {
+			return Err(Error::new("Session name cannot be empty"));
+		}
+		let previous = self.session_name.clone();
+		let now = SystemTime::now();
+		let iso = output::iso8601(now);
+		if self.store.enabled() {
+			let mut extra = serde_json::Map::new();
+			extra.insert("title".to_string(), json!(title));
+			extra.insert("source".to_string(), json!("user"));
+			if let Some(previous) = &previous {
+				extra.insert("previousTitle".to_string(), json!(previous));
+			}
+			let entry = session::SessionEntry {
+				kind: "title_change".to_string(),
+				id: format!("entry-{}", output::session_id()),
+				parent_id: self.store.leaf_id().map(str::to_string),
+				timestamp: iso.clone(),
+				extra: Value::Object(extra),
+			};
+			self.store.append_entry(entry).map_err(Error::new)?;
+		}
+		self.session_name = Some(title);
+		Ok(())
+	}
+
+	/// Messages of the current branch, in wire form.
+	#[must_use]
+	pub fn wire_messages(&self) -> &[Value] {
+		&self.messages
+	}
+
+	/// `get_branch_messages`: user messages with their entry ids.
+	#[must_use]
+	pub fn branch_messages(&self) -> Vec<Value> {
+		let entries: Vec<&MessageEntry> = if self.store.has_branch_context() {
+			self.store.branch_messages()
+		} else {
+			self.store.messages().iter().collect()
+		};
+		entries
+			.iter()
+			.filter(|entry| entry.message.role == "user")
+			.map(|entry| {
+				json!({
+					"entryId": entry.id,
+					"text": entry.message.content.text(),
+				})
+			})
+			.collect()
+	}
+
+	/// `branch` selection result. The store owns the leaf mutation: a durable
+	/// metadata marker moves the active branch to `entry_id` without editing or
+	/// deleting entries, so the selection survives a reload.
+	pub fn branch(&mut self, entry_id: &str) -> std::result::Result<Value, Prerequisite> {
+		if !self.store.has_entry(entry_id) {
+			return Err(Prerequisite::new(
+				"unknown_entry",
+				format!("Unknown session entry: {entry_id}"),
+			));
+		}
+		let text = self
+			.store
+			.messages()
+			.iter()
+			.find(|entry| entry.id == entry_id)
+			.map(|entry| entry.message.content.text())
+			.unwrap_or_default();
+		self.store.branch_to(entry_id).map_err(|error| {
+			Prerequisite::new("branch_unavailable", format!("cannot branch to {entry_id}: {error}"))
+		})?;
+		// Checkpoint state is branch-scoped: an open checkpoint or completed
+		// rewind from the path just abandoned must not leak into the new branch.
+		self.checkpoint_host = CheckpointHost::new();
+		self.checkpoint_host.rehydrate(&self.store);
+		self.reset_advisor_boundary();
+		self.restore_service_tiers();
+		// The branch changed under the same log: rebuild the context the next
+		// request and the frame surface read from.
+		self.history = if self.store.has_branch_context() {
+			self.store.branch_history().map_err(|error| {
+				Prerequisite::new("branch_unavailable", error)
+			})?
+		} else {
+			self.store.history().to_vec()
+		};
+		self.history_messages = None;
+		self.todo_phases = self.store.branch_todo_phases();
+		self.last_assistant_text = self
+			.history
+			.last()
+			.map(|turn| turn.assistant.clone())
+			.filter(|text| !text.is_empty());
+		self.messages = self
+			.store
+			.branch_messages()
+			.into_iter()
+			.filter_map(|entry| serde_json::to_value(&entry.message).ok())
+			.collect();
+		self.pending_wire = None;
+		Ok(json!({ "text": text, "cancelled": false }))
+	}
+
+	// ---------------------------------------------------------------- todos --
+
+	/// TS `loadSession`/`branch`: the effective selection follows the active
+	/// session/branch, so switching cannot leak the previous tiers.
+	fn restore_service_tiers(&mut self) {
+		self.service_tiers = if self.store.has_service_tier_entry() {
+			self.store.service_tier_by_family()
+		} else {
+			// The legacy single `serviceTier` is the OpenAI-only override.
+			crate::service_tier::overlay_openai(
+				self.config.service_tier.as_deref(),
+				&self.config.configured_service_tiers(),
+			)
+		};
+	}
+
+	pub fn set_todos(&mut self, phases: Vec<TodoPhase>) {
+		self.todo_phases = phases;
+	}
+
+	// --------------------------------------------------------------- prompt --
+
+	/// Latest assistant text for `get_last_assistant_text`.
+	#[must_use]
+	pub fn last_assistant_text(&self) -> Option<&str> {
+		self.last_assistant_text.as_deref()
+	}
+
+	/// Queue a follow-up message for after the current turn.
+	pub fn queue_follow_up(&mut self, input: TurnInput) -> usize {
+		self.queued.push_back(input);
+		self.queued.len()
+	}
+
+	/// Take the next queued messages according to a queue mode.
+	pub fn take_queued(&mut self, mode: QueueMode) -> Vec<TurnInput> {
+		match mode {
+			QueueMode::All => self.queued.drain(..).collect(),
+			QueueMode::OneAtATime => self.queued.pop_front().into_iter().collect(),
+		}
+	}
+
+	/// Convert request images to agent parts, rejecting malformed data and
+	/// models that cannot take image input.
+	fn image_parts(&self, images: &[RpcImage]) -> Result<Vec<ContentPart>> {
+		let mut parts: Vec<ContentPart> = Vec::new();
+		for image in images {
+			match AgentContentPart::image(&image.data, &image.mime_type) {
+				Ok(AgentContentPart::Image { data, mime_type }) => {
+					parts.push(ContentPart::image(&data, &mime_type));
+				},
+				Ok(_) => {
+					return Err(Error::new("image content is required for prompt images"));
+				},
+				Err(err) => return Err(Error::new(format!("invalid image: {err}"))),
+			}
+		}
+		if parts.is_empty() {
+			return Ok(parts);
+		}
+		let Some(raw) = self.model.as_deref() else {
+			return Err(Error::new("cannot send images without a selected model"));
+		};
+		let (base, _) = runtime::split_effort(raw);
+		let provider = self
+			.provider
+			.clone()
+			.or_else(|| self.catalog.provider_of(base).map(str::to_string))
+			.unwrap_or_default();
+		if self.catalog.supports_images(&provider, base) == Some(false) {
+			return Err(Error::new(format!(
+				"model '{provider}/{base}' does not support image input"
+			)));
+		}
+		Ok(parts)
+	}
+
+	/// Validate steering images before they reach the live turn, so the host
+	/// gets a protocol error instead of a silently dropped message.
+	pub fn validate_steering_images(
+		&self,
+		images: &[RpcImage],
+	) -> std::result::Result<(), Prerequisite> {
+		self.image_parts(images).map(|_| ()).map_err(|err| {
+			Prerequisite::new("invalid_steering_image", format!("cannot steer: {err}"))
+		})
+	}
+
+	/// Refuse a prompt whose host tools cannot mount, before the user entry is
+	/// journaled: a reserved or duplicated name fails the turn with the log
+	/// untouched, instead of leaving an unanswered prompt behind.
+	fn check_host_tool_names(&self) -> Result<()> {
+		if !self.tools_enabled {
+			return Ok(());
+		}
+		let reserved = runtime::reserved_tool_names();
+		let mut seen = std::collections::HashSet::new();
+		for tool in self.host_tools.adapters() {
+			let name = tool.name().to_string();
+			if reserved.iter().any(|known| known == &name) || !seen.insert(name.clone()) {
+				return Err(Error::new(format!("Duplicate tool name: {name}")));
+			}
+		}
+		Ok(())
+	}
+
+	/// Session usage at turn start: the goal accounting baseline and budget seed.
+	fn goal_seed(&self) -> crate::goal::TokenCounters {
+		let usage = self.store.session_usage();
+		crate::goal::TokenCounters {
+			input:       usage.input,
+			output:      usage.output,
+			cache_read:  usage.cache_read,
+			cache_write: usage.cache_write,
+		}
+	}
+
+	fn tool_selected(&self, name: &str) -> bool {
+		self.tools_enabled
+			&& self
+				.config
+				.tools
+				.as_ref()
+				.is_none_or(|allowed| allowed.iter().any(|tool| tool == name))
+	}
+
+	/// Headless registration rule: eager under `goal.enabled` unless the
+	/// selection excludes it, and always while a goal exists (#9444).
+	fn goal_tool_mounted(&self) -> bool {
+		self.config.goal.enabled()
+			&& self.tools_enabled
+			&& (self.goal.has_goal() || self.tool_selected(crate::goal_tool::GOAL_TOOL_NAME))
+	}
+
+	fn agent_dir(&self) -> PathBuf {
+		self.skill_options.agent_dir.clone().unwrap_or_else(crate::dirs::agent_dir)
+	}
+
+	/// TS `isToolAllowed` for the two auto-learn tools plus this port's
+	/// top-level-only registry gate: `manage_skill` follows `autolearn.enabled`,
+	/// `learn` additionally needs the local backend (no other backend is wired).
+	pub(crate) fn autolearn_tool_presence(&self) -> (bool, bool) {
+		if !self.tools_enabled || !self.config.autolearn.enabled() {
+			return (false, false);
+		}
+		let manage = self.tool_selected(crate::autolearn::MANAGE_SKILL_TOOL_NAME);
+		let learn = matches!(
+			self.config.memory_backend(),
+			crate::autolearn::MemoryBackend::Local
+		) && self.tool_selected(crate::autolearn::LEARN_TOOL_NAME);
+		(manage, learn)
+	}
+
+	fn autolearn_extra_tools(&self) -> Vec<crate::agent::ExtraTool> {
+		let (manage, learn) = self.autolearn_tool_presence();
+		let mut tools = Vec::new();
+		if manage && let Some(tool) = crate::autolearn::ManageSkillTool::create_if(
+			true,
+			self.skill_options.clone(),
+			self.skill_snapshot.clone(),
+		) {
+			let tool: Arc<dyn pi_agent::tool::Tool> = Arc::new(tool);
+			tools.push(crate::agent::ExtraTool::from(tool));
+		}
+		if learn && let Some(tool) = crate::autolearn::LocalLearnTool::create_if(
+			true,
+			crate::autolearn::MemoryBackend::Local,
+			self.skill_options.clone(),
+			self.skill_snapshot.clone(),
+		) {
+			let tool: Arc<dyn pi_agent::tool::Tool> = Arc::new(tool);
+			tools.push(crate::agent::ExtraTool::from(tool));
+		}
+		tools
+	}
+
+	/// TS `appendPrompt` suffixes: configured append, memory guidance, then the
+	/// auto-learn guidance for the tools actually mounted this session.
+	fn runtime_append_prompt(&self) -> Option<String> {
+		let memory = matches!(
+			self.config.memory_backend(),
+			crate::autolearn::MemoryBackend::Local
+		)
+		.then(|| {
+			crate::local_memory::build_memory_instructions(
+				&self.agent_dir(),
+				&self.cwd,
+				self.config.summary_injection_token_limit(),
+			)
+		})
+		.flatten();
+		let (manage, learn) = self.autolearn_tool_presence();
+		let autolearn = crate::autolearn::build_auto_learn_instructions(manage, learn);
+		let mut parts: Vec<String> = self.prompts.append.iter().cloned().collect();
+		parts.extend(memory);
+		parts.extend(autolearn);
+		(!parts.is_empty()).then(|| parts.join("\n\n"))
+	}
+
+	/// `/skill:<name>` expansion for the RPC and ACP prompt entry points.
+	pub(crate) fn expand_skill_command(&self, text: &str) -> Result<String> {
+		if !self.skill_options.enable_skill_commands {
+			return Ok(text.to_string());
+		}
+		Ok(crate::skills::expand_skill_invocation(&self.skill_snapshot, text)?
+			.unwrap_or_else(|| text.to_string()))
+	}
+
+	/// Isolated auto-learn capture turn: the conversation context and model are
+	/// reused, but nothing is journaled, no goal/plan context rides along, and
+	/// only the capture tools are mounted (`config.tools = []` removes every
+	/// builtin while the extra tools still mount).
+	pub(crate) fn autolearn_capture_request(&self) -> Result<RunRequest> {
+		let mut request =
+			self.request(crate::autolearn::auto_learn_nudge().to_string(), Vec::new(), false)?;
+		request.session_persisted = false;
+		request.session_file = None;
+		request.session_id = None;
+		request.child_session_root = None;
+		request.checkpoint_controller = None;
+		request.turn_ack = None;
+		request.cancellation_token = None;
+		request.goal = None;
+		request.goal_context = None;
+		request.plan_context = None;
+		request.plan_mode = crate::agent::PlanModeHooks::default();
+		// No advisor card may reach the primary session's sink from a capture;
+		// the runtime gate also refuses an advisor manager.
+		request.advisor_card_sink = None;
+		request.tool_ceiling = Some(crate::agent::ToolCeiling {
+			exclude_mcp:             true,
+			exclude_extension_tools: true,
+		});
+		request.todo_phases = Vec::new();
+		request.continuation = false;
+		request.acp_bridge = None;
+		request.extra_mcp_servers = Vec::new();
+		request.config.tools = Some(Vec::new());
+		request.extra_tools = self.autolearn_extra_tools();
+		Ok(request)
+	}
+
+	/// Hidden per-turn goal context (TS `goal-mode-context`).
+	fn goal_mode_context(&self) -> Option<String> {
+		let active = self.goal.build_active_prompt()?;
+		let todo = crate::goal::build_goal_todo_context(
+			&self.todo_phases,
+			self.tool_selected("todo"),
+		);
+		Some(crate::goal::render_goal_mode_context(&active, todo.as_deref()))
+	}
+
+	/// Drain queued goal writes through this session's single writer and return
+	/// the live `goal_updated` frames in order.
+	///
+	/// Successful `background-usage` appends move those keys into the
+	/// turn-scoped durable seed; other in-flight keys stay until they append.
+	pub fn goal_frames(&mut self) -> Vec<Value> {
+		let mut retired = Vec::new();
+		for intent in self.goal.take_pending() {
+			let result = match intent {
+				crate::goal::GoalPersist::ModeChange { mode, data } => {
+					self.store.append_mode_change(mode, data)
+				},
+				crate::goal::GoalPersist::Completed(data) => {
+					self.store.append_goal_completed(data)
+				},
+				crate::goal::GoalPersist::BackgroundUsage { id, result_key, usage } => {
+					if self.store.enabled() {
+						let mut data = json!({ "id": id, "usage": usage });
+						let retire_key = result_key
+							.as_deref()
+							.filter(|key| !key.is_empty())
+							.map(str::to_string)
+							.or_else(|| (!id.is_empty()).then_some(id.clone()));
+						if let Some(result_key) = result_key {
+							data["resultKey"] = json!(result_key);
+						}
+						match self.store.append_custom(
+							crate::goal::BACKGROUND_USAGE_CUSTOM_TYPE,
+							Some(data),
+						) {
+							Ok(entry_id) => {
+								if let Some(key) = retire_key {
+									retired.push(key);
+								}
+								Ok(entry_id)
+							},
+							Err(err) => Err(err),
+						}
+					} else {
+						Ok(String::new())
+					}
+				},
+			};
+			if let Err(err) = result {
+				eprintln!("warning: {err}");
+			}
+		}
+		if !retired.is_empty() {
+			self.goal.retire_durable_background_keys(retired);
+		}
+		self
+			.goal
+			.take_events()
+			.iter()
+			.map(crate::goal::goal_updated_frame)
+			.collect()
+	}
+
+	/// Complete-exit once the turn drained: clear the mode and write `none` plus
+	/// the terminal metric exactly once.
+	pub fn finish_goal_turn(&mut self) -> Vec<Value> {
+		let mut frames = self.goal_frames();
+		if let Some(goal) = self.goal.take_exiting() {
+			if let Err(err) = self.store.append_mode_change(crate::goal::MODE_NONE, None) {
+				eprintln!("warning: {err}");
+			}
+			if let Err(err) =
+				self.store.append_goal_completed(crate::goal::encode_completed_data(&goal))
+			{
+				eprintln!("warning: {err}");
+			}
+			frames.extend(self.goal_frames());
+		}
+		frames
+	}
+
+	/// TS `#reconcileModeFromSession` over the active branch.
+	pub fn reconcile_goal_mode(&mut self) -> Vec<Value> {
+		match crate::goal::plan_restore(&self.store, self.config.goal.enabled()) {
+			// No goal on the active branch: a previous session's live goal must
+			// not leak into a new/switched/branched log (#9444).
+			crate::goal::RestorePlan::Idle => {
+				self.goal.set_restored_state(None);
+				self.goal.clear_accounting();
+			},
+			crate::goal::RestorePlan::ClearGoalMode => {
+				self.goal.set_restored_state(None);
+				self.goal.clear_accounting();
+				if let Err(err) = self.store.append_mode_change(crate::goal::MODE_NONE, None) {
+					eprintln!("warning: {err}");
+				}
+			},
+			crate::goal::RestorePlan::Restore { enabled, goal } => {
+				self.goal.set_restored_state(Some(crate::goal::GoalModeState {
+					enabled,
+					mode: crate::goal::GoalMode::Active,
+					goal,
+				}));
+				// Replayed without an explicit preserve: an active goal pauses.
+				let _ = self.goal.on_thread_resumed(false);
+			},
+		}
+		self.goal_frames()
+	}
+
+	/// Publish plan mode and the planning tool selection before the first
+	/// prompt. The guard is rolled back if the tool-set or artifact root is
+	/// unusable, so the session never advertises an unapprovable plan.
+	fn arm_plan_yolo(&mut self) -> Result<()> {
+		let Some(shared) = self.plan_yolo.as_ref().cloned() else {
+			return Ok(());
+		};
+		let Some(arming) = shared.arm() else {
+			return Ok(());
+		};
+		let previous_plan_mode = self.plan_mode.clone();
+		let Some(artifacts) = self.plan_artifacts() else {
+			shared.rollback_arm(arming);
+			shared.abandon();
+			self.plan_mode = previous_plan_mode.clone();
+			return Err(Error::new(
+				"plan-yolo requires a persisted session for plan artifacts",
+			));
+		};
+		let tools = match crate::plan_yolo::plan_tools(
+			self.tools_enabled,
+			self.config.tools.as_deref(),
+		) {
+			Ok(tools) => tools,
+			Err(error) => {
+				shared.rollback_arm(arming);
+				shared.abandon();
+				self.plan_mode = previous_plan_mode;
+				return Err(Error::new(error));
+			},
+		};
+		self.config.tools = tools.selected().map(|selected| selected.to_vec());
+		self.plan_yolo_tools = Some(tools);
+		self.plan_mode = crate::plan_yolo::plan_hooks(&shared, Some(artifacts));
+		Ok(())
+	}
+
+	fn plan_context(&self) -> Option<String> {
+		let shared = self.plan_yolo.as_ref()?;
+		// Only the armed plan-yolo turn owns the typed request context. After
+		// the cutover the ACP driver injects the ordinary plan prefix itself;
+		// returning it here too would duplicate the plan block.
+		if !shared.is_armed() {
+			return None;
+		}
+		let gate = shared.gate();
+		let gate = gate.lock().unwrap_or_else(|poison| poison.into_inner());
+		gate.prompt_prefix(
+			self.tools_enabled && self.tool_selected("ask"),
+			self.tools_enabled && self.tool_selected("scout"),
+			self.tools_enabled && self.tool_selected("task"),
+		)
+	}
+
+	/// Build the provider request for a prompt, recording the user entry.
+	pub fn prepare_turn(
+		&mut self,
+		input: &TurnInput,
+	) -> Result<(RunRequest, PreparedTurn)> {
+		if self.is_streaming {
+			return Err(Error::new("a turn is already streaming"));
+		}
+		self.plan_yolo_commit_error = None;
+		if !input.continuation
+			&& let Some(shared) = self.plan_yolo.as_ref()
+		{
+			// A new user decision supersedes an approval left behind by an
+			// aborted turn; a fresh proposal is still required.
+			shared.cancel_pending();
+		}
+		// A cut queued by the previous run must land before this prompt joins
+		// the mirror, or the abandoned tail would sit before the new turn.
+		self.flush_pending_wire();
+		if self.store.is_v1() {
+			return Err(Error::new(
+				"cannot append to legacy v1 session log: read-only; use import_legacy_v1",
+			));
+		}
+		self.arm_plan_yolo()?;
+
+		if input.continuation {
+			// Detached plan continuation: no user entry, no goal budget window and
+			// no new persisted message. `input.text` is the reminder text; the
+			// provider history gets it appended exactly once.
+			let mut request = self.request(String::new(), Vec::new(), true)?;
+			let reminder = input.text.as_str();
+			if !reminder.trim().is_empty() {
+				let mut messages = match request.history_messages.take() {
+					Some(messages) => messages,
+					None => crate::runtime::history_messages(&request.history)
+						.map_err(|err| Error::new(err.to_string()))?,
+				};
+				// Identity is the exact persisted bytes (trailing newline and all);
+				// trimming here would both miss the stored reminder and risk
+				// collapsing distinct messages.
+				let already = messages.iter().any(|message| {
+					message.role == pi_agent::Role::Developer && message.content == reminder
+				});
+				if !already {
+					messages.push(pi_agent::Message::developer(reminder.to_string()));
+				}
+				request.history_messages = Some(messages);
+			}
+			let token = CancellationToken::new();
+			request.cancellation_token = Some(token.clone());
+			let turn_ack = TurnAck::new();
+			request.turn_ack = Some(Arc::clone(&turn_ack));
+			let started = Instant::now();
+			request.turn_started = started;
+			let prepared = PreparedTurn {
+				token,
+				turn_ack,
+				builder: TurnBuilder::new(String::new()),
+				parent_id: self.store.leaf_id().map(str::to_string),
+				in_memory_before: self.in_memory_messages.as_ref().map_or(0, Vec::len),
+				started,
+				model_fallback: self.model.clone(),
+				provider_fallback: self.provider.clone(),
+				tool_names: std::collections::HashMap::new(),
+				tool_images: std::collections::HashMap::new(),
+				wire_user_message: None,
+				aborted: false,
+			};
+			self.is_streaming = true;
+			return Ok((request, prepared));
+		}
+		let parts = self.image_parts(&input.images)?;
+		self.check_host_tool_names()?;
+		let started = SystemTime::now();
+		let iso = output::iso8601(started);
+		let started_ms = started
+			.duration_since(SystemTime::UNIX_EPOCH)
+			.unwrap_or_default()
+			.as_millis() as u64;
+
+		let (turn_parts, user_content) = if parts.is_empty() {
+			(Vec::new(), MessageContent::Text(input.text.clone()))
+		} else {
+			let mut assembled = Vec::new();
+			if !input.text.is_empty() {
+				assembled.push(ContentPart::text(&input.text));
+			}
+			assembled.extend(parts.iter().cloned());
+			(parts.clone(), MessageContent::Parts(assembled))
+		};
+
+		let user_id = format!("msg-{}", output::session_id());
+		let parent_id = self.store.leaf_id().map(str::to_string);
+		let message = SessionMessage::user(user_content, started_ms);
+		let entry = MessageEntry::new(user_id.clone(), parent_id, &iso, message);
+
+		let in_memory_before = self.in_memory_messages.as_ref().map_or(0, Vec::len);
+		// TS `#createMagicKeywordNotices`: the user prompt opens the `+Nk` budget
+		// window and the accounting baseline before the request is built.
+		let seed = self.goal_seed();
+		self.goal.begin_turn(Some(&input.text), seed);
+		self.goal.seed_background_dedup(crate::session::durable_background_keys(&self.store));
+		// Build the request BEFORE the user entry is appended: with a durable
+		// `branch_summary` the context is rebuilt from the store, so an entry
+		// written first would come back as history and the runner would append
+		// the same prompt (text and images) a second time.
+		let mut request = self.request(input.text.clone(), turn_parts, input.continuation)?;
+		if self.store.enabled() && self.store.durable_boundary().is_none() {
+			if let Err(err) = entry.validate() {
+				eprintln!("warning: {err}");
+			} else if let Err(err) = self.store.append_message(&entry) {
+				eprintln!("warning: {err}");
+			}
+		}
+		if let Ok(value) = serde_json::to_value(&entry.message) {
+			self.messages.push(value);
+		}
+		if !self.store.enabled() {
+			let user_message = runtime::user_message_from_parts(&input.text, &request.parts)
+				.map_err(|err| Error::new(err.to_string()))?;
+			self.in_memory_messages.get_or_insert_with(Vec::new).push(user_message);
+		}
+		// A fresh token isolates this turn; run-wide abort state belongs to the
+		// RPC command loop that owns the queue.
+		let token = CancellationToken::new();
+		request.cancellation_token = Some(token.clone());
+		let turn_ack = TurnAck::new();
+		request.turn_ack = Some(Arc::clone(&turn_ack));
+
+		let started = Instant::now();
+		request.turn_started = started;
+		let prepared = PreparedTurn {
+			token,
+			turn_ack,
+			builder: if request.parts.is_empty() {
+				TurnBuilder::new(input.text.clone())
+			} else {
+				TurnBuilder::new_with_parts(input.text.clone(), request.parts.clone())
+			},
+			parent_id: Some(user_id),
+			in_memory_before,
+			started,
+			model_fallback: self.model.clone(),
+			provider_fallback: self.provider.clone(),
+			tool_names: std::collections::HashMap::new(),
+			tool_images: std::collections::HashMap::new(),
+			wire_user_message: self.messages.last().cloned(),
+			aborted: false,
+		};
+		self.is_streaming = true;
+		Ok((request, prepared))
+	}
+
+	pub(crate) fn request(
+		&self,
+		prompt: String,
+		parts: Vec<ContentPart>,
+		continuation: bool,
+	) -> Result<RunRequest> {
+		let history_messages = if !self.store.enabled() {
+			Some(self.in_memory_messages.clone().unwrap_or_default())
+		} else if let Some(messages) = &self.history_messages {
+			Some(messages.clone())
+		} else if self.store.is_v1() {
+			None
+		} else {
+			// Always use the entry replay projection so terminal error/aborted
+			// turns are excluded exactly as they are from the durable seed.
+			if let Some(warning) = self.store.branch_chain_warning() {
+				eprintln!("warning: {warning}");
+			}
+			match CheckpointHost::context_messages(&self.store) {
+				Ok(messages) => Some(messages),
+				Err(err) => {
+					eprintln!("warning: cannot rebuild branch context: {err}");
+					None
+				},
+			}
+		};
+		let checkpoint_controller = self
+			.config
+			.checkpoint
+			.enabled()
+			.then(|| Arc::clone(self.checkpoint_host.controller()));
+		let session_persisted = self.store.enabled() && !self.store.is_v1();
+		let todo_phases = if session_persisted {
+			self.store.branch_todo_phases()
+		} else {
+			runtime::latest_todo_phases_from_turns(&self.history)
+		};
+		let mut extra_tools: Vec<crate::agent::ExtraTool> = Vec::new();
+		if self.goal_tool_mounted() {
+			let tool: Arc<dyn pi_agent::tool::Tool> = Arc::new(
+				crate::goal_tool::GoalTool::new(Arc::clone(&self.goal))
+					.with_plan_mode(self.plan_mode_probe.clone()),
+			);
+			extra_tools.push(crate::agent::ExtraTool::from(tool));
+		}
+		extra_tools.extend(self.autolearn_extra_tools());
+		// The live host tool set, mounted by the runner after every
+		// builtin/ask/checkpoint/eval tool; empty when the host registered none.
+		for tool in self.host_tools.adapters() {
+			extra_tools.push(crate::agent::ExtraTool::from(tool));
+		}
+		let goal_context = self.goal_mode_context();
+		// Advisor cards cross the transport as one sink call per card; the turn
+		// loop drains them, persists one `custom_message`, then emits frames.
+		let advisor_cards = Arc::new(std::sync::Mutex::new(self.advisor_cards_tx.clone()));
+		let advisor_wake = self.advisor_wake.clone();
+		let advisor_card_sink: crate::advisor_runtime::CardSink =
+			Arc::new(move |content: &str, details: &serde_json::Value| {
+				if let Ok(tx) = advisor_cards.lock() {
+					let _ = tx.send((content.to_string(), details.clone()));
+				}
+				if let Some(wake) = &advisor_wake {
+					let _ = wake.send(());
+				}
+			});
+		Ok(RunRequest {
+			prompt,
+			parts,
+			cwd: self.cwd.clone(),
+			output_mode: OutputMode::Json,
+			model: self.model_selector(),
+			provider: self.provider.clone(),
+			api_key: self.api_key.clone(),
+			provider_session_id: self.provider_session_id.clone(),
+			prompt_cache_key: self.prompt_cache_key.clone(),
+			system_prompt: self.prompts.system.clone(),
+			append_system_prompt: self.runtime_append_prompt(),
+			context_files: self.prompts.files.clone(),
+			skills: self.skill_snapshot.prompt_skills(),
+			history: self.history.clone(),
+			history_messages,
+			checkpoint_controller,
+			turn_ack: None,
+			durable: self.store.durable_boundary(),
+			todo_phases,
+			session_persisted,
+			session_file: session_persisted
+				.then(|| self.store.file().map(Path::to_path_buf))
+				.flatten(),
+			session_id: session_persisted.then(|| self.store.id().to_string()),
+			config: self.config.clone(),
+			catalog: Arc::clone(&self.catalog),
+			approvals: self.approvals.clone(),
+			max_time: self.max_time,
+			turn_started: std::time::Instant::now(),
+			max_turns: self.max_turns,
+			tools_enabled: self.tools_enabled,
+			cancellation_token: None,
+			// Goal tool first, then the live host tool set; both mount after every
+			// builtin/ask/checkpoint/eval tool and a duplicate name is a hard error.
+			extra_tools,
+			acp_bridge: self.acp_bridge.clone(),
+			extra_mcp_servers: self.mcp_servers.clone(),
+			internal_urls: Some(Arc::clone(&self.internal_urls)),
+			url_scope: Some(self.url_scope()),
+			subagent_observer: Some(crate::agent::ObserverHandle(Arc::clone(&self.observer))),
+			credential_resolver: Some(crate::agent::ResolverHandle(Arc::clone(&self.resolver))),
+			child_session_root: self.child_session_root(),
+			goal: Some(Arc::clone(&self.goal)),
+			goal_context,
+			plan_mode: self.plan_mode.clone(),
+			tool_ceiling: None,
+			skill_autoload: crate::agent::AutoloadHandle(Some(Arc::new(
+				crate::skills::SnapshotAutoloadResolver::new(self.skill_snapshot.clone()),
+			))),
+			continuation,
+			plan_context: self.plan_context(),
+			advisor_card_sink: Some(crate::agent::AdvisorCardHandle(advisor_card_sink)),
+			service_tier_by_family: self.service_tier_by_family(),
+			security_host: None,
+			security_worker: false,
+			parent_workspace_lease: None,
+		})
+	}
+
+	/// Persist one host-injected developer message (TS plan reminder) exactly
+	/// once, before its continuation is scheduled.
+	pub fn append_developer_message(&mut self, text: &str) -> Result<(), Error> {
+		let started = SystemTime::now();
+		let iso = output::iso8601(started);
+		let started_ms =
+			started.duration_since(SystemTime::UNIX_EPOCH).unwrap_or_default().as_millis() as u64;
+		let mut message = SessionMessage::user(MessageContent::Text(text.to_string()), started_ms);
+		message.role = "developer".to_string();
+		let id = format!("msg-{}", output::session_id());
+		let parent_id = self.store.leaf_id().map(str::to_string);
+		let entry = MessageEntry::new(id, parent_id, &iso, message);
+		if self.store.enabled() {
+			entry.validate().map_err(Error::new)?;
+			self
+				.store
+				.append_message(&entry)
+				.map_err(|err| Error::new(err.to_string()))?;
+		}
+		if let Ok(value) = serde_json::to_value(&entry.message) {
+			self.messages.push(value);
+		}
+		if !self.store.enabled() {
+			self
+				.in_memory_messages
+				.get_or_insert_with(Vec::new)
+				.push(pi_agent::Message::developer(text));
+		}
+		Ok(())
+	}
+
+	/// Immutable URL scope for this session's turns: the session file plus its
+	/// session-scoped artifacts directory as the `local://` root.
+	fn url_scope(&self) -> Arc<UrlScope> {
+		let session_file = self
+			.store
+			.file()
+			.filter(|_| self.store.enabled())
+			.map(Path::to_path_buf);
+		let local_root = session_file
+			.as_deref()
+			.and_then(session::artifacts_directory_for);
+		Arc::new(UrlScope {
+			session_file,
+			local_roots: local_root
+				.map(|dir| std::collections::BTreeMap::from([("local".to_string(), dir)]))
+				.unwrap_or_default(),
+		})
+	}
+
+	/// Session `local://` root (the artifacts directory), when the log is
+	/// persisted. Read by hosts that need the artifact path before a turn takes
+	/// the session lock.
+	#[must_use]
+	pub fn local_root(&self) -> Option<PathBuf> {
+		self.url_scope().local_roots.get("local").cloned()
+	}
+
+	/// Directory child transcripts live in. Only a persisted session has a
+	/// stable one; in-memory sessions keep `get_subagent_messages` unavailable
+	/// instead of inventing a temp path.
+	fn child_session_root(&self) -> Option<PathBuf> {
+		self
+			.store
+			.file()
+			.filter(|_| self.store.enabled())
+			.and_then(session::artifacts_directory_for)
+			.map(|dir| dir.join("subagents"))
+	}
+
+	/// Apply a rewind cut queued at turn end, once that turn's `turn_end` frame
+	/// has gone out.
+	fn flush_pending_wire(&mut self) {
+		if let Some(messages) = self.pending_wire.take() {
+			self.messages = messages;
+		}
+	}
+
+	/// Persist and account for one finished turn.
+	pub fn finish_turn(&mut self, prepared: &mut PreparedTurn, outcome: &TurnOutcome) {
+		self.is_streaming = false;
+		if outcome.error.is_some()
+			|| outcome.aborted
+			|| self.plan_yolo_commit_error.is_some()
+		{
+			if let Some(shared) = self.plan_yolo.as_ref() {
+				shared.cancel_pending();
+			}
+		}
+		let mut record = std::mem::take(&mut prepared.builder).finish();
+		if outcome.error.is_some() {
+			let canon = session::canonical_stop_reason(&record.stop_reason);
+			if record.stop_reason.is_empty() || canon == "toolUse" {
+				record.stop_reason = "aborted".to_string();
+			}
+			self.checkpoint_host.abandon_in_memory_rewind();
+			if !self.store.enabled() {
+				// The pending report was rolled back with the turn; a queued cut
+				// mirror must not outlive it.
+				self.pending_wire = None;
+			}
+			if let Some(messages) = self.in_memory_messages.as_mut() {
+				messages.truncate(prepared.in_memory_before);
+			}
+		}
+		if !record.assistant.is_empty() {
+			self.last_assistant_text = Some(record.assistant.clone());
+		}
+		// Token rate needs provider-reported usage, which this build's provider
+		// stream does not surface; the state field stays absent rather than zero.
+		self.tokens_per_second = None;
+		let _ = prepared.started.elapsed();
+		// A deferred rewind cut landed after its own `turn_end` frame; the
+		// mirror must follow the retained branch before `agent_end`.
+		self.flush_pending_wire();
+		let rewound = self.checkpoint_host.finish_in_memory_rewind();
+		if self.store.enabled() {
+			// The live path already journaled the prompt (prepare_turn) and every
+			// assistant/tool tail entry (persist_turn_end, record_user_steer), so
+			// appending the turn record here would write the whole turn twice.
+			// Rebuild the view from the log instead.
+			self.history_messages = None;
+			self.refresh_history_from_store();
+		} else if rewound {
+			// Same as headless: the rewind turn is abandoned, so its record must
+			// not become the session's last turn (todo fallback). The flushed
+			// wire mirror already follows the cut, so its last answer is the
+			// post-rewind one — or the retained checkpoint answer when the run
+			// ended on the rewound turn itself. `history` never received this
+			// run's record, so it cannot answer that.
+			if let Some(text) = wire_last_assistant_text(&self.messages) {
+				self.last_assistant_text = Some(text);
+			}
+		} else {
+			self.history.push(record);
+		}
+	}
+
+	/// Persist a steering message the loop accepted, at its real position, and
+	/// mirror it on the wire.
+	///
+	/// Called from the event pump after acceptance, never at queue time: a
+	/// message that was queued but not injected must not appear in the log.
+	fn record_user_steer(&mut self, prepared: &mut PreparedTurn, parts: &[AgentContentPart]) {
+		let mut text = Vec::new();
+		let mut images: Vec<ContentPart> = Vec::new();
+		for part in parts {
+			match part {
+				AgentContentPart::Text { text: value } => text.push(value.clone()),
+				AgentContentPart::Image { data, mime_type } => {
+					images.push(ContentPart::image(data, mime_type));
+				},
+				// A user message never carries provider reasoning or tool calls.
+				AgentContentPart::Thinking { .. }
+				| AgentContentPart::RedactedThinking { .. }
+				| AgentContentPart::ToolCall { .. } => {},
+			}
+		}
+		let joined = text.join("\n");
+		let content = if images.is_empty() {
+			MessageContent::Text(joined.clone())
+		} else {
+			let mut assembled = Vec::new();
+			if !joined.is_empty() {
+				assembled.push(ContentPart::text(&joined));
+			}
+			assembled.extend(images.iter().cloned());
+			MessageContent::Parts(assembled)
+		};
+		let now = SystemTime::now();
+		let timestamp_ms = now
+			.duration_since(SystemTime::UNIX_EPOCH)
+			.unwrap_or_default()
+			.as_millis() as u64;
+		// Parent is the current physical leaf, so the injected user lands at the
+		// position the loop accepted it instead of being replayed at the tail of
+		// the turn record.
+		let entry = MessageEntry::new(
+			format!("msg-{}", output::session_id()),
+			self.store.leaf_id().map(str::to_string),
+			output::iso8601(now),
+			SessionMessage::user(content, timestamp_ms),
+		);
+		let message = runtime::user_message_from_parts(&joined, &images).ok();
+		if self.store.enabled() && self.store.durable_boundary().is_none() {
+			if let Err(err) = entry.validate() {
+				eprintln!("warning: {err}");
+			} else if let Err(err) = self.store.append_message(&entry) {
+				eprintln!("warning: {err}");
+			} else {
+				// The accepted entry becomes the parent for everything this turn
+				// appends next (assistant text, tool results), so the active branch
+				// includes the steering message instead of orphaning it.
+				prepared.parent_id = Some(entry.id.clone());
+				// The next request rebuilds its context from the store, so follow
+				// it now: otherwise the injected message would be missing from
+				// the very next prompt even though the log holds it.
+				if let (Some(messages), Some(message)) =
+					(self.history_messages.as_mut(), message.as_ref())
+				{
+					messages.push(message.clone());
+				}
+				self.refresh_history_from_store();
+			}
+		} else if let Some(message) = message {
+			self.in_memory_messages.get_or_insert_with(Vec::new).push(message);
+		}
+		if let Ok(value) = serde_json::to_value(&entry.message) {
+			self.messages.push(value);
+		}
+	}
+
+	/// Re-derive the turn view from the log after an entry landed outside a
+	/// turn record (steering); the active branch decides which entries count.
+	fn refresh_history_from_store(&mut self) {
+		if self.store.durable_boundary().is_some()
+			&& let Err(err) = self.store.reload_from_durable()
+		{
+			eprintln!("warning: cannot reload durable session: {err}");
+		}
+		let rebuilt = if self.store.has_branch_context() {
+			self.store.branch_history()
+		} else {
+			Ok(self.store.history().to_vec())
+		};
+		match rebuilt {
+			Ok(history) => self.history = history,
+			Err(err) => eprintln!("warning: cannot rebuild session history: {err}"),
+		}
+		// Auto-title writes the slot after the first prompt; the cached name
+		// from `open` would otherwise leave turn-end `session_info_update` stale.
+		self.session_name = self
+			.store
+			.title_slot()
+			.map(|slot| slot.title.clone())
+			.or_else(|| self.store.header().and_then(|header| header.title.clone()));
+	}
+
+	/// Apply one streamed turn event to session state. Returns `true` when the
+	/// caller should keep streaming.
+	pub fn observe_event(&mut self, prepared: &mut PreparedTurn, event: &AgentEvent) {
+		match event {
+			AgentEvent::ToolStart { id, tool, .. } => {
+				prepared.tool_names.insert(id.clone(), tool.clone());
+			},
+			AgentEvent::ToolEnd { id, images, .. } => {
+				if !images.is_empty() {
+					let converted: Vec<ContentPart> = images
+						.iter()
+						.filter_map(|part| match part {
+							AgentContentPart::Image { data, mime_type } => {
+								Some(ContentPart::image(data, mime_type))
+							},
+							AgentContentPart::Text { .. }
+							| AgentContentPart::Thinking { .. }
+							| AgentContentPart::RedactedThinking { .. }
+							| AgentContentPart::ToolCall { .. } => None,
+						})
+						.collect();
+					prepared.tool_images.insert(id.clone(), converted);
+				}
+			},
+			AgentEvent::UserSteer { parts } => self.record_user_steer(prepared, parts),
+			AgentEvent::TurnEnd { message, tool_results, stop_reason, api, provider, model } => {
+				self.persist_turn_end(
+					prepared,
+					message,
+					tool_results,
+					stop_reason,
+					api.as_deref(),
+					provider.as_deref(),
+					model.as_deref(),
+				);
+			},
+			AgentEvent::AgentEnd { .. } => {
+				// The no-session mirror is maintained per turn in
+				// `persist_turn_end` (headless parity). `AgentEnd.messages` is
+				// only this run's delta and still holds turns the loop rewound
+				// away, so replacing the mirror from it would resurrect the
+				// abandoned context for the next prompt.
+				self.flush_pending_wire();
+			},
+			_ => {},
+		}
+	}
+
+	#[allow(clippy::too_many_arguments)]
+	fn persist_turn_end(
+		&mut self,
+		prepared: &mut PreparedTurn,
+		message: &Message,
+		tool_results: &[pi_agent::ToolResult],
+		stop_reason: &str,
+		api: Option<&str>,
+		provider: Option<&str>,
+		model: Option<&str>,
+	) {
+		let now = SystemTime::now();
+		let iso = output::iso8601(now);
+		let now_ms = now
+			.duration_since(SystemTime::UNIX_EPOCH)
+			.unwrap_or_default()
+			.as_millis() as u64;
+
+		let mut parts = Vec::new();
+		// Streamed block order, not a regrouped one: the persisted content array
+		// is what the host saw in `contentIndex` order, tool calls included.
+		let mut has_tool_part = false;
+		for part in &message.parts {
+			// Assistant content never persisted images before; keep that shape.
+			if matches!(part, pi_agent::ContentPart::Image { .. }) {
+				continue;
+			}
+			if let Some(part) = ContentPart::from_agent_part(part) {
+				has_tool_part |= part.kind == "toolCall";
+				parts.push(part);
+			}
+		}
+		if parts.is_empty() && !message.content.is_empty() {
+			parts.push(ContentPart::text(message.content.clone()));
+		}
+		// Only legacy/completion messages lack ToolCall parts; append their
+		// execution projection at the end, never alongside ordered blocks.
+		if !has_tool_part {
+			for call in &message.tool_calls {
+				parts.push(ContentPart::tool_call(
+					call.id.clone(),
+					call.name.clone(),
+					call.arguments.clone(),
+				));
+			}
+		}
+		let content = if parts.is_empty() {
+			MessageContent::Text(String::new())
+		} else {
+			MessageContent::Parts(parts)
+		};
+
+		// The assembled message knows the route that actually served it; the
+		// event/config values are only a fallback for adapters that omit it.
+		let asst_api = message.api.clone().or_else(|| {
+			api.map(str::to_string).or_else(|| {
+				provider
+					.or(prepared.provider_fallback.as_deref())
+					.and_then(|p| self.config.providers.get(p).and_then(|c| c.api.clone()))
+			})
+		})
+		.unwrap_or_default();
+		let asst_provider = message
+			.provider
+			.clone()
+			.or_else(|| provider.map(str::to_string))
+			.or_else(|| prepared.provider_fallback.clone())
+			.unwrap_or_default();
+		let asst_model = message
+			.model
+			.clone()
+			.or_else(|| model.map(str::to_string))
+			.or_else(|| prepared.model_fallback.clone())
+			.unwrap_or_default();
+
+		// The message's own terminal reason is authoritative; the event string
+		// only covers adapters that do not report one.
+		let canon_stop = message
+			.stop_reason
+			.map(pi_agent::StopReason::as_str)
+			.unwrap_or_else(|| session::canonical_stop_reason(stop_reason));
+		// One persisted usage per assistant message: `TurnEnd` repeats the same
+		// message snapshot as `MessageEnd`, so the usage is read here only and
+		// never added on the event stream.
+		let mut asst_msg = SessionMessage::assistant(
+			content,
+			asst_api,
+			asst_provider,
+			asst_model,
+			session::reported_usage(message),
+			canon_stop,
+			now_ms,
+		);
+		asst_msg.error_message = message.error_message.clone().or_else(|| {
+			(canon_stop == "aborted").then(|| "Interrupted by user".to_string())
+		});
+		asst_msg.attribution = message.attribution.map(|value| value.as_str().to_string());
+		asst_msg.disabled_features = message.disabled_features.clone();
+		let mut priority_notice: Option<String> = None;
+		let mut priority_downgraded = false;
+		if message
+			.disabled_features
+			.as_deref()
+			.is_some_and(|features| features.iter().any(|feature| feature == "priority"))
+			&& self.service_tiers.get("anthropic").map(String::as_str) == Some("priority")
+		{
+			// TS `agent-session.ts:2880-2889`: the server rejected priority, so
+			// the family selection drops, the journal records the new state and
+			// the user is told once.
+			self.service_tiers.remove("anthropic");
+			priority_downgraded = true;
+			priority_notice = Some(
+				"Priority/fast mode rejected for this model; retried without it. Fast mode is now off."
+					.to_string(),
+			);
+		}
+		let asst_id = format!("msg-{}", output::session_id());
+		let asst_entry = MessageEntry::new(
+			asst_id.clone(),
+			prepared.parent_id.take(),
+			&iso,
+			asst_msg,
+		);
+		let mut entries = vec![asst_entry];
+		let mut previous = asst_id;
+
+		for result in tool_results {
+			let id = format!("msg-{}", output::session_id());
+			let name = prepared
+				.tool_names
+				.get(&result.tool_call_id)
+				.cloned()
+				.unwrap_or_default();
+			let images = prepared
+				.tool_images
+				.get(&result.tool_call_id)
+				.cloned()
+				.unwrap_or_default();
+			let tool_content = if images.is_empty() {
+				MessageContent::Text(result.content.clone())
+			} else {
+				// Same parts the provider request carries (validated once in
+				// pi-agent from `details.images`), so the journal replays them.
+				let mut assembled = Vec::new();
+				if !result.content.is_empty() {
+					assembled.push(ContentPart::text(&result.content));
+				}
+				assembled.extend(images);
+				MessageContent::Parts(assembled)
+			};
+			let mut tool_msg = SessionMessage::tool_result(
+				result.tool_call_id.clone(),
+				name,
+				tool_content,
+				result.is_error,
+				now_ms,
+			);
+			if let Some(details) = &result.details {
+				tool_msg.extra.insert("details".to_string(), details.clone());
+			}
+			entries.push(MessageEntry::new(id.clone(), Some(previous.clone()), &iso, tool_msg));
+			previous = id;
+		}
+
+		let mut valid = Vec::new();
+		for entry in entries {
+			match entry.validate() {
+				Ok(()) => valid.push(entry),
+				Err(err) => eprintln!("warning: {err}"),
+			}
+		}
+		let pending = prepared.turn_ack.take();
+		let turn_start = pending.as_ref().map_or(0, |(request, _)| request.turn_start);
+		// The loop blocks on this reply: a rewrite decided after persistence must
+		// travel in it, never be dropped in favour of a default ack.
+		let mut decision = pi_agent::TurnAckDecision::default();
+		let mut rewound = false;
+		let mut rewind_cut: Option<pi_agent::InMemoryRewind> = None;
+		if self.store.enabled() {
+			let durable_live = self.store.durable_boundary().is_some();
+			let captured = if durable_live {
+				// The loop boundary already wrote the assistant turn before the
+				// tool effects and each tool result with its outcome. Reload the
+				// durable view instead of appending a second journal row.
+				if let Err(err) = self.store.reload_from_durable() {
+					eprintln!("warning: cannot reload durable session: {err}");
+				}
+				if priority_downgraded
+					&& let Err(err) =
+						self.store.append_service_tier_change(&self.service_tiers)
+				{
+					eprintln!("warning: cannot record service tier change: {err}");
+				}
+				let persisted = crate::session::select_current_turn_persisted_tools(
+					self.store.messages(),
+					tool_results,
+				);
+				let captured =
+					self.checkpoint_host.note_persisted_tool_results(&self.store, &persisted);
+				if let Err(err) = self.checkpoint_host.persist_active_reminder(&mut self.store) {
+					eprintln!("warning: {err}");
+				}
+				captured
+			} else if valid.is_empty() {
+				false
+			} else {
+				if let Err(err) = self.store.append_messages(&valid) {
+					eprintln!("warning: {err}");
+				}
+				// The downgrade entry must be the branch leaf: append it after
+				// the persisted turn, never as a sibling of the assistant.
+				if priority_downgraded
+					&& let Err(err) =
+						self.store.append_service_tier_change(&self.service_tiers)
+				{
+					eprintln!("warning: cannot record service tier change: {err}");
+				}
+				let captured =
+					self.checkpoint_host.note_persisted_tool_results(&self.store, &valid);
+				if let Err(err) = self.checkpoint_host.persist_active_reminder(&mut self.store) {
+					eprintln!("warning: {err}");
+				}
+				captured
+			};
+			if captured {
+				decision.warning = self.checkpoint_host.active_notice().map(str::to_string);
+			}
+			// Same turn-end cut as the headless loop: the persisted branch moves,
+			// abandoned entries stay on disk, and the next provider request gets
+			// the rebuilt conversation instead of the exploratory tail.
+			match self.checkpoint_host.apply_pending_rewind(&mut self.store) {
+				Ok(Some(applied)) => {
+					// The checkpoint is no longer active; its notice would
+					// contradict the retained report.
+					decision.warning = None;
+					match CheckpointHost::context_messages(&self.store) {
+						Ok(messages) => {
+							decision.rewrite = Some(pi_agent::TurnRewrite::Replace(messages));
+						},
+						Err(err) => {
+							eprintln!("warning: {err}; falling back to branch history");
+							if let Ok(messages) = runtime::history_messages(&applied.history) {
+								decision.rewrite =
+									Some(pi_agent::TurnRewrite::Replace(messages));
+							}
+						},
+					}
+					self.history = applied.history;
+					self.history_messages = None;
+					self.todo_phases = self.store.branch_todo_phases();
+					self.last_assistant_text = self
+						.history
+						.last()
+						.map(|turn| turn.assistant.clone())
+						.filter(|text| !text.is_empty());
+					rewound = true;
+					// The conversation was rewritten: re-prime advisor state so
+					// the abandoned tail is not reviewed and a quota latch from the
+					// abandoned branch cannot leak into the new one.
+					self.reset_advisor_boundary();
+				},
+				Ok(None) => {},
+				Err(err) => eprintln!("warning: cannot apply rewind: {err}"),
+			}
+		} else {
+			let captured = self
+				.checkpoint_host
+				.note_unpersisted_tool_results(tool_results, &prepared.tool_names, turn_start);
+			// Headless parity: the mirror receives this turn's assistant and
+			// tool results before the cut decision, so the cut anchors on the
+			// checkpoint result and the next run's request keeps it. Replacing
+			// the mirror from `AgentEnd` instead would re-introduce the
+			// abandoned turns the loop just cut.
+			if let Some(messages) = self.in_memory_messages.as_mut() {
+				messages.push(message.clone());
+				for result in tool_results {
+					let name = prepared
+						.tool_names
+						.get(&result.tool_call_id)
+						.map(String::as_str)
+						.unwrap_or("tool");
+					messages.push(Message::tool_with_status(
+						&result.tool_call_id,
+						name,
+						&result.content,
+						result.is_error,
+					));
+				}
+			}
+			if let Some(rewind) = self.checkpoint_host.apply_pending_rewind_in_memory() {
+				// Headless parity: the mirror is the uncompacted branch and now
+				// includes this turn's checkpoint result, so cut it and replay it
+				// wholesale. `Replace` ignores the live anchor, which mid-run
+				// compaction may already have pruned.
+				decision.rewrite = match self.in_memory_messages.as_mut() {
+					Some(messages) => {
+						crate::session_checkpoint::apply_in_memory_rewind(messages, &rewind);
+						Some(pi_agent::TurnRewrite::Replace(messages.clone()))
+					},
+					None => Some(pi_agent::TurnRewrite::InMemory(rewind.clone())),
+				};
+				rewind_cut = Some(rewind);
+			} else if captured {
+				decision.warning = self.checkpoint_host.active_notice().map(str::to_string);
+			}
+		}
+		// Pre-yield guard parity: an open checkpoint whose turn produced no tool
+		// calls must continue with the rewind warning instead of ending.
+		if self.checkpoint_host.needs_rewind_before_yield() && message.tool_calls.is_empty() {
+			if let Some(warning) = self.checkpoint_host.yield_warning() {
+				decision.continue_turn = true;
+				decision.warning = Some(warning.to_string());
+			}
+		}
+		if !self.store.enabled()
+			&& let Some(warning) = decision.warning.as_deref().filter(|w| !w.is_empty())
+			&& let Some(messages) = self.in_memory_messages.as_mut()
+		{
+			messages.push(Message::system(warning));
+		}
+
+		if let Some(notice) = priority_notice.take() {
+			// Live host notice on the protocol transport; never model guidance.
+			self.host_tools.send_notice("warning", &notice);
+		}
+		// Prewalk: advance the one-way switch at this settled boundary. A
+		// terminal provider turn never starts another request, so it neither
+		// swaps the provider nor injects guidance.
+		let terminal = matches!(
+			message.stop_reason,
+			Some(pi_agent::StopReason::Error | pi_agent::StopReason::Aborted)
+		);
+		if terminal
+			&& let Some(shared) = self.plan_yolo.as_ref()
+		{
+			shared.cancel_pending();
+		}
+		if !terminal
+			&& let Some(arm) = self.prewalk.target().cloned()
+		{
+			let noop = crate::prewalk::would_be_noop(
+				&self.catalog,
+				&arm.target,
+				arm.thinking,
+				self.provider.as_deref(),
+				self.model.as_deref(),
+				self.thinking,
+			);
+			let action_tool = tool_results.iter().find_map(|result| {
+				let name = prepared
+					.tool_names
+					.get(&result.tool_call_id)
+					.map(String::as_str)?;
+				crate::prewalk::is_implementation_action(name, result.details.as_ref())
+					.then_some(name)
+			});
+			let todo_succeeded = tool_results.iter().any(|result| {
+				!result.is_error
+					&& prepared
+						.tool_names
+						.get(&result.tool_call_id)
+						.map(String::as_str)
+						== Some("todo")
+			});
+			let todo_available = crate::prewalk::todo_available(
+				self.tools_enabled,
+				self.config.tools.as_deref(),
+			);
+			let boundary = crate::prewalk::TurnBoundary {
+				has_tool_results: !tool_results.is_empty(),
+				todo_succeeded,
+				action: action_tool,
+				todo_available,
+				noop,
+			};
+			let action = self.prewalk.advance(&boundary);
+			for notice in &action.notices {
+				eprintln!("{notice}");
+			}
+			if action.scrub_plan {
+				decision.scrub_custom_type =
+					Some(crate::prewalk::PREWALK_PLAN_TYPE.to_string());
+			}
+			let mut guidance = action.guidance;
+			if let Some(target) = action.switch {
+				// Root credential reuse requires the same provider **and** the
+				// same effective endpoint; a per-model `baseUrl` override makes a
+				// provider id match insufficient.
+				let target_endpoint = runtime::effective_endpoint(
+					&self.catalog,
+					&self.config,
+					&target.provider,
+					&target.model,
+				)
+				.ok();
+				let reuses_root = self.provider.as_deref() == Some(target.provider.as_str())
+					&& target_endpoint.is_some()
+					&& target_endpoint.as_deref() == self.root_base_url.as_deref();
+				let api_key = if reuses_root {
+					self.api_key.clone()
+				} else {
+					self.config.resolve_api_key(&target.provider).or_else(|| {
+						self.resolver
+							.peek_api_key(&target.provider)
+							.ok()
+							.flatten()
+							.filter(|key| !key.trim().is_empty())
+					})
+				};
+				let stored_auth = reuses_root
+					|| api_key.as_deref().is_some_and(|key| !key.trim().is_empty())
+					|| runtime::provider_has_configured_auth(
+						&self.catalog,
+						&self.config,
+						&target.provider,
+						None,
+					);
+				if !stored_auth {
+					// Never copy the root secret to another origin; disarm loudly
+					// when no independent target credential exists.
+					eprintln!(
+						"warning: prewalk switch skipped — no independent credential for {}/{}",
+						target.provider, target.model
+					);
+					guidance.clear();
+				} else {
+				let switch_thinking = action.switch_thinking.map(Some).or_else(|| {
+					match runtime::model_default_thinking(
+						&self.catalog,
+						&target.provider,
+						&target.model,
+					) {
+						runtime::DefaultThinking::Unspecified => None,
+						runtime::DefaultThinking::Resolved(level) => Some(level),
+					}
+				});
+				let mut switch_target = target.clone();
+				if switch_target.effort.is_none()
+					&& let Some(Some(runtime::CliThinking::Effort(effort))) =
+						switch_thinking
+				{
+					switch_target.effort = Some(effort.to_string());
+				}
+				let cache_key = if self.prompt_cache_key_inherited {
+					None
+				} else {
+					self.prompt_cache_key.clone()
+				};
+				match runtime::build_switch_provider(
+					&self.catalog,
+					&self.config,
+					&switch_target,
+					api_key.clone(),
+					// Provider session belongs to the previous route.
+					None,
+					cache_key,
+					&self.store.service_tier_by_family(),
+				) {
+					Ok(provider) => {
+						// Ephemeral role: resume/fork fall back to the configured
+						// default instead of the fast model.
+						if self.store.enabled()
+							&& let Err(err) = self.store.append_model_change(
+								&format!("{}/{}", target.provider, target.model),
+								"fallback",
+							)
+						{
+							eprintln!("warning: cannot record prewalk model change: {err}");
+						}
+						for (custom_type, content) in &action.journal {
+							if self.store.enabled() {
+								if let Err(err) = self.store.append_custom_message(
+									custom_type,
+									content,
+									false,
+									serde_json::Value::Null,
+								) {
+									eprintln!("warning: {err}");
+								}
+							} else if let Some(messages) = self.in_memory_messages.as_mut() {
+								messages.push(Message::guidance(*custom_type, *content));
+							}
+						}
+						decision.provider = Some(provider);
+						decision.context_limit = Some(
+							self.catalog
+								.context_window(&target.provider, &target.model)
+								.unwrap_or(runtime::DEFAULT_CONTEXT_LIMIT),
+						);
+						decision.continue_turn |= action.continue_turn;
+						decision.guidance = guidance;
+						// Later prompts use the new route; the journal already
+						// carries the ephemeral role and inherited state is cut.
+						self.provider = Some(target.provider);
+						self.model = Some(target.model);
+						self.api_key = api_key;
+						if let Some(level) = switch_thinking {
+							self.thinking = level;
+							self.thinking_level = match level {
+								Some(runtime::CliThinking::Off) => Some("off".to_string()),
+								Some(runtime::CliThinking::Effort(effort)) => {
+									Some(effort.to_string())
+								},
+								Some(runtime::CliThinking::Auto) | None => None,
+							};
+						}
+						self.provider_session_id = None;
+						if self.prompt_cache_key_inherited {
+							self.prompt_cache_key = None;
+							self.prompt_cache_key_inherited = false;
+						}
+						self.refresh_root_endpoint();
+					},
+					Err(err) => {
+						// Startup resolved this target; a setup failure here must
+						// not silently claim a switch.
+						eprintln!("warning: prewalk switch failed — {err}");
+						guidance.clear();
+					},
+				}
+				}
+			} else {
+				for (custom_type, content) in &action.journal {
+					if self.store.enabled() {
+						if let Err(err) = self.store.append_custom_message(
+							custom_type,
+							content,
+							false,
+							serde_json::Value::Null,
+						) {
+							eprintln!("warning: {err}");
+						}
+					} else if let Some(messages) = self.in_memory_messages.as_mut() {
+						messages.push(Message::guidance(*custom_type, *content));
+					}
+				}
+				decision.continue_turn |= action.continue_turn;
+				decision.guidance = guidance;
+			}
+		}
+		if !terminal
+			&& let Some(shared) = self.plan_yolo.as_ref().cloned()
+			&& shared.has_pending()
+		{
+			let artifacts = self.plan_artifacts();
+			let catalog = Arc::clone(&self.catalog);
+			let config = self.config.clone();
+			let root_provider = self.provider.clone();
+			let root_base_url = self.root_base_url.clone();
+			let root_api_key = self.api_key.clone();
+			let root_cache_key = self.prompt_cache_key.clone();
+			let inherited = self.prompt_cache_key_inherited;
+			let resolver = Arc::clone(&self.resolver);
+			let service_tiers = self.store.service_tier_by_family();
+			let committed = shared.commit_pending(artifacts.as_deref(), |pending| {
+				let target = pending.target().clone();
+				let switch_thinking = pending.thinking().map(Some).or_else(|| {
+					match runtime::model_default_thinking(
+						&catalog,
+						&target.provider,
+						&target.model,
+					) {
+						runtime::DefaultThinking::Unspecified => None,
+						runtime::DefaultThinking::Resolved(level) => Some(level),
+					}
+				});
+				let mut switch_target = target.clone();
+				if switch_target.effort.is_none()
+					&& let Some(Some(runtime::CliThinking::Effort(effort))) =
+						switch_thinking
+				{
+					switch_target.effort = Some(effort.to_string());
+				}
+				let target_endpoint = runtime::effective_endpoint(
+					&catalog,
+					&config,
+					&target.provider,
+					&target.model,
+				)
+				.ok();
+				let reuses_root = root_provider.as_deref()
+					== Some(target.provider.as_str())
+					&& target_endpoint.is_some()
+					&& target_endpoint.as_deref() == root_base_url.as_deref();
+				let api_key = if reuses_root {
+					root_api_key.clone()
+				} else {
+					config.resolve_api_key(&target.provider).or_else(|| {
+						resolver
+							.peek_api_key(&target.provider)
+							.ok()
+							.flatten()
+							.filter(|key| !key.trim().is_empty())
+					})
+				};
+				let stored_auth = reuses_root
+					|| api_key.as_deref().is_some_and(|key| !key.trim().is_empty())
+					|| runtime::provider_has_configured_auth(
+						&catalog,
+						&config,
+						&target.provider,
+						None,
+					);
+				if !stored_auth {
+					return Err(format!(
+						"no independent credential for {}/{}",
+						target.provider, target.model
+					));
+				}
+				let cache_key = if inherited { None } else { root_cache_key.clone() };
+				let provider = runtime::build_switch_provider(
+					&catalog,
+					&config,
+					&switch_target,
+					api_key.clone(),
+					None,
+					cache_key,
+					&service_tiers,
+				)?;
+				Ok((provider, switch_target, switch_thinking, api_key))
+			});
+			match committed {
+				Ok((commit, (provider, target, switch_thinking, api_key))) => {
+					if self.store.enabled() {
+						match self.store.append_model_change(
+							&format!("{}/{}", target.provider, target.model),
+							"fallback",
+						) {
+							Ok(id) => previous = id,
+							Err(err) => eprintln!(
+								"warning: cannot record plan-yolo model change: {err}"
+							),
+						}
+					}
+					decision.provider = Some(provider);
+					decision.context_limit = Some(
+						self.catalog
+							.context_window(&target.provider, &target.model)
+							.unwrap_or(runtime::DEFAULT_CONTEXT_LIMIT),
+					);
+					decision.guidance.push(pi_agent::Message::guidance(
+						crate::plan_yolo::PLAN_YOLO_HANDOFF_TYPE,
+						commit.handoff,
+					));
+					decision.continue_turn = true;
+					decision.tool_selection =
+						self.plan_yolo_tools.as_ref().map(|tools| {
+							pi_agent::TurnToolSelection::Hide(tools.hidden_by_plan())
+						});
+					eprintln!("{}", commit.notice);
+					self.provider = Some(target.provider);
+					self.model = Some(target.model);
+					self.api_key = api_key;
+					if let Some(level) = switch_thinking {
+						self.thinking = level;
+						self.thinking_level = match level {
+							Some(runtime::CliThinking::Off) => Some("off".to_string()),
+							Some(runtime::CliThinking::Effort(effort)) => {
+								Some(effort.to_string())
+							},
+							Some(runtime::CliThinking::Auto) | None => None,
+						};
+					}
+					self.provider_session_id = None;
+					if self.prompt_cache_key_inherited {
+						self.prompt_cache_key = None;
+						self.prompt_cache_key_inherited = false;
+					}
+					self.refresh_root_endpoint();
+					self.config.tools = self
+						.plan_yolo_tools
+						.take()
+						.and_then(|tools| tools.restore());
+					self.plan_mode = crate::agent::PlanModeHooks::default();
+					let gate = shared.gate();
+					let mut gate = gate.lock().unwrap_or_else(|poison| poison.into_inner());
+					let persisted = gate.persisted_mode_change();
+					gate.queue_mode_persist(persisted.0, persisted.1);
+					gate.queue_config_refresh();
+				},
+				Err(err) => {
+					// A failed cutover ends this turn with the live error; a
+					// warning would set `continue_turn` and re-run the same
+					// failing commit up to the turn budget.
+					let message = format!("plan-yolo switch failed — {err}");
+					eprintln!("warning: {message}");
+					decision.continue_turn = false;
+					self.plan_yolo_commit_error = Some(message);
+				},
+			}
+		}
+		// A cut queued by an earlier turn must not mix with this turn's tail.
+		self.flush_pending_wire();
+		for entry in &valid {
+			if let Ok(value) = serde_json::to_value(&entry.message) {
+				self.messages.push(value);
+			}
+		}
+		if rewound {
+			// The cut moved the leaf past the rewound turn's own entries; the
+			// mirror and the next parent must follow the retained branch. The
+			// swap waits until after `turn_end`, which must report the turn that
+			// actually settled rather than the retained checkpoint batch.
+			self.pending_wire = Some(branch_wire_messages(&self.store));
+			prepared.parent_id = self.store.leaf_id().map(str::to_string);
+		} else {
+			if let Some(rewind) = rewind_cut {
+				// Mirror the loop's cut once the frame is out; the loop remains
+				// authoritative for the conversation it carries.
+				let mut mirror = self.messages.clone();
+				apply_in_memory_rewind_wire(&mut mirror, &rewind);
+				self.pending_wire = Some(mirror);
+			}
+			prepared.parent_id = Some(previous);
+		}
+
+		if let Some((_, reply)) = pending {
+			let _ = reply.send(decision);
+		}
+	}
+}
+
+fn clean_title(name: &str) -> String {
+	let cleaned = name.trim().replace(['\r', '\n'], " ");
+	let mut chars = cleaned.chars();
+	let truncated: String = chars.by_ref().take(200).collect();
+	truncated.trim().to_string()
+}
+
+/// Live turn bookkeeping owned by the pump.
+pub struct PreparedTurn {
+	pub token:      CancellationToken,
+	pub turn_ack:   Arc<TurnAck>,
+	pub builder:    TurnBuilder,
+	pub parent_id:  Option<String>,
+	pub in_memory_before: usize,
+	pub started:    Instant,
+	pub model_fallback: Option<String>,
+	pub provider_fallback: Option<String>,
+	pub tool_names: std::collections::HashMap<String, String>,
+	/// Validated result images per tool call, as the provider request carries
+	/// them; persisted as tool-result parts and replayed on resume.
+	pub tool_images: std::collections::HashMap<String, Vec<ContentPart>>,
+	pub wire_user_message: Option<Value>,
+	pub aborted:    bool,
+}
+
+impl PreparedTurn {
+	/// Discard everything a failed attempt streamed so the retry starts a clean
+	/// assistant turn. The user entry (`parent_id`, `wire_user_message`) and the
+	/// in-memory boundary stay, so the retry cannot duplicate the prompt.
+	pub fn reset_for_retry(&mut self, input: &TurnInput, parts: &[ContentPart]) {
+		self.builder = if parts.is_empty() {
+			TurnBuilder::new(input.text.clone())
+		} else {
+			TurnBuilder::new_with_parts(input.text.clone(), parts.to_vec())
+		};
+		self.tool_names.clear();
+		self.started = Instant::now();
+		self.aborted = false;
+	}
+}
+
+/// Result of one pumped turn.
+#[derive(Debug, Clone, Default)]
+pub struct TurnOutcome {
+	pub error:   Option<String>,
+	pub aborted: bool,
+}
+
+/// Which turn the caller wants executed.
+pub enum TurnAdvance {
+	/// Begin the queued message now.
+	Run(TurnInput),
+	/// Nothing queued.
+	Idle,
+}
+
+impl RpcSession {
+	/// Pop the next queued turn according to the follow-up mode.
+	///
+	/// `all` batches every queued message into one native turn (the runner takes
+	/// a single prompt + parts, so texts are joined and images concatenated);
+	/// `one-at-a-time` returns exactly one message.
+	pub fn next_queued(&mut self) -> TurnAdvance {
+		let mode = self.follow_up_mode;
+		let batch = self.take_queued(mode);
+		if batch.is_empty() {
+			return TurnAdvance::Idle;
+		}
+		if batch.len() == 1 {
+			return TurnAdvance::Run(batch.into_iter().next().expect("one message"));
+		}
+		let mut text = String::new();
+		let mut images = Vec::new();
+		for input in batch {
+			if !text.is_empty() {
+				text.push_str("\n\n");
+			}
+			text.push_str(&input.text);
+			images.extend(input.images);
+		}
+		TurnAdvance::Run(TurnInput { text, images, continuation: false })
+	}
+
+	/// Whether messages are waiting for the current turn to finish.
+	#[must_use]
+	pub fn has_queued(&self) -> bool {
+		!self.queued.is_empty()
+	}
+
+	/// Put a message at the head of the queue (`abort_and_prompt`).
+	pub fn queue_front(&mut self, input: TurnInput) {
+		self.queued.push_front(input);
+	}
+
+	/// The assistant message and tool results just persisted for a finished
+	/// turn. Sliced by role so a missing tool result never mislabels the frame.
+	#[must_use]
+	pub fn last_turn_wire(&self, tool_count: usize) -> (Option<Value>, Vec<Value>) {
+		let mut index = self.messages.len();
+		let mut results = Vec::new();
+		for _ in 0..tool_count {
+			let Some(candidate) = index.checked_sub(1).and_then(|i| self.messages.get(i)) else {
+				break;
+			};
+			if candidate.get("role").and_then(Value::as_str) != Some("toolResult") {
+				break;
+			}
+			results.insert(0, candidate.clone());
+			index -= 1;
+		}
+		let message = index
+			.checked_sub(1)
+			.and_then(|i| self.messages.get(i))
+			.filter(|message| message.get("role").and_then(Value::as_str) == Some("assistant"))
+			.cloned();
+		(message, results)
+	}
+
+	/// Run one isolated summarizer request (no tools, one turn, not persisted)
+	/// and return the streamed assistant text.
+	fn summarize(&mut self, prompt: String) -> Result<String> {
+		let mut request = self.request(prompt, Vec::new(), false)?;
+		request.tools_enabled = false;
+		request.max_turns = 1;
+		request.session_persisted = false;
+		request.session_file = None;
+		request.session_id = None;
+		request.turn_ack = None;
+		request.cancellation_token = None;
+		request.history = Vec::new();
+		let runner = Arc::clone(&self.runner);
+		let events = runner.run(&request)?;
+		let mut text = String::new();
+		for event in events {
+			if let AgentEvent::MessageUpdate { delta } = event? {
+				text.push_str(&delta);
+			}
+		}
+		let text = text.trim().to_string();
+		if text.is_empty() {
+			return Err(Error::new("the summarizer returned no text"));
+		}
+		Ok(text)
+	}
+
+	/// `compact`: replace the live context with a model-written summary.
+	pub fn compact(&mut self, custom: Option<String>) -> Result<Value> {
+		if self.is_streaming {
+			return Err(Error::new("Cannot compact while a response is streaming"));
+		}
+		if self.is_compacting {
+			return Err(Error::new("Compaction already in progress"));
+		}
+		self.is_compacting = true;
+		let result = self.summarize(compaction_prompt(custom.as_deref()));
+		self.is_compacting = false;
+		let summary = result?;
+		// Upstream `prepareCompaction`: prompt-side occupancy of the newest
+		// reported request; 0 only when the branch never reported usage.
+		let tokens_before = self
+			.store
+			.latest_context_tokens()
+			.or_else(|| self.in_memory_context_tokens())
+			.unwrap_or(0);
+		let messages_removed = self.messages.len();
+		let mut summary_message = runtime::user_message_from_parts(&summary, &[])
+			.map_err(|err| Error::new(err.to_string()))?;
+		summary_message.custom_type = Some("compaction".to_string());
+
+		let mut first_kept = String::new();
+		if self.store.enabled() {
+			let entry = SessionEntry {
+				kind: "custom_message".to_string(),
+				id: format!("entry-{}", output::session_id()),
+				parent_id: self.store.leaf_id().map(str::to_string),
+				timestamp: output::iso8601(SystemTime::now()),
+				extra: json!({
+					"customType": "compaction",
+					"content": summary,
+					"display": false,
+					"attribution": "agent",
+					"details": {
+						"tokensBefore": tokens_before,
+						"messagesRemoved": messages_removed,
+					},
+				}),
+			};
+			let synthetic_val = serde_json::to_value(&summary_message)
+				.map_err(|err| Error::new(err.to_string()))?;
+			let projection = crate::durable_session::StoredProjection {
+				kept: Vec::new(),
+				synthetic: vec![synthetic_val],
+				anchor: None,
+			};
+			first_kept = self
+				.store
+				.compact_session(entry, projection)
+				.map_err(|err| Error::new(format!("cannot persist compaction: {err}")))?;
+		}
+
+		if self.store.enabled() {
+			self.history_messages = Some(vec![summary_message.clone()]);
+		} else {
+			// No-session mode sends `in_memory_messages`, not `history_messages`;
+			// the compacted summary must replace the pre-compaction history or
+			// the next turn still sends it.
+			self.history_messages = None;
+			self.in_memory_messages = Some(vec![summary_message.clone()]);
+		}
+		self.messages = vec![json!({
+			"role": "user",
+			"content": [{ "type": "text", "text": summary }],
+			"timestamp": now_ms(),
+		})];
+		self.pending_wire = None;
+		self.last_assistant_text = None;
+
+		Ok(json!({
+			"summary": summary,
+			"firstKeptEntryId": first_kept,
+			"tokensBefore": tokens_before,
+		}))
+	}
+
+	/// `handoff`: summarize, then continue in a fresh session that starts from
+	/// the summary. Returns the new session path when one was persisted.
+	pub fn handoff(&mut self, custom: Option<String>) -> Result<Option<String>> {
+		if self.is_streaming {
+			return Err(Error::new("Cannot hand off while a response is in progress"));
+		}
+		if self.is_compacting {
+			return Err(Error::new("Compaction already in progress"));
+		}
+		self.is_compacting = true;
+		let result = self.summarize(handoff_prompt(custom.as_deref()));
+		self.is_compacting = false;
+		let summary = result?;
+		self.new_session(None)?;
+		let summary_message = runtime::user_message_from_parts(&summary, &[])
+			.map_err(|err| Error::new(err.to_string()))?;
+		if self.store.enabled() {
+			self.history_messages = Some(vec![summary_message]);
+		} else {
+			// No-session mode sends `in_memory_messages`, not `history_messages`;
+			// the compacted summary must replace the pre-compaction history or
+			// the next turn still sends it.
+			self.history_messages = None;
+			self.in_memory_messages = Some(vec![summary_message]);
+		}
+		self.messages = vec![json!({
+			"role": "user",
+			"content": [{ "type": "text", "text": summary }],
+			"timestamp": now_ms(),
+		})];
+		self.pending_wire = None;
+		self.last_assistant_text = None;
+		Ok(self.store.file().map(|path| path.display().to_string()))
+	}
+
+	/// `export_html`: write a standalone HTML transcript.
+	pub fn export_html(&self, output_path: Option<&str>) -> Result<String> {
+		if !self.store.enabled() {
+			if let Some(reason) = self.store.corrupt_reason() {
+				return Err(Error::new(format!("cannot export corrupt session: {reason}")));
+			}
+		}
+		let path = match output_path {
+			Some(path) => PathBuf::from(path),
+			None => match self.store.file() {
+				Some(file) => file.with_extension("html"),
+				None => self.cwd.join(format!("arag-session-{}.html", self.session_id())),
+			},
+		};
+		let html = render_html(self);
+		if let Some(parent) = path.parent() {
+			if !parent.as_os_str().is_empty() {
+				std::fs::create_dir_all(parent).map_err(|err| {
+					Error::new(format!("cannot create {}: {err}", parent.display()))
+				})?;
+			}
+		}
+		std::fs::write(&path, html)
+			.map_err(|err| Error::new(format!("cannot write {}: {err}", path.display())))?;
+		Ok(path.display().to_string())
+	}
+}
+
+fn now_ms() -> u64 {
+	SystemTime::now()
+		.duration_since(SystemTime::UNIX_EPOCH)
+		.unwrap_or_default()
+		.as_millis() as u64
+}
+
+/// Latest non-empty assistant text on a wire mirror. The mirror follows the
+/// retained branch after a cut, so a rewound run's abandoned answer never wins.
+fn wire_last_assistant_text(messages: &[Value]) -> Option<String> {
+	messages
+		.iter()
+		.rev()
+		.filter(|message| message.get("role").and_then(Value::as_str) == Some("assistant"))
+		.find_map(wire_assistant_text)
+}
+
+/// Assistant text of one serialized message: a plain string, or the `text`
+/// parts joined the way `pi_agent` joins them when it rebuilds `content`.
+fn wire_assistant_text(message: &Value) -> Option<String> {
+	let text = match message.get("content")? {
+		Value::String(text) => text.clone(),
+		Value::Array(parts) => parts
+			.iter()
+			.filter(|part| part.get("type").and_then(Value::as_str) == Some("text"))
+			.filter_map(|part| part.get("text").and_then(Value::as_str))
+			.collect::<Vec<_>>()
+			.join("\n"),
+		_ => return None,
+	};
+	(!text.is_empty()).then_some(text)
+}
+
+/// Wire counterpart of the no-session retained-branch cut: truncate the
+/// serialized mirror after the checkpoint batch's tool results, matching the
+/// persisted branch's view. The summary/report stay loop-only context, exactly
+/// like the persisted branch's custom entries, which [`branch_wire_messages`]
+/// also omits. A mirror without the anchor is left intact rather than wiped by
+/// the zero fallback.
+fn apply_in_memory_rewind_wire(messages: &mut Vec<Value>, rewind: &pi_agent::InMemoryRewind) {
+	let Some(id) = rewind.checkpoint_tool_call_id.as_deref() else {
+		return;
+	};
+	let Some(assistant) = messages.iter().position(|message| {
+		message.get("role").and_then(Value::as_str) == Some("assistant")
+			&& message.get("content").and_then(Value::as_array).is_some_and(|parts| {
+				parts.iter().any(|part| {
+					part.get("type").and_then(Value::as_str) == Some("toolCall")
+						&& part.get("id").and_then(Value::as_str) == Some(id)
+				})
+			})
+	}) else {
+		// The loop still cuts; a mirror without the anchor must not be wiped by
+		// the zero fallback.
+		return;
+	};
+	let call_ids: std::collections::HashSet<&str> = messages[assistant]
+		.get("content")
+		.and_then(Value::as_array)
+		.into_iter()
+		.flatten()
+		.filter(|part| part.get("type").and_then(Value::as_str) == Some("toolCall"))
+		.filter_map(|part| part.get("id").and_then(Value::as_str))
+		.collect();
+	let mut end = assistant + 1;
+	while let Some(message) = messages.get(end) {
+		let is_result = message.get("role").and_then(Value::as_str) == Some("toolResult");
+		let in_batch = message
+			.get("toolCallId")
+			.and_then(Value::as_str)
+			.is_some_and(|id| call_ids.contains(id));
+		if !is_result || !in_batch {
+			break;
+		}
+		end += 1;
+	}
+	messages.truncate(end);
+}
+
+/// Wire mirror of the messages on the store's active branch.
+///
+/// `messages()` returns every entry on the file; when the log carries a
+/// `branch_summary` the visible conversation is only the selected path, so the
+/// mirror has to follow the same entries `history()` was rebuilt from.
+fn branch_wire_messages(store: &SessionStore) -> Vec<Value> {
+	if !store.has_branch_context() {
+		return store
+			.messages()
+			.iter()
+			.filter_map(|entry| serde_json::to_value(&entry.message).ok())
+			.collect();
+	}
+	store
+		.branch_messages()
+		.into_iter()
+		.filter_map(|entry| serde_json::to_value(&entry.message).ok())
+		.collect()
+}
+
+fn compaction_prompt(custom: Option<&str>) -> String {
+	let mut prompt = String::from(
+		"Provide a thorough summary of the conversation above for continuing work in a fresh \
+		 context. Focus on goals, decisions, files changed, and remaining tasks. Use plain \
+		 prose, no preamble.",
+	);
+	if let Some(custom) = custom.map(str::trim).filter(|custom| !custom.is_empty()) {
+		prompt.push_str("\n\nAdditional focus: ");
+		prompt.push_str(custom);
+	}
+	prompt
+}
+
+fn handoff_prompt(custom: Option<&str>) -> String {
+	let mut prompt = String::from(
+		"Write a handoff document for a fresh session. Cover the current goal, what has been \
+		 done, what is left, key constraints and open questions. Use plain prose, no preamble.",
+	);
+	if let Some(custom) = custom.map(str::trim).filter(|custom| !custom.is_empty()) {
+		prompt.push_str("\n\nAdditional focus: ");
+		prompt.push_str(custom);
+	}
+	prompt
+}
+
+fn html_escape(text: &str) -> String {
+	text.replace('&', "&amp;")
+		.replace('<', "&lt;")
+		.replace('>', "&gt;")
+		.replace('"', "&quot;")
+}
+
+fn render_html(session: &RpcSession) -> String {
+	let mut body = String::new();
+	for message in session.wire_messages() {
+		let role = message.get("role").and_then(Value::as_str).unwrap_or("unknown");
+		let mut text = String::new();
+		match message.get("content") {
+			Some(Value::String(value)) => text.push_str(value),
+			Some(Value::Array(parts)) => {
+				for part in parts {
+					if let Some(chunk) = part.get("text").and_then(Value::as_str) {
+						text.push_str(chunk);
+					}
+					if let Some(call) = part.get("input") {
+						text.push_str(&format!("\n[tool call] {call}"));
+					}
+				}
+			},
+			_ => {},
+		}
+		body.push_str(&format!(
+			"<article class=\"{role}\"><h2>{role}</h2><pre>{}</pre></article>\n",
+			html_escape(&text)
+		));
+	}
+	let title = html_escape(session.session_name.as_deref().unwrap_or("Aragent session"));
+	format!(
+		"<!doctype html>\n<html><head><meta charset=\"utf-8\"><title>{title}</title>\
+		 <style>body{{font-family:system-ui,sans-serif;max-width:52rem;margin:2rem auto;padding:0 1rem;}}\
+		 article{{border-top:1px solid #ddd;padding:1rem 0}}pre{{white-space:pre-wrap}}\
+		 .user h2{{color:#0b6}}.assistant h2{{color:#06c}}</style></head><body>\
+		 <h1>{title}</h1>\n{body}</body></html>\n"
+	)
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	struct NoopRunner;
+
+	impl AgentRunner for NoopRunner {
+		fn run(&self, _request: &RunRequest) -> Result<crate::agent::EventStream> {
+			Err(Error::new("test runner never streams"))
+		}
+	}
+
+	struct NoopObserver;
+
+	impl SubagentObserver for NoopObserver {
+		fn observe(&self, _event: &pi_agent::supervisor::SubagentEvent) {}
+	}
+
+	struct NoopResolver;
+
+	impl crate::rpc::auth::CredentialResolver for NoopResolver {
+		fn api_key(
+			&self,
+			_provider: &str,
+			_session_id: Option<&str>,
+			_cancel: &crate::auth::http::Cancel,
+		) -> std::result::Result<Option<String>, crate::auth::error::AuthError> {
+			Ok(None)
+		}
+
+		fn peek_api_key(
+			&self,
+			_provider: &str,
+		) -> std::result::Result<Option<String>, crate::auth::error::AuthError> {
+			Ok(None)
+		}
+	}
+
+	struct NullSink;
+
+	impl FrameSink for NullSink {
+		fn send(&self, _frame: Value) {}
+	}
+
+	/// `--no-session` session: every turn lives in the in-memory mirror only.
+	fn no_session() -> RpcSession {
+
+		let sink: Arc<dyn FrameSink> = Arc::new(NullSink);
+		let mut config = Config::default();
+		config.checkpoint.enabled = Some(true);
+		let cwd = std::env::temp_dir();
+		RpcSession::open(
+			RpcLaunch {
+				runner: Arc::new(NoopRunner),
+				config,
+				cwd: cwd.clone(),
+				prompts: Prompts::default(),
+				skill_snapshot: SkillSnapshot::new(),
+				skill_options: LoadOptions::new(cwd.clone()),
+				catalog: Arc::new(Catalog::default()),
+				agent_db: cwd.join("agent.db"),
+				approval_mode: ApprovalMode::Yolo,
+				allow: Vec::new(),
+				model: Some("local/mock-model".to_string()),
+				provider: Some("local".to_string()),
+				api_key: Some("sk-test".to_string()),
+				thinking: None,
+				restore_model: false,
+				prewalk: None,
+				plan_yolo: None,
+				max_time: None,
+				max_turns: 8,
+				tools_enabled: true,
+				prompt_cache_key: None,
+				prompt_cache_key_inherited: false,
+				service_tier_explicit: false,
+				provider_session_id: None,
+				store_options: SessionOptions {
+					enabled: false,
+					cwd: cwd.clone(),
+					model: None,
+					provider: None,
+					dir: None,
+					id: None,
+					continue_latest: false,
+					parent_session: None,
+					no_title: true,
+				},
+			preopened_store: None,
+				steer: None,
+			},
+			Approvals::new(ApprovalMode::Yolo, Vec::new()),
+			Arc::new(HostToolBridge::new(Arc::clone(&sink))),
+			Arc::new(HostUriBridge::new(Arc::clone(&sink))),
+			Arc::new(InternalUrlRouter::new()),
+			Arc::new(NoopObserver),
+			Arc::new(NoopResolver),
+		)
+		.expect("no-session RPC session")
+	}
+
+	fn start_turn(session: &mut RpcSession, text: &str) -> PreparedTurn {
+		let input = TurnInput { text: text.to_string(), images: Vec::new(), continuation: false };
+		let (_, prepared) = session.prepare_turn(&input).expect("prepare turn");
+		prepared
+	}
+
+	/// A failed turn can journal accepted steering (the loop writes it before
+	/// surfacing the interrupt) without a `TurnEnd`. The RPC error path must
+	/// reload the durable view, or the next prompt is built from a stale mirror
+	/// and diverges from the branch.
+	#[tokio::test]
+	async fn error_turn_reload_exposes_journaled_steering_to_the_next_request() {
+		use pi_agent::DurableBoundary as _;
+
+		let sink: Arc<dyn FrameSink> = Arc::new(NullSink);
+		let cwd = std::env::temp_dir();
+		let dir = cwd.join(format!(
+			"omp-rpc-reload-{}-{}",
+			std::process::id(),
+			std::time::SystemTime::now()
+				.duration_since(std::time::UNIX_EPOCH)
+				.unwrap_or_default()
+				.as_nanos()
+		));
+		std::fs::create_dir_all(&dir).expect("session dir");
+		let mut config = Config::default();
+		config.checkpoint.enabled = Some(true);
+		let mut session = RpcSession::open(
+			RpcLaunch {
+				runner:           Arc::new(NoopRunner),
+				config,
+				cwd:              cwd.clone(),
+				prompts:          Prompts::default(),
+				skill_snapshot:   SkillSnapshot::new(),
+				skill_options:    LoadOptions::new(cwd.clone()),
+				catalog:          Arc::new(Catalog::default()),
+				agent_db:         cwd.join("agent.db"),
+				approval_mode:    ApprovalMode::Yolo,
+				allow:            Vec::new(),
+				model:            Some("local/mock-model".to_string()),
+				provider:         Some("local".to_string()),
+				api_key:          Some("sk-test".to_string()),
+				thinking:         None,
+				restore_model:    false,
+				prewalk:          None,
+				plan_yolo:        None,
+				max_time:         None,
+				max_turns:        8,
+				tools_enabled:    true,
+				prompt_cache_key: None,
+				prompt_cache_key_inherited: false,
+				service_tier_explicit: false,
+				provider_session_id: None,
+				store_options:    SessionOptions {
+					enabled: true,
+					cwd: cwd.clone(),
+					model: None,
+					provider: None,
+					dir: Some(dir.clone()),
+					id: Some("rpc-reload".to_string()),
+					continue_latest: false,
+					parent_session: None,
+					no_title: true,
+				},
+			preopened_store: None,
+				steer: None,
+			},
+			Approvals::new(ApprovalMode::Yolo, Vec::new()),
+			Arc::new(HostToolBridge::new(Arc::clone(&sink))),
+			Arc::new(HostUriBridge::new(Arc::clone(&sink))),
+			Arc::new(InternalUrlRouter::new()),
+			Arc::new(NoopObserver),
+			Arc::new(NoopResolver),
+		)
+		.expect("durable RPC session");
+
+		let mut prepared = start_turn(&mut session, "first");
+		// What the loop boundary journals before the failed turn surfaces.
+		session
+			.store
+			.durable_boundary()
+			.expect("live durable boundary")
+			.persist_messages(&[
+				pi_agent::Message::user("first"),
+				pi_agent::Message::user("steer note"),
+			])
+			.await
+			.expect("journal the accepted steering");
+		session.finish_turn(
+			&mut prepared,
+			&TurnOutcome { error: Some("provider failed".to_string()), aborted: false },
+		);
+
+		let request = session
+			.request("second".to_string(), Vec::new(), false)
+			.expect("next request");
+		let history = request.history_messages.expect("durable context");
+		assert!(
+			history.iter().any(|message| {
+				message.role == pi_agent::Role::User && message.content.contains("steer note")
+			}),
+			"the error path must reload journaled steering before the next request"
+		);
+		assert_eq!(
+			history
+				.iter()
+				.filter(|message| {
+					message.role == pi_agent::Role::User && message.content == "first"
+				})
+				.count(),
+			1,
+			"the prompt is replayed exactly once"
+		);
+		std::fs::remove_dir_all(dir).ok();
+	}
+
+	fn tool_start(id: &str, tool: &str) -> AgentEvent {
+		AgentEvent::ToolStart { id: id.to_string(), tool: tool.to_string(), args: json!({}) }
+	}
+
+	/// Route metadata is present so the assistant/tool entries pass validation
+	/// and reach the wire mirror, exactly like a provider-reported turn.
+	fn turn_end(
+		message: pi_agent::Message,
+		tool_results: Vec<pi_agent::ToolResult>,
+		stop_reason: &str,
+	) -> AgentEvent {
+		AgentEvent::TurnEnd {
+			message,
+			tool_results,
+			stop_reason: stop_reason.to_string(),
+			api: Some("chat".to_string()),
+			provider: Some("local".to_string()),
+			model: Some("mock-model".to_string()),
+		}
+	}
+
+	fn tool_result(id: &str, content: &str, details: Value) -> pi_agent::ToolResult {
+		pi_agent::ToolResult {
+			tool_call_id: id.to_string(),
+			content: content.to_string(),
+			is_error: false,
+			terminate: false,
+			details: Some(details),
+		}
+	}
+
+	fn checkpoint_turn(call_id: &str) -> AgentEvent {
+		turn_end(
+			pi_agent::Message::assistant_with_tools(
+				"CHECKPOINT-ACK",
+				vec![pi_agent::ToolCall {
+					id: call_id.to_string(),
+					name: "checkpoint".to_string(),
+					arguments: json!({ "goal": "map it" }),
+				}],
+			),
+			vec![tool_result(
+				call_id,
+				"checkpoint saved",
+				json!({ "goal": "map it", "startedAt": "2026-01-01T00:00:00.000Z" }),
+			)],
+			"toolUse",
+		)
+	}
+
+	fn rewind_turn(call_id: &str) -> AgentEvent {
+		turn_end(
+			pi_agent::Message::assistant_with_tools(
+				"REWIND-ACK",
+				vec![pi_agent::ToolCall {
+					id: call_id.to_string(),
+					name: "rewind".to_string(),
+					arguments: json!({ "report": "FINDINGS" }),
+				}],
+			),
+			vec![tool_result(call_id, "FINDINGS", json!({ "report": "FINDINGS" }))],
+			"toolUse",
+		)
+	}
+
+	/// checkpoint → exploratory turn → rewind → post-rewind answer, then the
+	/// successful turn commit the loop's ack expects.
+	fn run_rewind_cycle(
+		session: &mut RpcSession,
+		checkpoint_id: &str,
+		rewind_id: &str,
+		final_text: &str,
+	) {
+		let mut prepared = start_turn(session, "investigate");
+		for event in [
+			tool_start(checkpoint_id, "checkpoint"),
+			checkpoint_turn(checkpoint_id),
+			turn_end(pi_agent::Message::assistant("EXPLORATORY-SECRET"), Vec::new(), "stop"),
+			tool_start(rewind_id, "rewind"),
+			rewind_turn(rewind_id),
+			turn_end(pi_agent::Message::assistant(final_text), Vec::new(), "stop"),
+		] {
+			session.observe_event(&mut prepared, &event);
+		}
+		session.finish_turn(&mut prepared, &TurnOutcome::default());
+	}
+
+	/// Regression: the rewound branch must not answer from `history` (empty for
+	/// a no-session session); the settled wire mirror holds the retained branch.
+	#[test]
+	fn no_session_rewind_reports_the_post_rewind_answer_across_runs() {
+		let mut session = no_session();
+		run_rewind_cycle(&mut session, "call-1", "call-2", "FINAL-ONE");
+		assert_eq!(
+			session.last_assistant_text(),
+			Some("FINAL-ONE"),
+			"the answer streamed after the cut must survive the abandoned rewind turn"
+		);
+		run_rewind_cycle(&mut session, "call-3", "call-4", "FINAL-TWO");
+		assert_eq!(
+			session.last_assistant_text(),
+			Some("FINAL-TWO"),
+			"a later run reports its own post-rewind answer, never a stale one"
+		);
+	}
+
+	/// A run that ends on the rewound turn has no answer after the cut: the last
+	/// retained assistant is the checkpoint batch's own message.
+	#[test]
+	fn no_session_rewind_ending_on_the_cut_turn_reports_the_retained_answer() {
+		let mut session = no_session();
+		let mut prepared = start_turn(&mut session, "investigate");
+		for event in [
+			tool_start("call-1", "checkpoint"),
+			checkpoint_turn("call-1"),
+			tool_start("call-2", "rewind"),
+			rewind_turn("call-2"),
+		] {
+			session.observe_event(&mut prepared, &event);
+		}
+		session.finish_turn(&mut prepared, &TurnOutcome::default());
+		assert_eq!(
+			session.last_assistant_text(),
+			Some("CHECKPOINT-ACK"),
+			"the cut abandoned the rewind turn, so the retained answer stands"
+		);
+	}
+
+	struct CompactTestRunner {
+		summary: String,
+	}
+
+	impl AgentRunner for CompactTestRunner {
+		fn run(&self, _request: &RunRequest) -> Result<crate::agent::EventStream> {
+			let events: Vec<Result<AgentEvent>> = vec![
+				Ok(AgentEvent::MessageUpdate {
+					delta: self.summary.clone(),
+				}),
+				Ok(AgentEvent::turn_end(
+					pi_agent::Message::assistant(&self.summary),
+					Vec::new(),
+					"stop",
+				)),
+			];
+			Ok(Box::new(events.into_iter()))
+		}
+	}
+
+	/// Regression: RPC compact must persist a durable projection so that after
+	/// restart, replay does not resurrect pre-compaction history along with the summary,
+	/// while the archive preserves all historical entries untouched.
+	#[tokio::test]
+	async fn rpc_compact_turn_restart_turn_preserves_context_and_archive() {
+		use pi_agent::DurableBoundary as _;
+
+		let sink: Arc<dyn FrameSink> = Arc::new(NullSink);
+		let cwd = std::env::temp_dir();
+		let dir = cwd.join(format!(
+			"omp-rpc-compact-test-{}-{}",
+			std::process::id(),
+			std::time::SystemTime::now()
+				.duration_since(std::time::UNIX_EPOCH)
+				.unwrap_or_default()
+				.as_nanos()
+		));
+		std::fs::create_dir_all(&dir).expect("session dir");
+		let mut config = Config::default();
+		config.checkpoint.enabled = Some(true);
+
+		let make_launch = |session_dir: std::path::PathBuf| RpcLaunch {
+			runner: Arc::new(CompactTestRunner {
+				summary: "Compacted summary of turn 1".to_string(),
+			}),
+			config: config.clone(),
+			cwd: cwd.clone(),
+			prompts: Prompts::default(),
+			skill_snapshot: SkillSnapshot::new(),
+			skill_options: LoadOptions::new(cwd.clone()),
+			catalog: Arc::new(Catalog::default()),
+			agent_db: cwd.join("agent.db"),
+			approval_mode: ApprovalMode::Yolo,
+			allow: Vec::new(),
+			model: Some("local/mock-model".to_string()),
+			provider: Some("local".to_string()),
+			api_key: Some("sk-test".to_string()),
+			thinking: None,
+			restore_model: false,
+			prewalk: None,
+			plan_yolo: None,
+			max_time: None,
+			max_turns: 8,
+			tools_enabled: true,
+			prompt_cache_key: None,
+			prompt_cache_key_inherited: false,
+			service_tier_explicit: false,
+			provider_session_id: None,
+			store_options: SessionOptions {
+				enabled: true,
+				cwd: cwd.clone(),
+				model: None,
+				provider: None,
+				dir: Some(session_dir),
+				id: Some("rpc-compact-session".to_string()),
+				continue_latest: false,
+				parent_session: None,
+				no_title: true,
+			},
+			preopened_store: None,
+			steer: None,
+		};
+
+		let mut session = RpcSession::open(
+			make_launch(dir.clone()),
+			Approvals::new(ApprovalMode::Yolo, Vec::new()),
+			Arc::new(HostToolBridge::new(Arc::clone(&sink))),
+			Arc::new(HostUriBridge::new(Arc::clone(&sink))),
+			Arc::new(InternalUrlRouter::new()),
+			Arc::new(NoopObserver),
+			Arc::new(NoopResolver),
+		)
+		.expect("open session");
+
+		// 1. Turn 1: initial dialogue before compaction
+		let mut prepared1 = start_turn(&mut session, "turn 1 user question");
+		session
+			.store
+			.durable_boundary()
+			.expect("durable boundary")
+			.persist_messages(&[
+				pi_agent::Message::user("turn 1 user question"),
+				pi_agent::Message::assistant("turn 1 assistant answer"),
+			])
+			.await
+			.expect("persist turn 1");
+		session.finish_turn(&mut prepared1, &TurnOutcome::default());
+
+		assert_eq!(session.store.messages().len(), 2);
+
+		// 2. RPC compact: summarize prior turns into durable projection
+		let compact_result = session.compact(None).expect("compact");
+		assert_eq!(
+			compact_result["summary"].as_str(),
+			Some("Compacted summary of turn 1")
+		);
+
+		let proj_after_compact = session.store.projection().expect("projection exists");
+		assert_eq!(proj_after_compact.kept.len(), 0);
+		assert_eq!(proj_after_compact.synthetic.len(), 1);
+
+		// 3. Turn 2 (next turn after compact, before restart)
+		let mut prepared2 = start_turn(&mut session, "turn 2 user question");
+		let h2 = {
+			let req2 = session
+				.request("turn 2 user question".to_string(), Vec::new(), false)
+				.expect("turn 2 request");
+			req2.history_messages.expect("turn 2 history")
+		};
+		// History contains only the summary, not pre-compaction turn 1
+		assert_eq!(h2.len(), 1);
+		assert_eq!(h2[0].content, "Compacted summary of turn 1");
+
+		let mut turn2_full = h2.clone();
+		turn2_full.push(pi_agent::Message::user("turn 2 user question"));
+		turn2_full.push(pi_agent::Message::assistant("turn 2 assistant answer"));
+		session
+			.store
+			.durable_boundary()
+			.expect("durable boundary")
+			.persist_messages(&turn2_full)
+			.await
+			.expect("persist turn 2");
+		session.finish_turn(&mut prepared2, &TurnOutcome::default());
+
+		// 4. Restart session
+		drop(session);
+
+		let mut restarted = RpcSession::open(
+			make_launch(dir.clone()),
+			Approvals::new(ApprovalMode::Yolo, Vec::new()),
+			Arc::new(HostToolBridge::new(Arc::clone(&sink))),
+			Arc::new(HostUriBridge::new(Arc::clone(&sink))),
+			Arc::new(InternalUrlRouter::new()),
+			Arc::new(NoopObserver),
+			Arc::new(NoopResolver),
+		)
+		.expect("reopen session after restart");
+
+		// Projection survived restart
+		let proj_reopened = restarted.store.projection().expect("reopened projection");
+		assert_eq!(proj_reopened.synthetic.len(), 1);
+		assert_eq!(proj_reopened.kept.len(), 2);
+
+		// Archive preservation: all historical entries remain in SQLite archive
+		let archive = restarted.store.messages();
+		assert!(
+			archive.iter().any(|m| m.message.content.text() == "turn 1 user question"),
+			"archive must preserve turn 1 user question"
+		);
+		assert!(
+			archive.iter().any(|m| m.message.content.text() == "turn 1 assistant answer"),
+			"archive must preserve turn 1 assistant answer"
+		);
+		assert!(
+			archive.iter().any(|m| m.message.content.text() == "turn 2 user question"),
+			"archive must preserve turn 2 user question"
+		);
+
+		// 5. Turn 3 (next turn after restart)
+		let mut prepared3 = start_turn(&mut restarted, "turn 3 user question");
+		let req3 = restarted
+			.request("turn 3 user question".to_string(), Vec::new(), false)
+			.expect("turn 3 request");
+		let h3 = req3.history_messages.expect("turn 3 replayed context");
+
+		// Context verification: must NOT contain turn 1 pre-compaction messages
+		assert!(
+			!h3.iter().any(|m| m.content.contains("turn 1 user question")),
+			"replayed context must not resurrect pre-compaction turn 1 user question"
+		);
+		assert!(
+			!h3.iter().any(|m| m.content.contains("turn 1 assistant answer")),
+			"replayed context must not resurrect pre-compaction turn 1 assistant answer"
+		);
+		// Context verification: must contain summary and turn 2
+		assert!(
+			h3.iter().any(|m| m.content == "Compacted summary of turn 1"),
+			"replayed context must contain compaction summary"
+		);
+		assert!(
+			h3.iter().any(|m| m.content == "turn 2 user question"),
+			"replayed context must contain turn 2 user question"
+		);
+		assert!(
+			h3.iter().any(|m| m.content == "turn 2 assistant answer"),
+			"replayed context must contain turn 2 assistant answer"
+		);
+
+		// Persist Turn 3 after restart: durable alignment must succeed without divergence
+		let mut turn3_full = h3.clone();
+		turn3_full.push(pi_agent::Message::user("turn 3 user question"));
+		turn3_full.push(pi_agent::Message::assistant("turn 3 assistant answer"));
+		restarted
+			.store
+			.durable_boundary()
+			.expect("durable boundary")
+			.persist_messages(&turn3_full)
+			.await
+			.expect("persist turn 3 on restarted session");
+		restarted.finish_turn(&mut prepared3, &TurnOutcome::default());
+
+		std::fs::remove_dir_all(dir).ok();
+	}
+
+	/// Regression: When crash occurs after messages are appended but before
+	/// durable projection's `kept` is updated, reconcile anchors on the compaction
+	/// custom message and backfills the missing kept messages from the branch suffix.
+	#[tokio::test]
+	async fn synthetic_only_projection_crash_before_kept_backfills_from_compaction_anchor() {
+		use pi_agent::DurableBoundary as _;
+
+		let sink: Arc<dyn FrameSink> = Arc::new(NullSink);
+		let cwd = std::env::temp_dir();
+		let dir = cwd.join(format!(
+			"omp-rpc-compact-reconcile-{}-{}",
+			std::process::id(),
+			std::time::SystemTime::now()
+				.duration_since(std::time::UNIX_EPOCH)
+				.unwrap_or_default()
+				.as_nanos()
+		));
+		std::fs::create_dir_all(&dir).expect("session dir");
+		let mut config = Config::default();
+		config.checkpoint.enabled = Some(true);
+
+		let make_launch = |session_dir: std::path::PathBuf| RpcLaunch {
+			runner: Arc::new(CompactTestRunner {
+				summary: "Compacted summary".to_string(),
+			}),
+			config: config.clone(),
+			cwd: cwd.clone(),
+			prompts: Prompts::default(),
+			skill_snapshot: SkillSnapshot::new(),
+			skill_options: LoadOptions::new(cwd.clone()),
+			catalog: Arc::new(Catalog::default()),
+			agent_db: cwd.join("agent.db"),
+			approval_mode: ApprovalMode::Yolo,
+			allow: Vec::new(),
+			model: Some("local/mock-model".to_string()),
+			provider: Some("local".to_string()),
+			api_key: Some("sk-test".to_string()),
+			thinking: None,
+			restore_model: false,
+			prewalk: None,
+			plan_yolo: None,
+			max_time: None,
+			max_turns: 8,
+			tools_enabled: true,
+			prompt_cache_key: None,
+			prompt_cache_key_inherited: false,
+			service_tier_explicit: false,
+			provider_session_id: None,
+			store_options: SessionOptions {
+				enabled: true,
+				cwd: cwd.clone(),
+				model: None,
+				provider: None,
+				dir: Some(session_dir),
+				id: Some("rpc-reconcile-session".to_string()),
+				continue_latest: false,
+				parent_session: None,
+				no_title: true,
+			},
+			preopened_store: None,
+			steer: None,
+		};
+
+		let mut session = RpcSession::open(
+			make_launch(dir.clone()),
+			Approvals::new(ApprovalMode::Yolo, Vec::new()),
+			Arc::new(HostToolBridge::new(Arc::clone(&sink))),
+			Arc::new(HostUriBridge::new(Arc::clone(&sink))),
+			Arc::new(InternalUrlRouter::new()),
+			Arc::new(NoopObserver),
+			Arc::new(NoopResolver),
+		)
+		.expect("open session");
+
+		// Turn 1
+		let mut prepared1 = start_turn(&mut session, "turn 1");
+		session
+			.store
+			.durable_boundary()
+			.expect("durable boundary")
+			.persist_messages(&[
+				pi_agent::Message::user("turn 1"),
+				pi_agent::Message::assistant("turn 1 reply"),
+			])
+			.await
+			.expect("persist turn 1");
+		session.finish_turn(&mut prepared1, &TurnOutcome::default());
+
+		// Compact: creates projection with kept: [], synthetic: [summary], anchor: Some(first_kept)
+		let compact_res = session.compact(None).expect("compact");
+		let first_kept = compact_res["firstKeptEntryId"].as_str().unwrap().to_string();
+
+		// Turn 2: persist to branch
+		let mut prepared2 = start_turn(&mut session, "turn 2");
+		let h2 = {
+			let req2 = session
+				.request("turn 2".to_string(), Vec::new(), false)
+				.expect("turn 2 request");
+			req2.history_messages.expect("turn 2 history")
+		};
+		let mut turn2_full = h2.clone();
+		turn2_full.push(pi_agent::Message::user("turn 2"));
+		turn2_full.push(pi_agent::Message::assistant("turn 2 reply"));
+		session
+			.store
+			.durable_boundary()
+			.expect("durable boundary")
+			.persist_messages(&turn2_full)
+			.await
+			.expect("persist turn 2");
+		session.finish_turn(&mut prepared2, &TurnOutcome::default());
+
+		// Simulate crash: close session, then directly update SQLite payload
+		// to kept = [] on disk, modeling a crash before kept was committed.
+		drop(session);
+
+		let db_path = crate::durable_session::database_path(&dir);
+		{
+			let conn = rusqlite::Connection::open(&db_path).expect("open sqlite db");
+			let mut payload: Value = conn
+				.query_row(
+					"SELECT payload_json FROM sessions WHERE id = ?1",
+					rusqlite::params!["rpc-reconcile-session"],
+					|row| {
+						let s: String = row.get(0)?;
+						Ok(serde_json::from_str(&s).unwrap())
+					},
+				)
+				.expect("query session payload");
+			payload["durableProjection"]["kept"] = json!([]);
+			conn.execute(
+				"UPDATE sessions SET payload_json = ?1 WHERE id = ?2",
+				rusqlite::params![payload.to_string(), "rpc-reconcile-session"],
+			)
+			.expect("reset kept to empty");
+		}
+
+		// Reopen session: reconcile must anchor on `first_kept` and backfill turn 2
+		let mut restarted = RpcSession::open(
+			make_launch(dir.clone()),
+			Approvals::new(ApprovalMode::Yolo, Vec::new()),
+			Arc::new(HostToolBridge::new(Arc::clone(&sink))),
+			Arc::new(HostUriBridge::new(Arc::clone(&sink))),
+			Arc::new(InternalUrlRouter::new()),
+			Arc::new(NoopObserver),
+			Arc::new(NoopResolver),
+		)
+		.expect("reopen session after crash");
+
+		let proj = restarted.store.projection().expect("reopened projection");
+		assert_eq!(
+			proj.kept.len(),
+			2,
+			"reconcile must have backfilled the 2 messages of turn 2 into kept"
+		);
+
+		let req3 = restarted
+			.request("turn 3".to_string(), Vec::new(), false)
+			.expect("turn 3 request");
+		let h3 = req3.history_messages.expect("turn 3 history");
+		assert_eq!(h3.len(), 3);
+		assert_eq!(h3[0].content, "Compacted summary");
+		assert_eq!(h3[1].content, "turn 2");
+		assert_eq!(h3[2].content, "turn 2 reply");
+
+		std::fs::remove_dir_all(dir).ok();
+	}
+
+	/// Regression: If durable projection persistence fails during compact,
+	/// compact must return Err and not publish live state as compacted.
+	#[tokio::test]
+	async fn compact_rejects_on_durable_projection_failure_without_publishing_live_state() {
+		let sink: Arc<dyn FrameSink> = Arc::new(NullSink);
+		let cwd = std::env::temp_dir();
+		let dir = cwd.join(format!(
+			"omp-rpc-compact-err-{}-{}",
+			std::process::id(),
+			std::time::SystemTime::now()
+				.duration_since(std::time::UNIX_EPOCH)
+				.unwrap_or_default()
+				.as_nanos()
+		));
+		std::fs::create_dir_all(&dir).expect("session dir");
+		let mut config = Config::default();
+		config.checkpoint.enabled = Some(true);
+
+		let launch = RpcLaunch {
+			runner: Arc::new(CompactTestRunner {
+				summary: "Compacted summary".to_string(),
+			}),
+			config: config.clone(),
+			cwd: cwd.clone(),
+			prompts: Prompts::default(),
+			skill_snapshot: SkillSnapshot::new(),
+			skill_options: LoadOptions::new(cwd.clone()),
+			catalog: Arc::new(Catalog::default()),
+			agent_db: cwd.join("agent.db"),
+			approval_mode: ApprovalMode::Yolo,
+			allow: Vec::new(),
+			model: Some("local/mock-model".to_string()),
+			provider: Some("local".to_string()),
+			api_key: Some("sk-test".to_string()),
+			thinking: None,
+			restore_model: false,
+			prewalk: None,
+			plan_yolo: None,
+			max_time: None,
+			max_turns: 8,
+			tools_enabled: true,
+			prompt_cache_key: None,
+			prompt_cache_key_inherited: false,
+			service_tier_explicit: false,
+			provider_session_id: None,
+			store_options: SessionOptions {
+				enabled: true,
+				cwd: cwd.clone(),
+				model: None,
+				provider: None,
+				dir: Some(dir.clone()),
+				id: Some("rpc-err-session".to_string()),
+				continue_latest: false,
+				parent_session: None,
+				no_title: true,
+			},
+			preopened_store: None,
+			steer: None,
+		};
+
+		let mut session = RpcSession::open(
+			launch,
+			Approvals::new(ApprovalMode::Yolo, Vec::new()),
+			Arc::new(HostToolBridge::new(Arc::clone(&sink))),
+			Arc::new(HostUriBridge::new(Arc::clone(&sink))),
+			Arc::new(InternalUrlRouter::new()),
+			Arc::new(NoopObserver),
+			Arc::new(NoopResolver),
+		)
+		.expect("open session");
+
+		// Simulate session being marked corrupt so append/set_projection fails
+		session.store.set_corrupt_for_test("forced database failure for testing");
+
+		let compact_err = session.compact(None);
+		assert!(compact_err.is_err(), "compact must fail when store cannot persist");
+
+		// Live state must NOT be published as compacted
+		assert!(session.history_messages.is_none());
+		assert!(session.messages.is_empty());
+
+		std::fs::remove_dir_all(dir).ok();
+	}
+
+	/// Regression: Compaction in a session without a durable store (e.g. in-memory or disabled)
+	/// succeeds in-memory and publishes summary without attempting or requiring SQLite persistence.
+	#[tokio::test]
+	async fn compact_in_memory_session_publishes_summary_without_durable_store() {
+		let sink: Arc<dyn FrameSink> = Arc::new(NullSink);
+		let cwd = std::env::temp_dir();
+		let mut config = Config::default();
+		config.checkpoint.enabled = Some(false);
+
+		let launch = RpcLaunch {
+			runner: Arc::new(CompactTestRunner {
+				summary: "In-memory summary".to_string(),
+			}),
+			config: config.clone(),
+			cwd: cwd.clone(),
+			prompts: Prompts::default(),
+			skill_snapshot: SkillSnapshot::new(),
+			skill_options: LoadOptions::new(cwd.clone()),
+			catalog: Arc::new(Catalog::default()),
+			agent_db: cwd.join("agent.db"),
+			approval_mode: ApprovalMode::Yolo,
+			allow: Vec::new(),
+			model: Some("local/mock-model".to_string()),
+			provider: Some("local".to_string()),
+			api_key: Some("sk-test".to_string()),
+			thinking: None,
+			restore_model: false,
+			prewalk: None,
+			plan_yolo: None,
+			max_time: None,
+			max_turns: 8,
+			tools_enabled: true,
+			prompt_cache_key: None,
+			prompt_cache_key_inherited: false,
+			service_tier_explicit: false,
+			provider_session_id: None,
+			store_options: SessionOptions {
+				enabled: false,
+				cwd: cwd.clone(),
+				model: None,
+				provider: None,
+				dir: None,
+				id: None,
+				continue_latest: false,
+				parent_session: None,
+				no_title: true,
+			},
+			preopened_store: None,
+			steer: None,
+		};
+
+		let mut session = RpcSession::open(
+			launch,
+			Approvals::new(ApprovalMode::Yolo, Vec::new()),
+			Arc::new(HostToolBridge::new(Arc::clone(&sink))),
+			Arc::new(HostUriBridge::new(Arc::clone(&sink))),
+			Arc::new(InternalUrlRouter::new()),
+			Arc::new(NoopObserver),
+			Arc::new(NoopResolver),
+		)
+		.expect("open in-memory session");
+
+		let compact_res = session.compact(None).expect("in-memory compact");
+		assert_eq!(compact_res["summary"].as_str(), Some("In-memory summary"));
+		assert_eq!(
+			session.in_memory_messages.as_ref().map(|m| m.len()),
+			Some(1)
+		);
+		assert_eq!(
+			session.in_memory_messages.as_ref().unwrap()[0].content,
+			"In-memory summary"
+		);
+	}
+}
+

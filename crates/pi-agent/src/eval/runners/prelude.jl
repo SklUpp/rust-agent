@@ -1,4 +1,4 @@
-# OMP Julia prelude helpers (loaded once into the runner's top-level scope).
+# Aragent Julia prelude helpers (loaded once into the runner's top-level scope).
 
 if !isdefined(Main, :__omp_prelude_loaded)
     global __omp_prelude_loaded = true

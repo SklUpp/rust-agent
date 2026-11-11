@@ -8,7 +8,7 @@
 //! every result is dropped and reported instead of returning nothing.
 //!
 //! The timestamp helpers are a localized port of the workspace's
-//! `crates/omp-cli/src/session.rs::parse_iso8601_ms` day arithmetic (Howard
+//! `crates/aragent/src/session.rs::parse_iso8601_ms` day arithmetic (Howard
 //! Hinnant's days-from-civil), extended with `±HH:MM` offsets and 1–9 digit
 //! fractions because SearXNG publishes both. `libc::strptime` was rejected:
 //! unix-only (no Windows target of this binary) and it yields no portable

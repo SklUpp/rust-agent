@@ -51,24 +51,24 @@ jobs:
         with:
           key: standalone-runtime-host
       - name: Check agent core and CLI
-        run: cargo check --locked -p pi-agent -p omp-cli
+        run: cargo check --locked -p pi-agent -p aragent
       - name: Test agent core and CLI
-        run: cargo test --locked -p pi-agent -p omp-cli
+        run: cargo test --locked -p pi-agent -p aragent
       - name: Test persistent shell session and env allowlist
         run: cargo test --locked -p pi-shell --test persistent_session --test session_env_allowlist
       - name: Build CLI for the smoke run
-        run: cargo build --locked -p omp-cli
+        run: cargo build --locked -p aragent
       - name: Run real CLI against local OpenAI-compatible fixture
-        run: python3 scripts/standalone-smoke.py --binary target/debug/omp --timeout 120
+        run: python3 scripts/standalone-smoke.py --binary target/debug/arag --timeout 120
       - name: Record host binary digest
-        run: sha256sum target/debug/omp > target/debug/omp.sha256
+        run: sha256sum target/debug/arag > target/debug/arag.sha256
       - name: Upload host binary
         uses: actions/upload-artifact@v4
         with:
-          name: omp-x86_64-unknown-linux-gnu
+          name: arag-x86_64-unknown-linux-gnu
           path: |
-            target/debug/omp
-            target/debug/omp.sha256
+            target/debug/arag
+            target/debug/arag.sha256
           if-no-files-found: error
 
   build-android:
@@ -105,7 +105,7 @@ jobs:
         uses: Swatinem/rust-cache@v2
         with:
           key: standalone-runtime-android
-      - name: Build omp for aarch64-linux-android
+      - name: Build arag for aarch64-linux-android
         env:
           NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
         run: |
@@ -120,8 +120,8 @@ jobs:
           export TARGET_CC="$CC_aarch64_linux_android"
           export TARGET_AR="$AR_aarch64_linux_android"
           export CARGO_TARGET_AARCH64_LINUX_ANDROID_RUSTFLAGS="-C opt-level=3 -C debuginfo=0 -C strip=symbols"
-          cargo build --release --locked -p omp-cli --target aarch64-linux-android
-          BIN="target/aarch64-linux-android/release/omp"
+          cargo build --release --locked -p aragent --target aarch64-linux-android
+          BIN="target/aarch64-linux-android/release/arag"
           "$TOOLCHAIN/llvm-strip" "$BIN"
           file -b "$BIN" | tee /dev/stderr | grep -q 'ELF 64-bit.*aarch64'
           ls -lh "$BIN"
@@ -129,8 +129,8 @@ jobs:
       - name: Upload Android binary
         uses: actions/upload-artifact@v4
         with:
-          name: omp-aarch64-linux-android
+          name: arag-aarch64-linux-android
           path: |
-            target/aarch64-linux-android/release/omp
-            target/aarch64-linux-android/release/omp.sha256
+            target/aarch64-linux-android/release/arag
+            target/aarch64-linux-android/release/arag.sha256
           if-no-files-found: error

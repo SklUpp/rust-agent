@@ -329,7 +329,8 @@ fn cache_read_spellings_and_deepseek_pair_normalize_without_double_count() {
 	);
 	assert_eq!(anthropic_style, usage(50, 5, 30, 20));
 
-	// Reasoning tokens are preserved (subset of output) and never invented.
+	// Reasoning tokens are preserved (subset of output); absent stays None,
+	// explicit zero stays Some(0).
 	let reasoning = normalize_usage(
 		&serde_json::from_value::<OpenAiUsage>(json!({
 			"prompt_tokens": 100,
@@ -347,7 +348,8 @@ fn cache_read_spellings_and_deepseek_pair_normalize_without_double_count() {
 		}))
 		.expect("zero reasoning shape"),
 	);
-	assert_eq!(no_reasoning.reasoning_tokens, None, "zero means unreported, not a value");
+	assert_eq!(no_reasoning.reasoning_tokens, None, "zero stays omitted on the wire");
+	assert!(no_reasoning.presence.reasoning, "explicit zero is still known");
 }
 
 #[test]
@@ -507,4 +509,39 @@ async fn failed_request_keeps_its_reported_usage_once() {
 		"TurnEnd repeats the same request snapshot; summing both would double count"
 	);
 	assert_eq!(provider.stream_calls.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn normalize_usage_preserves_absent_vs_explicit_zero_presence() {
+	let explicit_zero: OpenAiUsage = serde_json::from_value(json!({
+		"prompt_tokens": 10,
+		"completion_tokens": 2,
+		"prompt_tokens_details": { "cached_tokens": 0 },
+		"completion_tokens_details": { "reasoning_tokens": 0 }
+	}))
+	.expect("usage json");
+	let usage = normalize_usage(&explicit_zero);
+	assert!(usage.presence.input);
+	assert!(usage.presence.output);
+	assert!(usage.presence.cache_read, "explicit zero cache read is reported");
+	assert_eq!(usage.cache_read, 0);
+	assert!(!usage.presence.cache_write, "absent cache write is unknown");
+	assert!(usage.presence.reasoning, "explicit zero reasoning is reported");
+	assert_eq!(usage.reasoning_tokens, None, "wire keeps the old positive-only filter");
+	let wire = serde_json::to_value(&usage).expect("wire usage");
+	assert!(wire.get("reasoningTokens").is_none(), "explicit zero must not appear on the wire");
+
+	let omitted: OpenAiUsage = serde_json::from_value(json!({
+		"prompt_tokens": 10,
+		"completion_tokens": 2
+	}))
+	.expect("usage json");
+	let usage = normalize_usage(&omitted);
+	assert!(usage.presence.input);
+	assert!(usage.presence.output);
+	assert!(!usage.presence.cache_read, "absent cache read is unknown");
+	assert!(!usage.presence.cache_write, "absent cache write is unknown");
+	assert!(!usage.presence.reasoning, "absent reasoning is unknown");
+	assert_eq!(usage.reasoning_tokens, None);
+	assert_eq!(usage.cache_read, 0);
 }

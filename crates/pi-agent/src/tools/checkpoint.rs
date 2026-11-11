@@ -419,7 +419,7 @@ fn content_text(content: Option<&Value>) -> String {
 }
 
 /// RFC 3339 UTC timestamp with millisecond precision, matching the
-/// `omp-cli` formatter without a chrono dependency.
+/// `aragent` formatter without a chrono dependency.
 #[must_use]
 pub fn now_iso8601() -> String {
 	let duration = std::time::SystemTime::now()

@@ -59,7 +59,7 @@ use crate::{
 
 /// Ownership marker written into a task-isolation base dir; byte-compatible
 /// with `packages/coding-agent/src/task/isolation-ownership.ts` so
-/// `omp worktree clear` sees live sandboxes from either runtime.
+/// `arag worktree clear` sees live sandboxes from either runtime.
 pub const ISOLATION_OWNER_FILE: &str = ".omp-isolation-owner.json";
 
 /// Mount dir name under the owned base dir. `merged` is a legacy alias read by
@@ -1580,7 +1580,7 @@ enum PlainPlan {
 }
 
 enum PlainApplyError {
-	/// Another omp writer holds the parent lease, or the path appeared after
+	/// Another arag writer holds the parent lease, or the path appeared after
 	/// preflight. Nothing was written.
 	External(String),
 	/// The target no longer matches the content preflight observed.
@@ -1663,7 +1663,7 @@ fn merge_plain(
 	// re-checks content before publishing.
 	if let Err(error) = &writer {
 		warnings.push(format!(
-			"Parent workspace writer lease is unavailable ({error}); integration ran without the omp writer lease. External changes detected before each write are reported, but this is not an atomic compare-and-swap."
+			"Parent workspace writer lease is unavailable ({error}); integration ran without the arag writer lease. External changes detected before each write are reported, but this is not an atomic compare-and-swap."
 		));
 	}
 
@@ -2008,7 +2008,7 @@ fn apply_plain_action(
 	let _lease = match writer {
 		Some(writer) => Some(writer.acquire(&target).map_err(|error| match error {
 			LockError::Occupied { .. } => PlainApplyError::External(format!(
-				"another omp writer holds the lease for {}",
+				"another arag writer holds the lease for {}",
 				target.display()
 			)),
 			LockError::Io(error) => PlainApplyError::Io(format!(
@@ -2347,7 +2347,7 @@ fn ensure_blocking(
 	check_disjoint(&base_dir, &repo_root, common.as_deref())?;
 	if base_dir.exists() {
 		return Err(format!(
-			"isolation sandbox {} already exists; run `omp worktree clear` and retry",
+			"isolation sandbox {} already exists; run `arag worktree clear` and retry",
 			base_dir.display()
 		));
 	}
@@ -2441,7 +2441,7 @@ fn stop_and_discard(
 			format!("remove failed sandbox {}: {error}", base_dir.display())
 		}),
 		Err(error) => Err(format!(
-			"isolation backend {} stop failed after setup error ({error}); sandbox retained at {} for `omp worktree clear`",
+			"isolation backend {} stop failed after setup error ({error}); sandbox retained at {} for `arag worktree clear`",
 			backend.as_str(),
 			base_dir.display()
 		)),
@@ -2548,7 +2548,7 @@ fn point_gitdir(destination: &Path, admin: &Path) -> Result<(), String> {
 }
 
 /// Remove the sandbox. Never recurses into a still-mounted view: a stop error
-/// leaves the owned base dir in place for `omp worktree clear`.
+/// leaves the owned base dir in place for `arag worktree clear`.
 pub fn cleanup_blocking(handle: &IsolationHandle) -> Result<(), String> {
 	match pi_iso::backend(handle.backend).stop(&handle.merged_dir) {
 		Ok(()) => match fs::remove_dir_all(&handle.base_dir) {
@@ -2560,7 +2560,7 @@ pub fn cleanup_blocking(handle: &IsolationHandle) -> Result<(), String> {
 			)),
 		},
 		Err(error) => Err(format!(
-			"isolation backend {} stop failed ({error}); sandbox retained at {} for `omp worktree clear`",
+			"isolation backend {} stop failed ({error}); sandbox retained at {} for `arag worktree clear`",
 			handle.backend.as_str(),
 			handle.base_dir.display()
 		)),
@@ -2885,7 +2885,7 @@ fn ensure_trailing_commit(merged: &Path, message: Option<&str>) -> Result<bool, 
 		return Ok(false);
 	}
 	git_ok(merged, &["add", "-A"])?;
-	let message = message.unwrap_or("omp: apply isolated changes");
+	let message = message.unwrap_or("arag: apply isolated changes");
 	git_ok(
 		merged,
 		&["-c", "commit.gpgsign=false", "commit", "--no-verify", "-m", message],
@@ -2895,9 +2895,9 @@ fn ensure_trailing_commit(merged: &Path, message: Option<&str>) -> Result<bool, 
 			merged,
 			&[
 				"-c",
-				"user.name=omp",
+				"user.name=arag",
 				"-c",
-				"user.email=omp@localhost",
+				"user.email=arag@localhost",
 				"-c",
 				"commit.gpgsign=false",
 				"commit",
@@ -2916,14 +2916,14 @@ fn create_baseline_commit(
 	id: &str,
 ) -> Result<String, String> {
 	let tree = write_synthetic_tree(merged, baseline)?;
-	let message = format!("omp: isolation baseline {id}");
+	let message = format!("arag: isolation baseline {id}");
 	git_text(
 		merged,
 		&[
 			"-c",
-			"user.name=omp",
+			"user.name=arag",
 			"-c",
-			"user.email=omp@localhost",
+			"user.email=arag@localhost",
 			"commit-tree",
 			tree.as_str(),
 			"-p",
@@ -2943,9 +2943,9 @@ fn rebase_onto_baseline(
 		merged,
 		&[
 			"-c",
-			"user.name=omp",
+			"user.name=arag",
 			"-c",
-			"user.email=omp@localhost",
+			"user.email=arag@localhost",
 			"-c",
 			"commit.gpgsign=false",
 			"rebase",
@@ -3237,7 +3237,7 @@ fn apply_nested(
 			.map(|bytes| !bytes.is_empty())
 			.unwrap_or(false);
 		let stash_message = format!(
-			"omp isolation pre-merge {}",
+			"arag isolation pre-merge {}",
 			artifact.relative_path
 		);
 		let stashed = dirty
@@ -3265,7 +3265,7 @@ fn apply_nested(
 			.and_then(Clone::clone)
 			.unwrap_or_else(|| match commits {
 				IsolationCommitStyle::Generic => format!(
-					"omp: apply isolated changes in {}",
+					"arag: apply isolated changes in {}",
 					artifact.relative_path
 				),
 				IsolationCommitStyle::Ai => String::new(),
@@ -3308,9 +3308,9 @@ fn apply_nested(
 					&repo,
 					&[
 						"-c",
-						"user.name=omp",
+						"user.name=arag",
 						"-c",
-						"user.email=omp@localhost",
+						"user.email=arag@localhost",
 						"-c",
 						"commit.gpgsign=false",
 						"commit",

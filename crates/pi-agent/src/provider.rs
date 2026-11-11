@@ -7,7 +7,7 @@ use async_trait::async_trait;
 use futures::{Stream, StreamExt};
 use serde::{Deserialize, Serialize};
 
-use crate::state::{Message, Role, StopReason, TokenUsage, ToolCall};
+use crate::state::{Message, Role, StopReason, TokenUsage, ToolCall, UsagePresence};
 
 /// Maximum characters of an error response body kept for diagnostics.
 const ERROR_BODY_CHARS: usize = 2048;
@@ -938,6 +938,14 @@ pub fn normalize_usage(raw: &OpenAiUsage) -> TokenUsage {
 
 	let write_reported = details.and_then(|details| details.cache_write_tokens);
 	let write_deepseek = raw.prompt_cache_miss_tokens;
+	let cache_read_reported = raw.cached_tokens.is_some()
+		|| raw.prompt_cache_hit_tokens.is_some()
+		|| details.and_then(|details| details.cached_tokens).is_some()
+		|| raw.cached_content_token_count.is_some();
+	let reasoning = raw
+		.completion_tokens_details
+		.as_ref()
+		.and_then(|details| details.reasoning_tokens);
 	// TS `isDeepSeekUsage`: both DeepSeek counters present, no explicit write
 	// counter, and a positive miss count.
 	let deepseek_style = raw.prompt_cache_hit_tokens.is_some()
@@ -958,13 +966,16 @@ pub fn normalize_usage(raw: &OpenAiUsage) -> TokenUsage {
 		cache_read,
 		cache_write,
 		total_tokens: input + output + cache_read + cache_write,
-		// TS `calculateOpenAIUsageAccounting`: only positive reports are kept,
-		// absent stays unknown instead of zero.
-		reasoning_tokens: raw
-			.completion_tokens_details
-			.as_ref()
-			.and_then(|details| details.reasoning_tokens)
-			.filter(|tokens| *tokens > 0),
+		// Domain/wire compatibility: only positive reasoning is persisted as a
+		// value; explicit zero is carried by `presence.reasoning` for diagnostics.
+		reasoning_tokens: reasoning.filter(|tokens| *tokens > 0),
+		presence: UsagePresence {
+			input:       raw.prompt_tokens.is_some(),
+			output:      raw.completion_tokens.is_some(),
+			cache_read:  cache_read_reported,
+			cache_write: write_reported.is_some() || write_deepseek.is_some(),
+			reasoning:   reasoning.is_some(),
+		},
 		// OpenAI reports no Anthropic cache-ttl/server-tool breakdown.
 		..TokenUsage::default()
 	}

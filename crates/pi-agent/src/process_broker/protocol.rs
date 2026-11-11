@@ -58,7 +58,7 @@ pub const MAX_META_BYTES: u64 = 4 * 1024 * 1024;
 
 /// Profile-scoped runtime root (`<agent dir>/run/daemons`).
 ///
-/// Mirrors `omp-cli::dirs`/`default_log_root` without depending on the CLI
+/// Mirrors `aragent::dirs`/`default_log_root` without depending on the CLI
 /// crate: `PI_CONFIG_DIR` else `~/.omp`, a named profile relocated to
 /// `<base>/profiles/<profile>/agent`, `PI_CODING_AGENT_DIR` override in default
 /// mode. Never ambient `/tmp`.
@@ -74,7 +74,7 @@ pub fn runtime_root() -> PathBuf {
 		.map(PathBuf::from)
 		.filter(|path| !path.as_os_str().is_empty())
 		.unwrap_or_else(|| {
-			// Mirrors `omp-cli::dirs::base_config_root`: `$PI_CONFIG_DIR` else
+			// Mirrors `aragent::dirs::base_config_root`: `$PI_CONFIG_DIR` else
 			// `~/.omp` (never a bare relative `agent` when HOME is missing).
 			std::env::var_os("HOME")
 				.or_else(|| std::env::var_os("USERPROFILE"))
@@ -154,7 +154,7 @@ pub fn physical_runtime_dir_with(
 
 /// Private per-user base for shortened runtime dirs (`$TMPDIR/omp-broker-<uid>`).
 ///
-/// `None` when no absolute temp directory exists. `omp ps --all` enumerates
+/// `None` when no absolute temp directory exists. `arag ps --all` enumerates
 /// only this base for scopes whose logical root is too long for a socket path.
 #[must_use]
 pub fn short_runtime_base() -> Option<PathBuf> {

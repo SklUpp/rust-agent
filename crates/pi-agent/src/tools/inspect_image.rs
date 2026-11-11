@@ -23,8 +23,8 @@
 //! - `details.model` / `details.usage` are `null`: no completion is issued.
 //!
 //! Sniffing mirrors `packages/utils/src/mime.ts` (`parseImageMetadata`).
-//! `crates/omp-cli/src/file_mentions.rs::detect_image_mime` is the other Rust
-//! sniffer but is unreachable from here: `omp-cli` depends on `pi-agent`.
+//! `crates/aragent/src/file_mentions.rs::detect_image_mime` is the other Rust
+//! sniffer but is unreachable from here: `aragent` depends on `pi-agent`.
 
 use std::path::Path;
 use std::sync::LazyLock;

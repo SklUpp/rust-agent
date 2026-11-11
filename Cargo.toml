@@ -1,6 +1,6 @@
 [workspace]
 members = [
-   "crates/omp-cli",
+   "crates/aragent",
    "crates/pi-agent",
    "crates/pi-ast",
    "crates/pi-builtins",

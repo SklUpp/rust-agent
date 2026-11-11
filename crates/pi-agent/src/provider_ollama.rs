@@ -3950,6 +3950,27 @@ fn tool_arguments(call: &OllamaChunkToolCall) -> String {
 }
 
 /// Parse one NDJSON line into zero or more stream chunks.
+/// Ollama reports only `prompt_eval_count` and `eval_count`; cache and
+/// reasoning counters do not exist for this provider.
+fn done_usage(chunk: &OllamaChatChunk) -> TokenUsage {
+	let input = chunk.prompt_eval_count.unwrap_or(0);
+	let output = chunk.eval_count.unwrap_or(0);
+	TokenUsage {
+		input,
+		output,
+		cache_read: 0,
+		cache_write: 0,
+		total_tokens: input.saturating_add(output),
+		reasoning_tokens: None,
+		presence: crate::state::UsagePresence {
+			input:  chunk.prompt_eval_count.is_some(),
+			output: chunk.eval_count.is_some(),
+			..crate::state::UsagePresence::default()
+		},
+		..TokenUsage::default()
+	}
+}
+
 fn process_line(
 	line: &[u8],
 	state: &mut ParseState,
@@ -4009,19 +4030,8 @@ fn process_line(
 	if chunk.done == Some(true) {
 		// TS updates `output.stopReason`/usage here but only pushes the
 		// terminal event after the read loop, so keep the finalization for EOF.
-		let input = chunk.prompt_eval_count.unwrap_or(0);
-		let output_tokens = chunk.eval_count.unwrap_or(0);
-		let usage = TokenUsage {
-			input,
-			output: output_tokens,
-			cache_read: 0,
-			cache_write: 0,
-			total_tokens: input.saturating_add(output_tokens),
-			reasoning_tokens: None,
-			..TokenUsage::default()
-		};
 		state.terminal = Some((
-			Some(usage),
+			Some(done_usage(&chunk)),
 			map_done_reason(chunk.done_reason.as_deref(), state.saw_tool_calls),
 		));
 	}
@@ -4256,6 +4266,23 @@ mod tests {
 				.len(),
 			2
 		);
+	}
+
+	#[test]
+	fn done_usage_preserves_explicit_zero_presence() {
+		let chunk = OllamaChatChunk {
+			prompt_eval_count: Some(0),
+			eval_count: None,
+			done: Some(true),
+			..OllamaChatChunk::default()
+		};
+		let usage = done_usage(&chunk);
+		assert!(usage.presence.input, "explicit zero prompt count is reported");
+		assert_eq!(usage.input, 0);
+		assert!(!usage.presence.output, "missing eval count is unknown");
+		assert!(!usage.presence.cache_read);
+		assert!(!usage.presence.cache_write);
+		assert!(!usage.presence.reasoning);
 	}
 
 	#[test]

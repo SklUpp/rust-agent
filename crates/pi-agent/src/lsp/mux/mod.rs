@@ -30,7 +30,7 @@ pub const PROJECT_DIR_ENV: &str = "OMP_LSP_MUX_PROJECT_DIR";
 /// Stable broker daemon name for the shared LSP mux.
 pub const DAEMON_NAME: &str = "omp.lsp.mux";
 /// Prefix of the readiness banner printed once the mux accepts connections.
-pub const READY_PATTERN: &str = "omp lsp mux listening on ";
+pub const READY_PATTERN: &str = "arag lsp mux listening on ";
 /// Socket file name inside the project runtime directory.
 pub const SOCKET_FILE: &str = "lsp-mux.sock";
 /// Socket path budget (Linux/Android `sun_path` is 108 bytes including NUL).

@@ -9,7 +9,7 @@
 //! Root turns share the runner's session, children own theirs, and a shared mux
 //! server is never killed — the broker answers `shutdown` and `exit` closes
 //! just that link. The mux daemon is the hidden CLI worker
-//! `omp __omp_worker_lsp_mux` (see [`mux::worker`]).
+//! `arag __omp_worker_lsp_mux` (see [`mux::worker`]).
 //!
 //! See `docs/tools/lsp.md`.
 

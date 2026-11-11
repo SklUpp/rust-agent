@@ -2,7 +2,7 @@
 //!
 //! Mirrors `packages/coding-agent/src/internal-urls/router.ts`: the `read` and
 //! `write` tools consult one router before touching the filesystem, handlers
-//! register per scheme, reserved OMP namespaces cannot be replaced, and a
+//! register per scheme, reserved Aragent namespaces cannot be replaced, and a
 //! scheme with no handler is an explicit protocol error instead of a path.
 //!
 //! No transport lives here: RPC host schemes register an adapter handler that
@@ -37,7 +37,7 @@ use crate::CancellationToken;
 /// [`UrlScope::local_roots`].
 pub const LOCAL_SCHEME: &str = "local";
 
-/// OMP-owned namespaces a host may never replace: `security://` is reserved for
+/// Aragent-owned namespaces a host may never replace: `security://` is reserved for
 /// the security review surface, `local://` for the built-in root handler,
 /// `artifact://` for the built-in spilled-output reader, `agent://` for saved
 /// subagent outputs, `ssh://` for the built-in native OpenSSH read handler,
@@ -56,7 +56,7 @@ pub const RESERVED_SCHEMES: [&str; 10] =
 /// Reserved scheme for the read-only security review surface.
 pub const SECURITY_SCHEME: &str = "security";
 
-/// The only reserved schemes OMP itself mounts after construction. Keeping the
+/// The only reserved schemes Aragent itself mounts after construction. Keeping the
 /// list closed is what stops a host bridge from installing a handler over any
 /// other built-in namespace.
 const RESERVED_MOUNT_SCHEMES: [&str; 2] = ["history", SECURITY_SCHEME];
@@ -118,7 +118,7 @@ pub fn is_valid_scheme(scheme: &str) -> bool {
 	chars.all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || matches!(c, '+' | '.' | '-'))
 }
 
-/// Whether `scheme` is an OMP namespace hosts may not replace.
+/// Whether `scheme` is an Aragent namespace hosts may not replace.
 #[must_use]
 pub fn is_reserved_scheme(scheme: &str) -> bool {
 	RESERVED_SCHEMES.contains(&scheme)
@@ -332,7 +332,7 @@ impl InternalUrlRouter {
 		Ok(self.lock_handlers().insert(scheme, handler))
 	}
 
-	/// Mount one of OMP's own reserved handlers.
+	/// Mount one of Aragent's own reserved handlers.
 	///
 	/// Only `history://` (`hub_park::register_history`) and `security://`
 	/// ([`register_security`]) use this: both are reserved so a host bridge
@@ -346,7 +346,7 @@ impl InternalUrlRouter {
 		let scheme = handler.scheme().to_ascii_lowercase();
 		if !RESERVED_MOUNT_SCHEMES.contains(&scheme.as_str()) {
 			return Err(format!(
-				"{scheme}:// is not an OMP-reserved mount scheme"
+				"{scheme}:// is not an Aragent-reserved mount scheme"
 			));
 		}
 		Ok(self.lock_handlers().insert(scheme, handler))
@@ -437,7 +437,7 @@ impl InternalUrlRouter {
 
 /// Mount the read-only `security://` review namespace.
 ///
-/// `security://` is reserved for the OMP-native security surface: a host bridge
+/// `security://` is reserved for the Aragent-native security surface: a host bridge
 /// can never register or replace it through [`InternalUrlRouter::register`].
 /// The CLI security module owns the handler and calls this to install it, so
 /// the mount pins the exact scheme and refuses a writable handler — the
@@ -1024,7 +1024,7 @@ mod tests {
 			.register_core(Echo::new("mcp", true, false))
 			.err()
 			.expect("core refuses non-mount schemes");
-		assert_eq!(error, "mcp:// is not an OMP-reserved mount scheme");
+		assert_eq!(error, "mcp:// is not an Aragent-reserved mount scheme");
 		assert!(router.get_handler("mcp").is_some());
 	}
 

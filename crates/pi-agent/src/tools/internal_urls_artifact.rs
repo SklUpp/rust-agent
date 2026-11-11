@@ -11,7 +11,7 @@
 //! process-global session registry: a session binds its artifacts directory as
 //! the `local://` root (`RpcSession::url_scope`), and a subagent's scope adds
 //! the owning root's artifact directory under `artifact://` because every
-//! child publishes into that same directory (`crates/omp-cli/src/eval_host.rs`
+//! child publishes into that same directory (`crates/aragent/src/eval_host.rs`
 //! hands children one shared `artifacts_dir`). Scanning every session on the
 //! box would leak artifacts across unrelated sessions, so only those
 //! caller-owned roots are searched. This is a deliberate security boundary:

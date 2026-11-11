@@ -3062,15 +3062,19 @@ impl AnthropicUsage {
 	fn apply(&self, usage: &mut TokenUsage) {
 		if let Some(value) = self.input_tokens {
 			usage.input = value;
+			usage.presence.input = true;
 		}
 		if let Some(value) = self.output_tokens {
 			usage.output = value;
+			usage.presence.output = true;
 		}
 		if let Some(value) = self.cache_read_input_tokens {
 			usage.cache_read = value;
+			usage.presence.cache_read = true;
 		}
 		if let Some(value) = self.cache_creation_input_tokens {
 			usage.cache_write = value;
+			usage.presence.cache_write = true;
 		}
 		if let Some(cache_creation) = &self.cache_creation {
 			let five_minute = cache_creation.ephemeral_5m_input_tokens.unwrap_or(0);
@@ -3817,3 +3821,27 @@ fn stream_error(event: &serde_json::Value, secrets: &[String]) -> ProviderError 
 //   br/zstd/deflate decoders; TS advertises all four.
 // - OAuth request ids come from `/dev/urandom` (time/pid fallback); the CCH
 //   attestation is xxHash64 over the serialized body.
+#[cfg(test)]
+mod usage_presence_tests {
+	use super::AnthropicUsage;
+
+	#[test]
+	fn anthropic_preserves_explicit_zero_and_absent_counters() {
+		let usage = AnthropicUsage {
+			input_tokens: Some(0),
+			output_tokens: None,
+			cache_read_input_tokens: Some(0),
+			cache_creation_input_tokens: None,
+			cache_creation: None,
+			server_tool_use: None,
+		}
+		.into_token_usage();
+		assert!(usage.presence.input, "explicit zero input is reported");
+		assert_eq!(usage.input, 0);
+		assert!(usage.presence.cache_read, "explicit zero cache read is reported");
+		assert_eq!(usage.cache_read, 0);
+		assert!(!usage.presence.output, "absent output is unknown");
+		assert!(!usage.presence.cache_write, "absent cache write is unknown");
+		assert!(!usage.presence.reasoning);
+	}
+}

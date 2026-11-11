@@ -45,6 +45,7 @@ pub use state::{
 	AcpClientBridge, AcpClientError, AgentConfig, AgentContext, AgentShell, AgentState,
 	Attribution,
 	CacheTtlUsage, ContentPart, ImagePart, Message, Role, ServerToolUsage, StopReason, TokenUsage,
+	UsagePresence,
 	ToolApprover, ToolCall, ToolResult, TurnResult, TurnStatus,
 };
 pub use tokenizer::Tokenizer;

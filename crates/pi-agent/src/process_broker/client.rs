@@ -560,7 +560,7 @@ fn lease_live(runtime_dir: &Path) -> bool {
 
 fn spawn_worker(project_dir: &Path, runtime_dir: &Path) -> Result<(), String> {
 	let executable =
-		std::env::current_exe().map_err(|err| format!("cannot resolve the omp executable: {err}"))?;
+		std::env::current_exe().map_err(|err| format!("cannot resolve the arag executable: {err}"))?;
 	let mut command = std::process::Command::new(executable);
 	command
 		.arg(protocol::WORKER_ARG)

@@ -1,4 +1,4 @@
-// Persistent JavaScript kernel for omp eval (Bun subprocess, node:vm).
+// Persistent JavaScript kernel for arag eval (Bun subprocess, node:vm).
 //
 // Protocol: one JSON request per stdin line ({id,code,cwd,env,silent,storeHistory}
 // or {type:"exit"}); JSON frames on stdout. Cell stdout/stderr go through a

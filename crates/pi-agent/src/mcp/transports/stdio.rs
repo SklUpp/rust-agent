@@ -520,7 +520,7 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn roots_list_returns_encoded_configured_cwd() {
-        let dir = std::env::temp_dir().join(format!("omp mcp roots #{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("arag mcp roots #{}", std::process::id()));
         std::fs::create_dir_all(&dir).expect("create root dir");
         let script_path = dir.join("roots_server.py");
         std::fs::write(
@@ -576,7 +576,7 @@ for line in sys.stdin:
         assert!(uri.starts_with("file:///"), "uri={uri}");
         assert!(!uri.contains(' '), "space must be encoded: {uri}");
         assert!(!uri.contains('#'), "fragment delimiter must be encoded: {uri}");
-        assert!(uri.contains("omp%20mcp%20roots%20%23"), "configured cwd must be the root: {uri}");
+        assert!(uri.contains("arag%20mcp%20roots%20%23"), "configured cwd must be the root: {uri}");
 
         let _ = std::fs::remove_dir_all(&dir);
     }

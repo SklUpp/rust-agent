@@ -121,7 +121,7 @@ async fn create_and_init_transport(
             roots: Some(MCPRootsCapability { list_changed: false }),
         },
         client_info: crate::mcp::types::MCPClientInfo {
-            name: "omp".to_string(),
+            name: "arag".to_string(),
             version: "1.0.0".to_string(),
         },
     };
