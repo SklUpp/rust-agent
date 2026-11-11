@@ -68,7 +68,7 @@ struct Row {
 	reason:   Option<i64>,
 }
 
-fn rows(path: &Path) -> Vec<Row> {
+fn fetch_rows(path: &Path) -> Vec<Row> {
 	let connection = Connection::open(path).expect("open diagnostics");
 	let mut statement = connection
 		.prepare(
@@ -203,7 +203,7 @@ fn enabled_trace_records_boundaries_and_nullable_tokens() {
 	drop(trace);
 	sink.flush();
 
-	let rows = rows(&dir.db());
+	let rows = fetch_rows(&dir.db());
 	assert!(
 		rows
 			.iter()
@@ -292,13 +292,13 @@ fn disabled_setting_writes_nothing_and_keeps_existing_rows() {
 	span.finish(SpanStatus::Succeeded, TokenRecord::default());
 	sink.flush();
 	drop(sink);
-	let before = rows(&dir.db()).len();
+	let before = fetch_rows(&dir.db()).len();
 	assert_eq!(before, 2);
 
 	config.diagnostics.enabled = Some(false);
 	assert!(diagnostics::open_for_config(&config, dir.db()).is_none());
 	assert!(dir.db().exists(), "disabled mode must not delete the database");
-	let after = rows(&dir.db()).len();
+	let after = fetch_rows(&dir.db()).len();
 	assert_eq!(before, after, "disabled mode must not append rows");
 }
 
@@ -357,7 +357,7 @@ fn unknown_provider_usage_is_null_not_zero() {
 	let mut span = sink.begin_span(SpanKind::Model, None);
 	span.finish(SpanStatus::Succeeded, TokenRecord::default());
 	sink.flush();
-	let rows = rows(&dir.db());
+	let rows = fetch_rows(&dir.db());
 	let end = rows
 		.iter()
 		.find(|row| row.status == "succeeded")
@@ -529,7 +529,7 @@ fn subagent_recorders_are_isolated_per_scope() {
 		recorder.observe(&lifecycle(id, SubagentLifecycleStatus::Completed, Some(3)));
 	}
 	sink.flush();
-	let rows = rows(&dir.db());
+	let rows = fetch_rows(&dir.db());
 	let subagents = rows
 		.iter()
 		.filter(|row| row.kind == "subagent" && row.status == "succeeded")
@@ -545,14 +545,14 @@ fn abrupt_shutdown_closes_open_sessions_once() {
 	let trace = sink.start_session("raw-abrupt-session");
 	assert!(sink.session_span("raw-abrupt-session").is_some());
 	sink.shutdown();
-	let rows = rows(&dir.db());
-	let closed = rows
+	let initial = fetch_rows(&dir.db());
+	let closed = initial
 		.iter()
 		.filter(|row| row.kind == "session" && row.status == "closed")
 		.count();
 	assert_eq!(closed, 1, "abrupt teardown closes the open session once");
 	drop(trace);
-	let after = rows(&dir.db());
+	let after = fetch_rows(&dir.db());
 	assert_eq!(
 		after.iter().filter(|row| row.kind == "session" && row.status == "closed").count(),
 		1,
@@ -570,7 +570,7 @@ fn session_alias_parents_security_runs() {
 	assert_eq!(sink.session_span("security:scan-42"), Some(canonical));
 	drop(trace);
 	sink.flush();
-	let rows = rows(&dir.db());
+	let rows = fetch_rows(&dir.db());
 	assert_eq!(
 		rows.iter().filter(|row| row.kind == "session").count(),
 		2,
@@ -596,6 +596,6 @@ fn concurrent_writers_all_flush() {
 		handle.join().expect("writer");
 	}
 	sink.flush();
-	let rows = rows(&dir.db());
+	let rows = fetch_rows(&dir.db());
 	assert_eq!(rows.len(), 400, "every start/end pair persisted");
 }
