@@ -552,9 +552,9 @@ fn abrupt_shutdown_closes_open_sessions_once() {
 		.count();
 	assert_eq!(closed, 1, "abrupt teardown closes the open session once");
 	drop(trace);
-	let rows = rows(&dir.db());
+	let after = rows(&dir.db());
 	assert_eq!(
-		rows.iter().filter(|row| row.kind == "session" && row.status == "closed").count(),
+		after.iter().filter(|row| row.kind == "session" && row.status == "closed").count(),
 		1,
 		"trace drop after shutdown must not duplicate the close row"
 	);
