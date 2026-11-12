@@ -400,7 +400,7 @@ Built-in import graph нет. Feasible:
 
 ### 7.1 Structural edits/codemods
 
-- `ast_edit` (`ops: [{pat, out}]`) does 1:1 AST substitution with `$NAME`, `$_`, `$$$NAME`, `$$$`; captures substituted; no multi-sibling expansion unless grammar permits.
+- `ast_edit` (`ops: [{pat, out}]`) supports `$NAME` and `$$$NAME` captures in replacement templates. Anonymous `$_` and `$$$` match without reusable bindings; name a capture to substitute it. No multi-sibling expansion unless grammar permits.
 - Preview first; actual write via `write xd://resolve`; exact-byte stale gate; error files skipped; max files cap; parse issues reported; files not modified on stale.
 - `ast_grep` structural search; `pi_ast::ops::{compile_rewrite_rules, rewrite_source, apply_edits}` is the lower-level engine.
 - Codemod can rename identifiers textually, change calls, rewrite patterns; cannot guarantee semantic equivalence.

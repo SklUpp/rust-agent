@@ -11,12 +11,11 @@ use std::{
 };
 
 use serde_json::Value;
-use tokio::process::Command;
+use tokio::{io::AsyncWriteExt, process::Command};
 use tokio_util::sync::CancellationToken;
 
 use super::{
 	config::resolve_command,
-	edits::write_text_atomic,
 	types::{CustomLinter, Diagnostic, Position, Range, ServerConfig},
 	utils::{absolutize, normalize_absolute},
 };
@@ -82,6 +81,48 @@ async fn run(
 			Ok(Ok(output)) => output,
 			Ok(Err(error)) => return Err(error.to_string()),
 			Err(_) => return Err("linter command timed out".to_string()),
+		}
+	};
+	Ok(CommandOutput {
+		stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
+		stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+		success: output.status.success(),
+	})
+}
+async fn run_with_stdin(
+	program: &Path,
+	args: &[String],
+	cwd: &Path,
+	content: &str,
+	cancel: &CancellationToken,
+) -> Result<CommandOutput, String> {
+	let mut command = Command::new(program);
+	command
+		.args(args)
+		.current_dir(cwd)
+		.stdin(std::process::Stdio::piped())
+		.stdout(std::process::Stdio::piped())
+		.stderr(std::process::Stdio::piped())
+		.kill_on_drop(true);
+	#[cfg(unix)]
+	command.process_group(0);
+	let mut child = command.spawn().map_err(|error| error.to_string())?;
+	let mut stdin = child
+		.stdin
+		.take()
+		.ok_or_else(|| "linter stdin unavailable".to_string())?;
+	let write_stdin = async move {
+		stdin.write_all(content.as_bytes()).await.map_err(|error| error.to_string())?;
+		drop(stdin);
+		Ok::<(), String>(())
+	};
+	let wait = child.wait_with_output();
+	let output = tokio::select! {
+		_ = cancel.cancelled() => return Err("Operation aborted".to_string()),
+		result = tokio::time::timeout(CLI_TIMEOUT, async { tokio::join!(write_stdin, wait) }) => {
+			let (write_result, wait_result) = result.map_err(|_| "linter command timed out".to_string())?;
+			write_result?;
+			wait_result.map_err(|error| error.to_string())?
 		}
 	};
 	Ok(CommandOutput {
@@ -158,20 +199,19 @@ pub async fn format(
 	let program = resolved(config, cwd)?;
 	match kind {
 		LinterKind::Biome => {
-			write_text_atomic(file_path, content).await?;
 			let args = vec![
 				"format".to_string(),
-				"--write".to_string(),
+				"--stdin-file-path".to_string(),
 				file_path.to_string_lossy().into_owned(),
 			];
-			let output = run(&program, &args, cwd, cancel).await?;
+			let output = run_with_stdin(&program, &args, cwd, content, cancel).await?;
 			if !output.success {
 				return Ok(Some(content.to_string()));
 			}
-			let formatted = tokio::fs::read_to_string(file_path)
-				.await
-				.map_err(|error| error.to_string())?;
-			Ok(Some(formatted))
+			if output.stdout.is_empty() && !content.trim().is_empty() {
+				return Err("Biome formatter returned empty output for non-empty input".to_string());
+			}
+			Ok(Some(output.stdout))
 		}
 		LinterKind::SwiftLint => Ok(Some(content.to_string())),
 	}

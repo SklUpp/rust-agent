@@ -1984,7 +1984,7 @@ const GALLERY_TOOLS: [GalleryTool; 20] = [
 	GalleryTool { name: "glob", args: r#"{"pattern":"src/**/*.ts"}"#, result: "src/main.ts\nsrc/util.ts" },
 	GalleryTool { name: "grep", args: r#"{"pattern":"TODO","path":"src"}"#, result: "src/main.ts:12: // TODO: cache" },
 	GalleryTool { name: "ast_grep", args: r#"{"pattern":"console.log($$$)","path":"src"}"#, result: "src/main.ts:14: console.log(app)" },
-	GalleryTool { name: "ast_edit", args: r#"{"pattern":"console.log($$$)","rewrite":"logger.info($$$)"}"#, result: "Edited 1 match in src/main.ts" },
+	GalleryTool { name: "ast_edit", args: r#"{"ops":[{"pat":"console.log($$$ARGS)","out":"logger.info($$$ARGS)"}],"paths":["src"]}"#, result: "Edited 1 match in src/main.ts" },
 	GalleryTool { name: "write", args: r##"{"path":"notes.md","content":"# Notes\n"}"##, result: "Wrote 8 bytes to notes.md" },
 	GalleryTool { name: "edit", args: r#"{"path":"src/main.ts","old_string":"let a = 1","new_string":"let a = 2"}"#, result: "Edited src/main.ts" },
 	GalleryTool { name: "bash", args: r#"{"command":"git status --short"}"#, result: " M src/main.ts" },

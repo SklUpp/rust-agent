@@ -493,7 +493,7 @@ async fn sync_content_best_effort(
 	client::sync_content(client, absolute_path, content, cancel).await
 }
 
-/// Format a file on disk, writing back only when the formatter changed it.
+/// Format a file on disk, writing back only when the formatter changed an unchanged file.
 pub async fn format_file(
 	absolute_path: &Path,
 	cwd: &Path,
@@ -501,9 +501,13 @@ pub async fn format_file(
 	cancel: &CancellationToken,
 	session: &Arc<LspSession>,
 ) -> Result<(FormatResultStatus, String), String> {
-	let original = tokio::fs::read_to_string(absolute_path)
-		.await
+	let writer = crate::workspace_writer::WorkspaceWriter::new().map_err(|error| error.to_string())?;
+	let _lease = writer.acquire(absolute_path).map_err(|error| error.to_string())?;
+	let version = crate::workspace_writer::FileVersion::read(absolute_path)
 		.map_err(|error| error.to_string())?;
+	let original = std::str::from_utf8(version.raw())
+		.map_err(|error| error.to_string())?
+		.to_owned();
 	let result = format_content(absolute_path, &original, cwd, servers, cancel, session).await;
 	if result.failed {
 		return Ok((FormatResultStatus::Failed, original));
@@ -514,7 +518,13 @@ pub async fn format_file(
 	if result.content == original {
 		return Ok((FormatResultStatus::Unchanged, result.content));
 	}
-	crate::lsp::edits::write_text_atomic(absolute_path, &result.content).await?;
+	crate::workspace_writer::replace_if_unchanged(
+		version.canonical(),
+		&version,
+		result.content.as_bytes(),
+		None,
+	)
+	.map_err(|error| error.to_string())?;
 	Ok((FormatResultStatus::Formatted, result.content))
 }
 

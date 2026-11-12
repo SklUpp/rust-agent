@@ -161,7 +161,7 @@ impl Tool for AstEditTool {
 							},
 							"out": {
 								"type": "string",
-								"description": "replacement template"
+								"description": "replacement template; reuse named captures such as $NAME or $$$ARGS from pat. Anonymous $$$ is not a capture and cannot be substituted"
 							}
 						},
 						"required": ["pat", "out"]
