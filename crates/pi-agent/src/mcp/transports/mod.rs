@@ -9,6 +9,7 @@ pub mod header_policy;
 pub mod http;
 pub mod sse;
 pub mod stdio;
+pub mod rmcp_adapter;
 
 #[async_trait]
 pub trait McpTransport: Send + Sync {
@@ -31,7 +32,7 @@ pub trait McpTransport: Send + Sync {
 /// Building the URI by hand (`format!("file://{path}")`) leaves spaces and `#`
 /// unescaped, which strict servers reject or truncate as a fragment. There is no
 /// malformed fallback: an unconvertible path is an error.
-fn root_uri(path: &Path) -> Result<String, String> {
+pub(crate) fn root_uri(path: &Path) -> Result<String, String> {
     let absolute = if path.is_absolute() {
         path.to_path_buf()
     } else {

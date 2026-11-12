@@ -29,7 +29,7 @@ const MAX_LIST_ENTRIES: usize = 10_000;
 
 pub fn is_retriable_connection_error(error: &McpError) -> bool {
     match error {
-        McpError::AcceptedStreamError(_) => false,
+        McpError::AcceptedStreamError(_) | McpError::UnknownOutcome(_) => false,
         McpError::Http { status, .. } => *status == 404 || *status == 502 || *status == 503,
         McpError::Transport(msg) | McpError::Timeout(msg) | McpError::Tool(msg) => {
             let lower = msg.to_lowercase();
@@ -48,13 +48,7 @@ pub fn is_retriable_connection_error(error: &McpError) -> bool {
         }
         McpError::Io(io_err) => {
             use std::io::ErrorKind;
-            matches!(
-                io_err.kind(),
-                ErrorKind::ConnectionRefused
-                    | ErrorKind::ConnectionReset
-                    | ErrorKind::BrokenPipe
-                    | ErrorKind::NotConnected
-            )
+            matches!(io_err.kind(), ErrorKind::ConnectionRefused | ErrorKind::ConnectionReset | ErrorKind::BrokenPipe | ErrorKind::NotConnected)
         }
         McpError::Closed => true,
         _ => false,
@@ -66,10 +60,7 @@ pub fn is_retriable_connection_error(error: &McpError) -> bool {
 /// replay could execute a mutating call twice. [`McpError::Closed`] is excluded —
 /// transports report it only when the request never left the client.
 pub fn is_unverified_delivery(error: &McpError) -> bool {
-    matches!(
-        error,
-        McpError::Transport(_) | McpError::Http { status: 502 | 503, .. }
-    )
+    matches!(error, McpError::Transport(_) | McpError::UnknownOutcome(_) | McpError::Http { status: 502 | 503, .. })
 }
 
 pub struct McpConnection {
@@ -96,15 +87,20 @@ impl std::fmt::Debug for McpConnection {
 async fn create_and_init_transport(
     config: &MCPServerConfig,
 ) -> Result<(Arc<dyn McpTransport>, MCPInitializeResult), McpError> {
-    let transport: Arc<dyn McpTransport> = match config {
-        MCPServerConfig::Stdio(s) => Arc::new(StdioTransport::spawn(s).await?),
-        MCPServerConfig::Http(h) => Arc::new(HttpTransport::new(h)),
+    let (transport, rmcp_init_result): (Arc<dyn McpTransport>, Option<MCPInitializeResult>) = match config {
+        MCPServerConfig::Stdio(stdio) => {
+            let service = crate::mcp::transports::rmcp_adapter::StdioService::connect(stdio).await?;
+            let result = service.initialized_result().await?;
+            (Arc::new(service), Some(result))
+        }
+        MCPServerConfig::Http(h) => (Arc::new(HttpTransport::new(h)), None),
         MCPServerConfig::Sse(s) => {
             let sse = LegacySseTransport::new(s);
             sse.connect().await?;
-            Arc::new(sse)
+            (Arc::new(sse), None)
         }
     };
+    if let Some(result) = rmcp_init_result { return Ok((transport, result)); }
 
     let timeout_ms = resolve_mcp_timeout_ms(config.timeout());
     let timeout_dur = if timeout_ms > 0 {
@@ -640,7 +636,7 @@ impl McpConnection {
             // The server accepted this call and its result stream then died
             // (streamable HTTP reports that as `AcceptedStreamError`): execution
             // is uncertain. Surface it unchanged and never replay.
-            Err(e @ McpError::AcceptedStreamError(_)) => return Err(e),
+            Err(e @ McpError::AcceptedStreamError(_)) | Err(e @ McpError::UnknownOutcome(_)) => return Err(e),
             // The request was already on the wire when the connection failed:
             // delivery, and therefore execution, cannot be verified. Reconnect
             // for future calls, but NEVER transparently replay a potentially

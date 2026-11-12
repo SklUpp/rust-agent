@@ -74,7 +74,7 @@ const INHERITED_ENV: &[&str] = &[
     "NODE_EXTRA_CA_CERTS",
 ];
 
-fn apply_isolated_env(cmd: &mut Command, overrides: &HashMap<String, String>) {
+pub(crate) fn apply_isolated_env(cmd: &mut Command, overrides: &HashMap<String, String>) {
     cmd.env_clear();
     for key in INHERITED_ENV {
         if let Some(value) = std::env::var_os(key) {

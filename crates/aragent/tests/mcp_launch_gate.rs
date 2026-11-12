@@ -190,7 +190,7 @@ fn wait_for_mock_child_exit(rt: &tokio::runtime::Runtime, pid_file: &Path) {
 		if !mock_child_alive(pid) {
 			return;
 		}
-		rt.block_on(tokio::time::sleep(std::time::Duration::from_millis(20)));
+		rt.block_on(async { tokio::time::sleep(std::time::Duration::from_millis(20)).await });
 	}
 	panic!("MCP child {pid} still alive");
 }

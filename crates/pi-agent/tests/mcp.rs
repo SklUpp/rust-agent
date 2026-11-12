@@ -172,6 +172,140 @@ async fn test_oauth_explicit_rejection() {
 }
 
 #[tokio::test]
+async fn test_rmcp_stdio_numeric_ids_and_server_metadata() {
+    let temp = std::env::temp_dir().join(format!("mcp_rmcp_stdio_{}.py", std::process::id()));
+    std::fs::write(&temp, r#"import sys,json
+for line in sys.stdin:
+ m=json.loads(line); method=m.get('method'); mid=m.get('id')
+ if method=='initialize':
+  print(json.dumps({'jsonrpc':'2.0','id':mid,'result':{'protocolVersion':'2025-11-25','capabilities':{'tools':{}},'serverInfo':{'name':'rmcp-fixture','version':'1'}}}),flush=True)
+ elif method=='tools/list':
+  print(json.dumps({'jsonrpc':'2.0','id':mid,'result':{'tools':[{'name':'hello','inputSchema':{}}]}}),flush=True)
+"#).unwrap();
+    let config = MCPServerConfig::Stdio(MCPStdioServerConfig {
+        command: "python3".into(), args: vec![temp.to_string_lossy().into_owned()],
+        env: HashMap::new(), cwd: None, timeout: Some(5_000), request_id_format: Some(RequestIdFormat::Number),
+    });
+    let conn = connect_to_server("rmcp", config).await.expect("connect");
+    assert_eq!(conn.server_info.name, "rmcp-fixture");
+    assert_eq!(conn.list_tools().await.expect("tools")[0].name, "hello");
+    conn.close().await.expect("close");
+    std::fs::remove_file(temp).unwrap();
+}
+
+#[tokio::test]
+async fn test_rmcp_stdio_roots_env_call_and_shutdown() {
+    let dir = std::env::temp_dir();
+    let script_path = dir.join(format!("mcp_rmcp_behavior_{}.py", std::process::id()));
+    let marker = dir.join(format!("mcp_rmcp_behavior_{}.marker", std::process::id()));
+    let script = format!(r#"import json, os, sys, time
+marker = r"{}"
+for line in sys.stdin:
+    msg = json.loads(line)
+    method = msg.get("method")
+    mid = msg.get("id")
+    if method == "initialize":
+        print(json.dumps({{"jsonrpc":"2.0","id":mid,"result":{{"protocolVersion":"2025-11-25","capabilities":{{"tools":{{}}}},"serverInfo":{{"name":"rmcp-behavior","version":"1"}}}}}}), flush=True)
+    elif method == "notifications/initialized":
+        print(json.dumps({{"jsonrpc":"2.0","id":"roots-1","method":"roots/list"}}), flush=True)
+    elif mid == "roots-1":
+        with open(marker + ".root", "w") as f: json.dump(msg, f)
+    elif method == "tools/list":
+        print(json.dumps({{"jsonrpc":"2.0","id":mid,"result":{{"tools":[{{"name":"hello","inputSchema":{{}}}}]}}}}), flush=True)
+    elif method == "tools/call":
+        with open(marker, "w") as f: f.write(os.environ.get("RMCP_TEST_ENV", "missing"))
+        print(json.dumps({{"jsonrpc":"2.0","id":mid,"result":{{"content":[{{"type":"text","text":"called"}}],"isError":False}}}}), flush=True)
+"#, marker.display());
+    std::fs::write(&script_path, script).unwrap();
+    let config = MCPServerConfig::Stdio(MCPStdioServerConfig {
+        command: "python3".into(), args: vec![script_path.to_string_lossy().into_owned()],
+        env: HashMap::from([(String::from("RMCP_TEST_ENV"), String::from("explicit-env"))]),
+        cwd: None, timeout: Some(5_000), request_id_format: Some(RequestIdFormat::Number),
+    });
+    let conn = connect_to_server("rmcp-behavior", config).await.expect("connect");
+    assert_eq!(conn.server_info.name, "rmcp-behavior");
+    assert_eq!(conn.list_tools().await.expect("list")[0].name, "hello");
+    let result = conn.call_tool("hello", json!({})).await.expect("call");
+    assert_eq!(result.content.len(), 1);
+    for _ in 0..20 {
+        if marker.exists() && marker.with_extension("marker.root").exists() { break; }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(std::fs::read_to_string(&marker).unwrap(), "explicit-env");
+    let root_wire = std::fs::read_to_string(marker.with_extension("marker.root")).unwrap();
+    assert!(root_wire.contains("file://"));
+    conn.close().await.expect("shutdown");
+    let _ = std::fs::remove_file(script_path);
+    let _ = std::fs::remove_file(marker);
+    let _ = std::fs::remove_file(dir.join(format!("mcp_rmcp_behavior_{}.marker.root", std::process::id())));
+}
+
+#[tokio::test]
+async fn test_rmcp_stdio_string_ids_rejected_before_spawn() {
+    let config = MCPServerConfig::Stdio(MCPStdioServerConfig {
+        command: "/path/that/must/not/spawn".into(), args: vec![], env: HashMap::new(), cwd: None,
+        timeout: Some(100), request_id_format: Some(RequestIdFormat::String),
+    });
+    let error = connect_to_server("rmcp-string-id", config).await.expect_err("string IDs must be rejected");
+    assert!(error.to_string().contains("requestIdFormat=string"));
+}
+
+#[tokio::test]
+async fn test_rmcp_stdio_timeout_is_unknown_outcome() {
+    let script_path = std::env::temp_dir().join(format!("mcp_rmcp_timeout_{}.py", std::process::id()));
+    std::fs::write(&script_path, r#"import json,sys,time
+for line in sys.stdin:
+ m=json.loads(line); method=m.get('method'); mid=m.get('id')
+ if method=='initialize': print(json.dumps({'jsonrpc':'2.0','id':mid,'result':{'protocolVersion':'2025-11-25','capabilities':{'tools':{}},'serverInfo':{'name':'rmcp-timeout','version':'1'}}}),flush=True)
+ elif method=='tools/call': time.sleep(2)
+"#).unwrap();
+    let config = MCPServerConfig::Stdio(MCPStdioServerConfig {
+        command: "python3".into(), args: vec![script_path.to_string_lossy().into_owned()], env: HashMap::new(), cwd: None,
+        timeout: Some(500), request_id_format: Some(RequestIdFormat::Number),
+    });
+    let conn = connect_to_server("rmcp-timeout", config).await.expect("connect");
+    let error = conn.call_tool("mutate", json!({})).await.expect_err("call must time out");
+    assert!(matches!(error, McpError::UnknownOutcome(_)), "unexpected error: {error:?}");
+    conn.close().await.expect("shutdown");
+    let _ = std::fs::remove_file(script_path);
+}
+
+
+#[tokio::test]
+async fn test_rmcp_stdio_init_timeout_is_bounded() {
+    let script_path = std::env::temp_dir().join(format!("mcp_rmcp_init_timeout_{}.py", std::process::id()));
+    std::fs::write(&script_path, "import time\ntime.sleep(2)\n").unwrap();
+    let config = MCPServerConfig::Stdio(MCPStdioServerConfig {
+        command: "python3".into(), args: vec![script_path.to_string_lossy().into_owned()], env: HashMap::new(), cwd: None,
+        timeout: Some(40), request_id_format: Some(RequestIdFormat::Number),
+    });
+    let started = std::time::Instant::now();
+    let error = connect_to_server("rmcp-init-timeout", config).await.expect_err("init must time out");
+    assert!(matches!(error, McpError::Timeout(_)));
+    assert!(started.elapsed() < Duration::from_secs(1));
+    let _ = std::fs::remove_file(script_path);
+}
+
+#[tokio::test]
+async fn test_rmcp_stdio_read_timeout_is_not_unknown_outcome() {
+    let script_path = std::env::temp_dir().join(format!("mcp_rmcp_read_timeout_{}.py", std::process::id()));
+    std::fs::write(&script_path, r#"import json,sys,time
+for line in sys.stdin:
+ m=json.loads(line); method=m.get('method'); mid=m.get('id')
+ if method=='initialize': print(json.dumps({'jsonrpc':'2.0','id':mid,'result':{'protocolVersion':'2025-11-25','capabilities':{'tools':{},'resources':{}},'serverInfo':{'name':'rmcp-read-timeout','version':'1'}}}),flush=True)
+ elif method=='resources/list': time.sleep(2)
+"#).unwrap();
+    let config = MCPServerConfig::Stdio(MCPStdioServerConfig {
+        command: "python3".into(), args: vec![script_path.to_string_lossy().into_owned()], env: HashMap::new(), cwd: None,
+        timeout: Some(500), request_id_format: Some(RequestIdFormat::Number),
+    });
+    let conn = connect_to_server("rmcp-read-timeout", config).await.expect("connect");
+    let error = conn.list_resources().await.expect_err("read request must time out");
+    assert!(matches!(error, McpError::Timeout(_)), "unexpected error: {error:?}");
+    conn.close().await.expect("shutdown");
+    let _ = std::fs::remove_file(script_path);
+}
+#[tokio::test]
 async fn test_stdio_initialize_list_call_and_ping() {
     // Write a mock stdio server in python
     let temp_dir = std::env::temp_dir();
@@ -2001,23 +2135,22 @@ async fn test_legacy_sse_drop_connection_aborts_reader_and_closes_socket() {
 }
 
 #[tokio::test]
-async fn test_stdio_no_newline_oversized_frame_rejected() {
+async fn test_stdio_oversized_frame_discarded_and_connection_continues() {
     let script_path = std::env::temp_dir().join(format!("omp-mcp-stdio-huge-{}.py", std::process::id()));
-    let py_code = r#"import sys, time
+    let py_code = r#"import sys, time, json
 line = sys.stdin.readline()
-# Reply to initialize
-sys.stdout.write('{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2025-11-25","capabilities":{},"serverInfo":{"name":"huge","version":"1"}}}\n')
+# Reply to initialize using request ID supplied by RMCP.
+request = json.loads(line)
+sys.stdout.write(json.dumps({'jsonrpc':'2.0','id':request.get('id'),'result':{'protocolVersion':'2025-11-25','capabilities':{},'serverInfo':{'name':'huge','version':'1'}}}) + '\n')
 sys.stdout.flush()
 # Read notifications/initialized
 sys.stdin.readline()
-# Now emit 17 MiB without any newline!
-chunk = "A" * 65536
-for _ in range(17 * 16 + 1):
-    try:
-        sys.stdout.write(chunk)
-        sys.stdout.flush()
-    except BrokenPipeError:
-        break
+# Emit one terminated oversized line. RMCP discards it, then must continue reading.
+sys.stdout.write(('A' * (17 * 1024 * 1024)) + '\n')
+sys.stdout.flush()
+request = json.loads(sys.stdin.readline())
+sys.stdout.write(json.dumps({'jsonrpc':'2.0','id':request.get('id'),'result':{'content':[{'type':'text','text':'continued'}],'isError':False}}) + '\n')
+sys.stdout.flush()
 "#;
     std::fs::write(&script_path, py_code).unwrap();
 
@@ -2031,16 +2164,13 @@ for _ in range(17 * 16 + 1):
     });
 
     let conn = connect_to_server("stdio_huge", config).await.expect("connect");
-    // Next call fails because child exceeded 16 MiB line bound without newline and reader closed
-    let err = conn.call_tool("any", json!({})).await.unwrap_err();
-    assert!(
-        matches!(err, McpError::Closed | McpError::Transport(_)),
-        "Expected connection close on oversize no-newline stdio stream, got: {:?}",
-        err
-    );
+    // RMCP AsyncRwTransport discards the terminated oversized line and continues reading.
+    let result = conn.call_tool("any", json!({})).await.expect("connection must continue after discard");
+    assert!(matches!(&result.content[0], MCPContent::Text { text } if text == "continued"));
 
     let _ = std::fs::remove_file(script_path);
 }
+
 
 #[tokio::test]
 async fn test_sse_connect_many_short_data_lines_exceeding_bound() {

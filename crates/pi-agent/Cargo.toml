@@ -23,6 +23,7 @@ libc = { workspace = true }
 reqwest = { workspace = true }
 pi-shell = { workspace = true }
 pi-walker = { workspace = true }
+rmcp = { version = "=3.9.0", default-features = false, features = ["client", "transport-child-process"] }
 pi-iso = { workspace = true }
 pi-ast = { workspace = true }
 portable-pty = { workspace = true }

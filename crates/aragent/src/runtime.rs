@@ -5324,9 +5324,12 @@ fn format_mcp_infrastructure_error(server_name: &str, stage: &str, err: &McpErro
 				"request timed out".to_string()
 			}
 		},
-		McpError::AcceptedStreamError(_) => {
-			"stream disconnected after call accepted (non-replayable, execution uncertain)".to_string()
-		},
+        McpError::AcceptedStreamError(_) => {
+            "stream disconnected after call accepted (non-replayable, execution uncertain; check remote state before retry)".to_string()
+        },
+        McpError::UnknownOutcome(_) => {
+            "remote execution outcome unknown (action may have run; check remote state before retry)".to_string()
+        }
 		McpError::Protocol(_) => "protocol error".to_string(),
 		McpError::Transport(_) => "connection failed".to_string(),
 		McpError::Closed => "connection closed".to_string(),

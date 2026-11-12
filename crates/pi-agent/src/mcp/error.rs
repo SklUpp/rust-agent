@@ -46,6 +46,9 @@ pub enum McpError {
     #[error("Accepted stream error (non-replayable mutating call): {0}")]
     AcceptedStreamError(String),
 
+    #[error("Remote execution outcome unknown; verify server state before retry: {0}")]
+    UnknownOutcome(String),
+
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
 

@@ -5,6 +5,9 @@ pub fn validate_server_config(name: &str, config: &MCPServerConfig) -> Result<()
 
     match config {
         MCPServerConfig::Stdio(s) => {
+            if s.request_id_format == Some(crate::mcp::types::RequestIdFormat::String) {
+                errors.push(format!("Server \"{}\": requestIdFormat=string is unsupported by rmcp stdio", name));
+            }
             if s.command.trim().is_empty() {
                 errors.push(format!("Server \"{}\": stdio server requires \"command\" field", name));
             }
