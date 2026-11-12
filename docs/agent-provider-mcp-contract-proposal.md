@@ -35,6 +35,7 @@ Roots — описательное объявление контекста, не
 Server-initiated sampling/elicitation и другие запросы проходят соответствующие product policy/budgets; наличие обработчика в SDK не разрешает модельный запрос или действие. Не объявляем «полный MCP» до проверки выбранной matrix; fork tools-only implementation не годится как доказательство полноты.
 
 Cancel запроса и фактическое завершение remote effect различаются. Обрыв соединения не доказывает отмену действия; unknown outcome сохраняется. Перезапуск server после ошибки не означает безопасного повтора tools/call. Reconnection/auth details остаются открытыми.
+**Implementation note (2026-11-12):** `rmcp 3.9.0` migration keeps legacy SSE on its existing client path. Stdio and streamable HTTP use the SDK only if host env isolation, redirect/origin credential rules, response limits, cancellation outcome, and no-replay semantics remain enforced. SDK numeric request IDs are an accepted compatibility change; unsupported `requestIdFormat: "string"` must be rejected explicitly, never ignored. Cancellation is not proof of rollback; an uncertain `tools/call` result requires state verification before retry. Do not infer server identity from implementation name/version; ownership remains tied to the configured server instance.
 
 ## Состав переносов
 
