@@ -230,6 +230,75 @@ async fn tools_list_follows_cursor_pages_in_order() {
 }
 
 #[tokio::test]
+async fn tools_list_rejects_repeated_cursor() {
+	let server = spawn_mock(|_, seen| match seen.body.get("method").and_then(Value::as_str) {
+		Some("initialize") => Reply::json(rpc_result(&seen.body, initialize_result())),
+		Some("notifications/initialized") => Reply::json("{}".to_string()),
+		Some("tools/list") => Reply::json(rpc_result(
+			&seen.body,
+			json!({ "tools": [], "nextCursor": "same" }),
+		)),
+		_ => Reply::json(rpc_result(&seen.body, json!({}))),
+	})
+	.await;
+	let connection = connect_to_server("repeated-cursor", MCPServerConfig::Http(http_config(&server.url)))
+		.await
+		.expect("connect");
+	let error = connection.list_tools().await.expect_err("repeated cursor must fail");
+	assert!(matches!(error, McpError::Protocol(message) if message.contains("repeated cursor")));
+	let calls = server.seen.lock().unwrap().iter()
+		.filter(|seen| seen.body.get("method").and_then(Value::as_str) == Some("tools/list"))
+		.count();
+	assert_eq!(calls, 2, "stop when cursor repeats");
+}
+
+#[tokio::test]
+async fn tools_list_rejects_page_limit_without_truncating() {
+	let server = spawn_mock(|_, seen| match seen.body.get("method").and_then(Value::as_str) {
+		Some("initialize") => Reply::json(rpc_result(&seen.body, initialize_result())),
+		Some("notifications/initialized") => Reply::json("{}".to_string()),
+		Some("tools/list") => {
+			let cursor = seen.body.get("params").and_then(|params| params.get("cursor"));
+			let page = cursor.and_then(Value::as_str).and_then(|value| value.strip_prefix("page-"))
+				.and_then(|value| value.parse::<usize>().ok()).unwrap_or(1);
+			Reply::json(rpc_result(&seen.body, json!({
+				"tools": [], "nextCursor": format!("page-{}", page + 1),
+			})))
+		},
+		_ => Reply::json(rpc_result(&seen.body, json!({}))),
+	})
+	.await;
+	let connection = connect_to_server("page-limit", MCPServerConfig::Http(http_config(&server.url)))
+		.await
+		.expect("connect");
+	let error = connection.list_tools().await.expect_err("page limit must fail");
+	assert!(matches!(error, McpError::Protocol(message) if message.contains("pagination bounds")));
+	let calls = server.seen.lock().unwrap().iter()
+		.filter(|seen| seen.body.get("method").and_then(Value::as_str) == Some("tools/list"))
+		.count();
+	assert_eq!(calls, 64, "must stop at page limit without returning partial list");
+}
+
+#[tokio::test]
+async fn tools_list_rejects_entry_limit_without_truncating() {
+	let server = spawn_mock(|_, seen| match seen.body.get("method").and_then(Value::as_str) {
+		Some("initialize") => Reply::json(rpc_result(&seen.body, initialize_result())),
+		Some("notifications/initialized") => Reply::json("{}".to_string()),
+		Some("tools/list") => Reply::json(rpc_result(
+			&seen.body,
+			json!({ "tools": vec![json!({ "name": "tool", "inputSchema": {} }); 10_001] }),
+		)),
+		_ => Reply::json(rpc_result(&seen.body, json!({}))),
+	})
+	.await;
+	let connection = connect_to_server("entry-limit", MCPServerConfig::Http(http_config(&server.url)))
+		.await
+		.expect("connect");
+	let error = connection.list_tools().await.expect_err("entry limit must fail");
+	assert!(matches!(error, McpError::Protocol(message) if message.contains("pagination bounds")));
+}
+
+#[tokio::test]
 async fn configured_headers_lose_to_generated_and_session_headers_follow() {
 	let server = spawn_mock(|_, seen| match seen.body.get("method").and_then(Value::as_str) {
 		Some("initialize") => Reply::json(rpc_result(&seen.body, initialize_result()))

@@ -200,24 +200,52 @@ impl McpConnection {
 
     pub async fn list_tools(&self) -> Result<Vec<MCPToolDefinition>, McpError> {
         let timeout_dur = self.request_timeout();
-
+        let deadline = timeout_dur.map(|timeout| Instant::now() + timeout);
         let mut all_tools = Vec::new();
         let mut cursor: Option<String> = None;
+        let mut seen = HashSet::new();
+        let mut pages = 0usize;
 
         loop {
+            pages += 1;
+            if pages > MAX_LIST_PAGES {
+                return Err(McpError::Protocol(
+                    "tools/list exceeded pagination bounds".to_string(),
+                ));
+            }
             let mut params = json!({});
             if let Some(c) = &cursor {
                 params["cursor"] = json!(c);
             }
-
-            let transport = {
-                let guard = self.transport.read().await;
-                guard.clone()
+            let remaining = match deadline {
+                Some(deadline) => {
+                    let remaining = deadline.saturating_duration_since(Instant::now());
+                    if remaining.is_zero() {
+                        return Err(McpError::Timeout(
+                            "tools/list pagination deadline exceeded".to_string(),
+                        ));
+                    }
+                    Some(remaining)
+                }
+                None => None,
             };
-
-            let call_res = transport
-                .request("tools/list", Some(params.clone()), timeout_dur)
-                .await;
+            let request = async {
+                let transport = {
+                    let guard = self.transport.read().await;
+                    guard.clone()
+                };
+                transport
+                    .request("tools/list", Some(params.clone()), remaining)
+                    .await
+            };
+            let call_res = match remaining {
+                Some(remaining) => tokio::time::timeout(remaining, request)
+                    .await
+                    .map_err(|_| McpError::Timeout(
+                        "tools/list pagination deadline exceeded".to_string(),
+                    ))?,
+                None => request.await,
+            };
 
             let res_val = match call_res {
                 Ok(v) => v,
@@ -225,29 +253,66 @@ impl McpConnection {
                 // retrying once is safe even when the previous attempt was
                 // already on the wire.
                 Err(e) if is_retriable_connection_error(&e) || is_unverified_delivery(&e) => {
-                    self.reconnect().await?;
-                    let new_transport = {
-                        let guard = self.transport.read().await;
-                        guard.clone()
+                    let reconnect = self.reconnect();
+                    match deadline {
+                        Some(deadline) => tokio::time::timeout_at(
+                            tokio::time::Instant::from_std(deadline), reconnect,
+                        )
+                        .await
+                        .map_err(|_| McpError::Timeout(
+                            "tools/list pagination deadline exceeded".to_string(),
+                        ))??,
+                        None => reconnect.await?,
+                    }
+                    let retry = async {
+                        let new_transport = {
+                            let guard = self.transport.read().await;
+                            guard.clone()
+                        };
+                        let retry_timeout = deadline.map(|deadline| {
+                            deadline.saturating_duration_since(Instant::now())
+                        });
+                        if retry_timeout.is_some_and(|timeout| timeout.is_zero()) {
+                            return Err(McpError::Timeout(
+                                "tools/list pagination deadline exceeded".to_string(),
+                            ));
+                        }
+                        new_transport.request("tools/list", Some(params), retry_timeout).await
                     };
-                    new_transport
-                        .request("tools/list", Some(params), timeout_dur)
-                        .await?
+                    match deadline {
+                        Some(deadline) => tokio::time::timeout_at(
+                            tokio::time::Instant::from_std(deadline), retry,
+                        )
+                        .await
+                        .map_err(|_| McpError::Timeout(
+                            "tools/list pagination deadline exceeded".to_string(),
+                        ))??,
+                        None => retry.await?,
+                    }
                 }
                 Err(e) => return Err(e),
             };
             let page: MCPToolsListResult = serde_json::from_value(res_val)
                 .map_err(|e| McpError::Protocol(format!("Invalid tools/list response: {}", e)))?;
 
+            if page.tools.len() > MAX_LIST_ENTRIES.saturating_sub(all_tools.len()) {
+                return Err(McpError::Protocol(
+                    "tools/list exceeded pagination bounds".to_string(),
+                ));
+            }
             all_tools.extend(page.tools);
 
-            if let Some(next) = page.next_cursor {
-                if !next.is_empty() {
+            match page.next_cursor {
+                Some(next) if !next.is_empty() => {
+                    if !seen.insert(next.clone()) {
+                        return Err(McpError::Protocol(
+                            "tools/list returned a repeated cursor".to_string(),
+                        ));
+                    }
                     cursor = Some(next);
-                    continue;
                 }
+                _ => break,
             }
-            break;
         }
 
         Ok(all_tools)
