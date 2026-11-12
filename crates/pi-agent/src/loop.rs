@@ -2064,10 +2064,7 @@ impl AgentLoop {
 			match steering_rx.as_deref_mut() {
 				Some(rx) if rx_open => {
 					tokio::select! {
-						batch = execute.as_mut() => {
-							outcome.results = batch;
-							finished = true;
-						},
+						biased;
 						event = rx.recv() => match event {
 							Some(SteeringEvent::InjectMessage(message)) => outcome.injections.push(message),
 							Some(SteeringEvent::Interrupt) => outcome.interrupted = true,
@@ -2076,6 +2073,10 @@ impl AgentLoop {
 								outcome.interrupt_reason.get_or_insert(reason);
 							},
 							None => rx_open = false,
+						},
+						batch = execute.as_mut() => {
+							outcome.results = batch;
+							finished = true;
 						},
 					}
 				},
@@ -2163,6 +2164,7 @@ impl AgentLoop {
 				match steering_rx.as_deref_mut() {
 					Some(rx) => {
 						tokio::select! {
+							biased;
 							_ = cancellation_token.cancelled() => return Err(NextAssistantError::interrupted(interrupted_message(Message::assistant(""), None), None)),
 							event = rx.recv() => match event {
 								Some(event @ (SteeringEvent::Interrupt | SteeringEvent::InterruptWithReason(_))) => {
@@ -2205,6 +2207,7 @@ impl AgentLoop {
 			match steering_rx.as_deref_mut() {
 				Some(rx) => {
 					tokio::select! {
+						biased;
 						_ = cancellation_token.cancelled() => {
 							let partial = interrupted_message(Message::assistant(""), None);
 							return Err(NextAssistantError::interrupted(partial, None));
@@ -2252,6 +2255,7 @@ impl AgentLoop {
 			let next_chunk = match steering_rx.as_deref_mut() {
 				Some(rx) if rx_open => {
 					tokio::select! {
+						biased;
 						_ = cancellation_token.cancelled() => {
 							let partial = interrupted_message(Self::with_source(provider, assembler.finish_partial()), None);
 							return Err(NextAssistantError::interrupted(partial, None));
