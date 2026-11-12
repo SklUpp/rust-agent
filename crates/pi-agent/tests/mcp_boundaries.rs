@@ -478,12 +478,15 @@ for line in sys.stdin:
 		tokio::time::sleep(Duration::from_millis(10)).await;
 	}
 
-	connection.close().await.expect("close");
-	let result = tokio::time::timeout(Duration::from_secs(2), pending)
-		.await
-		.expect("pending request must settle on close")
-		.expect("task");
-	assert!(matches!(result, Err(McpError::Closed)), "{result:?}");
+    connection.close().await.expect("close");
+    let result = tokio::time::timeout(Duration::from_secs(2), pending)
+        .await
+        .expect("pending request must settle on close")
+        .expect("task");
+    match result {
+        Err(McpError::UnknownOutcome(message)) => assert!(message.contains("remote outcome unknown"), "{message}"),
+        other => panic!("pending mutating call must report unknown outcome, got {other:?}"),
+    }
 
 	let alive = std::process::Command::new("kill")
 		.args(["-0", &pid.to_string()])

@@ -5331,8 +5331,9 @@ fn format_mcp_infrastructure_error(server_name: &str, stage: &str, err: &McpErro
             "remote execution outcome unknown (action may have run; check remote state before retry)".to_string()
         }
 		McpError::Protocol(_) => "protocol error".to_string(),
-		McpError::Transport(_) => "connection failed".to_string(),
-		McpError::Closed => "connection closed".to_string(),
+        McpError::Closed => {
+            "connection closed (remote action may have run; check remote state before retry)".to_string()
+        }
 		McpError::JsonRpc { code, .. } => format!("JSON-RPC error {code}"),
 		McpError::Tool(_) => "tool execution error".to_string(),
 		McpError::Config(_) => "configuration error".to_string(),

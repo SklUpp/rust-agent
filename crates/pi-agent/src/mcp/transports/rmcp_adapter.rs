@@ -1,9 +1,10 @@
-use std::{future::Future, time::Duration};
+use std::{future::Future, sync::atomic::{AtomicBool, Ordering}, time::Duration};
 use serde_json::{json, Value};
 use tokio::process::Command;
 use crate::mcp::{error::McpError, transports::{McpTransport, root_uri}, types::MCPStdioServerConfig};
 
-pub(crate) struct StdioService { service: tokio::sync::Mutex<Option<rmcp::service::RunningService<rmcp::RoleClient, Handler>>> }
+pub(crate) struct StdioService { service: tokio::sync::Mutex<Option<rmcp::service::RunningService<rmcp::RoleClient, Handler>>>, closed: AtomicBool }
+
 struct Handler { config: rmcp::model::ClientConfig, root: Result<String, String> }
 impl rmcp::ClientHandler for Handler {
     fn get_info(&self) -> rmcp::model::ClientConfig { self.config.clone() }
@@ -25,7 +26,7 @@ impl StdioService {
         let root=match config.cwd.as_deref(){Some(p)=>root_uri(std::path::Path::new(p)),None=>std::env::current_dir().map_err(|e|e.to_string()).and_then(|p|root_uri(&p))};
         let handshake=Handler{config:client,root}.serve_with_lifecycle(transport,ClientLifecycleMode::Initialize);
         let service=if timeout_ms > 0 { tokio::time::timeout(Duration::from_millis(timeout_ms),handshake).await.map_err(|_|McpError::Timeout("MCP initialization timed out; child transport dropped".into()))? } else { handshake.await } .map_err(map_initialize_error)?;
-        Ok(Self{service:tokio::sync::Mutex::new(Some(service))})
+        Ok(Self{service:tokio::sync::Mutex::new(Some(service)), closed: AtomicBool::new(false)})
     }
     pub(crate) async fn initialized_result(&self)->Result<crate::mcp::types::MCPInitializeResult,McpError>{
         let service=self.service.lock().await; let info=service.as_ref().ok_or(McpError::Closed)?.peer().peer_info().ok_or_else(||McpError::Protocol("RMCP initialization omitted peer info".into()))?;
@@ -48,13 +49,23 @@ impl McpTransport for StdioService {
             "prompts/get"=>encode(peer.send_request(rmcp::model::ClientRequest::CustomRequest(rmcp::model::CustomRequest::new("prompts/get",Some(p)))).await,false),
             "ping"=>encode(peer.send_request(rmcp::model::ClientRequest::PingRequest(rmcp::model::PingRequest::default())).await,false),
             _=>Err(McpError::Protocol(format!("Unsupported MCP method: {method}"))),}};
-        match timeout {Some(d)=>tokio::time::timeout(d,run).await.map_err(|_|if method=="tools/call"{McpError::UnknownOutcome(format!("{method} timed out; verify server state before retry"))}else{McpError::Timeout(format!("{method} timed out"))})?,None=>run.await}
+        let result=match timeout {Some(d)=>tokio::time::timeout(d,run).await.map_err(|_|if method=="tools/call"{McpError::UnknownOutcome(format!("{method} timed out; verify server state before retry"))}else{McpError::Timeout(format!("{method} timed out"))})?,None=>run.await};
+        if self.closed.load(Ordering::Acquire) {
+            match result {
+                Ok(value) => Ok(value),
+                Err(error) if method == "tools/call" => match error {
+                    McpError::UnknownOutcome(_) => Err(error),
+                    other => Err(McpError::UnknownOutcome(format!("tools/call interrupted by close; remote outcome unknown: {other}"))),
+                },
+                Err(_) => Err(McpError::Closed),
+            }
+        } else { result }
     }
     async fn notify(&self,method:&str,params:Option<Value>)->Result<(),McpError>{
         let peer={let service=self.service.lock().await; service.as_ref().ok_or(McpError::Closed)?.peer().clone()};
         peer.send_notification(rmcp::model::ClientNotification::CustomNotification(rmcp::model::CustomNotification::new(method,params))).await.map_err(|e|McpError::Transport(e.to_string()))
     }
-    async fn close(&self)->Result<(),McpError>{let service={let mut guard=self.service.lock().await;guard.take()};let Some(mut service)=service else{return Ok(())};match service.close_with_timeout(Duration::from_secs(2)).await{Ok(Some(_))=>Ok(()),Ok(None)=>Err(McpError::Transport("RMCP shutdown timed out; child cleanup incomplete".into())),Err(e)=>Err(McpError::Transport(e.to_string()))}}
+    async fn close(&self)->Result<(),McpError>{self.closed.store(true,Ordering::Release);let service={let mut guard=self.service.lock().await;guard.take()};let Some(mut service)=service else{return Ok(())};match service.close_with_timeout(Duration::from_secs(8)).await{Ok(Some(_))=>Ok(()),Ok(None)=>Err(McpError::Transport("RMCP shutdown timed out; child cleanup incomplete".into())),Err(e)=>Err(McpError::Transport(e.to_string()))}}
 
 }
 
