@@ -2191,7 +2191,7 @@ impl AgentLoop {
 			let partial = Self::terminal_message(provider, Message::assistant(text), &attempt);
 			let status = TurnStatus::Error(err.to_string());
 			return Some(Err(NextAssistantError::Failed {
-				error: err.into(),
+				error: AgentError::Durable(err.to_string()),
 				terminal: Some((partial, status)),
 			}));
 		}
@@ -2524,8 +2524,7 @@ impl AgentLoop {
 		let message = match assembler.finish() {
 			Ok(message) => Self::terminal_message(provider, message, &attempt),
 			Err(err) => {
-				memory_snapshot = assembler.finish_partial().content;
-				if let Some(outcome) = self.flush_stream_draft_text(&memory_snapshot, &attempt, provider).await {
+				if let Some(outcome) = self.flush_stream_draft_text(&partial.content, &attempt, provider).await {
 					return outcome;
 				}
 				let status = TurnStatus::Error(err.to_string());
