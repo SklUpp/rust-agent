@@ -247,9 +247,9 @@ fn redact_url_queries(text: &str) -> String {
 	while let Some(rel) = text[index..].find("://") {
 		let url_start = index + rel + 3;
 		let url_end = text[url_start..]
-			.find(|c: char| {
-				c.is_whitespace() || matches!(c, '"' | '\'' | '<' | '>' | ')' | ']' | '}' | '`')
-			})
+			// `]`/`}` are not terminators: `[REDACTED]` already sits inside the
+			// span and cutting there would split the marker.
+			.find(|c: char| c.is_whitespace() || matches!(c, '"' | '\'' | '<' | '>' | ')' | '`'))
 			.map(|rel| url_start + rel)
 			.unwrap_or(text.len());
 		out.push_str(&text[index..url_start]);
