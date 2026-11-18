@@ -6,7 +6,7 @@ use std::{
 
 use pi_agent::{
 	AgentConfig, AgentContext, AgentLoop, AgentState,
-	ChildStatus, DelegationLimits, HubTool,
+	ChildStatus, DelegationLimits, HubTool, StreamPartialConfig,
 	Role, Supervisor, TaskTool, Tool, ToolRegistry,
 	tools::{InternalUrlRouter, UrlScope, task_catalog::{AgentCatalog, AgentDefinition, AgentSource, Spawns}},
 };
@@ -420,6 +420,7 @@ async fn test_t1_happy_delegation() {
 		context_limit: 100_000,
 		system_prompt: None,
 		cwd: std::env::temp_dir(),
+		stream_partial: StreamPartialConfig::default(),
 	};
 
 	let agent_loop = AgentLoop::new(config, provider, root_registry);
@@ -764,6 +765,7 @@ async fn test_t2_depth_limits() {
 		context_limit: 100_000,
 		system_prompt: None,
 		cwd: std::env::temp_dir(),
+		stream_partial: StreamPartialConfig::default(),
 	};
 
 	let agent_loop = AgentLoop::new(config, provider, root_registry);
@@ -811,6 +813,7 @@ async fn test_t3_cancellation_cleans_up_and_records_aborted() {
 		context_limit: 100_000,
 		system_prompt: None,
 		cwd: std::env::temp_dir(),
+		stream_partial: StreamPartialConfig::default(),
 	};
 
 	let agent_loop = AgentLoop::new(config, provider, root_registry);
@@ -876,6 +879,7 @@ async fn test_t4_batch_execution_order() {
 		context_limit: 100_000,
 		system_prompt: None,
 		cwd: std::env::temp_dir(),
+		stream_partial: StreamPartialConfig::default(),
 	};
 
 	let agent_loop = AgentLoop::new(config, provider, root_registry);
@@ -945,6 +949,7 @@ async fn test_t5_hub_jobs_snapshot_after_child_completion() {
 		context_limit: 100_000,
 		system_prompt: None,
 		cwd: std::env::temp_dir(),
+		stream_partial: StreamPartialConfig::default(),
 	};
 	let agent_loop = AgentLoop::new(config, provider, root_registry);
 	let mut state = AgentState::default();

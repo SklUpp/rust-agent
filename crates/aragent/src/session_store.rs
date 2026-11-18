@@ -45,7 +45,7 @@ use serde_json::{Value, json};
 
 use crate::durable_session::StoredProjection;
 /// Current schema version. Bump only with a new branch in [`SqliteStore::initialize`].
-pub const SCHEMA_VERSION: i64 = 3;
+pub const SCHEMA_VERSION: i64 = 4;
 const SCHEMA_VERSION_DDL: &str = "
 	CREATE TABLE IF NOT EXISTS schema_version (
 		id INTEGER PRIMARY KEY CHECK (id = 1),
@@ -148,6 +148,19 @@ const SCHEMA_V1_DDL: &str = "
 const SCHEMA_V2_MIGRATION_DDL: &str = "
 	ALTER TABLE deliveries ADD COLUMN message_id TEXT REFERENCES messages(id);
 	CREATE UNIQUE INDEX IF NOT EXISTS deliveries_message_id_idx ON deliveries(message_id) WHERE message_id IS NOT NULL;
+";
+
+/// Branch-scoped draft of an in-progress assistant stream. At most one row per
+/// branch; never replayed as executable history. The completed message clears
+/// it in the same transaction that appends the message.
+const SCHEMA_V4_MIGRATION_DDL: &str = "
+	CREATE TABLE IF NOT EXISTS stream_drafts (
+		branch_id TEXT PRIMARY KEY REFERENCES branches(id) ON DELETE CASCADE,
+		session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+		payload_json TEXT NOT NULL,
+		updated_at_ms INTEGER NOT NULL
+	);
+	CREATE INDEX IF NOT EXISTS stream_drafts_session_idx ON stream_drafts(session_id);
 ";
 
 /// Immutable fork-only classification of a copied tool-result message. Not an
@@ -292,7 +305,11 @@ fn fork_provenance_conn(connection: &Connection, session_id: &str) -> StoreResul
 			.query_row("SELECT version FROM schema_version WHERE id = 1", [], |row| row.get(0))
 			.optional()?;
 		return match version {
-			Some(version) if version < SCHEMA_VERSION => Ok(Vec::new()),
+			// Provenance is mandatory since schema v3: an older read-only
+			// snapshot legitimately has no table. Keep this pinned to 3, not
+			// SCHEMA_VERSION, so future migrations cannot reclassify a
+			// damaged v3 snapshot as empty provenance.
+			Some(version) if version < 3 => Ok(Vec::new()),
 			Some(version) => Err(StoreError::Corrupt(format!(
 				"schema version {version} is missing the fork_provenance table"
 			))),
@@ -810,6 +827,10 @@ pub struct SqliteStore {
 }
 
 impl SqliteStore {
+
+/// Maximum preserved prior stream fragments per branch. Bounds the
+/// draft row when interrupted streams chain without terminals.
+const MAX_STREAM_PRIORS: usize = 8;
 	/// Open (or create) a dedicated session database. Parent directories are
 	/// created when missing. The path is explicit: this never reuses `agent.db`
 	/// or any credential database.
@@ -1008,6 +1029,7 @@ impl SqliteStore {
 				}
 				transaction.execute_batch(SCHEMA_V1_DDL)?;
 				transaction.execute_batch(SCHEMA_V3_MIGRATION_DDL)?;
+				transaction.execute_batch(SCHEMA_V4_MIGRATION_DDL)?;
 				transaction.execute(
 					"INSERT INTO schema_version (id, version) VALUES (1, ?1)",
 					params![SCHEMA_VERSION],
@@ -1016,6 +1038,7 @@ impl SqliteStore {
 			Some(1) => {
 				transaction.execute_batch(SCHEMA_V2_MIGRATION_DDL)?;
 				transaction.execute_batch(SCHEMA_V3_MIGRATION_DDL)?;
+				transaction.execute_batch(SCHEMA_V4_MIGRATION_DDL)?;
 				transaction.execute(
 					"UPDATE schema_version SET version = ?1 WHERE id = 1",
 					params![SCHEMA_VERSION],
@@ -1023,6 +1046,14 @@ impl SqliteStore {
 			},
 			Some(2) => {
 				transaction.execute_batch(SCHEMA_V3_MIGRATION_DDL)?;
+				transaction.execute_batch(SCHEMA_V4_MIGRATION_DDL)?;
+				transaction.execute(
+					"UPDATE schema_version SET version = ?1 WHERE id = 1",
+					params![SCHEMA_VERSION],
+				)?;
+			},
+			Some(3) => {
+				transaction.execute_batch(SCHEMA_V4_MIGRATION_DDL)?;
 				transaction.execute(
 					"UPDATE schema_version SET version = ?1 WHERE id = 1",
 					params![SCHEMA_VERSION],
@@ -3244,6 +3275,186 @@ impl SqliteStore {
 		Ok(())
 	}
 
+	/// Overwrite the branch-scoped stream draft for `attempt`.
+	///
+	/// Empty text clears the draft. When the stored current draft belongs to
+	/// a *different* attempt, it is preserved as a prior fragment instead of
+	/// being overwritten: a new stream starting on the same branch must never
+	/// destroy the recovered draft of an older interrupted stream before its
+	/// terminal transition. Priors are capped (`MAX_STREAM_PRIORS`); overflow
+	/// merges the two oldest into one entry so no fragment text is silently
+	/// discarded. Drafts carry assistant text only, never tool calls, and
+	/// are invisible to every replay projection.
+	pub fn save_stream_draft(
+		&mut self,
+		session_id: &str,
+		branch_id: &str,
+		text: &str,
+		attempt: &str,
+	) -> StoreResult<()> {
+		validate_id("session id", session_id)?;
+		validate_id("branch id", branch_id)?;
+		require_branch_owner(&self.connection, session_id, branch_id)?;
+		Self::require_stream_drafts_table(&self.connection)?;
+		let redacted_text = crate::auth::error::redact_free_text(text);
+		if redacted_text.is_empty() {
+			return self.clear_stream_draft(session_id, branch_id);
+		}
+		let existing = Self::read_stream_draft_row(&self.connection, session_id, branch_id)?;
+		let mut priors = existing
+			.as_ref()
+			.and_then(|row| row.get("priors").cloned())
+			.filter(|value| value.is_array())
+			.unwrap_or_else(|| serde_json::Value::Array(Vec::new()));
+		if let Some(list) = priors.as_array_mut() {
+			for entry in list.iter_mut() {
+				if let Some(prior_text) = entry.get("text").and_then(Value::as_str).map(crate::auth::error::redact_free_text) {
+					entry["text"] = Value::String(prior_text);
+				}
+			}
+		}
+		// Legacy single-text rows (pre attempt-scoped payloads) carry no
+		// attempt: preserve the text as a prior so the first attempt-scoped
+		// save never destroys it.
+		if priors.as_array().is_some_and(|list| list.is_empty())
+			&& existing.as_ref().and_then(|row| row.get("current")).is_none_or(|current| current.is_null() || current.get("text").and_then(Value::as_str).is_none_or(|text| text.is_empty()))
+			&& let Some(legacy) = existing.as_ref().and_then(|row| row.get("text")).and_then(Value::as_str).filter(|text| !text.is_empty())
+			&& let Some(list) = priors.as_array_mut()
+		{
+			list.push(serde_json::json!({
+				"text": crate::auth::error::redact_free_text(legacy),
+				"attempt": "legacy",
+			}));
+		}
+		if let Some(current) = existing.as_ref().and_then(|row| row.get("current")) {
+			let current_attempt = current.get("attempt").and_then(Value::as_str);
+			if current_attempt != Some(attempt)
+				&& let Some(current_text) = current.get("text").and_then(Value::as_str).filter(|text| !text.is_empty())
+				&& let Some(list) = priors.as_array_mut()
+			{
+				// A new stream on this branch supersedes a stored draft from
+				// an older interrupted stream: preserve it as a prior
+				// fragment. It clears with the new attempt's terminal, after
+				// being delivered as interrupted context.
+				let mut prior = current.clone();
+				prior["text"] = Value::String(crate::auth::error::redact_free_text(current_text));
+				list.push(prior);
+				// Bound the row without silent loss: merge oldest priors into
+				// one entry so no fragment text is discarded.
+				while list.len() > Self::MAX_STREAM_PRIORS {
+					let first = list.remove(0);
+					let second = list.remove(0);
+					let first_text = first.get("text").and_then(Value::as_str).unwrap_or("");
+					let second_text = second.get("text").and_then(Value::as_str).unwrap_or("");
+					let merged = format!("{first_text}\n\n--- interrupted stream fragment ---\n\n{second_text}");
+					list.insert(0, serde_json::json!({ "text": merged, "attempt": "merged" }));
+				}
+			}
+		}
+		let payload = serde_json::json!({
+			"current": { "text": redacted_text, "attempt": attempt },
+			"priors": priors,
+			"stopReason": "aborted",
+			"interrupted": true,
+			"partial": true,
+		});
+		let now = now_ms();
+		self.connection.execute(
+			"INSERT INTO stream_drafts (branch_id, session_id, payload_json, updated_at_ms) \
+			 VALUES (?1, ?2, ?3, ?4) \
+			 ON CONFLICT(branch_id) DO UPDATE SET session_id = excluded.session_id, \
+			 payload_json = excluded.payload_json, updated_at_ms = excluded.updated_at_ms",
+			params![branch_id, session_id, encode_json(&payload)?, now],
+		)?;
+		Ok(())
+	}
+
+	/// Drop the branch-scoped stream draft, if any.
+	pub fn clear_stream_draft(&mut self, session_id: &str, branch_id: &str) -> StoreResult<()> {
+		validate_id("session id", session_id)?;
+		validate_id("branch id", branch_id)?;
+		require_branch_owner(&self.connection, session_id, branch_id)?;
+		Self::require_stream_drafts_table(&self.connection)?;
+		self.connection.execute(
+			"DELETE FROM stream_drafts WHERE branch_id = ?1 AND session_id = ?2",
+			params![branch_id, session_id],
+		)?;
+		Ok(())
+	}
+
+	/// Read the branch-scoped stream draft text, if any.
+	pub fn stream_draft(
+		&self,
+		session_id: &str,
+		branch_id: &str,
+	) -> StoreResult<Option<String>> {
+		validate_id("session id", session_id)?;
+		validate_id("branch id", branch_id)?;
+		if !table_exists_conn(&self.connection, "stream_drafts")? {
+			// Read-only snapshots of pre-v4 databases legitimately have no
+			// draft table. A v4 database without it is damaged: fail closed
+			// instead of pretending no fragment exists.
+			let version: Option<i64> = self
+				.connection
+				.query_row("SELECT version FROM schema_version WHERE id = 1", [], |row| row.get(0))
+				.optional()?;
+			return match version {
+				Some(version) if version >= 4 => Err(StoreError::Schema(
+					"stream_drafts table is missing; database schema is damaged".to_string(),
+				)),
+				_ => Ok(None),
+			};
+		}
+		let row = Self::read_stream_draft_row(&self.connection, session_id, branch_id)?;
+		let Some(payload) = row else {
+			return Ok(None);
+		};
+		Ok(Some(combined_stream_draft_text(&payload)).filter(|text| !text.is_empty()))
+	}
+	/// Fail closed when the draft table is missing on a writable handle.
+	/// Writable opens always run migrations, so a missing table is a damaged
+	/// schema, not an old database.
+	fn require_stream_drafts_table(connection: &Connection) -> StoreResult<()> {
+		if table_exists_conn(connection, "stream_drafts")? {
+			return Ok(());
+		}
+		Err(StoreError::Schema(
+			"stream_drafts table is missing; database schema is damaged".to_string(),
+		))
+	}
+
+	/// Read the raw draft payload row, if any. Returns `Ok(None)` when the
+	/// row is absent. On a read-only snapshot of a pre-v4 database the table
+	/// itself may legitimately be absent (`Ok(None)`); a v4 database without
+	/// it is damaged and fails closed.
+	fn read_stream_draft_row(
+		connection: &Connection,
+		session_id: &str,
+		branch_id: &str,
+	) -> StoreResult<Option<Value>> {
+		if !table_exists_conn(connection, "stream_drafts")? {
+			let version: Option<i64> = connection
+				.query_row("SELECT version FROM schema_version WHERE id = 1", [], |row| {
+					row.get(0)
+				})
+				.optional()?;
+			return match version {
+				Some(version) if version >= 4 => Err(StoreError::Schema(
+					"stream_drafts table is missing; database schema is damaged".to_string(),
+				)),
+				_ => Ok(None),
+			};
+		}
+		let row: Option<String> = connection
+			.query_row(
+				"SELECT payload_json FROM stream_drafts WHERE branch_id = ?1 AND session_id = ?2",
+				params![branch_id, session_id],
+				|row| row.get(0),
+			)
+			.optional()?;
+		row.map(|raw| decode_json(&raw)).transpose()
+	}
+
 	/// Amend the terminal stop reason and optional error message of an assistant message row.
 	pub fn update_message_terminal(
 		&mut self,
@@ -3454,6 +3665,37 @@ fn append_message_tx(
 		"UPDATE branches SET leaf_message_id = ?1 WHERE id = ?2",
 		params![message.id, message.branch_id],
 	)?;
+	// Attempt-scoped terminal clearing, in the same transaction as the
+	// terminal append: a loop-stamped assistant message with a successful
+	// final stop (`stop`, `length`) and no tool calls clears the draft. A
+	// mirror write (RPC tail, replay) carries no marker and never clears.
+	// `toolUse`, `error`, `aborted`, and unknown-stop rows never clear: the
+	// turn is not successfully over (or it is the aborted/error partial
+	// itself), so the fragment must survive for the next successful turn.
+	if payload_role(&message.payload) == Some("assistant") {
+		// `SessionMessage.extra` is `#[serde(flatten)]`: the marker lands at
+		// `message.streamAttempt`, not under an `extra` object.
+		let terminal_attempt = message
+			.payload
+			.get("message")
+			.and_then(|message| message.get("streamAttempt"))
+			.and_then(Value::as_str);
+		let stop = message
+			.payload
+			.get("message")
+			.and_then(|message| message.get("stopReason"))
+			.and_then(Value::as_str);
+		let has_tool_calls = !extract_assistant_tool_call_counts(&message.payload).is_empty();
+		let is_final = matches!(stop, Some("stop") | Some("length")) && !has_tool_calls;
+		if let (Some(attempt), true) = (terminal_attempt, is_final) {
+			clear_stream_draft_attempt_tx(
+				transaction,
+				&message.session_id,
+				&message.branch_id,
+				attempt,
+			)?;
+		}
+	}
 	transaction.execute(
 		"UPDATE sessions SET updated_at_ms = ?1 WHERE id = ?2",
 		params![now, message.session_id],
@@ -4306,7 +4548,171 @@ fn validate_id(label: &str, value: &str) -> StoreResult<()> {
 	}
 	Ok(())
 }
+/// Full uncapped draft text: priors oldest-first, then live current, then
+/// legacy fallback. Shared by delivery (`combined_stream_draft_text`) and
+/// clear, so both compute the identical newest-tail cut.
+fn full_draft_text(payload: &Value) -> String {
+	let mut parts: Vec<String> = Vec::new();
+	if let Some(priors) = payload.get("priors").and_then(Value::as_array) {
+		for prior in priors {
+			if let Some(text) = prior.get("text").and_then(Value::as_str).filter(|text| !text.is_empty()) {
+				parts.push(crate::auth::error::redact_free_text(text));
+			}
+		}
+	}
+	if let Some(text) = payload
+		.get("current")
+		.and_then(|current| current.get("text"))
+		.and_then(Value::as_str)
+		.filter(|text| !text.is_empty())
+	{
+		parts.push(crate::auth::error::redact_free_text(text));
+	}
+	if parts.is_empty()
+		&& let Some(text) = payload.get("text").and_then(Value::as_str).filter(|text| !text.is_empty())
+	{
+		parts.push(crate::auth::error::redact_free_text(text));
+	}
+	parts.join("\n\n--- interrupted stream fragment ---\n\n")
+}
 
+
+/// Fail closed when a draft write names a branch that does not belong to the
+/// session: without this, an upsert keyed only by `branch_id` could attach a
+/// fragment to the wrong session's branch and silently steal its recovery.
+/// Combine a draft row into display/model text: priors oldest-first,
+/// then the live current draft. Joined with an explicit interrupted banner
+/// per fragment so concatenated streams never read as one response.
+/// Capped to bound model context; truncation is marked.
+fn combined_stream_draft_text(payload: &Value) -> String {
+	const MAX_COMBINED_CHARS: usize = 8000;
+	let full = full_draft_text(payload);
+	if full.chars().count() <= MAX_COMBINED_CHARS {
+		return full;
+	}
+	// Keep the newest tail: cut from the front at a char boundary, then
+	// mark so the model never mistakes the remainder for a complete reply.
+	let excess = full.chars().count() - MAX_COMBINED_CHARS;
+	let tail: String = full.chars().skip(excess).collect();
+	format!("[truncated: oldest fragments omitted]\n\n{tail}")
+}
+
+/// Clear the delivered tail of the branch draft on a loop-stamped successful
+/// terminal (`stop`/`length`, no tool calls), preserving any undelivered
+/// prefix as a legacy row. Delivery caps the combined text at 8000 chars
+/// (newest tail) computed from the row as it stood at request time — i.e.
+/// excluding this terminal's own current attempt, whose flushes landed after
+/// the request was built. Only the loop stamps `streamAttempt`, so mirror
+/// writes (RPC tail, replay) carry no marker and never clear. Only
+/// `stop`/`length` without tool calls clears: `toolUse` means the turn is
+/// not over, and `error`/`aborted`/unknown stops are the partial itself —
+/// the fragment must survive until the next successful terminal.
+fn clear_stream_draft_attempt_tx(
+	transaction: &Transaction<'_>,
+	session_id: &str,
+	branch_id: &str,
+	attempt: &str,
+) -> StoreResult<()> {
+	if !table_exists_conn(transaction, "stream_drafts")? {
+		return Err(StoreError::Schema(
+			"stream_drafts table is missing; database schema is damaged".to_string(),
+		));
+	}
+	if attempt.is_empty() {
+		return Ok(());
+	}
+	let raw: Option<String> = transaction
+		.query_row(
+			"SELECT payload_json FROM stream_drafts WHERE branch_id = ?1 AND session_id = ?2",
+			params![branch_id, session_id],
+			|row| row.get(0),
+		)
+		.optional()?;
+	let Some(raw) = raw else {
+		return Ok(());
+	};
+	let payload: Value = decode_json(&raw)?;
+	// Request-time parts: everything except this terminal's own current
+	// attempt, whose text flushed after the request was built and was never
+	// delivered as interrupted context. A normal first stream (>8000 chars,
+	// no priors) therefore has an empty request-time set: nothing was
+	// delivered, and success deletes the row instead of keeping a bogus
+	// "interrupted" prefix of its own completed output.
+	let own = payload
+		.get("current")
+		.and_then(|current| current.get("attempt"))
+		.and_then(Value::as_str)
+		== Some(attempt);
+	let mut request_parts: Vec<String> = Vec::new();
+	if let Some(priors) = payload.get("priors").and_then(Value::as_array) {
+		for prior in priors {
+			if let Some(text) = prior.get("text").and_then(Value::as_str).filter(|text| !text.is_empty()) {
+				request_parts.push(crate::auth::error::redact_free_text(text));
+			}
+		}
+	}
+	if !own {
+		if let Some(text) = payload
+			.get("current")
+			.and_then(|current| current.get("text"))
+			.and_then(Value::as_str)
+			.filter(|text| !text.is_empty())
+		{
+			request_parts.push(crate::auth::error::redact_free_text(text));
+		}
+		// Legacy single-text rows (pre attempt-scoped payloads).
+		if request_parts.is_empty()
+			&& let Some(text) = payload.get("text").and_then(Value::as_str).filter(|text| !text.is_empty())
+		{
+			request_parts.push(crate::auth::error::redact_free_text(text));
+		}
+	}
+	const MAX_COMBINED_CHARS: usize = 8000;
+	let request_full = request_parts.join("\n\n--- interrupted stream fragment ---\n\n");
+	let request_len = request_full.chars().count();
+	// Undelivered head: the prefix beyond the newest-tail 8000-char delivery
+	// window. Char-exact split, so kept + delivered == request-time text with
+	// no duplication or omission; the next turn delivers `kept` once.
+	let kept: String = if request_len <= MAX_COMBINED_CHARS {
+		String::new()
+	} else {
+		request_full.chars().take(request_len - MAX_COMBINED_CHARS).collect()
+	};
+	if kept.trim().is_empty() {
+		transaction.execute(
+			"DELETE FROM stream_drafts WHERE branch_id = ?1 AND session_id = ?2",
+			params![branch_id, session_id],
+		)?;
+		return Ok(());
+	}
+	let kept_payload = serde_json::json!({ "text": crate::auth::error::redact_free_text(&kept) });
+	transaction.execute(
+		"UPDATE stream_drafts SET payload_json = ?1, updated_at_ms = ?2 WHERE branch_id = ?3 AND session_id = ?4",
+		params![encode_json(&kept_payload)?, now_ms(), branch_id, session_id],
+	)?;
+	Ok(())
+}
+
+fn require_branch_owner(
+	connection: &Connection,
+	session_id: &str,
+	branch_id: &str,
+) -> StoreResult<()> {
+	let owner: Option<String> = connection
+		.query_row("SELECT session_id FROM branches WHERE id = ?1", params![branch_id], |row| {
+			row.get(0)
+		})
+		.optional()?;
+	match owner.as_deref() {
+		Some(owner) if owner == session_id => Ok(()),
+		Some(_) => Err(StoreError::Corrupt(format!(
+			"branch {branch_id} does not belong to session {session_id}; refusing draft write"
+		))),
+		None => Err(StoreError::Corrupt(format!(
+			"branch {branch_id} does not exist; refusing draft write"
+		))),
+	}
+}
 fn encode_json(value: &Value) -> StoreResult<String> {
 	serde_json::to_string(value).map_err(StoreError::Json)
 }
@@ -8166,6 +8572,48 @@ mod tests {
 			.expect_err("nonexistent branch must fail");
 		assert!(matches!(err, StoreError::NotFound(_)));
 
+		let _ = std::fs::remove_dir_all(dir);
+	}
+
+	#[test]
+	fn stream_draft_redacts_secrets_on_save_and_legacy_read() {
+		let (dir, path) = temp_db("stream-draft-redact");
+		let store = SqliteStore::open(&path).expect("open store");
+		store
+			.create_session(NewSession {
+				id: "s_red".to_string(),
+				parent_session_id: None,
+				payload: json!({}),
+				initial_branch_id: "b1".to_string(),
+				initial_branch_payload: json!({}),
+			})
+			.expect("create session");
+
+		store
+			.save_stream_draft(
+				"s_red",
+				"b1",
+				"use serde(skip_serializing_if) with sk-secret-token-123456 and Bearer bearer-secret-999",
+				"1-0",
+			)
+			.expect("save draft");
+		let loaded = store.stream_draft("s_red", "b1").expect("load").expect("present");
+		assert!(loaded.contains("skip_serializing_if"), "normal identifiers kept: {loaded}");
+		assert!(!loaded.contains("sk-secret-token-123456"), "secret redacted: {loaded}");
+		assert!(!loaded.contains("bearer-secret-999"), "bearer redacted: {loaded}");
+		drop(store);
+
+		let conn = Connection::open(&path).expect("raw sqlite");
+		conn.execute(
+			"UPDATE stream_drafts SET payload_json = ?1 WHERE session_id = 's_red'",
+			params![r#"{"text":"legacy ghp_1234567890abcdefghij leaked"}"#],
+		)
+		.expect("seed legacy secret");
+		drop(conn);
+
+		let reopened = SqliteStore::open(&path).expect("reopen");
+		let legacy = reopened.stream_draft("s_red", "b1").expect("read legacy").expect("present");
+		assert!(!legacy.contains("ghp_1234567890abcdefghij"), "legacy scrubbed: {legacy}");
 		let _ = std::fs::remove_dir_all(dir);
 	}
 }

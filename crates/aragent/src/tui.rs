@@ -1901,7 +1901,10 @@ mod imp {
 		}
 	}
 
-	fn history_lines(history: &[aragent::session::TurnRecord]) -> Vec<String> {
+	fn history_lines(
+		history: &[aragent::session::TurnRecord],
+		interrupted_fragment: Option<&str>,
+	) -> Vec<String> {
 		let mut lines = Vec::new();
 		for (index, turn) in history.iter().enumerate() {
 			lines.push(format!("── turn {} ──", index + 1));
@@ -1934,6 +1937,14 @@ mod imp {
 		}
 		if lines.is_empty() {
 			lines.push("no turns in this session yet".to_string());
+		}
+		// Recovered draft: explicitly not a turn, never replayed, never tool
+		// calls. Shown so an interrupted stream is visible, not silent.
+		if let Some(fragment) = interrupted_fragment {
+			lines.push("── interrupted fragment (not replayed, no tool calls) ──".to_string());
+			for line in fragment.lines().take(200) {
+				lines.push(format!("  {line}"));
+			}
 		}
 		lines
 	}
@@ -2101,7 +2112,7 @@ mod imp {
 				app.open_text_view("Status", lines);
 			},
 			UiCommand::History => {
-				app.history_lines = history_lines(&session.history);
+				app.history_lines = history_lines(&session.history, session.interrupted_fragment.as_deref());
 				let lines = app.history_lines.clone();
 				app.open_text_view("History", lines);
 			},
@@ -2152,7 +2163,7 @@ mod imp {
 			},
 		}
 		app.status = status_of(session);
-		app.history_lines = history_lines(&session.history);
+		app.history_lines = history_lines(&session.history, session.interrupted_fragment.as_deref());
 		app.dirty = true;
 		Ok(false)
 	}
@@ -2399,7 +2410,14 @@ mod imp {
 		install_surfaces(session, &tx);
 		let cancel = session.cancel_slot();
 		let mut app = App::new(status_of(session), session.config.ask.timeout());
-		app.history_lines = history_lines(&session.history);
+		app.history_lines = history_lines(&session.history, session.interrupted_fragment.as_deref());
+		if let Some(fragment) = session.interrupted_fragment.as_deref() {
+			let preview: String = fragment.chars().take(240).collect();
+			let ellipsis = if fragment.chars().count() > 240 { "…" } else { "" };
+			app.push_system(format!(
+				"recovered interrupted assistant fragment (not replayed, no tool calls): {preview}{ellipsis}"
+			));
+		}
 		app.push_system(
 			"arag interactive TUI — /help lists commands; Ctrl-C cancels a turn",
 		);
@@ -2427,7 +2445,7 @@ mod imp {
 					},
 					Action::Submit(prompt) => {
 						app.start_turn(&prompt);
-						app.history_lines = history_lines(&session.history);
+						app.history_lines = history_lines(&session.history, session.interrupted_fragment.as_deref());
 						// No cancel can meaningfully survive into a new turn;
 						// one that arrives after this point is kept as pending
 						// and applied when `turn_inner` publishes its token.
@@ -2466,7 +2484,7 @@ mod imp {
 						})?;
 						app.finish_turn();
 						app.status = status_of(session);
-						app.history_lines = history_lines(&session.history);
+						app.history_lines = history_lines(&session.history, session.interrupted_fragment.as_deref());
 						app.dirty = true;
 						if app.quit {
 							break;

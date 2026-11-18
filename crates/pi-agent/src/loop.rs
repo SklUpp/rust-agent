@@ -793,6 +793,14 @@ pub struct AgentLoop {
 	/// after a prune, with the index mapping it applied. Owners journal there,
 	/// so a compaction can only drop turns that are already on disk.
 	turn_observer: Option<TurnObserver>,
+	/// Boot nanos for stream-attempt identity (`{boot_nanos}-{counter}`).
+	/// Attempts stay unique across process restarts reusing a branch, so a
+	/// new stream can never alias a recovered fragment's attempt.
+	stream_boot_nanos: u64,
+	/// Per-stream counter for attempt identity. Incremented once per
+	/// `next_assistant` call; a single stream per branch keeps flush and
+	/// terminal on the same attempt.
+	stream_attempts: std::sync::atomic::AtomicU64,
 }
 
 /// Host hook for [`AgentLoop::with_turn_observer`].
@@ -830,6 +838,11 @@ impl AgentLoop {
 			continuation: false,
 			assistant_guard: None,
 			turn_observer: None,
+			stream_boot_nanos: std::time::SystemTime::now()
+				.duration_since(std::time::UNIX_EPOCH)
+				.map(|d| d.as_nanos() as u64)
+				.unwrap_or(0),
+			stream_attempts: std::sync::atomic::AtomicU64::new(0),
 		}
 	}
 
@@ -857,6 +870,11 @@ impl AgentLoop {
 			continuation: false,
 			assistant_guard: None,
 			turn_observer: None,
+			stream_boot_nanos: std::time::SystemTime::now()
+				.duration_since(std::time::UNIX_EPOCH)
+				.map(|d| d.as_nanos() as u64)
+				.unwrap_or(0),
+			stream_attempts: std::sync::atomic::AtomicU64::new(0),
 		}
 	}
 
@@ -2125,6 +2143,7 @@ impl AgentLoop {
 	/// issued it, so the route must travel with the message instead of being
 	/// inferred later from a session default. The provider is the dialog-local
 	/// active one, not necessarily the one the loop was constructed with.
+
 	fn with_source(provider: &Arc<dyn ModelProvider>, mut message: Message) -> Message {
 		if message.api.is_none() {
 			message.api = provider.api().map(str::to_string);
@@ -2136,6 +2155,47 @@ impl AgentLoop {
 			message.model = provider.model().map(str::to_string);
 		}
 		message
+	}
+
+	/// Terminal assistant message for `attempt`: sourced like
+	/// [`Self::with_source`] plus the stream-attempt marker, so the durable
+	/// store can clear exactly the draft this stream wrote. Every return
+	/// path of `next_assistant` builds its terminal through here; mirror
+	/// writes elsewhere carry no marker and never clear.
+	fn terminal_message(
+		provider: &Arc<dyn ModelProvider>,
+		message: Message,
+		attempt: &str,
+	) -> Message {
+		let mut message = Self::with_source(provider, message);
+		message.stream_attempt = Some(attempt.to_string());
+		message
+	}
+	/// Flush snapshot text as a branch-scoped durable draft.
+	///
+	/// Returns `Some(outcome)` when the flush itself failed and the turn must
+	/// end: the caller returns it directly. `None` means the draft is fresh
+	/// (or there is no durable boundary / nothing to write yet). The draft
+	/// carries text only, never tool calls; completion clears it atomically.
+	async fn flush_stream_draft_text(
+		&self,
+		text: &str,
+		attempt: &str,
+		provider: &Arc<dyn ModelProvider>,
+	) -> Option<Result<Message, NextAssistantError>> {
+		let durable = self.durable.as_ref()?;
+		if text.is_empty() {
+			return None;
+		}
+		if let Err(err) = durable.persist_partial_assistant(text, attempt).await {
+			let partial = Self::terminal_message(provider, Message::assistant(text), &attempt);
+			let status = TurnStatus::Error(err.to_string());
+			return Some(Err(NextAssistantError::Failed {
+				error: err.into(),
+				terminal: Some((partial, status)),
+			}));
+		}
+		None
 	}
 
 	/// Ask the provider for one assistant turn.
@@ -2154,6 +2214,16 @@ impl AgentLoop {
 		mut steering_rx: Option<&mut mpsc::Receiver<SteeringEvent>>,
 		injections: &mut Vec<Vec<ContentPart>>,
 	) -> Result<Message, NextAssistantError> {
+		// Stream attempt identity (`{boot_nanos}-{counter}`): flushes carry
+		// it so the store can tell this stream's draft from a recovered
+		// fragment of an older attempt, and the terminal assistant carries
+		// it so only the corresponding terminal clears. Boot nanos keep
+		// attempts unique across process restarts reusing a branch.
+		let attempt = format!(
+			"{}-{}",
+			self.stream_boot_nanos,
+			self.stream_attempts.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+		);
 		if cancellation_token.is_cancelled() {
 			return Err(NextAssistantError::interrupted(interrupted_message(Message::assistant(""), None), None));
 		}
@@ -2184,17 +2254,17 @@ impl AgentLoop {
 								None => {
 									tokio::select! {
 										_ = cancellation_token.cancelled() => return Err(NextAssistantError::interrupted(interrupted_message(Message::assistant(""), None), None)),
-										res = &mut complete_fut => return Ok(Self::with_source(provider, res?)),
+										res = &mut complete_fut => return Ok(Self::terminal_message(provider, res?, &attempt)),
 									}
 								}
 							},
-							res = &mut complete_fut => return Ok(Self::with_source(provider, res?)),
+							res = &mut complete_fut => return Ok(Self::terminal_message(provider, res?, &attempt)),
 						}
 					}
 					None => {
 						tokio::select! {
 							_ = cancellation_token.cancelled() => return Err(NextAssistantError::interrupted(interrupted_message(Message::assistant(""), None), None)),
-							res = &mut complete_fut => return Ok(Self::with_source(provider, res?)),
+							res = &mut complete_fut => return Ok(Self::terminal_message(provider, res?, &attempt)),
 						}
 					}
 				}
@@ -2250,6 +2320,19 @@ impl AgentLoop {
 		let mut assembler = StreamAssembler::new();
 		let mut done = false;
 		let mut rx_open = steering_rx.is_some();
+		// Bounded periodic durability for the in-progress stream. Normalized
+		// once so a bad config cannot spam the store or stall recovery.
+		let partial_cfg = self.config.stream_partial.normalized();
+		let mut chunks_since_flush = 0usize;
+		let mut chunks_since_snapshot = 0usize;
+		// Memory tier: running text refreshed every `memory_snapshot_chunks`
+		// chunks. Flush and interrupt paths read this instead of rebuilding
+		// the partial message from the assembler on every use.
+		let mut memory_snapshot = String::new();
+		// Stall deadline: fires even when neither chunks nor steering events
+		// arrive, so the disk draft is at most one interval stale. Reset on
+		// every flush; recreated implicitly by re-entering the select.
+		let mut idle_flush = Box::pin(tokio::time::sleep(partial_cfg.flush_interval()));
 
 		while !done {
 			let next_chunk = match steering_rx.as_deref_mut() {
@@ -2257,7 +2340,15 @@ impl AgentLoop {
 					tokio::select! {
 						biased;
 						_ = cancellation_token.cancelled() => {
-							let partial = interrupted_message(Self::with_source(provider, assembler.finish_partial()), None);
+							// Cancellation still preserves the fragment: flush
+							// the latest text, then report the interrupt. A
+							// failed flush fails the turn closed with the
+							// flush error instead of silently losing text.
+							memory_snapshot = assembler.finish_partial().content;
+							if let Some(outcome) = self.flush_stream_draft_text(&memory_snapshot, &attempt, provider).await {
+								return outcome;
+							}
+							let partial = interrupted_message(Self::terminal_message(provider, assembler.finish_partial(), &attempt), None);
 							return Err(NextAssistantError::interrupted(partial, None));
 						},
 						event = rx.recv() => match event {
@@ -2267,8 +2358,12 @@ impl AgentLoop {
 									SteeringEvent::InterruptWithReason(reason) => Some(reason),
 									_ => None,
 								};
+								memory_snapshot = assembler.finish_partial().content;
+								if let Some(outcome) = self.flush_stream_draft_text(&memory_snapshot, &attempt, provider).await {
+									return outcome;
+								}
 								let partial = interrupted_message(
-									Self::with_source(provider, assembler.finish_partial()),
+									Self::terminal_message(provider, assembler.finish_partial(), &attempt),
 									reason.clone(),
 								);
 								return Err(NextAssistantError::interrupted(partial, reason));
@@ -2283,15 +2378,44 @@ impl AgentLoop {
 							}
 						},
 						chunk = stream.next() => chunk,
-					}
+						_ = &mut idle_flush => {
+							// Stalled stream: refresh the memory snapshot, flush
+							// it as the disk draft, and re-arm the deadline.
+							// A failed flush fails the turn closed.
+							memory_snapshot = assembler.finish_partial().content;
+							chunks_since_snapshot = 0;
+							if let Some(outcome) = self.flush_stream_draft_text(&memory_snapshot, &attempt, provider).await {
+								return outcome;
+							}
+							chunks_since_flush = 0;
+							let deadline = tokio::time::Instant::now() + partial_cfg.flush_interval();
+							idle_flush.as_mut().reset(deadline);
+							continue;
+						},
+				}
 				}
 				_ => {
 					tokio::select! {
 						_ = cancellation_token.cancelled() => {
-							let partial = interrupted_message(Self::with_source(provider, assembler.finish_partial()), None);
+							memory_snapshot = assembler.finish_partial().content;
+							if let Some(outcome) = self.flush_stream_draft_text(&memory_snapshot, &attempt, provider).await {
+								return outcome;
+							}
+							let partial = interrupted_message(Self::terminal_message(provider, assembler.finish_partial(), &attempt), None);
 							return Err(NextAssistantError::interrupted(partial, None));
 						},
 						chunk = stream.next() => chunk,
+						_ = &mut idle_flush => {
+							memory_snapshot = assembler.finish_partial().content;
+							chunks_since_snapshot = 0;
+							if let Some(outcome) = self.flush_stream_draft_text(&memory_snapshot, &attempt, provider).await {
+								return outcome;
+							}
+							chunks_since_flush = 0;
+							let deadline = tokio::time::Instant::now() + partial_cfg.flush_interval();
+							idle_flush.as_mut().reset(deadline);
+							continue;
+						},
 					}
 				}
 			};
@@ -2302,7 +2426,14 @@ impl AgentLoop {
 			let chunk = match chunk {
 				Ok(c) => c,
 				Err(err) => {
-					let partial = Self::with_source(provider, assembler.finish_partial());
+					// Persist the latest partial before returning: the error
+					// ends this stream, so the draft must reflect it. A failed
+					// flush fails the turn closed with the flush error.
+					memory_snapshot = assembler.finish_partial().content;
+					if let Some(outcome) = self.flush_stream_draft_text(&memory_snapshot, &attempt, provider).await {
+						return outcome;
+					}
+					let partial = Self::terminal_message(provider, assembler.finish_partial(), &attempt);
 					let status = TurnStatus::Error(err.to_string());
 					return Err(NextAssistantError::Failed {
 						error: err.into(),
@@ -2329,20 +2460,59 @@ impl AgentLoop {
 			}
 			done = chunk.is_done;
 			if let Err(err) = assembler.push(&chunk) {
-				let partial = Self::with_source(provider, assembler.finish_partial());
+				memory_snapshot = assembler.finish_partial().content;
+				if let Some(outcome) = self.flush_stream_draft_text(&memory_snapshot, &attempt, provider).await {
+					return outcome;
+				}
+				let partial = Self::terminal_message(provider, assembler.finish_partial(), &attempt);
 				let status = TurnStatus::Error(err.to_string());
 				return Err(NextAssistantError::Failed {
 					error: err.into(),
 					terminal: Some((partial, status)),
 				});
 			}
+			// Memory tier: refresh the snapshot every `memory_snapshot_chunks`
+			// chunks so flush and interrupt paths reuse it instead of
+			chunks_since_snapshot += 1;
+			if chunks_since_snapshot >= partial_cfg.memory_snapshot_chunks {
+				memory_snapshot = assembler.finish_partial().content;
+				chunks_since_snapshot = 0;
+			}
+		// Disk tier: flush the branch-scoped draft when the chunk knob
+		// fires. The snapshot is refreshed first when dirty, so the disk
+		// draft is always latest — independent of the memory cadence (a
+		// wide `memory_snapshot_chunks` with `persist_every_chunks = 1`
+		// still persists every chunk). The stall timer resets only when
+		// text was actually written; an empty no-op leaves the deadline
+		// alone so a stalled stream cannot postpone recovery forever. A
+		// failed flush fails the turn closed: silent durability loss is
+		// worse than an error.
+		chunks_since_flush += 1;
+		if chunks_since_flush >= partial_cfg.persist_every_chunks {
+			if chunks_since_snapshot > 0 {
+				memory_snapshot = assembler.finish_partial().content;
+				chunks_since_snapshot = 0;
+			}
+			if !memory_snapshot.is_empty() {
+				if let Some(outcome) = self.flush_stream_draft_text(&memory_snapshot, &attempt, provider).await {
+					return outcome;
+				}
+				chunks_since_flush = 0;
+				let deadline = tokio::time::Instant::now() + partial_cfg.flush_interval();
+				idle_flush.as_mut().reset(deadline);
+			}
+		}
 			if done {
 				break;
 			}
 		}
 
 		if !done {
-			let partial = Self::with_source(provider, assembler.finish_partial());
+			memory_snapshot = assembler.finish_partial().content;
+			if let Some(outcome) = self.flush_stream_draft_text(&memory_snapshot, &attempt, provider).await {
+				return outcome;
+			}
+			let partial = Self::terminal_message(provider, assembler.finish_partial(), &attempt);
 			let err_msg = "stream ended before completion".to_string();
 			let status = TurnStatus::Error(err_msg.clone());
 			return Err(NextAssistantError::Failed {
@@ -2350,10 +2520,14 @@ impl AgentLoop {
 				terminal: Some((partial, status)),
 			});
 		}
-		let partial = Self::with_source(provider, assembler.finish_partial());
+		let partial = Self::terminal_message(provider, assembler.finish_partial(), &attempt);
 		let message = match assembler.finish() {
-			Ok(message) => Self::with_source(provider, message),
+			Ok(message) => Self::terminal_message(provider, message, &attempt),
 			Err(err) => {
+				memory_snapshot = assembler.finish_partial().content;
+				if let Some(outcome) = self.flush_stream_draft_text(&memory_snapshot, &attempt, provider).await {
+					return outcome;
+				}
 				let status = TurnStatus::Error(err.to_string());
 				return Err(NextAssistantError::Failed {
 					error: err.into(),

@@ -113,8 +113,86 @@ struct UiMeta {
 }
 
 static SETTINGS_SCHEMA: LazyLock<Snapshot> = LazyLock::new(|| {
-	serde_json::from_str(include_str!("../settings-schema.snapshot.json"))
-		.expect("settings schema snapshot is generated and valid JSON")
+	let mut snapshot: Snapshot = serde_json::from_str(include_str!("../settings-schema.snapshot.json"))
+		.expect("settings schema snapshot is generated and valid JSON");
+	let runtime_settings = [
+		SettingDef {
+			path: "model.requestTimeout.timeoutMs".to_string(),
+			kind: "number".to_string(),
+			values: None,
+			default: Some(Json::from(0)),
+			default_absent: false,
+			credential: false,
+			ui: Some(UiMeta {
+				tab: "model".to_string(),
+				group: Some("Request".to_string()),
+				label: "Model Request Timeout (ms)".to_string(),
+				description: "Per-model-request timeout in milliseconds (0 disables)".to_string(),
+			}),
+		},
+		SettingDef {
+			path: "model.requestTimeout.maxRetries".to_string(),
+			kind: "number".to_string(),
+			values: None,
+			default: Some(Json::from(0)),
+			default_absent: false,
+			credential: false,
+			ui: Some(UiMeta {
+				tab: "model".to_string(),
+				group: Some("Request".to_string()),
+				label: "Model Request Timeout Retries".to_string(),
+				description: "Maximum model request retries after a timeout before failing".to_string(),
+			}),
+		},
+		SettingDef {
+			path: "model.streamPartial.memorySnapshotChunks".to_string(),
+			kind: "number".to_string(),
+			values: None,
+			default: Some(Json::from(5)),
+			default_absent: false,
+			credential: false,
+			ui: Some(UiMeta {
+				tab: "model".to_string(),
+				group: Some("Streaming".to_string()),
+				label: "Stream Memory Snapshot Chunks".to_string(),
+				description: "Refresh interval in chunks for the in-memory partial response snapshot".to_string(),
+			}),
+		},
+		SettingDef {
+			path: "model.streamPartial.persistEveryChunks".to_string(),
+			kind: "number".to_string(),
+			values: None,
+			default: Some(Json::from(20)),
+			default_absent: false,
+			credential: false,
+			ui: Some(UiMeta {
+				tab: "model".to_string(),
+				group: Some("Streaming".to_string()),
+				label: "Stream Persist Chunks".to_string(),
+				description: "Chunks between durable stream draft flushes to SQLite".to_string(),
+			}),
+		},
+		SettingDef {
+			path: "model.streamPartial.flushIntervalMs".to_string(),
+			kind: "number".to_string(),
+			values: None,
+			default: Some(Json::from(2000)),
+			default_absent: false,
+			credential: false,
+			ui: Some(UiMeta {
+				tab: "model".to_string(),
+				group: Some("Streaming".to_string()),
+				label: "Stream Flush Interval (ms)".to_string(),
+				description: "Maximum milliseconds between durable stream draft flushes to SQLite".to_string(),
+			}),
+		},
+	];
+	for def in runtime_settings {
+		if !snapshot.settings.iter().any(|existing| existing.path == def.path) {
+			snapshot.settings.push(def);
+		}
+	}
+	snapshot
 });
 
 fn find_def(path: &str) -> Option<&'static SettingDef> {
@@ -2880,5 +2958,19 @@ mod tests {
 			}),
 			Some("always")
 		);
+	}
+
+	#[test]
+	fn standalone_runtime_timeout_and_stream_partial_keys_are_configurable() {
+		for key in [
+			"model.requestTimeout.timeoutMs",
+			"model.requestTimeout.maxRetries",
+			"model.streamPartial.memorySnapshotChunks",
+			"model.streamPartial.persistEveryChunks",
+			"model.streamPartial.flushIntervalMs",
+		] {
+			let def = def(key);
+			assert_eq!(parse_value(def, "42").expect("parse"), Value::Int(42));
+		}
 	}
 }

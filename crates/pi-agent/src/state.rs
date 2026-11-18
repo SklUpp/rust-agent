@@ -633,6 +633,12 @@ pub struct Message {
 	/// Absent stays omitted so older journals keep parsing.
 	#[serde(rename = "disabledFeatures", default, skip_serializing_if = "Option::is_none")]
 	pub disabled_features: Option<Vec<String>>,
+	/// Stream attempt that produced this assistant message (`{boot_nanos}-{counter}`).
+	/// Set by the loop on the terminal assistant only, so the durable store can
+	/// clear exactly the draft that stream wrote. Absent stays omitted so older
+	/// journals keep parsing; provider serializers ignore it.
+	#[serde(rename = "streamAttempt", default, skip_serializing_if = "Option::is_none")]
+	pub stream_attempt: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -673,6 +679,8 @@ struct RawMessage {
 	custom_type: Option<String>,
 	#[serde(rename = "disabledFeatures", default)]
 	disabled_features: Option<Vec<String>>,
+	#[serde(rename = "streamAttempt", default)]
+	stream_attempt: Option<String>,
 }
 
 impl<'de> Deserialize<'de> for Message {
@@ -718,6 +726,7 @@ impl<'de> Deserialize<'de> for Message {
 			attribution: raw.attribution,
 			custom_type: raw.custom_type,
 			disabled_features: raw.disabled_features,
+			stream_attempt: raw.stream_attempt,
 		})
 	}
 }
@@ -740,6 +749,7 @@ impl Message {
 			attribution: None,
 			custom_type: None,
 			disabled_features: None,
+			stream_attempt: None,
 		}
 	}
 
@@ -762,6 +772,7 @@ impl Message {
 			attribution: None,
 			custom_type: None,
 			disabled_features: None,
+			stream_attempt: None,
 		}
 	}
 
@@ -787,6 +798,7 @@ impl Message {
 			attribution: Some(Attribution::Agent),
 			custom_type: Some(custom_type.into()),
 			disabled_features: None,
+			stream_attempt: None,
 		}
 	}
 
@@ -808,6 +820,7 @@ impl Message {
 			attribution: None,
 			custom_type: None,
 			disabled_features: None,
+			stream_attempt: None,
 		}
 	}
 
@@ -837,6 +850,7 @@ impl Message {
 			attribution: None,
 			custom_type: None,
 			disabled_features: None,
+			stream_attempt: None,
 		}
 	}
 
@@ -869,6 +883,7 @@ impl Message {
 			attribution: None,
 			custom_type: None,
 			disabled_features: None,
+			stream_attempt: None,
 		}
 	}
 
@@ -898,6 +913,7 @@ impl Message {
 			attribution: None,
 			custom_type: None,
 			disabled_features: None,
+			stream_attempt: None,
 		}
 	}
 
@@ -919,6 +935,7 @@ impl Message {
 			attribution: None,
 			custom_type: None,
 			disabled_features: None,
+			stream_attempt: None,
 		}
 	}
 
@@ -940,6 +957,7 @@ impl Message {
 			attribution: None,
 			custom_type: None,
 			disabled_features: None,
+			stream_attempt: None,
 		}
 	}
 
@@ -966,6 +984,7 @@ impl Message {
 			attribution: None,
 			custom_type: None,
 			disabled_features: None,
+			stream_attempt: None,
 		}
 	}
 	pub fn tool_with_status_and_parts(
@@ -992,7 +1011,58 @@ impl Message {
 			attribution: None,
 			custom_type: None,
 			disabled_features: None,
+			stream_attempt: None,
 		}
+	}
+}
+
+/// Bounds for periodic partial assistant persistence during streaming.
+///
+/// Memory tier (`memory_snapshot_chunks`): the loop refreshes an in-memory
+/// snapshot of the running text after this many chunks. Disk flushes and the
+/// stall timer read the snapshot instead of rebuilding the partial message
+/// from the assembler on every use.
+/// Disk tier (`persist_every_chunks` / `flush_interval_ms`): a branch-scoped
+/// draft is flushed when either knob fires, whichever comes first. The chunk
+/// knob bounds fast streams; the time knob is a stall deadline the loop
+/// enforces with a timer even when no chunk arrives. The draft never carries
+/// tool calls. `normalized` clamps all knobs so a bad config cannot spam
+/// the store or stall crash recovery.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StreamPartialConfig {
+	/// Memory tier: refresh the in-memory snapshot of the running text after
+	/// this many streamed chunks (default 5). Disk flushes and the stall
+	/// timer read the snapshot instead of rebuilding the partial message.
+	pub memory_snapshot_chunks: usize,
+	/// Disk tier: flush the branch-scoped draft after this many streamed
+	/// chunks (default 20).
+	pub persist_every_chunks: usize,
+	/// Disk tier: flush deadline in ms (default 2000), timer-enforced even
+	/// when the stream stalls with no chunks arriving.
+	pub flush_interval_ms: u64,
+}
+
+impl Default for StreamPartialConfig {
+	fn default() -> Self {
+		Self { memory_snapshot_chunks: 5, persist_every_chunks: 20, flush_interval_ms: 2000 }
+	}
+}
+
+impl StreamPartialConfig {
+	#[must_use]
+	pub fn normalized(self) -> Self {
+		Self {
+			memory_snapshot_chunks: self.memory_snapshot_chunks.clamp(1, 100),
+			persist_every_chunks: self.persist_every_chunks.clamp(1, 1000),
+			flush_interval_ms:    self.flush_interval_ms.clamp(250, 60_000),
+		}
+	}
+
+	/// Disk-flush deadline. The loop enforces it with a timer even when the
+	/// stream stalls, so a silent provider still leaves a recoverable draft.
+	#[must_use]
+	pub fn flush_interval(&self) -> std::time::Duration {
+		std::time::Duration::from_millis(self.flush_interval_ms)
 	}
 }
 
@@ -1006,6 +1076,9 @@ pub struct AgentConfig {
 	pub context_limit: usize,
 	pub system_prompt: Option<String>,
 	pub cwd: PathBuf,
+	/// Periodic partial-stream durability knobs; normalized on loop build.
+	#[serde(default)]
+	pub stream_partial: StreamPartialConfig,
 }
 
 /// A non-forcing requirement to call `tool_name` before the loop runs other

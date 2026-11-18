@@ -149,7 +149,22 @@ impl EventFrames {
 				// `output.content`), so a retried stream cannot inherit stale blocks.
 				self.blocks.clear();
 				if !self.turn_open {
-					sink.send(json!({ "type": "turn_start" }));
+					// Client visibility for a recovered interrupted stream:
+					// metadata only (length + short preview), never executable
+					// content. The full text reached the model as explicitly
+					// interrupted context; the host already owns the session
+					// database, so no new secret crosses the wire. Absent
+					// stays omitted so older hosts keep parsing.
+					let mut frame = json!({ "type": "turn_start" });
+					if let Some(fragment) = session.interrupted_fragment.as_deref() {
+						let preview: String = fragment.chars().take(240).collect();
+						frame["recoveredFragment"] = json!({
+							"chars": fragment.chars().count(),
+							"preview": preview,
+							"note": "interrupted assistant fragment recovered from the durable draft; delivered to the model as interrupted context, not replayed, no tool calls",
+						});
+					}
+					sink.send(frame);
 					self.turn_open = true;
 				}
 				sink.send(json!({
@@ -1841,7 +1856,9 @@ fn run_turn(
 			let mut guard = session
 				.lock()
 				.unwrap_or_else(std::sync::PoisonError::into_inner);
-			guard.finish_turn(&mut prepared, &outcome);
+			if let Err(error) = guard.finish_turn(&mut prepared, &outcome) {
+				outcome.error.get_or_insert(error.to_string());
+			}
 			for frame in guard.finish_goal_turn() {
 				sink.send(frame);
 			}
@@ -2023,7 +2040,10 @@ fn run_turn(
 			}
 			outcome.error.get_or_insert(error);
 		}
-		guard.finish_turn(&mut prepared, &outcome);
+		let finish_error = guard.finish_turn(&mut prepared, &outcome).err().map(|error| error.to_string());
+		if let Some(error) = finish_error {
+			outcome.error.get_or_insert(error);
+		}
 		// Drain goal persistence and complete-exit after the turn settles, so a
 		// goal tool call cannot lose its `goal_updated`/terminal metric.
 		for frame in guard.finish_goal_turn() {

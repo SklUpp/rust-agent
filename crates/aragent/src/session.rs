@@ -1859,9 +1859,24 @@ impl SessionStore {
 		})
 	}
 
+	/// Interrupted stream text from the branch-scoped durable draft, if any.
+	/// Display-only: the caller must never append it to history or provider
+	/// context and never convert it into tool calls. Peeks without consuming
+	/// so a crash before the next completed turn keeps the fragment; the next
+	/// terminal assistant message clears it atomically. Storage or schema
+	/// failures propagate: a silent `None` here would hide a damaged draft
+	/// table behind a missing fragment.
+	pub fn recovered_partial_text(&self) -> StoreResult<Option<String>> {
+		self
+			.durable
+			.as_ref()
+			.map(|durable| durable.peek_recovered_partial())
+			.transpose()
+			.map(|draft| draft.flatten())
+	}
+
 	/// `true` for a read-only legacy JSONL view: reads are supported, appends
 	/// fail explicitly until the log is imported into SQLite.
-	#[must_use]
 	pub fn legacy_read_only(&self) -> bool {
 		self.legacy_read_only
 	}

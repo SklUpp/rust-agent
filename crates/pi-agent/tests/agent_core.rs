@@ -14,9 +14,9 @@ use pi_agent::{
 	AgentConfig, AgentError, AgentError::Interrupted, AgentEvent, AgentLoop, AgentState,
 	CancellationToken, ChunkStream, ContentPart, DelegationLimits, DurableBoundary, DurableError,
 	EditTool, GlobTool, GrepTool, ImagePart, Message, ModelProvider, ProviderError, ReadTool, Role,
-	SteeringEvent, StopReason, StreamAssembler, StreamChunk, Supervisor, Tool, ToolCall,
-	ToolCallDelta, ToolChoice, ToolRegistry, ToolResult, TurnStatus, WriteTool, parse_sse_line,
-	sse_stream,
+	SteeringEvent, StopReason, StreamAssembler, StreamChunk, StreamPartialConfig, Supervisor, Tool,
+	ToolCall, ToolCallDelta, ToolChoice, ToolRegistry, ToolResult, TurnStatus, WriteTool,
+	parse_sse_line, sse_stream,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use serde_json::json;
@@ -152,6 +152,7 @@ fn config(cwd: &std::path::Path, max_turns: usize) -> AgentConfig {
 		context_limit: 100_000,
 		system_prompt: Some("test system prompt".to_string()),
 		cwd: cwd.to_path_buf(),
+		stream_partial: StreamPartialConfig::default(),
 	}
 }
 
@@ -3610,6 +3611,7 @@ fn directly_constructed_message_with_content_and_image_part_preserves_both_on_wi
 		attribution: None,
 		custom_type: None,
 		disabled_features: None,
+		stream_attempt: None,
 	};
 	let wire = pi_agent::to_openai_messages(&[msg]).expect("openai messages");
 	let val = serde_json::to_value(&wire[0]).expect("serialize");

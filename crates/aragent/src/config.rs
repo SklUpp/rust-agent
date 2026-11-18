@@ -829,6 +829,87 @@ impl ToolCallLoopGuardConfig {
 	}
 }
 
+/// `model.requestTimeout.*`: per-model-request timeout and bounded retry after timeout.
+///
+/// `timeoutMs` bounds one model request (`0`/absent disables); `maxRetries`
+/// bounds reissues after a timeout only. Retries never replay tools and never
+/// combine partial streams: a stream that already yielded a chunk fails with
+/// the timeout instead of being retried.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ModelRequestTimeoutConfig {
+	pub timeout_ms:  Option<u64>,
+	pub max_retries: Option<u32>,
+}
+
+impl ModelRequestTimeoutConfig {
+	/// Effective per-request budget; `None` (absent or `0`) disables the wrapper.
+	#[must_use]
+	pub fn timeout(&self) -> Option<std::time::Duration> {
+		self.timeout_ms.filter(|millis| *millis > 0).map(std::time::Duration::from_millis)
+	}
+
+	/// Bounded reissues after a timeout only; absent means no retry.
+	#[must_use]
+	pub fn max_retries(&self) -> u32 {
+		self.max_retries.unwrap_or(0)
+	}
+
+	/// Effective `pi-agent` request-timeout configuration.
+	#[must_use]
+	pub fn effective(&self) -> pi_agent::provider::timeout::RequestTimeoutConfig {
+		pi_agent::provider::timeout::RequestTimeoutConfig {
+			timeout:     self.timeout(),
+			max_retries: self.max_retries(),
+		}
+	}
+
+	fn merge(&mut self, overlay: Self) {
+		if overlay.timeout_ms.is_some() { self.timeout_ms = overlay.timeout_ms; }
+		if overlay.max_retries.is_some() { self.max_retries = overlay.max_retries; }
+	}
+}
+
+/// `model.streamPartial.*`: periodic persistence of the in-progress assistant
+/// stream as a branch-scoped draft.
+///
+/// `persistEveryChunks` flushes after this many streamed chunks;
+/// `flushIntervalMs` flushes when this long passed since the last flush.
+/// Both knobs are bounded and normalized by `pi-agent` (`1..=1000` chunks,
+/// `250..=60_000` ms); absent means the loop defaults (20 chunks, 2000 ms).
+/// The draft carries assistant text only, never tool calls, and is cleared
+/// atomically with the completed message.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct StreamPartialDurabilityConfig {
+	pub memory_snapshot_chunks: Option<usize>,
+	pub persist_every_chunks: Option<usize>,
+	pub flush_interval_ms:    Option<u64>,
+}
+
+impl StreamPartialDurabilityConfig {
+	/// Effective `pi-agent` partial-stream durability configuration.
+	#[must_use]
+	pub fn effective(&self) -> pi_agent::state::StreamPartialConfig {
+		let base = pi_agent::state::StreamPartialConfig::default();
+		pi_agent::state::StreamPartialConfig {
+			memory_snapshot_chunks: self.memory_snapshot_chunks.unwrap_or(base.memory_snapshot_chunks),
+			persist_every_chunks: self.persist_every_chunks.unwrap_or(base.persist_every_chunks),
+			flush_interval_ms:    self.flush_interval_ms.unwrap_or(base.flush_interval_ms),
+		}
+		.normalized()
+	}
+
+	fn merge(&mut self, overlay: Self) {
+		if overlay.memory_snapshot_chunks.is_some() {
+			self.memory_snapshot_chunks = overlay.memory_snapshot_chunks;
+		}
+		if overlay.persist_every_chunks.is_some() {
+			self.persist_every_chunks = overlay.persist_every_chunks;
+		}
+		if overlay.flush_interval_ms.is_some() {
+			self.flush_interval_ms = overlay.flush_interval_ms;
+		}
+	}
+}
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Config {
 	pub default_model:        Option<String>,
@@ -875,6 +956,11 @@ pub struct Config {
 	pub advisor:              AdvisorSettings,
 	/// `model.toolCallLoopGuard.*`.
 	pub tool_call_loop_guard: ToolCallLoopGuardConfig,
+	/// `model.requestTimeout.*`: per-model-request timeout and bounded retry.
+	pub model_request_timeout: ModelRequestTimeoutConfig,
+	/// `model.streamPartial.*`: periodic persistence of the in-progress
+	/// assistant stream as a branch-scoped draft.
+	pub stream_partial: StreamPartialDurabilityConfig,
 	/// `eval.*` backend enablement and interpreter groups.
 	pub eval_config:          EvalConfig,
 	/// `searxng.*`: the web-search endpoint and its credentials.
@@ -1006,6 +1092,8 @@ impl Config {
 		self.security.merge(overlay.security);
 		self.advisor.merge(overlay.advisor);
 		self.tool_call_loop_guard.merge(overlay.tool_call_loop_guard);
+		self.model_request_timeout.merge(overlay.model_request_timeout);
+		self.stream_partial.merge(overlay.stream_partial);
 		self.eval_config.merge(overlay.eval_config);
 		// `searxng.*` merges per leaf so an explicit host overlay can add
 		// credentials to a globally configured endpoint (and vice versa).
@@ -1911,6 +1999,72 @@ fn apply_nested_settings(config: &mut Config, value: &Value, path: &Path) -> Res
 			},
 		}
 	}
+	if let Some(timeout) = settings_nested_leaf(
+		value,
+		"model",
+		"requestTimeout",
+		"timeoutMs",
+		"model.requestTimeout.timeoutMs",
+	) {
+		config.model_request_timeout.timeout_ms =
+			expect_millis(timeout, "model.requestTimeout.timeoutMs", path)?;
+	}
+	if let Some(retries) = settings_nested_leaf(
+		value,
+		"model",
+		"requestTimeout",
+		"maxRetries",
+		"model.requestTimeout.maxRetries",
+	) {
+		match retries {
+			Value::Null => config.model_request_timeout.max_retries = None,
+			Value::Int(value) if *value >= 0 => {
+				config.model_request_timeout.max_retries =
+					Some(u32::try_from(*value).unwrap_or(u32::MAX));
+			},
+			_ => {
+				eprintln!(
+					"warning: {}: model.requestTimeout.maxRetries must be an integer >= 0; ignoring",
+					path.display()
+				);
+			},
+		}
+	}
+	if let Some(snapshot) = settings_nested_leaf(
+		value,
+		"model",
+		"streamPartial",
+		"memorySnapshotChunks",
+		"model.streamPartial.memorySnapshotChunks",
+	) {
+		match expect_usize(snapshot, "model.streamPartial.memorySnapshotChunks", path)? {
+			Some(0) | None => {},
+			Some(count) => config.stream_partial.memory_snapshot_chunks = Some(count),
+		}
+	}
+	if let Some(chunks) = settings_nested_leaf(
+		value,
+		"model",
+		"streamPartial",
+		"persistEveryChunks",
+		"model.streamPartial.persistEveryChunks",
+	) {
+		match expect_usize(chunks, "model.streamPartial.persistEveryChunks", path)? {
+			Some(0) | None => {},
+			Some(count) => config.stream_partial.persist_every_chunks = Some(count),
+		}
+	}
+	if let Some(interval) = settings_nested_leaf(
+		value,
+		"model",
+		"streamPartial",
+		"flushIntervalMs",
+		"model.streamPartial.flushIntervalMs",
+	) {
+		config.stream_partial.flush_interval_ms =
+			expect_millis(interval, "model.streamPartial.flushIntervalMs", path)?;
+	}
+
 	if let Some(sync) = settings_leaf(value, "advisor", "syncBacklog", "advisor.syncBacklog") {
 		match sync.to_text().as_deref() {
 			Some(value @ ("off" | "1" | "3" | "5")) => {
@@ -3227,6 +3381,7 @@ mod tests {
 		assert_eq!(host_off.diagnostics.enabled, Some(true));
 
 		// A host that did not opt out keeps its own value.
+
 		let mut host_on = Config::default();
 		host_on.diagnostics.enabled = Some(true);
 		Config::apply_project_layers(&mut host_on, &root).expect("project layer");
@@ -3240,6 +3395,40 @@ mod tests {
 
 		let _ = fs::remove_dir_all(root);
 	}
+	#[test]
+	fn model_request_timeout_parses_and_merges() {
+		let config = parse_config(
+			"model:\n  requestTimeout:\n    timeoutMs: 30000\n    maxRetries: 2\n",
+		)
+		.expect("request timeout");
+		assert_eq!(
+			config.model_request_timeout.timeout(),
+			Some(std::time::Duration::from_secs(30))
+		);
+		assert_eq!(config.model_request_timeout.max_retries(), 2);
+		assert!(config.model_request_timeout.effective().is_enabled());
+
+		let disabled = parse_config("model:\n  requestTimeout:\n    timeoutMs: 0\n")
+			.expect("disabled timeout");
+		assert_eq!(disabled.model_request_timeout.timeout(), None);
+		assert!(!disabled.model_request_timeout.effective().is_enabled());
+
+		let defaulted = Config::default();
+		assert_eq!(defaulted.model_request_timeout.max_retries(), 0);
+		assert!(!defaulted.model_request_timeout.effective().is_enabled());
+
+		let mut base =
+			parse_config("model:\n  requestTimeout:\n    timeoutMs: 1000\n").expect("base");
+		base.merge(
+			parse_config("model:\n  requestTimeout:\n    maxRetries: 1\n").expect("overlay"),
+		);
+		assert_eq!(
+			base.model_request_timeout.timeout(),
+			Some(std::time::Duration::from_secs(1))
+		);
+		assert_eq!(base.model_request_timeout.max_retries(), 1);
+	}
+
 
 	#[test]
 	fn tool_call_loop_guard_parser_accepts_threshold_one_and_yaml_lists() {

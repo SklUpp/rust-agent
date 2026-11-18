@@ -1028,6 +1028,7 @@ fn run() -> std::result::Result<(), CliError> {
 		service_tier_recorded: false,
 		history: Vec::new(),
 		checkpoint_host: CheckpointHost::new(),
+		interrupted_fragment: None,
 		turn_tool_calls: 0,
 		turn_started_in_goal: false,
 		in_memory_messages: None,
@@ -1320,10 +1321,20 @@ fn run() -> std::result::Result<(), CliError> {
 		store.history().to_vec()
 	};
 	session.checkpoint_host.rehydrate(&store);
+	// Surface an interrupted stream draft as a display-only fragment: never
+	// history, never provider context, never tool calls. The draft stays in
+	// the store (peek, not take) so a crash before the next completed turn
+	// keeps it; that turn's persist clears it atomically.
+	session.interrupted_fragment =
+		store.recovered_partial_text().map_err(|err| CliError::fail(err.to_string()))?;
+	if let Some(fragment) = session.interrupted_fragment.as_deref() {
+		let preview: String = fragment.chars().take(240).collect();
+		let ellipsis = if fragment.chars().count() > 240 { "…" } else { "" };
+		eprintln!("note: recovered an interrupted assistant fragment (not replayed, no tool calls): {preview}{ellipsis}");
+	}
 	session.store = store;
 	// One authoritative live selection, resolved once at launch with the TS
 	// precedence (explicit flag, then the recorded entry including a reset,
-	// then configured family defaults, then the legacy single value).
 	let base_service_tiers = if session.store.has_service_tier_entry() {
 		session.store.service_tier_by_family()
 	} else {
@@ -1768,8 +1779,11 @@ struct Session<'a> {
 	service_tier_recorded: bool,
 	history: Vec<TurnRecord>,
 	checkpoint_host: CheckpointHost,
+	/// Interrupted stream text recovered from the branch-scoped durable draft.
+	/// Display-only: never appended to `history` or provider context, never
+	/// converted into tool calls. Cleared when the next turn persists.
+	interrupted_fragment: Option<String>,
 	/// Tool results in the just-finished turn (TS `tool_execution_end` count),
-	/// consumed by the `autolearn.minToolCalls` gate.
 	turn_tool_calls: usize,
 	/// Goal mode when the just-finished turn started; capture skips the turn
 	/// even if a goal tool completed it.
@@ -2272,8 +2286,10 @@ impl Session<'_> {
 			request.goal = None;
 			request.goal_context = None;
 			request.plan_context = None;
+			// The recovered fragment belongs to the next real turn, not to a
+			// background capture: hand it back instead of consuming it here.
+			self.interrupted_fragment = request.interrupted_context.take();
 			request.todo_phases = Vec::new();
-			request.acp_bridge = None;
 			request.extra_mcp_servers = Vec::new();
 			request.config.tools = Some(Vec::new());
 			request.extra_tools = self.autolearn_extra_tools();
@@ -2476,6 +2492,11 @@ impl Session<'_> {
 			))),
 			continuation: false,
 			plan_context,
+			// Clone, not take: an immediate runner failure before any persist
+			// must not lose the fragment. The turn-end refresh clears the
+			// in-memory copy once the terminal assistant message has cleared
+			// the store draft; an aborted turn re-peeks the fresh draft.
+			interrupted_context: self.interrupted_fragment.clone(),
 			advisor_card_sink: Some(agent::AdvisorCardHandle(advisor_card_sink)),
 			service_tier_by_family,
 			security_host: None,
@@ -3608,6 +3629,13 @@ impl Session<'_> {
 				self.history = history;
 			}
 			self.history.push(record);
+			// Refresh the display-only fragment: an aborted stream may have left
+			// a fresh one. Storage failures propagate: hiding them would desync
+			// the banner from the store.
+			self.interrupted_fragment = self
+				.store
+				.recovered_partial_text()
+				.map_err(|error| Error::with_source("cannot read recovered stream draft", error))?;
 			return Err(err);
 		}
 		let rewound = self.checkpoint_host.finish_in_memory_rewind();
@@ -3616,6 +3644,12 @@ impl Session<'_> {
 		} else if !rewound {
 			self.history.push(record);
 		}
+		// The completed turn persisted; its append cleared the draft. Refresh
+		// so a stale banner never outlives finalization.
+		self.interrupted_fragment = self
+			.store
+			.recovered_partial_text()
+			.map_err(|error| Error::with_source("cannot read recovered stream draft", error))?;
 		Ok(())
 	}
 }

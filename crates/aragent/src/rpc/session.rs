@@ -277,9 +277,11 @@ pub struct RpcSession {
 	pub(crate) store:    SessionStore,
 	pub(crate) store_options: SessionOptions,
 	pub(crate) history:  Vec<TurnRecord>,
+	/// Recovered interrupted stream text, display-only. Passed one-shot as
+	/// explicitly-interrupted model context, never journaled or replayed.
+	pub(crate) interrupted_fragment: Option<String>,
 	/// Exact provider-ready context override (after compaction or rewind).
 	pub(crate) history_messages: Option<Vec<Message>>,
-	/// Live conversation in wire form (`AgentMessage` JSON), oldest first.
 	pub(crate) messages: Vec<Value>,
 	/// Wire mirror replacement queued by a turn-end rewind cut. Applied after
 	/// the settled turn's own `turn_end` frame, so that frame still describes
@@ -520,6 +522,7 @@ impl RpcSession {
 			store,
 			store_options,
 			history,
+			interrupted_fragment: None,
 			history_messages: None,
 			messages,
 			pending_wire: None,
@@ -588,6 +591,10 @@ impl RpcSession {
 		}
 		session.refresh_root_endpoint();
 		session.reconcile_goal_mode();
+		// Same one-shot recovery as the CLI path: peek (don't consume) so a
+		// crash before the next terminal message keeps the fragment.
+		session.interrupted_fragment =
+			session.store.recovered_partial_text().map_err(Error::new)?;
 		Ok(session)
 	}
 
@@ -1420,11 +1427,17 @@ impl RpcSession {
 		self.todo_phases.clear();
 		self.session_name = None;
 		self.last_assistant_text = None;
-		self.tokens_per_second = None;
+		// New log, new fragment: a fresh session has no interrupted stream.
+		// Peek (fail closed) so a stray draft can never leak across sessions.
+		self.interrupted_fragment = self.store.recovered_partial_text().map_err(Error::new)?;
 		self.checkpoint_host = CheckpointHost::new();
 		self.checkpoint_host.rehydrate(&self.store);
 		self.reset_advisor_boundary();
 		self.restore_service_tiers();
+		// Session or branch changed: re-read the fragment for the new
+		// scope (peek keeps it crash-safe) so a stale fragment can never
+		// leak across sessions or branches. Storage failures fail closed.
+		self.interrupted_fragment = self.store.recovered_partial_text().map_err(Error::new)?;
 		let target = self.session_scope_identity();
 		self.runner
 			.reopen_session(target.0.as_deref(), target.1.as_deref());
@@ -1533,6 +1546,10 @@ impl RpcSession {
 		self.checkpoint_host.rehydrate(&self.store);
 		self.reset_advisor_boundary();
 		self.restore_service_tiers();
+		// Session or branch changed: re-read the fragment for the new
+		// scope (peek keeps it crash-safe) so a stale fragment can never
+		// leak across sessions or branches. Storage failures fail closed.
+		self.interrupted_fragment = self.store.recovered_partial_text().map_err(Error::new)?;
 		let target = self.session_scope_identity();
 		self.runner
 			.reopen_session(target.0.as_deref(), target.1.as_deref());
@@ -1657,6 +1674,12 @@ impl RpcSession {
 			.filter_map(|entry| serde_json::to_value(&entry.message).ok())
 			.collect();
 		self.pending_wire = None;
+		// Branch changed under the same log: the draft is branch-scoped, so
+		// re-read it (peek keeps it crash-safe) instead of showing the old
+		// branch's fragment. Storage failures fail the switch closed.
+		self.interrupted_fragment = self.store.recovered_partial_text().map_err(|error| {
+			Prerequisite::new("branch_unavailable", format!("cannot read recovered draft: {error}"))
+		})?;
 		Ok(json!({ "text": text, "cancelled": false }))
 	}
 
@@ -1885,6 +1908,9 @@ impl RpcSession {
 		request.goal = None;
 		request.goal_context = None;
 		request.plan_context = None;
+		// A capture run must never see another turn's recovered fragment:
+		// it is unrelated context, not a completed response to continue.
+		request.interrupted_context = None;
 		request.plan_mode = crate::agent::PlanModeHooks::default();
 		// No advisor card may reach the primary session's sink from a capture;
 		// the runtime gate also refuses an advisor manager.
@@ -2071,6 +2097,13 @@ impl RpcSession {
 		)
 	}
 
+	/// Recovered draft for the next provider request. Clones (not takes): an
+	/// immediate runner failure before any persist must not lose the
+	/// fragment. The post-turn refresh clears the in-memory copy once the
+	/// terminal assistant message has cleared the store draft.
+	fn interrupted_context(&self) -> Option<String> {
+		self.interrupted_fragment.clone()
+	}
 	/// Build the provider request for a prompt, recording the user entry.
 	pub fn prepare_turn(
 		&mut self,
@@ -2342,8 +2375,11 @@ impl RpcSession {
 			))),
 			continuation,
 			plan_context: self.plan_context(),
+			// RPC resume surfaces the recovered draft the same one-shot way:
+			// explicitly-interrupted context, never a fake assistant turn.
+			interrupted_context: self.interrupted_context(),
 			advisor_card_sink: Some(crate::agent::AdvisorCardHandle(advisor_card_sink)),
-			service_tier_by_family: self.service_tier_by_family(),
+			service_tier_by_family: self.service_tiers.clone(),
 			security_host: None,
 			security_worker: false,
 			parent_workspace_lease: None,
@@ -2428,8 +2464,10 @@ impl RpcSession {
 		}
 	}
 
-	/// Persist and account for one finished turn.
-	pub fn finish_turn(&mut self, prepared: &mut PreparedTurn, outcome: &TurnOutcome) {
+/// Persist and account for one finished turn. Fails closed: a storage read
+/// failure surfaces as `Err` instead of silently desyncing the recovered
+/// fragment banner from the store.
+pub fn finish_turn(&mut self, prepared: &mut PreparedTurn, outcome: &TurnOutcome) -> Result<()> {
 		self.is_streaming = false;
 		if outcome.error.is_some()
 			|| outcome.aborted
@@ -2472,6 +2510,10 @@ impl RpcSession {
 			// appending the turn record here would write the whole turn twice.
 			// Rebuild the view from the log instead.
 			self.history_messages = None;
+			// Completed persist cleared the store draft; an aborted stream may
+			// have left a fresh one. Storage failures propagate: hiding them
+			// would desync the banner from the store.
+			self.interrupted_fragment = self.store.recovered_partial_text().map_err(Error::new)?;
 			self.refresh_history_from_store();
 		} else if rewound {
 			// Same as headless: the rewind turn is abandoned, so its record must
@@ -2486,6 +2528,7 @@ impl RpcSession {
 		} else {
 			self.history.push(record);
 		}
+		Ok(())
 	}
 
 	/// Persist a steering message the loop accepted, at its real position, and
@@ -4002,7 +4045,8 @@ mod tests {
 		session.finish_turn(
 			&mut prepared,
 			&TurnOutcome { error: Some("provider failed".to_string()), aborted: false },
-		);
+		)
+		.expect("finish turn records the failed run");
 
 		let request = session
 			.request("second".to_string(), Vec::new(), false)
@@ -4111,7 +4155,7 @@ mod tests {
 		] {
 			session.observe_event(&mut prepared, &event);
 		}
-		session.finish_turn(&mut prepared, &TurnOutcome::default());
+		session.finish_turn(&mut prepared, &TurnOutcome::default()).expect("finish turn");
 	}
 
 	/// Regression: the rewound branch must not answer from `history` (empty for
@@ -4147,7 +4191,7 @@ mod tests {
 		] {
 			session.observe_event(&mut prepared, &event);
 		}
-		session.finish_turn(&mut prepared, &TurnOutcome::default());
+		session.finish_turn(&mut prepared, &TurnOutcome::default()).expect("finish turn");
 		assert_eq!(
 			session.last_assistant_text(),
 			Some("CHECKPOINT-ACK"),
@@ -4261,7 +4305,7 @@ mod tests {
 			])
 			.await
 			.expect("persist turn 1");
-		session.finish_turn(&mut prepared1, &TurnOutcome::default());
+		session.finish_turn(&mut prepared1, &TurnOutcome::default()).expect("finish turn");
 
 		assert_eq!(session.store.messages().len(), 2);
 
@@ -4298,7 +4342,7 @@ mod tests {
 			.persist_messages(&turn2_full)
 			.await
 			.expect("persist turn 2");
-		session.finish_turn(&mut prepared2, &TurnOutcome::default());
+		session.finish_turn(&mut prepared2, &TurnOutcome::default()).expect("finish turn");
 
 		// 4. Restart session
 		drop(session);
@@ -4375,7 +4419,7 @@ mod tests {
 			.persist_messages(&turn3_full)
 			.await
 			.expect("persist turn 3 on restarted session");
-		restarted.finish_turn(&mut prepared3, &TurnOutcome::default());
+		restarted.finish_turn(&mut prepared3, &TurnOutcome::default()).expect("finish turn");
 
 		std::fs::remove_dir_all(dir).ok();
 	}
@@ -4466,7 +4510,7 @@ mod tests {
 			])
 			.await
 			.expect("persist turn 1");
-		session.finish_turn(&mut prepared1, &TurnOutcome::default());
+		session.finish_turn(&mut prepared1, &TurnOutcome::default()).expect("finish turn");
 
 		// Compact: creates projection with kept: [], synthetic: [summary], anchor: Some(first_kept)
 		let compact_res = session.compact(None).expect("compact");
@@ -4490,7 +4534,7 @@ mod tests {
 			.persist_messages(&turn2_full)
 			.await
 			.expect("persist turn 2");
-		session.finish_turn(&mut prepared2, &TurnOutcome::default());
+		session.finish_turn(&mut prepared2, &TurnOutcome::default()).expect("finish turn");
 
 		// Simulate crash: close session, then directly update SQLite payload
 		// to kept = [] on disk, modeling a crash before kept was committed.

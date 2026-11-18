@@ -295,7 +295,7 @@ impl SecurityRunSession {
 			goal: None,
 			goal_context: None,
 			plan_context: None,
-			service_tier_by_family: self.service_tier.clone(),
+			interrupted_context: None,
 			credential_resolver: Some(ResolverHandle(Arc::new(ExactResolverAdapter {
 				resolver: self.request.resolver.clone(),
 				cancel:   self.request.cancel.clone(),
@@ -312,6 +312,7 @@ impl SecurityRunSession {
 			continuation: false,
 			security_host: None,
 			security_worker: true,
+			service_tier_by_family: std::collections::BTreeMap::new(),
 			parent_workspace_lease: self.parent_workspace_lease.clone(),
 		})
 	}

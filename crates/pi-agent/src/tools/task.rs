@@ -761,6 +761,7 @@ impl TaskTool {
 			context_limit: 100_000,
 			system_prompt: child_system_prompt(&item.agent, prompt_schema.as_ref()),
 			cwd: child_cwd,
+			stream_partial: crate::state::StreamPartialConfig::default(),
 		};
 		// `autoloadSkills` resolve through this tool's captured session resolver.
 		// Unknown names are skipped; read/containment/cancel errors fail the
@@ -2129,6 +2130,7 @@ async fn run_background_child(
 		context_limit: 100_000,
 		system_prompt: child_system_prompt(&item.agent, prompt_schema.as_ref()),
 		cwd: child_cwd,
+		stream_partial: crate::state::StreamPartialConfig::default(),
 	};
 	let autoload_msgs = autoload_messages(autoload.as_deref(), &item.agent)
 		.map_err(AgentError::Internal)?;

@@ -41,12 +41,13 @@ pub use provider::{
 	StreamBlockKind, StreamChunk, ToolCallDelta, ToolChoice, normalize_usage, parse_sse_line,
 	sse_stream, to_openai_messages,
 };
+pub use provider::timeout::{RequestTimeoutConfig, TimeoutProvider, is_timeout_error};
 pub use state::{
 	AcpClientBridge, AcpClientError, AgentConfig, AgentContext, AgentShell, AgentState,
 	Attribution,
 	CacheTtlUsage, ContentPart, ImagePart, Message, Role, ServerToolUsage, StopReason, TokenUsage,
 	UsagePresence,
-	ToolApprover, ToolCall, ToolResult, TurnResult, TurnStatus,
+	StreamPartialConfig, ToolApprover, ToolCall, ToolResult, TurnResult, TurnStatus,
 };
 pub use tokenizer::Tokenizer;
 pub use delivery::{BackgroundDelivery, BackgroundResultSink};

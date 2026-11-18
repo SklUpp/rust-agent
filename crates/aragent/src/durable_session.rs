@@ -685,6 +685,31 @@ impl DurableSession {
 		lock(&self.cursor).branch.clone()
 	}
 
+	/// Take the branch-scoped stream draft left by an interrupted stream, if
+	/// any. Display the text as an interrupted fragment, never as a completed
+	/// assistant response, and never convert it into tool calls: drafts carry
+	/// text only by construction. Consumes the draft so reopening surfaces it
+	/// once.
+	pub fn take_recovered_partial(&self) -> StoreResult<Option<String>> {
+		let session_id = self.session_id.clone();
+		let branch_id = lock(&self.cursor).branch.clone();
+		self.writer.call(move |store| {
+			let draft = store.stream_draft(&session_id, &branch_id)?;
+			if draft.is_some() {
+				store.clear_stream_draft(&session_id, &branch_id)?;
+			}
+			Ok(draft)
+		})
+	}
+
+	/// Peek at the branch-scoped stream draft without consuming it. Resume
+	/// display uses this so a crash before the next completed turn keeps the
+	/// fragment; the next persisted message clears it atomically.
+	pub fn peek_recovered_partial(&self) -> StoreResult<Option<String>> {
+		let session_id = self.session_id.clone();
+		let branch_id = lock(&self.cursor).branch.clone();
+		self.writer.call(move |store| store.stream_draft(&session_id, &branch_id))
+	}
 	/// Load the active branch and its full entry set. Used on resume and after
 	/// an external durable write (the loop's assistant/tool rows).
 	pub fn load(&self) -> StoreResult<LoadedSession> {
@@ -1248,6 +1273,15 @@ impl DurableSession {
 				);
 				entry.error_message = message.error_message.clone();
 				entry.disabled_features = message.disabled_features.clone();
+				// Terminal-stream identity for attempt-scoped draft clearing.
+				// Only the loop stamps this on the terminal assistant; mirror
+				// writes (RPC tail, replays) carry none and never clear.
+				if let Some(attempt) = message.stream_attempt.clone() {
+					entry.extra.insert(
+						"streamAttempt".to_string(),
+						serde_json::Value::String(attempt),
+					);
+				}
 				entry
 			},
 			_ => {
@@ -1649,10 +1683,34 @@ impl DurableBoundary for DurableSession {
 		Ok(())
 	}
 
+	async fn persist_partial_assistant(&self, text: &str, attempt: &str) -> Result<(), DurableError> {
+		let session_id = self.session_id.clone();
+		let branch_id = lock(&self.cursor).branch.clone();
+		let text = text.to_string();
+		let attempt = attempt.to_string();
+		if text.is_empty() {
+			return Ok(());
+		}
+		self
+			.call_async_owned(move |store| {
+				store.save_stream_draft(&session_id, &branch_id, &text, &attempt)
+			})
+			.await
+			.map_err(|error| DurableError::new(error.to_string()))
+	}
+
+	async fn clear_partial_assistant(&self) -> Result<(), DurableError> {
+		let session_id = self.session_id.clone();
+		let branch_id = lock(&self.cursor).branch.clone();
+		self
+			.call_async_owned(move |store| store.clear_stream_draft(&session_id, &branch_id))
+			.await
+			.map_err(|error| DurableError::new(error.to_string()))
+	}
+
 	fn child_durability_factory(&self) -> Option<Arc<dyn ChildDurabilityFactory>> {
 		Some(self.durable_child_factory())
 	}
-
 	async fn mark_deliveries_delivered(
 		&self,
 		delivery_ids: &[String],

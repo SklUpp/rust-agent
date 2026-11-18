@@ -15,6 +15,9 @@ const ERROR_BODY_CHARS: usize = 2048;
 /// OpenAI-compatible chat-completions transport.
 pub mod http;
 
+/// Per-model-request timeout with bounded retry after timeout.
+pub mod timeout;
+
 /// Per-request credential callback (C6 exact OAuth). Called before every HTTP
 /// request with `force_refresh=false`; called again with `true` only after a
 /// 401/403 whose parsed body is exactly `invalid_key`, and the same request body
@@ -57,6 +60,9 @@ pub enum ProviderError {
 	UnsupportedImage(String),
 	#[error("Invalid tool choice: {0}")]
 	InvalidToolChoice(String),
+	/// Per-model-request timeout (possibly after bounded retries).
+	#[error("Model request timed out: {0}")]
+	Timeout(String),
 }
 
 /// Request-scoped tool selection.
@@ -1665,6 +1671,7 @@ mod tests {
 			attribution: None,
 			custom_type: None,
 			disabled_features: None,
+			stream_attempt: None,
 		};
 		let err = to_openai_messages(&[t1]).unwrap_err();
 		assert!(matches!(err, ProviderError::UnsupportedImage(_)));

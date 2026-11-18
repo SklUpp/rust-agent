@@ -320,6 +320,123 @@ fn redact_bearer_tokens(text: &str) -> String {
 	out
 }
 
+/// Mask bearer tokens, known provider secret prefixes, JWTs, and secret URL
+/// query parameters in arbitrary assistant prose/code without corrupting
+/// ordinary JSON keys (`"code"`, `"key"`) or identifiers (`skip_serializing_if`).
+pub(crate) fn redact_free_text(text: &str) -> String {
+	let after_queries = redact_url_queries(text);
+	let after_jwt = redact_strict_jwts(&after_queries);
+	redact_boundary_tokens(&after_jwt)
+}
+
+fn redact_strict_jwts(text: &str) -> String {
+	let bytes = text.as_bytes();
+	let is_jwt_char = |b: u8| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_');
+	let mut out = String::with_capacity(text.len());
+	let mut i = 0usize;
+	while i < bytes.len() {
+		if text[i..].starts_with("eyJ")
+			&& (i == 0 || (!bytes[i - 1].is_ascii_alphanumeric() && bytes[i - 1] != b'_'))
+		{
+			let mut p = i;
+			while p < bytes.len() && is_jwt_char(bytes[p]) {
+				p += 1;
+			}
+			if p - i >= 16 && bytes.get(p) == Some(&b'.') {
+				let seg2_start = p + 1;
+				let mut q = seg2_start;
+				while q < bytes.len() && is_jwt_char(bytes[q]) {
+					q += 1;
+				}
+				if q - seg2_start >= 16 && bytes.get(q) == Some(&b'.') {
+					let seg3_start = q + 1;
+					let mut r = seg3_start;
+					while r < bytes.len() && is_jwt_char(bytes[r]) {
+						r += 1;
+					}
+					if r - seg3_start >= 16 {
+						out.push_str("[REDACTED-JWT]");
+						i = r;
+						continue;
+					}
+				}
+			}
+		}
+		let ch = text[i..].chars().next().expect("char boundary");
+		out.push(ch);
+		i += ch.len_utf8();
+	}
+	out
+}
+
+fn redact_boundary_tokens(text: &str) -> String {
+	const PREFIXES: &[(&str, usize, bool)] = &[
+		("Bearer ", 8, false),
+		("github_pat_", 10, true),
+		("xoxb-", 10, true),
+		("xoxa-", 10, true),
+		("xoxp-", 10, true),
+		("xoxr-", 10, true),
+		("xoxs-", 10, true),
+		("nvapi-", 10, true),
+		("xai-", 10, true),
+		("csk-", 10, true),
+		("fpk-", 10, true),
+		("fpk_", 10, true),
+		("ghp_", 10, true),
+		("gho_", 10, true),
+		("ghu_", 10, true),
+		("ghs_", 10, true),
+		("ghr_", 10, true),
+		("npm_", 10, true),
+		("AIza", 10, true),
+		("AKIA", 16, true),
+		("ASIA", 16, true),
+		("sk-", 10, true),
+		("sk_", 10, true),
+		("fw_", 10, true),
+		("bt_", 10, true),
+	];
+
+	let bytes = text.as_bytes();
+	let mut out = String::with_capacity(text.len());
+	let mut i = 0usize;
+	'outer: while i < bytes.len() {
+		let at_boundary =
+			i == 0 || (!bytes[i - 1].is_ascii_alphanumeric() && bytes[i - 1] != b'_');
+		if at_boundary {
+			for &(prefix, min_tail, ident_only) in PREFIXES {
+				if let Some(tail) = text[i..].strip_prefix(prefix) {
+					if prefix == "Bearer " && tail.starts_with("[REDACTED") {
+						break;
+					}
+					let end = if ident_only {
+						tail.find(|c: char| !c.is_ascii_alphanumeric() && c != '_' && c != '-')
+							.unwrap_or(tail.len())
+					} else {
+						tail.find(|c: char| {
+							c.is_whitespace() || matches!(c, '"' | '\'' | ',' | ';' | ')' | '}')
+						})
+						.unwrap_or(tail.len())
+					};
+					if end >= min_tail {
+						if prefix == "Bearer " {
+							out.push_str(prefix);
+						}
+						out.push_str("[REDACTED]");
+						i += prefix.len() + end;
+						continue 'outer;
+					}
+				}
+			}
+		}
+		let ch = text[i..].chars().next().expect("char boundary");
+		out.push(ch);
+		i += ch.len_utf8();
+	}
+	out
+}
+
 /// `invalid_grant`-class OAuth identifiers: the provider rejected the stored
 /// grant itself, so disabling the row is safe (`auth-classify.ts`).
 #[must_use]
@@ -480,5 +597,21 @@ mod tests {
 
 		let jwt = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0.c2lnbmF0dXJl";
 		assert!(!redact(jwt).contains("eyJhbGciOiJIUzI1NiJ9"));
+	}
+
+	#[test]
+	fn redact_free_text_masks_secrets_without_corrupting_identifiers() {
+		let input = "serde(skip_serializing_if) disk-cache-key sk-secret-token-123456 Bearer bearer-secret-123 ghp_1234567890abcdef AKIAIOSFODNN7EXAMPLE https://x/cb?access_token=tok123&ok=1 eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.c2lnbmF0dXJlMTIzNDU2";
+		let redacted = redact_free_text(input);
+		assert!(redacted.contains("skip_serializing_if"));
+		assert!(redacted.contains("disk-cache-key"));
+		assert!(redacted.contains("ok=1"));
+		assert!(!redacted.contains("sk-secret-token-123456"));
+		assert!(!redacted.contains("bearer-secret-123"));
+		assert!(!redacted.contains("ghp_1234567890abcdef"));
+		assert!(!redacted.contains("AKIAIOSFODNN7EXAMPLE"));
+		assert!(!redacted.contains("tok123"));
+		assert!(!redacted.contains("eyJhbGciOiJIUzI1NiJ9"));
+		assert_eq!(redact_free_text(&redacted), redacted);
 	}
 }

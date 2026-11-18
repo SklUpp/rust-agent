@@ -100,6 +100,30 @@ pub trait DurableBoundary: Send + Sync + std::fmt::Debug {
 		result: &ToolResult,
 	) -> Result<(), DurableError>;
 
+	/// Flush a branch-scoped draft of the in-progress assistant text.
+	///
+	/// `attempt` identifies the stream that produced the text
+	/// (`{boot_nanos}-{counter}`, unique per loop boot). A flush whose
+	/// attempt differs from the stored current draft preserves that draft as
+	/// a prior fragment instead of overwriting it; a completed assistant
+	/// message carrying the same attempt clears it atomically. Drafts carry
+	/// no tool calls and are never replayed as executable history. Default
+	/// no-op for ephemeral boundaries; durable hosts fail closed on write
+	/// error.
+	async fn persist_partial_assistant(
+		&self,
+		_text: &str,
+		_attempt: &str,
+	) -> Result<(), DurableError> {
+		Ok(())
+	}
+
+	/// Drop the branch-scoped draft without persisting a message, for example
+	/// after the completed assistant message cleared it already. Default
+	/// no-op; durable hosts fail closed on write error.
+	async fn clear_partial_assistant(&self) -> Result<(), DurableError> {
+		Ok(())
+	}
 	/// Amend the active turn's assistant record with its terminal status.
 	///
 	/// When an assistant message requesting tools is persisted before tool

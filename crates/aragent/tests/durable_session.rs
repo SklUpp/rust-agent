@@ -249,6 +249,7 @@ fn config(cwd: &std::path::Path) -> AgentConfig {
 		context_limit: 100_000,
 		system_prompt: None,
 		cwd: cwd.to_path_buf(),
+		stream_partial: pi_agent::state::StreamPartialConfig::default(),
 	}
 }
 
@@ -3735,5 +3736,66 @@ fn path_unsafe_session_id_refused_for_lease() {
 			"{bad:?} => {err:?}"
 		);
 	}
+	std::fs::remove_dir_all(dir).ok();
+}
+
+/// An interrupted stream leaves a branch-scoped draft that recovery surfaces
+/// once as an interrupted fragment: text only, never tool calls, consumed on
+/// take. A later completed message clears the draft atomically with its own
+/// append, so reopening never shows both.
+#[tokio::test]
+async fn interrupted_stream_draft_recovers_once_then_clears_on_complete() {
+	let dir = temp_dir("stream-draft-recover");
+	let db = dir.join("sessions.db");
+	let session = DurableSession::create(db.clone(), header("s-draft", &dir)).expect("create");
+	session.persist_partial_assistant("half-written reply", "1-0").await.expect("flush draft");
+	drop(session);
+	let (reopened, _) =
+		DurableSession::open(db.clone(), "s-draft", header("s-draft", &dir)).expect("reopen");
+
+	let draft = reopened.take_recovered_partial().expect("take draft");
+	assert_eq!(draft.as_deref(), Some("half-written reply"), "draft text recovers");
+	assert_eq!(reopened.take_recovered_partial().expect("retake").as_deref(), None, "take consumes");
+	drop(reopened);
+
+	// A new stream on the same branch must preserve, not overwrite, the
+	// older attempt's draft: it becomes a prior fragment instead.
+	let (session, _) =
+		DurableSession::open(db.clone(), "s-draft", header("s-draft", &dir)).expect("reopen for flush");
+	session.persist_partial_assistant("second try", "1-1").await.expect("flush again");
+	session.persist_partial_assistant("new stream text", "1-2").await.expect("flush new attempt");
+	let combined = session.peek_recovered_partial().expect("peek combined");
+	let combined = combined.expect("draft present");
+	assert!(combined.contains("second try"), "prior attempt preserved: {combined}");
+	assert!(combined.contains("new stream text"), "current attempt present: {combined}");
+	drop(session);
+	let (reopened, _) =
+		DurableSession::open(db.clone(), "s-draft", header("s-draft", &dir)).expect("reopen2");
+	// A later user prompt must not delete the draft before its own terminal
+	// message exists: no attempt marker, no clear.
+	reopened
+		.persist_messages(&[Message::user("next prompt")])
+		.await
+		.expect("persist user");
+	let after_user = reopened.peek_recovered_partial().expect("peek after user").expect("draft kept");
+	assert!(after_user.contains("second try"), "user append keeps priors: {after_user}");
+	// The terminal of attempt 1-2 clears the live draft and the delivered
+	// priors atomically, in the same transaction as its own append.
+	let mut terminal = Message::assistant("finished");
+	terminal.stream_attempt = Some("1-2".to_string());
+	reopened
+		.persist_messages(&[terminal])
+		.await
+		.expect("persist completed");
+	assert_eq!(
+		reopened.take_recovered_partial().expect("take after complete").as_deref(),
+		None,
+		"completed append clears the draft atomically"
+	);
+	let loaded = reopened.load().expect("load");
+	let assistant_rows: Vec<_> =
+		loaded.branch_messages.iter().filter(|entry| entry.message.role == "assistant").collect();
+	assert_eq!(assistant_rows.len(), 1, "exactly one completed assistant row, no replayed draft");
+	assert!(assistant_rows[0].message.tool_calls.is_empty(), "no partial tool calls persisted");
 	std::fs::remove_dir_all(dir).ok();
 }

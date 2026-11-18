@@ -235,6 +235,11 @@ pub struct RunRequest {
 	/// Host-hidden Plan reference context, inserted once before the current user
 	/// prompt (TS pre-LLM plan slot). Never persisted as a transcript turn.
 	pub plan_context: Option<String>,
+	/// Recovered interrupted assistant fragment, inserted once before the
+	/// current user prompt as an explicitly-interrupted developer message.
+	/// Never journaled, never an assistant turn (no fake completed response),
+	/// and carries no tool calls so nothing can replay effects.
+	pub interrupted_context: Option<String>,
 	/// Resolved per-family service-tier selection (TS `ServiceTierByFamily`,
 	/// string values). Empty means "no selection" and must not re-enable the
 	/// configured priority default.

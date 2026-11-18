@@ -14,7 +14,7 @@ use std::{
 use async_trait::async_trait;
 use futures::stream;
 use pi_agent::{
-	AgentConfig, AgentLoop, CancellationToken,
+	AgentConfig, AgentLoop, CancellationToken, StreamPartialConfig,
 	compaction::{CompactionReport, is_compaction_notice},
 	mailbox::MAIN_AGENT_ID,
 	provider::{
@@ -440,6 +440,8 @@ fn live_child(
 			context_limit: 100_000,
 			system_prompt: Some("child system prompt".to_string()),
 			cwd: root.to_path_buf(),
+			stream_partial: StreamPartialConfig::default(),
+
 		},
 		provider,
 		registry_with_builtins(),
@@ -1820,6 +1822,8 @@ async fn an_undurable_journal_blocks_destructive_compaction() {
 			context_limit: 1,
 			system_prompt: Some("child system prompt".to_string()),
 			cwd: root.clone(),
+			stream_partial: StreamPartialConfig::default(),
+
 		},
 		provider,
 		registry_with_builtins(),

@@ -664,6 +664,7 @@ impl PersistedChildReviverFactory for DefaultPersistedReviverFactory {
 				Some(contract.system_prompt.clone())
 			},
 			cwd:           contract.cwd.clone(),
+			stream_partial: crate::state::StreamPartialConfig::default(),
 		};
 		let mut agent_loop = match &self.approver {
 			Some(approver) => AgentLoop::with_approver(

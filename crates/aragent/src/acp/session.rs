@@ -1186,6 +1186,27 @@ impl AcpSession {
 		if self.gate.cancel_requested() {
 			token.cancel();
 		}
+		// Client visibility for a recovered interrupted stream: metadata only
+		// (length + short preview), never executable content. Mirrors the RPC
+		// `turn_start.recoveredFragment` frame so ACP resume surfaces the same
+		// one-shot recovery. The full text reached the model as explicitly
+		// interrupted context; the host already owns the session database, so
+		// no new secret crosses the wire. Emitted only when a fragment was
+		// actually delivered with this turn's request.
+		if let Some(fragment) = request.interrupted_context.as_deref().filter(|text| !text.trim().is_empty()) {
+			let preview: String = fragment.chars().take(240).collect();
+			self.emit_update(json!({
+				"sessionUpdate": "agent_message_chunk",
+				"content": { "type": "text", "text": format!("note: recovered an interrupted assistant fragment (not replayed, no tool calls): {preview}") },
+				"_meta": {
+					"recoveredFragment": {
+						"chars": fragment.chars().count(),
+						"preview": preview,
+						"note": "interrupted assistant fragment recovered from the durable draft; delivered to the model as interrupted context, not replayed, no tool calls",
+					},
+				},
+			}));
+		}
 		let mut map = TurnMap::default();
 		let mut last_stop = String::new();
 		let mut last_calls: Vec<PlanToolCall> = Vec::new();
@@ -1272,9 +1293,11 @@ impl AcpSession {
 				"_meta": { "advisor": details },
 			}));
 		}
-		let outcome =
+		let mut outcome =
 			TurnOutcome { error: stream_error.clone().filter(|_| !cancelled), aborted: cancelled };
-		session.finish_turn(&mut prepared, &outcome);
+		if let Err(error) = session.finish_turn(&mut prepared, &outcome) {
+			outcome.error.get_or_insert(error.to_string());
+		}
 		if self
 			.plan_yolo
 			.as_ref()

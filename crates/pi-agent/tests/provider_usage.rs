@@ -18,6 +18,7 @@ use pi_agent::{
 	AgentConfig, AgentEvent, AgentLoop, AgentState, ChunkStream, Message, ModelProvider,
 	OpenAiUsage, ProviderError, StreamAssembler, StreamChunk, TokenUsage,
 	ToolChoice, ToolRegistry, TurnStatus, normalize_usage, parse_sse_line,
+	StreamPartialConfig,
 };
 use pi_agent::provider::http::OpenAiCompatibleProvider;
 use serde_json::{Value, json};
@@ -450,6 +451,7 @@ fn config(cwd: &std::path::Path) -> AgentConfig {
 		context_limit: 100_000,
 		system_prompt: Some("test system prompt".to_string()),
 		cwd: cwd.to_path_buf(),
+		stream_partial: StreamPartialConfig::default(),
 	}
 }
 
