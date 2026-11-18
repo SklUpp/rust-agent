@@ -397,12 +397,30 @@ fn map_service_error(error: rmcp::ServiceError, mutating: bool) -> McpError {
 /// HTTP status carried by an rmcp transport failure, when the server answered
 /// with an error response instead of the stream breaking. rmcp keeps the status
 /// and discards the body, so surfacing it cannot leak a response body secret.
+///
+/// rmcp's `HttpStatus` variant is transparent, so it never appears as a link in
+/// `source()`; the typed error itself has to be downcast. rmcp and this crate
+/// resolve the same `reqwest 0.13`, which makes the concrete type nameable; the
+/// display fallback covers a future rmcp whose error type changes, because the
+/// status variant is the only one whose whole message is `HTTP <code>`.
 fn http_status(error: &rmcp::transport::DynamicTransportError) -> Option<u16> {
-	use rmcp::transport::streamable_http_client::HttpStatusError;
-	let mut current: Option<&(dyn std::error::Error + 'static)> = Some(error);
+	use rmcp::transport::streamable_http_client::{HttpStatusError, StreamableHttpError};
+	let mut current: Option<&(dyn std::error::Error + 'static)> = Some(error.error.as_ref());
 	while let Some(err) = current {
 		if let Some(status) = err.downcast_ref::<HttpStatusError>() {
 			return Some(status.status);
+		}
+		if let Some(StreamableHttpError::HttpStatus(status)) =
+			err.downcast_ref::<StreamableHttpError<reqwest::Error>>()
+		{
+			return Some(status.status);
+		}
+		if let Some(code) = err
+			.to_string()
+			.strip_prefix("HTTP ")
+			.filter(|tail| tail.len() == 3 && tail.bytes().all(|byte| byte.is_ascii_digit()))
+		{
+			return code.parse().ok();
 		}
 		current = err.source();
 	}
@@ -423,5 +441,28 @@ fn map_initialize_error(error: rmcp::service::ClientInitializeError) -> McpError
 			McpError::Protocol(format!("MCP initialization failed: {context}: {error}"))
 		},
 		other => McpError::Protocol(format!("MCP initialization failed: {other}")),
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+	use rmcp::transport::DynamicTransportError;
+	use rmcp::transport::streamable_http_client::{HttpStatusError, StreamableHttpError};
+
+	fn transport_error(inner: StreamableHttpError<reqwest::Error>) -> DynamicTransportError {
+		DynamicTransportError::from_parts("test", std::any::TypeId::of::<()>(), Box::new(inner))
+	}
+
+	#[test]
+	fn http_status_reads_the_status_variant_of_a_transport_failure() {
+		let error = transport_error(StreamableHttpError::HttpStatus(HttpStatusError::new(500, None)));
+		assert_eq!(http_status(&error), Some(500));
+	}
+
+	#[test]
+	fn http_status_is_none_for_a_broken_stream() {
+		let error = transport_error(StreamableHttpError::TransportChannelClosed);
+		assert_eq!(http_status(&error), None);
 	}
 }
