@@ -4577,21 +4577,31 @@ fn full_draft_text(payload: &Value) -> String {
 }
 
 
+/// Delivery window for an interrupted draft, in chars.
+///
+/// Deliberately a compile-time constant rather than config: the clear path
+/// must use exactly the window the delivery path used, otherwise a config
+/// change between two turns shifts the boundary and either deletes
+/// undelivered text or re-delivers already-sent text. The window bounds the
+/// model context a recovery costs, not what the row stores.
+const STREAM_DRAFT_DELIVERY_CHARS: usize = 8000;
+const STREAM_DRAFT_TRUNCATION_MARKER: &str = "[truncated: oldest fragments omitted]\n\n";
+
 /// Combine a draft row into display/model text: priors oldest-first,
 /// then the live current draft. Joined with an explicit interrupted banner
 /// per fragment so concatenated streams never read as one response.
-/// Capped to bound model context; truncation is marked.
+/// Capped to `STREAM_DRAFT_DELIVERY_CHARS`; truncation is marked and the
+/// cut is char-exact so the undelivered prefix survives for the next turn.
 fn combined_stream_draft_text(payload: &Value) -> String {
-	const MAX_COMBINED_CHARS: usize = 8000;
 	let full = full_draft_text(payload);
-	if full.chars().count() <= MAX_COMBINED_CHARS {
+	if full.chars().count() <= STREAM_DRAFT_DELIVERY_CHARS {
 		return full;
 	}
 	// Keep the newest tail: cut from the front at a char boundary, then
 	// mark so the model never mistakes the remainder for a complete reply.
-	let excess = full.chars().count() - MAX_COMBINED_CHARS;
+	let excess = full.chars().count() - STREAM_DRAFT_DELIVERY_CHARS;
 	let tail: String = full.chars().skip(excess).collect();
-	format!("[truncated: oldest fragments omitted]\n\n{tail}")
+	format!("{STREAM_DRAFT_TRUNCATION_MARKER}{tail}")
 }
 
 /// Clear the delivered tail of the branch draft on a loop-stamped terminal
@@ -4663,16 +4673,19 @@ fn clear_stream_draft_attempt_tx(
 			request_parts.push(crate::auth::error::redact_free_text(text));
 		}
 	}
-	const MAX_COMBINED_CHARS: usize = 8000;
 	let request_full = request_parts.join("\n\n--- interrupted stream fragment ---\n\n");
 	let request_len = request_full.chars().count();
-	// Undelivered head: the prefix beyond the newest-tail 8000-char delivery
-	// window. Char-exact split, so kept + delivered == request-time text with
+	// Undelivered head: the prefix beyond the newest-tail delivery window
+	// (`STREAM_DRAFT_DELIVERY_CHARS`, the same constant delivery uses).
+	// Char-exact split, so kept + delivered == request-time text with
 	// no duplication or omission; the next turn delivers `kept` once.
-	let kept: String = if request_len <= MAX_COMBINED_CHARS {
+	let kept: String = if request_len <= STREAM_DRAFT_DELIVERY_CHARS {
 		String::new()
 	} else {
-		request_full.chars().take(request_len - MAX_COMBINED_CHARS).collect()
+		request_full
+			.chars()
+			.take(request_len - STREAM_DRAFT_DELIVERY_CHARS)
+			.collect()
 	};
 	if kept.trim().is_empty() {
 		transaction.execute(
@@ -8687,5 +8700,29 @@ mod tests {
 			"journaled tool-use assistant clears the delivered draft"
 		);
 		let _ = std::fs::remove_dir_all(dir);
+	}
+
+	#[test]
+	fn stream_draft_delivery_window_keeps_newest_tail_char_exact() {
+		// Exactly at the window: delivered whole and unmarked.
+		let at_window = json!({ "priors": [{ "text": "x".repeat(STREAM_DRAFT_DELIVERY_CHARS) }] });
+		let delivered = combined_stream_draft_text(&at_window);
+		assert_eq!(delivered.chars().count(), STREAM_DRAFT_DELIVERY_CHARS);
+		assert!(!delivered.contains("truncated"), "no marker at the boundary");
+
+		// One char over: the single oldest char is dropped, the newest window
+		// is kept whole, and the marker is the only addition.
+		let over_window = json!({
+			"priors": [{ "text": format!("A{}", "y".repeat(STREAM_DRAFT_DELIVERY_CHARS)) }]
+		});
+		let delivered = combined_stream_draft_text(&over_window);
+		let tail = delivered
+			.strip_prefix(STREAM_DRAFT_TRUNCATION_MARKER)
+			.expect("truncation is marked");
+		assert_eq!(tail.chars().count(), STREAM_DRAFT_DELIVERY_CHARS);
+		assert!(
+			tail.chars().all(|c| c == 'y'),
+			"undelivered head must be cut, delivered tail must not be re-sent"
+		);
 	}
 }
