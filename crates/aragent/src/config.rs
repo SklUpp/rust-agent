@@ -836,7 +836,7 @@ impl ToolCallLoopGuardConfig {
 /// two. Retries never replay tools and never combine partial streams: a stream
 /// that already yielded a chunk fails with the timeout instead of being
 /// retried.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ModelRequestTimeoutConfig {
 	pub timeout_ms:  Option<u64>,
 	pub max_retries: Option<u32>,
@@ -847,26 +847,23 @@ pub const DEFAULT_MODEL_REQUEST_TIMEOUT_MS: u64 = 300_000;
 /// Default bound on reissues after a timeout.
 pub const DEFAULT_MODEL_REQUEST_MAX_RETRIES: u32 = 2;
 
-impl Default for ModelRequestTimeoutConfig {
-	fn default() -> Self {
-		Self {
-			timeout_ms:  Some(DEFAULT_MODEL_REQUEST_TIMEOUT_MS),
-			max_retries: Some(DEFAULT_MODEL_REQUEST_MAX_RETRIES),
-		}
-	}
-}
-
 impl ModelRequestTimeoutConfig {
-	/// Effective per-request budget; `None` (absent or `0`) disables the wrapper.
+	/// Effective per-request budget. Absent means the five-minute default;
+	/// an explicit `0` disables the wrapper. Kept separate from the stored
+	/// `Option` so an overlay that omits the key never overrides a lower layer.
 	#[must_use]
 	pub fn timeout(&self) -> Option<std::time::Duration> {
-		self.timeout_ms.filter(|millis| *millis > 0).map(std::time::Duration::from_millis)
+		match self.timeout_ms {
+			Some(0) => None,
+			Some(millis) => Some(std::time::Duration::from_millis(millis)),
+			None => Some(std::time::Duration::from_millis(DEFAULT_MODEL_REQUEST_TIMEOUT_MS)),
+		}
 	}
 
-	/// Bounded reissues after a timeout only; absent means no retry.
+	/// Bounded reissues after a timeout only; absent means the default of two.
 	#[must_use]
 	pub fn max_retries(&self) -> u32 {
-		self.max_retries.unwrap_or(0)
+		self.max_retries.unwrap_or(DEFAULT_MODEL_REQUEST_MAX_RETRIES)
 	}
 
 	/// Effective `pi-agent` request-timeout configuration.
