@@ -3796,6 +3796,6 @@ async fn interrupted_stream_draft_recovers_once_then_clears_on_complete() {
 	let assistant_rows: Vec<_> =
 		loaded.branch_messages.iter().filter(|entry| entry.message.role == "assistant").collect();
 	assert_eq!(assistant_rows.len(), 1, "exactly one completed assistant row, no replayed draft");
-	assert!(assistant_rows[0].message.tool_calls.is_empty(), "no partial tool calls persisted");
+	assert!(assistant_rows[0].message.tool_name.is_none(), "no partial tool calls persisted");
 	std::fs::remove_dir_all(dir).ok();
 }

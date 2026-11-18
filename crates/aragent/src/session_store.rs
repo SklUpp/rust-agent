@@ -8578,7 +8578,7 @@ mod tests {
 	#[test]
 	fn stream_draft_redacts_secrets_on_save_and_legacy_read() {
 		let (dir, path) = temp_db("stream-draft-redact");
-		let store = SqliteStore::open(&path).expect("open store");
+		let mut store = SqliteStore::open(&path).expect("open store");
 		store
 			.create_session(NewSession {
 				id: "s_red".to_string(),
