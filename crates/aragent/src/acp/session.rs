@@ -1197,7 +1197,7 @@ impl AcpSession {
 			let preview: String = fragment.chars().take(240).collect();
 			self.emit_update(json!({
 				"sessionUpdate": "agent_message_chunk",
-				"content": { "type": "text", "text": format!("note: recovered an interrupted assistant fragment (not replayed, no tool calls): {preview}") },
+				"content": { "type": "text", "text": format!("note: recovered an interrupted assistant fragment (not journaled; sent to the model once as interrupted context, no tool calls): {preview}") },
 				"_meta": {
 					"recoveredFragment": {
 						"chars": fragment.chars().count(),

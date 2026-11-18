@@ -1429,12 +1429,6 @@ impl RpcSession {
 		self.todo_phases.clear();
 		self.session_name = None;
 		self.last_assistant_text = None;
-		// New log, new fragment: a fresh session has no interrupted stream.
-		// Peek (fail closed) so a stray draft can never leak across sessions.
-		self.interrupted_fragment = self
-			.store
-			.recovered_partial_text()
-			.map_err(|error| Error::with_source("cannot read recovered stream draft", error))?;
 		self.checkpoint_host = CheckpointHost::new();
 		self.checkpoint_host.rehydrate(&self.store);
 		self.reset_advisor_boundary();

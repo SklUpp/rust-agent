@@ -240,6 +240,27 @@ fn redact_url_queries(text: &str) -> String {
 		"auth",
 	];
 
+	// Only `scheme://…` spans carry query strings. Redacting a bare `?key=` in
+	// prose or code (`cond ? key = value`) would corrupt ordinary text.
+	let mut out = String::with_capacity(text.len());
+	let mut index = 0usize;
+	while let Some(rel) = text[index..].find("://") {
+		let url_start = index + rel + 3;
+		let url_end = text[url_start..]
+			.find(|c: char| {
+				c.is_whitespace() || matches!(c, '"' | '\'' | '<' | '>' | ')' | ']' | '}' | '`')
+			})
+			.map(|rel| url_start + rel)
+			.unwrap_or(text.len());
+		out.push_str(&text[index..url_start]);
+		out.push_str(&redact_query_span(&text[url_start..url_end], SECRET_QUERY_KEYS));
+		index = url_end;
+	}
+	out.push_str(&text[index..]);
+	out
+}
+
+fn redact_query_span(text: &str, secret_keys: &[&str]) -> String {
 	let mut out = String::with_capacity(text.len());
 	let mut index = 0usize;
 	while index < text.len() {
@@ -264,7 +285,7 @@ fn redact_url_queries(text: &str) -> String {
 			.find(|c: char| c == '&' || c == '#' || c.is_whitespace() || matches!(c, '"' | '\'' | ')'))
 			.map(|rel| value_start + rel)
 			.unwrap_or(text.len());
-		if SECRET_QUERY_KEYS.iter().any(|known| known.eq_ignore_ascii_case(key.trim())) {
+		if secret_keys.iter().any(|known| known.eq_ignore_ascii_case(key.trim())) {
 			out.push_str("[REDACTED]");
 		} else {
 			out.push_str(&text[value_start..value_end]);
@@ -370,33 +391,36 @@ fn redact_strict_jwts(text: &str) -> String {
 }
 
 fn redact_boundary_tokens(text: &str) -> String {
-	const PREFIXES: &[(&str, usize, bool)] = &[
-		("Bearer ", 8, false),
-		("github_pat_", 10, true),
-		("xoxb-", 10, true),
-		("xoxa-", 10, true),
-		("xoxp-", 10, true),
-		("xoxr-", 10, true),
-		("xoxs-", 10, true),
-		("nvapi-", 10, true),
-		("xai-", 10, true),
-		("csk-", 10, true),
-		("fpk-", 10, true),
-		("fpk_", 10, true),
-		("ghp_", 10, true),
-		("gho_", 10, true),
-		("ghu_", 10, true),
-		("ghs_", 10, true),
-		("ghr_", 10, true),
-		("npm_", 10, true),
-		("AIza", 10, true),
-		("AKIA", 16, true),
-		("ASIA", 16, true),
-		("sk-", 10, true),
-		("sk_", 10, true),
-		("fw_", 10, true),
-		("bt_", 10, true),
+	// (prefix, minimum run length). Real credentials are long and mixed, so a
+	// short run is prose or an identifier, not a secret.
+	const PREFIXES: &[(&str, usize)] = &[
+		("Bearer ", 20),
+		("github_pat_", 20),
+		("xoxb-", 20),
+		("xoxa-", 20),
+		("xoxp-", 20),
+		("xoxr-", 20),
+		("xoxs-", 20),
+		("nvapi-", 20),
+		("xai-", 20),
+		("csk-", 20),
+		("fpk-", 20),
+		("fpk_", 20),
+		("ghp_", 20),
+		("gho_", 20),
+		("ghu_", 20),
+		("ghs_", 20),
+		("ghr_", 20),
+		("npm_", 20),
+		("AIza", 20),
+		("AKIA", 16),
+		("ASIA", 16),
+		("sk-", 20),
+		("sk_", 20),
+		("fw_", 20),
+		("bt_", 20),
 	];
+
 
 	let bytes = text.as_bytes();
 	let mut out = String::with_capacity(text.len());
@@ -405,26 +429,22 @@ fn redact_boundary_tokens(text: &str) -> String {
 		let at_boundary =
 			i == 0 || (!bytes[i - 1].is_ascii_alphanumeric() && bytes[i - 1] != b'_');
 		if at_boundary {
-			for &(prefix, min_tail, ident_only) in PREFIXES {
+			for &(prefix, min_tail) in PREFIXES {
 				if let Some(tail) = text[i..].strip_prefix(prefix) {
 					if prefix == "Bearer " && tail.starts_with("[REDACTED") {
 						break;
 					}
-					let end = if ident_only {
-						tail.find(|c: char| !c.is_ascii_alphanumeric() && c != '_' && c != '-')
-							.unwrap_or(tail.len())
-					} else {
-						tail.find(|c: char| {
-							c.is_whitespace() || matches!(c, '"' | '\'' | ',' | ';' | ')' | '}')
-						})
-						.unwrap_or(tail.len())
-					};
-					if end >= min_tail {
+					let run = tail
+						.find(|c: char| !c.is_ascii_alphanumeric() && c != '_' && c != '-')
+						.unwrap_or(tail.len());
+					// Real credentials are long and mixed: `Bearer authentication`
+					// (a prose phrase) and `sk-learn-pipeline` (an identifier) stay.
+					if run >= min_tail && tail[..run].bytes().any(|b| b.is_ascii_digit()) {
 						if prefix == "Bearer " {
 							out.push_str(prefix);
 						}
 						out.push_str("[REDACTED]");
-						i += prefix.len() + end;
+						i += prefix.len() + run;
 						continue 'outer;
 					}
 				}
@@ -601,17 +621,32 @@ mod tests {
 
 	#[test]
 	fn redact_free_text_masks_secrets_without_corrupting_identifiers() {
-		let input = "serde(skip_serializing_if) disk-cache-key sk-secret-token-123456 Bearer bearer-secret-123 ghp_1234567890abcdef AKIAIOSFODNN7EXAMPLE https://x/cb?access_token=tok123&ok=1 eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.c2lnbmF0dXJlMTIzNDU2";
+		let input = "serde(skip_serializing_if) disk-cache-key sk-proj-abcdefghij1234567890 Bearer abcdefghij1234567890abcdef ghp_1234567890abcdefghij AKIAIOSFODNN7EXAMPLE https://x/cb?access_token=tok123&ok=1 eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.c2lnbmF0dXJlMTIzNDU2";
 		let redacted = redact_free_text(input);
 		assert!(redacted.contains("skip_serializing_if"));
 		assert!(redacted.contains("disk-cache-key"));
 		assert!(redacted.contains("ok=1"));
-		assert!(!redacted.contains("sk-secret-token-123456"));
-		assert!(!redacted.contains("bearer-secret-123"));
-		assert!(!redacted.contains("ghp_1234567890abcdef"));
+		assert!(!redacted.contains("sk-proj-abcdefghij1234567890"));
+		assert!(!redacted.contains("abcdefghij1234567890abcdef"));
+		assert!(!redacted.contains("ghp_1234567890abcdefghij"));
 		assert!(!redacted.contains("AKIAIOSFODNN7EXAMPLE"));
 		assert!(!redacted.contains("tok123"));
 		assert!(!redacted.contains("eyJhbGciOiJIUzI1NiJ9"));
 		assert_eq!(redact_free_text(&redacted), redacted);
+	}
+
+	#[test]
+	fn redact_free_text_leaves_prose_and_code_untouched() {
+		// Ordinary prose and code must survive: a recovered fragment is model
+		// context, and corrupting it is a permanent loss of what the user saw.
+		for text in [
+			"Bearer authentication is negotiated per request",
+			"sk-learn-pipeline is our feature name",
+			"let v = cond ? key = value : None;",
+			"the disk token bucket refills every minute",
+			"skip_serializing_if",
+		] {
+			assert_eq!(redact_free_text(text), text, "unchanged: {text}");
+		}
 	}
 }

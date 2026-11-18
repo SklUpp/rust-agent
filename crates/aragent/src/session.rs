@@ -1860,8 +1860,9 @@ impl SessionStore {
 	}
 
 	/// Interrupted stream text from the branch-scoped durable draft, if any.
-	/// Display-only: the caller must never append it to history or provider
-	/// context and never convert it into tool calls. Peeks without consuming
+	/// The caller must not journal it: `runtime` delivers it once per turn as a
+	/// separate untrusted context block, never as an assistant turn and never
+	/// as tool calls. Peeks without consuming
 	/// so a crash before the next completed turn keeps the fragment; the next
 	/// terminal assistant message clears it atomically. Storage or schema
 	/// failures propagate: a silent `None` here would hide a damaged draft

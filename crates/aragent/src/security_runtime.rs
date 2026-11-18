@@ -312,7 +312,7 @@ impl SecurityRunSession {
 			continuation: false,
 			security_host: None,
 			security_worker: true,
-			service_tier_by_family: std::collections::BTreeMap::new(),
+			service_tier_by_family: self.service_tier.clone(),
 			parent_workspace_lease: self.parent_workspace_lease.clone(),
 		})
 	}

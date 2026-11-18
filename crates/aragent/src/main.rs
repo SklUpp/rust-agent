@@ -1321,8 +1321,9 @@ fn run() -> std::result::Result<(), CliError> {
 		store.history().to_vec()
 	};
 	session.checkpoint_host.rehydrate(&store);
-	// Surface an interrupted stream draft as a display-only fragment: never
-	// history, never provider context, never tool calls. The draft stays in
+	// Surface an interrupted stream draft: never journaled, never tool calls;
+	// `runtime` sends it to the model once as a separate untrusted block. The
+	// draft stays in
 	// the store (peek, not take) so a crash before the next completed turn
 	// keeps it; that turn's persist clears it atomically.
 	session.interrupted_fragment =
@@ -1330,7 +1331,7 @@ fn run() -> std::result::Result<(), CliError> {
 	if let Some(fragment) = session.interrupted_fragment.as_deref() {
 		let preview: String = fragment.chars().take(240).collect();
 		let ellipsis = if fragment.chars().count() > 240 { "…" } else { "" };
-		eprintln!("note: recovered an interrupted assistant fragment (not replayed, no tool calls): {preview}{ellipsis}");
+		eprintln!("note: recovered an interrupted assistant fragment (not journaled; sent to the model once as interrupted context, no tool calls): {preview}{ellipsis}");
 	}
 	session.store = store;
 	// One authoritative live selection, resolved once at launch with the TS
@@ -1780,8 +1781,9 @@ struct Session<'a> {
 	history: Vec<TurnRecord>,
 	checkpoint_host: CheckpointHost,
 	/// Interrupted stream text recovered from the branch-scoped durable draft.
-	/// Display-only: never appended to `history` or provider context, never
-	/// converted into tool calls. Cleared when the next turn persists.
+	/// Never appended to `history` and never converted into tool calls; sent to
+	/// the model once as separate interrupted context. Cleared when the next
+	/// journaled terminal persists.
 	interrupted_fragment: Option<String>,
 	/// Tool results in the just-finished turn (TS `tool_execution_end` count),
 	turn_tool_calls: usize,

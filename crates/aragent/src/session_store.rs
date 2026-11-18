@@ -3666,12 +3666,13 @@ fn append_message_tx(
 		params![message.id, message.branch_id],
 	)?;
 	// Attempt-scoped terminal clearing, in the same transaction as the
-	// terminal append: a loop-stamped assistant message with a successful
-	// final stop (`stop`, `length`) and no tool calls clears the draft. A
-	// mirror write (RPC tail, replay) carries no marker and never clears.
-	// `toolUse`, `error`, `aborted`, and unknown-stop rows never clear: the
-	// turn is not successfully over (or it is the aborted/error partial
-	// itself), so the fragment must survive for the next successful turn.
+	// terminal append. The draft exists to preserve text that the journal will
+	// not replay, so it clears exactly when the assistant turn is durable and
+	// replayable: a `stop`/`length` final answer, or a `toolUse` assistant whose
+	// text (and tool calls) are journaled. A mirror write (RPC tail, replay)
+	// carries no marker and never clears. `error`, `aborted`, and unknown-stop
+	// rows never clear: that assistant is excluded from replay, so the draft is
+	// the only surviving copy of its text.
 	if payload_role(&message.payload) == Some("assistant") {
 		// `SessionMessage.extra` is `#[serde(flatten)]`: the marker lands at
 		// `message.streamAttempt`, not under an `extra` object.
@@ -3685,8 +3686,7 @@ fn append_message_tx(
 			.get("message")
 			.and_then(|message| message.get("stopReason"))
 			.and_then(Value::as_str);
-		let has_tool_calls = !extract_assistant_tool_call_counts(&message.payload).is_empty();
-		let is_final = matches!(stop, Some("stop") | Some("length")) && !has_tool_calls;
+		let is_final = matches!(stop, Some("stop") | Some("length") | Some("toolUse"));
 		if let (Some(attempt), true) = (terminal_attempt, is_final) {
 			clear_stream_draft_attempt_tx(
 				transaction,
@@ -4577,9 +4577,6 @@ fn full_draft_text(payload: &Value) -> String {
 }
 
 
-/// Fail closed when a draft write names a branch that does not belong to the
-/// session: without this, an upsert keyed only by `branch_id` could attach a
-/// fragment to the wrong session's branch and silently steal its recovery.
 /// Combine a draft row into display/model text: priors oldest-first,
 /// then the live current draft. Joined with an explicit interrupted banner
 /// per fragment so concatenated streams never read as one response.
@@ -4693,6 +4690,9 @@ fn clear_stream_draft_attempt_tx(
 	Ok(())
 }
 
+/// Fail closed when a draft write names a branch that does not belong to the
+/// session: without this, an upsert keyed only by `branch_id` could attach a
+/// fragment to the wrong session's branch and silently steal its recovery.
 fn require_branch_owner(
 	connection: &Connection,
 	session_id: &str,
@@ -8593,14 +8593,14 @@ mod tests {
 			.save_stream_draft(
 				"s_red",
 				"b1",
-				"use serde(skip_serializing_if) with sk-secret-token-123456 and Bearer bearer-secret-999",
+				"use serde(skip_serializing_if) with sk-proj-abcdefghij1234567890 and Bearer abcdefghij1234567890abcdef",
 				"1-0",
 			)
 			.expect("save draft");
 		let loaded = store.stream_draft("s_red", "b1").expect("load").expect("present");
 		assert!(loaded.contains("skip_serializing_if"), "normal identifiers kept: {loaded}");
-		assert!(!loaded.contains("sk-secret-token-123456"), "secret redacted: {loaded}");
-		assert!(!loaded.contains("bearer-secret-999"), "bearer redacted: {loaded}");
+		assert!(!loaded.contains("sk-proj-abcdefghij1234567890"), "secret redacted: {loaded}");
+		assert!(!loaded.contains("abcdefghij1234567890abcdef"), "bearer redacted: {loaded}");
 		drop(store);
 
 		let conn = Connection::open(&path).expect("raw sqlite");
@@ -8614,6 +8614,79 @@ mod tests {
 		let reopened = SqliteStore::open(&path).expect("reopen");
 		let legacy = reopened.stream_draft("s_red", "b1").expect("read legacy").expect("present");
 		assert!(!legacy.contains("ghp_1234567890abcdefghij"), "legacy scrubbed: {legacy}");
+		let _ = std::fs::remove_dir_all(dir);
+	}
+
+	#[test]
+	fn stream_draft_clears_on_journaled_tool_use_but_survives_abort() {
+		let (dir, path) = temp_db("stream-draft-tooluse");
+		let mut store = SqliteStore::open(&path).expect("open store");
+		store
+			.create_session(NewSession {
+				id: "s_tool".to_string(),
+				parent_session_id: None,
+				payload: json!({}),
+				initial_branch_id: "b1".to_string(),
+				initial_branch_payload: json!({}),
+			})
+			.expect("create session");
+
+		// An aborted assistant is excluded from replay: its text survives only
+		// in the draft, so the terminal write must keep it.
+		store
+			.save_stream_draft("s_tool", "b1", "aborted partial text", "1-0")
+			.expect("save draft");
+		store
+			.append_message(NewMessage {
+				id: "m_abort".to_string(),
+				session_id: "s_tool".to_string(),
+				branch_id: "b1".to_string(),
+				parent_message_id: None,
+				payload: json!({
+					"kind": "message",
+					"id": "m_abort",
+					"message": {
+						"role": "assistant",
+						"content": "",
+						"stopReason": "aborted",
+						"streamAttempt": "1-0"
+					}
+				}),
+			})
+			.expect("append aborted");
+		assert!(
+			store.stream_draft("s_tool", "b1").expect("read").is_some(),
+			"aborted terminal keeps the only copy of the text"
+		);
+
+		// A tool-use assistant is journaled and replayed, so keeping the draft
+		// would resend its text as a spurious interrupted fragment.
+		store
+			.save_stream_draft("s_tool", "b1", "tool-use text", "1-1")
+			.expect("save draft");
+		store
+			.append_message(NewMessage {
+				id: "m_tool".to_string(),
+				session_id: "s_tool".to_string(),
+				branch_id: "b1".to_string(),
+				parent_message_id: Some("m_abort".to_string()),
+				payload: json!({
+					"kind": "message",
+					"id": "m_tool",
+					"message": {
+						"role": "assistant",
+						"content": "tool-use text",
+						"stopReason": "toolUse",
+						"streamAttempt": "1-1",
+						"tool_calls": [{"id": "call_1", "name": "read", "arguments": "{}"}]
+					}
+				}),
+			})
+			.expect("append tool use");
+		assert!(
+			store.stream_draft("s_tool", "b1").expect("read").is_none(),
+			"journaled tool-use assistant clears the delivered draft"
+		);
 		let _ = std::fs::remove_dir_all(dir);
 	}
 }

@@ -1941,7 +1941,7 @@ mod imp {
 		// Recovered draft: explicitly not a turn, never replayed, never tool
 		// calls. Shown so an interrupted stream is visible, not silent.
 		if let Some(fragment) = interrupted_fragment {
-			lines.push("── interrupted fragment (not replayed, no tool calls) ──".to_string());
+			lines.push("── interrupted fragment (not journaled; sent to the model once, no tool calls) ──".to_string());
 			for line in fragment.lines().take(200) {
 				lines.push(format!("  {line}"));
 			}
@@ -2415,7 +2415,7 @@ mod imp {
 			let preview: String = fragment.chars().take(240).collect();
 			let ellipsis = if fragment.chars().count() > 240 { "…" } else { "" };
 			app.push_system(format!(
-				"recovered interrupted assistant fragment (not replayed, no tool calls): {preview}{ellipsis}"
+				"recovered interrupted assistant fragment (not journaled; sent to the model once, no tool calls): {preview}{ellipsis}"
 			));
 		}
 		app.push_system(
