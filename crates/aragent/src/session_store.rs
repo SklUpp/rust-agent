@@ -4594,16 +4594,15 @@ fn combined_stream_draft_text(payload: &Value) -> String {
 	format!("[truncated: oldest fragments omitted]\n\n{tail}")
 }
 
-/// Clear the delivered tail of the branch draft on a loop-stamped successful
-/// terminal (`stop`/`length`, no tool calls), preserving any undelivered
-/// prefix as a legacy row. Delivery caps the combined text at 8000 chars
-/// (newest tail) computed from the row as it stood at request time — i.e.
-/// excluding this terminal's own current attempt, whose flushes landed after
-/// the request was built. Only the loop stamps `streamAttempt`, so mirror
-/// writes (RPC tail, replay) carry no marker and never clear. Only
-/// `stop`/`length` without tool calls clears: `toolUse` means the turn is
-/// not over, and `error`/`aborted`/unknown stops are the partial itself —
-/// the fragment must survive until the next successful terminal.
+/// Clear the delivered tail of the branch draft on a loop-stamped terminal
+/// whose text the journal replays (`stop`/`length`/`toolUse`), preserving any
+/// undelivered prefix as a legacy row. Delivery caps the combined text at
+/// 8000 chars (newest tail) computed from the row as it stood at request
+/// time — i.e. excluding this terminal's own current attempt, whose flushes
+/// landed after the request was built. Only the loop stamps `streamAttempt`,
+/// so mirror writes (RPC tail, replay) carry no marker and never clear.
+/// `error`/`aborted`/unknown stops are the partial itself and their assistant
+/// is not replayed, so the draft stays the only copy of that text.
 fn clear_stream_draft_attempt_tx(
 	transaction: &Transaction<'_>,
 	session_id: &str,

@@ -792,7 +792,7 @@ mod tests {
 			Arc::new(Catalog::default()),
 			Approvals::new(crate::approve::ApprovalMode::Yolo, std::iter::empty::<String>()),
 			Some(root.join("state")),
-			std::collections::BTreeMap::new(),
+			std::collections::BTreeMap::from([("mock".to_string(), "priority".to_string())]),
 			None,
 		)
 		.expect("worker session");
@@ -808,6 +808,11 @@ mod tests {
 		);
 		assert_eq!(built.provider.as_deref(), Some("mock"));
 		assert!(built.security_worker);
+		assert_eq!(
+			built.service_tier_by_family.get("mock").map(String::as_str),
+			Some("priority"),
+			"the worker keeps the live per-family service tier"
+		);
 
 		drop(session);
 		let _ = std::fs::remove_dir_all(&root);
