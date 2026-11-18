@@ -103,6 +103,22 @@ cargo build --release --offline
 
 No claim is made that the build or tests pass until they are actually run.
 
+## Versioning
+
+`arag` has its own version line, independent of the donor packages (upstream `18.x`).
+
+- Scheme: `0.MINOR.PATCH`. `MAJOR` stays `0` until the first stable release; no compatibility
+  promise is implied by a `0.x` number.
+- `MINOR` bumps when a planned capability slice group is complete and verified (see
+  `docs/agent-preliminary-implementation-plan.md`); `PATCH` bumps for fixes that do not add or
+  change a capability.
+- Builds that must be distinguishable before a release carry a semver pre-release suffix:
+  `0.2.0-dev.1`, `0.2.0-alpha.1`, `0.2.0-beta.1`, where `dev < alpha < beta < 0.2.0`. Never
+  reuse a suffix for a different build.
+- A version number alone never identifies a build: every CI artifact ships the commit SHA and
+  `arag.sha256`, and device smoke reports both.
+- Session/database schema versions are separate integers and are not tied to the package version.
+
 ## Observed verification
 
 - CI run `42240498060`: Linux `cargo check` and Android release build passed;
@@ -110,7 +126,8 @@ No claim is made that the build or tests pass until they are actually run.
 - Android artifact SHA-256:
   `423aff2912245478d94ba44bd0a93ae0d093562f1ed144bd4c0630e56ca01e79`.
 - On Termux, the pre-rename `omp --version` returned `omp 18.0.9` (exit 0);
-  the renamed `arag` binary reports `arag 18.0.9`.
+  the renamed `arag` binary reports its own version, now `arag 0.1.0` (the
+  donor's `18.0.9` is no longer this product's version).
 - `python scripts/standalone-smoke.py --binary <downloaded-pre-rename-omp>
   --timeout 120` passed (exit 0): two local fixture API requests, streamed
   `read` call, real tool result, final response. No external provider

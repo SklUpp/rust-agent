@@ -831,14 +831,29 @@ impl ToolCallLoopGuardConfig {
 
 /// `model.requestTimeout.*`: per-model-request timeout and bounded retry after timeout.
 ///
-/// `timeoutMs` bounds one model request (`0`/absent disables); `maxRetries`
-/// bounds reissues after a timeout only. Retries never replay tools and never
-/// combine partial streams: a stream that already yielded a chunk fails with
-/// the timeout instead of being retried.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+/// `timeoutMs` bounds one model request (`0` disables) and defaults to five
+/// minutes; `maxRetries` bounds reissues after a timeout only and defaults to
+/// two. Retries never replay tools and never combine partial streams: a stream
+/// that already yielded a chunk fails with the timeout instead of being
+/// retried.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ModelRequestTimeoutConfig {
 	pub timeout_ms:  Option<u64>,
 	pub max_retries: Option<u32>,
+}
+
+/// Default per-request budget: five minutes of establishment plus streaming.
+pub const DEFAULT_MODEL_REQUEST_TIMEOUT_MS: u64 = 300_000;
+/// Default bound on reissues after a timeout.
+pub const DEFAULT_MODEL_REQUEST_MAX_RETRIES: u32 = 2;
+
+impl Default for ModelRequestTimeoutConfig {
+	fn default() -> Self {
+		Self {
+			timeout_ms:  Some(DEFAULT_MODEL_REQUEST_TIMEOUT_MS),
+			max_retries: Some(DEFAULT_MODEL_REQUEST_MAX_RETRIES),
+		}
+	}
 }
 
 impl ModelRequestTimeoutConfig {
@@ -3414,8 +3429,13 @@ mod tests {
 		assert!(!disabled.model_request_timeout.effective().is_enabled());
 
 		let defaulted = Config::default();
-		assert_eq!(defaulted.model_request_timeout.max_retries(), 0);
-		assert!(!defaulted.model_request_timeout.effective().is_enabled());
+		assert_eq!(defaulted.model_request_timeout.max_retries(), 2);
+		assert_eq!(
+			defaulted.model_request_timeout.timeout(),
+			Some(std::time::Duration::from_secs(300))
+		);
+		assert!(defaulted.model_request_timeout.effective().is_enabled());
+		assert_eq!(parse_config("").expect("empty").model_request_timeout, defaulted.model_request_timeout);
 
 		let mut base =
 			parse_config("model:\n  requestTimeout:\n    timeoutMs: 1000\n").expect("base");
