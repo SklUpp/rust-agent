@@ -3773,18 +3773,20 @@ async fn interrupted_stream_draft_recovers_once_then_clears_on_complete() {
 		DurableSession::open(db.clone(), "s-draft", header("s-draft", &dir)).expect("reopen2");
 	// A later user prompt must not delete the draft before its own terminal
 	// message exists: no attempt marker, no clear.
+	let user = Message::user("next prompt");
 	reopened
-		.persist_messages(&[Message::user("next prompt")])
+		.persist_messages(std::slice::from_ref(&user))
 		.await
 		.expect("persist user");
 	let after_user = reopened.peek_recovered_partial().expect("peek after user").expect("draft kept");
 	assert!(after_user.contains("second try"), "user append keeps priors: {after_user}");
 	// The terminal of attempt 1-2 clears the live draft and the delivered
 	// priors atomically, in the same transaction as its own append.
+	// `persist_messages` takes the whole conversation, not a delta.
 	let mut terminal = Message::assistant("finished");
 	terminal.stream_attempt = Some("1-2".to_string());
 	reopened
-		.persist_messages(&[terminal])
+		.persist_messages(&[user, terminal])
 		.await
 		.expect("persist completed");
 	assert_eq!(
