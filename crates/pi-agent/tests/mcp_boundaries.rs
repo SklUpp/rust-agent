@@ -222,8 +222,9 @@ async fn tools_list_follows_cursor_pages_in_order() {
 		.filter(|seen| seen.body.get("method").and_then(Value::as_str) == Some("tools/list"))
 		.collect();
 	assert_eq!(list_calls.len(), 2, "one request per cursor page");
-	assert_eq!(list_calls[0].body["params"], json!({}));
-	assert_eq!(list_calls[1].body["params"]["cursor"], "page-2");
+assert!(list_calls[0].body["params"].get("cursor").is_none());
+assert!(list_calls[0].body["params"]["_meta"]["progressToken"].is_number());
+assert_eq!(list_calls[1].body["params"]["cursor"], "page-2");
 
 	connection.close().await.expect("close");
 	connection.close().await.expect("close is idempotent for HTTP");
@@ -323,12 +324,12 @@ async fn configured_headers_lose_to_generated_and_session_headers_follow() {
 	let init_headers = requests[0].headers.to_ascii_lowercase();
 	assert!(init_headers.contains("authorization: bearer tok"), "{init_headers}");
 	assert!(init_headers.contains("x-api-key: k-1"), "{init_headers}");
-	assert!(init_headers.contains("content-type: application/json"), "{init_headers}");
-	assert!(!init_headers.contains("text/plain"), "generated content-type wins");
-	assert!(
-		!init_headers.contains("mcp-protocol-version"),
-		"configured protocol version must be stripped before negotiation"
-	);
+assert!(init_headers.contains("content-type: application/json"), "SDK must generate JSON content type: {init_headers}");
+assert!(!init_headers.contains("text/plain"), "configured content type must be rejected: {init_headers}");
+assert!(
+	!init_headers.contains("mcp-protocol-version: spoofed"),
+	"configured protocol version must not override SDK negotiation: {init_headers}"
+);
 
 	let notify_headers = requests[1].headers.to_ascii_lowercase();
 	assert!(
@@ -384,35 +385,18 @@ async fn retriable_tools_list_failure_reconnects_and_retries_once() {
 }
 
 #[tokio::test]
-async fn origin_locked_redirect_is_refused_before_a_second_server_is_contacted() {
+async fn http_redirect_is_refused_before_second_origin_contact() {
 	let target = spawn_mock(|_, seen| Reply::json(rpc_result(&seen.body, json!({})))).await;
 	let target_hits = Arc::clone(&target.seen);
-
 	let redirector = spawn_mock(move |_, _| Reply {
 		status: 302,
 		headers: vec![("Location", target.url.clone())],
 		body: String::new(),
-	})
-	.await;
-
-	let mut config = http_config(&redirector.url);
-	config.header_policy = Some("origin-locked".to_string());
-	let err = connect_to_server("locked", MCPServerConfig::Http(config))
-		.await
-		.expect_err("cross-origin redirect must be refused");
-	match err {
-		McpError::Transport(message) => {
-			assert!(
-				message.contains("Refusing non-method-preserving redirect 302"),
-				"{message}"
-			);
-		},
-		other => panic!("expected transport refusal, got {other:?}"),
-	}
-	assert!(
-		target_hits.lock().unwrap().is_empty(),
-		"refused redirect must never reach the other origin"
-	);
+	}).await;
+	let config = http_config(&redirector.url);
+	let err = connect_to_server("locked", MCPServerConfig::Http(config)).await.expect_err("Policy::none must refuse all redirects");
+assert!(matches!(&err, McpError::Protocol(message) if message.contains("HTTP 302")), "expected rmcp Protocol redirect refusal, got {err:?}");
+	assert!(target_hits.lock().unwrap().is_empty(), "refused redirect must never reach target origin");
 }
 
 #[tokio::test]
@@ -484,17 +468,244 @@ for line in sys.stdin:
         .expect("pending request must settle on close")
         .expect("task");
     match result {
-        Err(McpError::UnknownOutcome(message)) => assert!(message.contains("remote outcome unknown"), "{message}"),
+        Err(McpError::UnknownOutcome(message)) => assert!(message.contains("unverified") || message.contains("unknown"), "{message}"),
         other => panic!("pending mutating call must report unknown outcome, got {other:?}"),
     }
 
-	let alive = std::process::Command::new("kill")
-		.args(["-0", &pid.to_string()])
-		.status()
-		.is_ok_and(|status| status.success());
-	assert!(!alive, "close must terminate the stdio child");
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    let mut alive = true;
+    while alive && tokio::time::Instant::now() < deadline {
+        alive = std::process::Command::new("kill")
+            .args(["-0", &pid.to_string()])
+            .status()
+            .is_ok_and(|status| status.success());
+        if alive { tokio::time::sleep(Duration::from_millis(20)).await; }
+    }
+    assert!(!alive, "close must terminate the stdio child");
 
 	let _ = std::fs::remove_file(&script);
 	let _ = std::fs::remove_file(&pid_file);
 	let _ = std::fs::remove_file(&marker);
+}
+
+/// Transport that fails every request with one prepared error class. Used to
+/// drive the client's error classification and transport-blame bookkeeping
+/// without a live server.
+struct FailingTransport {
+	failure: Failure,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum Failure {
+	/// Ambiguous: the request may have been accepted.
+	Transport,
+	/// Definite: never dispatched.
+	Closed,
+	/// Definite: the server answered with an error.
+	JsonRpc,
+}
+
+#[async_trait::async_trait]
+impl pi_agent::mcp::McpTransport for FailingTransport {
+	async fn request(
+		&self,
+		_method: &str,
+		_params: Option<Value>,
+		_timeout: Option<Duration>,
+	) -> Result<Value, McpError> {
+		Err(match self.failure {
+			Failure::Transport => McpError::Transport("mock transport broke".to_string()),
+			Failure::Closed => McpError::Closed,
+			Failure::JsonRpc => McpError::JsonRpc {
+				code: -32000,
+				message: "rejected".to_string(),
+				data: None,
+			},
+		})
+	}
+
+	async fn notify(&self, _method: &str, _params: Option<Value>) -> Result<(), McpError> {
+		Ok(())
+	}
+
+	async fn close(&self) -> Result<(), McpError> {
+		Ok(())
+	}
+}
+
+/// A connection whose installed transport is the given fake. `config` must
+/// point at a live mock server, because a reconnect builds a real transport
+/// from it.
+fn fake_connection(failure: Failure, config: MCPServerConfig) -> Arc<pi_agent::mcp::McpConnection> {
+	Arc::new(pi_agent::mcp::McpConnection {
+		name: "fake".to_string(),
+		config,
+		transport: Arc::new(tokio::sync::RwLock::new(Arc::new(FailingTransport { failure })
+			as Arc<dyn pi_agent::mcp::McpTransport>)),
+		server_info: pi_agent::mcp::MCPServerInfo { name: "fake".to_string(), version: None },
+		capabilities: pi_agent::mcp::MCPServerCapabilities::default(),
+		instructions: None,
+		closed: std::sync::atomic::AtomicBool::new(false),
+		transport_epoch: std::sync::atomic::AtomicU64::new(1),
+		failed_epoch: std::sync::atomic::AtomicU64::new(0),
+		close_completed: std::sync::atomic::AtomicBool::new(false),
+		close_barrier: Arc::new(tokio::sync::Mutex::new(())),
+		state_barrier: Arc::new(tokio::sync::Mutex::new(())),
+	})
+}
+
+fn method_count(server: &MockServer, method: &str) -> usize {
+	server
+		.seen
+		.lock()
+		.unwrap()
+		.iter()
+		.filter(|seen| seen.body.get("method").and_then(Value::as_str) == Some(method))
+		.count()
+}
+
+fn tools_call_result(body: &Value) -> String {
+	rpc_result(body, json!({ "content": [{ "type": "text", "text": "ok" }], "isError": false }))
+}
+
+#[tokio::test]
+async fn definite_errors_never_condemn_the_transport() {
+	let server = spawn_mock(|_, seen| match seen.body.get("method").and_then(Value::as_str) {
+		Some("initialize") => Reply::json(rpc_result(&seen.body, initialize_result())),
+		Some("notifications/initialized") => Reply::json("{}".to_string()),
+		_ => Reply::json(tools_call_result(&seen.body)),
+	})
+	.await;
+
+	// A JSON-RPC error response means the server answered: the transport is
+	// healthy, so neither this call nor the next may trigger a handshake.
+	let connection = fake_connection(Failure::JsonRpc, MCPServerConfig::Http(http_config(&server.url)));
+	let error = connection.call_tool("tool", json!({})).await.expect_err("fake always fails");
+	assert!(matches!(error, McpError::JsonRpc { .. }), "{error:?}");
+	connection.call_tool("tool", json!({})).await.expect_err("fake always fails");
+	assert_eq!(
+		method_count(&server, "initialize"),
+		0,
+		"a server answer must not mark the transport broken"
+	);
+}
+
+#[tokio::test]
+async fn closed_transport_is_replaced_on_the_next_call() {
+	let server = spawn_mock(|_, seen| match seen.body.get("method").and_then(Value::as_str) {
+		Some("initialize") => Reply::json(rpc_result(&seen.body, initialize_result())),
+		Some("notifications/initialized") => Reply::json("{}".to_string()),
+		_ => Reply::json(tools_call_result(&seen.body)),
+	})
+	.await;
+
+	let connection = fake_connection(Failure::Closed, MCPServerConfig::Http(http_config(&server.url)));
+	// Definite: the request never left the client, so it is reported as `Closed`
+	// rather than as an unknown outcome.
+	let error = connection.call_tool("tool", json!({})).await.expect_err("fake fails");
+	assert!(matches!(error, McpError::Closed), "{error:?}");
+
+	// A transport that reports `Closed` is gone, so the next call replaces it.
+	connection.call_tool("tool", json!({})).await.expect("reconnected call succeeds");
+	assert_eq!(method_count(&server, "initialize"), 1, "closed transport is replaced once");
+}
+
+#[tokio::test]
+async fn unverified_delivery_retires_only_its_own_epoch() {
+	let server = spawn_mock(|_, seen| match seen.body.get("method").and_then(Value::as_str) {
+		Some("initialize") => Reply::json(rpc_result(&seen.body, initialize_result())),
+		Some("notifications/initialized") => Reply::json("{}".to_string()),
+		_ => Reply::json(tools_call_result(&seen.body)),
+	})
+	.await;
+
+	let connection = fake_connection(Failure::Transport, MCPServerConfig::Http(http_config(&server.url)));
+
+	// An unverified delivery blames the transport that produced it.
+	let error = connection.call_tool("tool", json!({})).await.expect_err("fake fails");
+	assert!(matches!(error, McpError::Transport(_)), "{error:?}");
+
+	// The next call reconnects (one handshake) and the replacement serves it.
+	connection.call_tool("tool", json!({})).await.expect("reconnected call succeeds");
+	assert_eq!(method_count(&server, "initialize"), 1, "exactly one reconnect");
+	assert_eq!(
+		connection.transport_epoch.load(Ordering::SeqCst),
+		2,
+		"reconnect installs a new epoch"
+	);
+
+	// A late failure from the retired transport must not mark the healthy one:
+	// record it against epoch 1, then prove no further handshake happens.
+	connection.failed_epoch.fetch_max(1, Ordering::AcqRel);
+	connection.call_tool("tool", json!({})).await.expect("healthy transport keeps serving");
+	assert_eq!(method_count(&server, "initialize"), 1, "stale epoch must be ignored");
+
+	// A failure on the installed epoch is genuine and must survive: it is the
+	// epoch reconnect has actually observed, so the next call reconnects again.
+	connection.failed_epoch.fetch_max(2, Ordering::AcqRel);
+	connection.call_tool("tool", json!({})).await.expect("second reconnect succeeds");
+	assert_eq!(method_count(&server, "initialize"), 2, "current-epoch failure is honoured");
+}
+
+#[tokio::test]
+async fn concurrent_calls_share_one_reconnect() {
+	let call_attempts = Arc::new(AtomicUsize::new(0));
+	let attempts = Arc::clone(&call_attempts);
+	let server = spawn_mock(move |_, seen| match seen.body.get("method").and_then(Value::as_str) {
+		Some("initialize") => Reply::json(rpc_result(&seen.body, initialize_result())),
+		Some("tools/call") => {
+			if attempts.fetch_add(1, Ordering::SeqCst) == 0 {
+				Reply { status: 503, headers: Vec::new(), body: "unavailable".to_string() }
+			} else {
+				Reply::json(tools_call_result(&seen.body))
+			}
+		},
+		Some("notifications/initialized") => Reply::json("{}".to_string()),
+		_ => Reply::json(rpc_result(&seen.body, json!({}))),
+	})
+	.await;
+
+	let connection = connect_to_server("shared", MCPServerConfig::Http(http_config(&server.url)))
+		.await
+		.expect("connect");
+	assert!(connection.call_tool("tool", json!({})).await.is_err(), "first call breaks");
+
+	// Both callers observe the broken epoch; exactly one of them may rebuild it.
+	let (left, right) = tokio::join!(connection.call_tool("tool", json!({})), connection.call_tool("tool", json!({})));
+	left.expect("left call succeeds after reconnect");
+	right.expect("right call succeeds on the reconnected transport");
+
+	assert_eq!(call_attempts.load(Ordering::SeqCst), 3, "the failed call is never replayed");
+	assert_eq!(
+		method_count(&server, "initialize"),
+		2,
+		"one reconnect shared by both concurrent callers"
+	);
+	connection.close().await.expect("close");
+}
+
+#[tokio::test]
+async fn close_wins_over_concurrent_reconnect() {
+	let server = spawn_mock(|_, seen| match seen.body.get("method").and_then(Value::as_str) {
+		Some("initialize") => Reply::json(rpc_result(&seen.body, initialize_result())),
+		Some("notifications/initialized") => Reply::json("{}".to_string()),
+		_ => Reply::json(tools_call_result(&seen.body)),
+	})
+	.await;
+
+	let connection = connect_to_server("race", MCPServerConfig::Http(http_config(&server.url)))
+		.await
+		.expect("connect");
+	let (reconnected, closed) = tokio::join!(connection.reconnect(), connection.close());
+	// Whichever order the two win, neither may panic and teardown must finish.
+	assert!(
+		reconnected.is_ok() || matches!(reconnected, Err(McpError::Closed)),
+		"reconnect after close is Closed, never a half-installed transport: {reconnected:?}"
+	);
+	closed.expect("close completes");
+
+	// Post-close requests are definite: nothing reached a transport.
+	let error = connection.call_tool("tool", json!({})).await.expect_err("closed session");
+	assert!(matches!(error, McpError::Closed), "{error:?}");
+	connection.close().await.expect("close is idempotent");
 }

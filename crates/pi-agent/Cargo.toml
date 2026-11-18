@@ -21,9 +21,10 @@ thiserror = { workspace = true }
 regex = { workspace = true }
 libc = { workspace = true }
 reqwest = { workspace = true }
+rmcp_http = { package = "reqwest", version = "0.13.2", default-features = false, features = ["json", "stream", "rustls"] }
 pi-shell = { workspace = true }
 pi-walker = { workspace = true }
-rmcp = { version = "=3.9.0", default-features = false, features = ["client", "transport-child-process"] }
+rmcp = { version = "=3.9.0", default-features = false, features = ["client", "transport-child-process", "transport-streamable-http-client-reqwest"] }
 pi-iso = { workspace = true }
 pi-ast = { workspace = true }
 portable-pty = { workspace = true }

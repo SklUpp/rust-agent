@@ -248,90 +248,27 @@ fn sse_config(url: &str) -> MCPSseServerConfig {
 }
 
 #[tokio::test]
-async fn same_origin_relative_redirect_keeps_auth_session_and_protocol_headers() {
-	const AUTH: &str = "Bearer same-origin-contract-secret";
-
-	let server = spawn_mock(|request| {
-		let body = request.json_body();
-		let method = body
-			.get("method")
-			.and_then(Value::as_str)
-			.unwrap_or("");
-		match (request.path(), method) {
-			("/mcp", "initialize") => Reply::redirect(307, Some("/moved-init")),
-			("/moved-init", "initialize") => {
-				Reply::json(rpc_result(request, initialize_result()))
-					.with_header("Mcp-Session-Id", "relative-session")
-			},
-			("/mcp", "notifications/initialized") => Reply::json("{}".to_string()),
-			("/mcp", "tools/list") => Reply::redirect(307, Some("/moved-tools")),
-			("/moved-tools", "tools/list") => Reply::json(rpc_result(
-				request,
-				json!({
-					"tools": [{ "name": "via-relative-redirect", "inputSchema": {} }],
-				}),
-			)),
-			_ => Reply {
-				status: 404,
-				headers: Vec::new(),
-				body: String::new(),
-			},
-		}
-	})
-	.await;
-
-	let mut config = http_config(&format!("{}/mcp", server.url));
-	config.header_policy = Some("origin-locked".to_string());
-	config.headers.insert("Authorization".to_string(), AUTH.to_string());
-
-	let connection = connect_to_server("relative_redirect", MCPServerConfig::Http(config))
-		.await
-		.expect("same-origin relative redirects are followed");
-	let tools = connection
-		.list_tools()
-		.await
-		.expect("tools/list must succeed through the relative redirect");
-	assert_eq!(tools.len(), 1);
-	assert_eq!(tools[0].name, "via-relative-redirect");
-
-	let captured = server.captured.lock().unwrap().clone();
-	let redirected: Vec<&Captured> = captured
-		.iter()
-		.filter(|request| request.path() == "/moved-tools")
-		.collect();
-	assert_eq!(
-		redirected.len(),
-		1,
-		"tools/list must be re-sent to the relative redirect target"
-	);
-
-	let request = redirected[0];
-	assert_eq!(request.method(), "POST");
-	assert_eq!(
-		request.header("authorization").as_deref(),
-		Some(AUTH),
-		"configured credential must survive a same-origin redirect"
-	);
-	assert_eq!(
-		request.header("mcp-session-id").as_deref(),
-		Some("relative-session"),
-		"negotiated session must survive a same-origin redirect"
-	);
-	assert_eq!(
-		request.header("mcp-protocol-version").as_deref(),
-		Some("2025-11-25"),
-		"negotiated protocol version must survive a same-origin redirect"
-	);
-	assert_eq!(
-		request.header("content-type").as_deref(),
-		Some("application/json")
-	);
-	assert_eq!(
-		request.json_body().get("method").and_then(Value::as_str),
-		Some("tools/list")
-	);
+async fn same_origin_relative_redirect_is_refused_without_following_credentials() {
+    const AUTH: &str = "Bearer same-origin-contract-secret";
+    let server = spawn_mock(|request| {
+        let body = request.json_body();
+        match body.get("method").and_then(Value::as_str) {
+            Some("initialize") => Reply::redirect(307, Some("/moved-init")),
+            _ => Reply::json(rpc_result(request, json!({}))),
+        }
+    })
+    .await;
+    let mut config = http_config(&format!("{}/mcp", server.url));
+    config.headers.insert("Authorization".to_string(), AUTH.to_string());
+    let error = connect_to_server("relative_redirect", MCPServerConfig::Http(config))
+        .await
+        .expect_err("Policy::none must refuse same-origin redirects");
+    assert!(matches!(&error, McpError::Protocol(message) if message.contains("HTTP 307")), "expected rmcp Protocol refusal, got {error:?}");
+    let captured = server.captured.lock().unwrap().clone();
+    assert_eq!(captured.len(), 1, "redirect target must not be contacted");
+    assert_eq!(captured[0].path(), "/mcp");
+    assert_eq!(captured[0].header("authorization").as_deref(), Some(AUTH));
 }
-
 #[tokio::test]
 async fn legacy_sse_cross_origin_endpoint_is_refused_before_contact() {
 	const AUTH: &str = "Bearer legacy-sse-contract-secret";
@@ -402,15 +339,15 @@ async fn redirect_without_location_is_a_typed_transport_error() {
 	let server = spawn_mock(|_| Reply::redirect(307, None)).await;
 
 	let mut config = http_config(&format!("{}/mcp", server.url));
-	config.header_policy = Some("origin-locked".to_string());
+    config.header_policy = None;
 
 	let error = connect_to_server("missing_location", MCPServerConfig::Http(config))
 		.await
 		.expect_err("a redirect without Location must fail");
-	assert!(
-		matches!(error, McpError::Transport(_)),
-		"expected a typed transport error, got {error:?}"
-	);
+    assert!(
+        matches!(&error, McpError::Protocol(message) if message.contains("HTTP 307")),
+        "expected rmcp Protocol refusal, got {error:?}"
+    );
 
 	let captured = server.captured.lock().unwrap().clone();
 	assert_eq!(

@@ -1129,6 +1129,12 @@ mod tests {
 				resources: Some(json!({})),
 				..Default::default()
 			},
+			closed: std::sync::atomic::AtomicBool::new(false),
+			transport_epoch: std::sync::atomic::AtomicU64::new(1),
+			failed_epoch: std::sync::atomic::AtomicU64::new(0),
+			close_completed: std::sync::atomic::AtomicBool::new(false),
+			close_barrier: std::sync::Arc::new(tokio::sync::Mutex::new(())),
+			state_barrier: std::sync::Arc::new(tokio::sync::Mutex::new(())),
 			instructions: None,
 		});
 		register_active_session(Arc::clone(&connection));

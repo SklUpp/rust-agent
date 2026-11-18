@@ -13,6 +13,9 @@ pub fn validate_server_config(name: &str, config: &MCPServerConfig) -> Result<()
             }
         }
         MCPServerConfig::Http(h) => {
+            if h.request_id_format == Some(crate::mcp::types::RequestIdFormat::String) {
+                errors.push(format!("Server \"{}\": requestIdFormat=string is unsupported by rmcp Streamable HTTP", name));
+            }
             if h.url.trim().is_empty() {
                 errors.push(format!("Server \"{}\": http server requires \"url\" field", name));
             }

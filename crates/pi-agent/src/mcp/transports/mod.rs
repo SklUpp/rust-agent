@@ -5,12 +5,10 @@ use std::time::Duration;
 
 use crate::mcp::error::McpError;
 
-pub mod header_policy;
-pub mod http;
-pub mod sse;
 pub mod stdio;
 pub mod rmcp_adapter;
-
+pub mod sse;
+pub mod header_policy;
 #[async_trait]
 pub trait McpTransport: Send + Sync {
     async fn request(

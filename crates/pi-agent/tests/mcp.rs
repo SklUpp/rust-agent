@@ -251,6 +251,23 @@ async fn test_rmcp_stdio_string_ids_rejected_before_spawn() {
 }
 
 #[tokio::test]
+async fn test_rmcp_http_string_ids_rejected_before_connect() {
+    let config = MCPServerConfig::Http(MCPHttpServerConfig {
+        url: "http://127.0.0.1:1/mcp".into(),
+        headers: HashMap::new(),
+        timeout: Some(100),
+        request_id_format: Some(RequestIdFormat::String),
+        header_policy: None,
+        auth: None,
+        oauth: None,
+    });
+    let error = connect_to_server("rmcp-http-string-id", config)
+        .await
+        .expect_err("string IDs must be rejected before HTTP connect");
+    assert!(error.to_string().contains("requestIdFormat=string"));
+}
+
+#[tokio::test]
 async fn test_rmcp_stdio_timeout_is_unknown_outcome() {
     let script_path = std::env::temp_dir().join(format!("mcp_rmcp_timeout_{}.py", std::process::id()));
     std::fs::write(&script_path, r#"import json,sys,time
@@ -788,10 +805,10 @@ for line in sys.stdin:
     elif method == "tools/call":
         with open(state_path, "r") as f:
             val = int(f.read().strip())
+        with open(state_path, "w") as f:
+            f.write(str(val + 1))
         if val == 0:
             # First attempt: crash/exit abruptly
-            with open(state_path, "w") as f:
-                f.write("1")
             sys.exit(1)
         else:
             # Second attempt (after reconnect): succeed!
@@ -822,16 +839,16 @@ for line in sys.stdin:
     // 1. First call fails because child crashed mid-execution (uncertain delivery: NEVER replayed!)
     let first_err = conn.call_tool("any_tool", json!({})).await.unwrap_err();
     assert!(
-        matches!(first_err, McpError::Transport(_)),
-        "Expected Transport error on crashed child, got: {:?}",
+        matches!(first_err, McpError::UnknownOutcome(_)),
+        "Expected UnknownOutcome on crashed mutating child, got: {:?}",
         first_err
     );
     // Assert mutation was NOT replayed (file contains exactly '1', not '2')
     let val_after_crash = std::fs::read_to_string(&state_file).unwrap();
     assert_eq!(val_after_crash.trim(), "1", "Tool call must NOT be replayed after crash");
 
-    // 2. Future call succeeds because transport automatically reconnected!
-    let res = conn.call_tool("any_tool", json!({})).await.expect("subsequent call_tool should succeed via reconnected child");
+    // Future explicit call may reconnect, but uncertain mutation is never replayed.
+    let res = conn.call_tool("any_tool", json!({})).await.expect("future call must reconnect and succeed");
     assert_eq!(res.is_error, Some(false));
     match &res.content[0] {
         MCPContent::Text { text } => assert_eq!(text, "reconnected success"),
@@ -904,7 +921,7 @@ async fn test_http_mismatched_response_id_rejected() {
                 if method == "initialize" {
                     let resp = json!({
                         "jsonrpc": "2.0",
-                        "id": 1,
+                        "id": json_body.get("id").cloned().unwrap_or(Value::Null),
                         "result": {
                             "protocolVersion": "2025-11-25",
                             "capabilities": { "tools": {} },
@@ -952,8 +969,8 @@ async fn test_http_mismatched_response_id_rejected() {
     let conn = connect_to_server("mismatch_srv", config).await.expect("connect");
     let err = conn.list_tools().await.unwrap_err();
     assert!(
-        matches!(err, McpError::Protocol(_)),
-        "Expected Protocol error on mismatched ID, got: {:?}",
+        matches!(err, McpError::Timeout(_)),
+        "Expected Timeout when rmcp drops uncorrelated response, got: {:?}",
         err
     );
 }
@@ -978,7 +995,7 @@ async fn test_http_hanging_sse_timeout() {
                 if method == "initialize" {
                     let resp = json!({
                         "jsonrpc": "2.0",
-                        "id": 1,
+                        "id": json_body.get("id").cloned().unwrap_or(Value::Null),
                         "result": {
                             "protocolVersion": "2025-11-25",
                             "capabilities": { "tools": {} },
@@ -1044,7 +1061,7 @@ async fn test_notification_failure_propagates() {
                 if method == "initialize" {
                     let resp = json!({
                         "jsonrpc": "2.0",
-                        "id": 1,
+                        "id": json_body.get("id").cloned().unwrap_or(Value::Null),
                         "result": {
                             "protocolVersion": "2025-11-25",
                             "capabilities": { "tools": {} },
@@ -1080,9 +1097,15 @@ async fn test_notification_failure_propagates() {
     let res = connect_to_server("notif_fail_srv", config).await;
     assert!(res.is_err(), "connect_to_server must fail if notification fails");
     let err = res.err().unwrap();
-    assert!(matches!(err, McpError::Http { status: 500, .. }));
+    match err {
+        McpError::Protocol(message) => {
+            assert!(message.contains("MCP initialization failed"), "unexpected protocol error: {message}");
+            assert!(message.contains("send initialized notification"), "protocol error must identify failing notification: {message}");
+            assert!(message.contains("Transport channel closed"), "protocol error must preserve rmcp channel failure: {message}");
+        }
+        other => panic!("expected rmcp Protocol initialization error, got {other:?}"),
+    }
 }
-
 #[tokio::test]
 async fn test_legacy_sse_stream_close_drains_pending() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1255,7 +1278,7 @@ async fn test_no_replay_after_accepted_mutating_call() {
                 if method == "initialize" {
                     let resp = json!({
                         "jsonrpc": "2.0",
-                        "id": 1,
+                        "id": json_body.get("id").cloned().unwrap_or(Value::Null),
                         "result": {
                             "protocolVersion": "2025-11-25",
                             "capabilities": { "tools": {} },
@@ -1296,8 +1319,8 @@ async fn test_no_replay_after_accepted_mutating_call() {
     let conn = connect_to_server("accepted_test", config).await.expect("connect");
     let err = conn.call_tool("mutating_action", json!({})).await.unwrap_err();
     assert!(
-        matches!(err, McpError::AcceptedStreamError(_)),
-        "Expected AcceptedStreamError, got: {:?}",
+        matches!(err, McpError::UnknownOutcome(_)),
+        "Expected UnknownOutcome after accepted call socket close, got: {:?}",
         err
     );
     // Assert call was only attempted ONCE and NOT replayed!
@@ -1305,7 +1328,7 @@ async fn test_no_replay_after_accepted_mutating_call() {
 }
 
 #[tokio::test]
-async fn test_typed_value_id_mismatch_numeric_vs_string() {
+async fn test_numeric_request_response_ids_match() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
 
@@ -1324,7 +1347,7 @@ async fn test_typed_value_id_mismatch_numeric_vs_string() {
                 if method == "initialize" {
                     let resp = json!({
                         "jsonrpc": "2.0",
-                        "id": "req_1", // Matching string ID
+                        "id": json_body.get("id").cloned().unwrap_or(Value::Null),
                         "result": {
                             "protocolVersion": "2025-11-25",
                             "capabilities": { "tools": {} },
@@ -1341,10 +1364,9 @@ async fn test_typed_value_id_mismatch_numeric_vs_string() {
                 } else if method == "notifications/initialized" {
                     socket.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n").await.unwrap();
                 } else if method == "tools/list" {
-                    // Client sends string id: "req_2", but server returns numeric id: 2!
                     let resp = json!({
                         "jsonrpc": "2.0",
-                        "id": 2, // NUMERIC, not string "req_2"!
+                        "id": json_body.get("id").cloned().unwrap_or(Value::Null),
                         "result": { "tools": [] }
                     });
                     let resp_bytes = serde_json::to_vec(&resp).unwrap();
@@ -1363,19 +1385,15 @@ async fn test_typed_value_id_mismatch_numeric_vs_string() {
         url: format!("http://{}", addr),
         headers: HashMap::new(),
         timeout: Some(5000),
-        request_id_format: Some(RequestIdFormat::String), // Explicit String IDs
+        request_id_format: Some(RequestIdFormat::Number),
         header_policy: None,
         auth: None,
         oauth: None,
     });
 
     let conn = connect_to_server("typed_srv", config).await.expect("connect");
-    let err = conn.list_tools().await.unwrap_err();
-    assert!(
-        matches!(err, McpError::Protocol(_)),
-        "Expected Protocol error on typed ID mismatch (string vs number), got: {:?}",
-        err
-    );
+    let tools = conn.list_tools().await.expect("numeric request/response IDs match");
+    assert!(tools.is_empty());
 }
 
 #[tokio::test]
@@ -1445,7 +1463,7 @@ async fn test_accepted_json_reset_does_not_replay() {
                 if method == "initialize" {
                     let resp = json!({
                         "jsonrpc": "2.0",
-                        "id": 1,
+                        "id": json_body.get("id").cloned().unwrap_or(Value::Null),
                         "result": {
                             "protocolVersion": "2025-11-25",
                             "capabilities": { "tools": {} },
@@ -1486,12 +1504,40 @@ async fn test_accepted_json_reset_does_not_replay() {
     let conn = connect_to_server("json_reset_srv", config).await.expect("connect");
     let err = conn.call_tool("mutating_action", json!({})).await.unwrap_err();
     assert!(
-        matches!(err, McpError::AcceptedStreamError(_)),
-        "Expected AcceptedStreamError on body truncated after 200 headers, got: {:?}",
+        matches!(err, McpError::UnknownOutcome(_)),
+        "Expected UnknownOutcome after accepted JSON body reset, got: {:?}",
         err
     );
     // Assert call was only attempted ONCE and NOT replayed!
     assert_eq!(call_count.load(Ordering::SeqCst), 1, "Mutating call must NOT be replayed after 200 JSON headers");
+}
+async fn read_http_json_request(socket: &mut tokio::net::TcpStream) -> Option<(String, Value)> {
+    let mut bytes = Vec::new();
+    let mut chunk = [0u8; 4096];
+    loop {
+        let read = socket.read(&mut chunk).await.ok()?;
+        if read == 0 {
+            return None;
+        }
+        bytes.extend_from_slice(&chunk[..read]);
+        let Some(header_end) = bytes.windows(4).position(|window| window == b"\r\n\r\n") else {
+            continue;
+        };
+        let body_start = header_end + 4;
+        let headers = String::from_utf8_lossy(&bytes[..header_end]).into_owned();
+        let content_length = headers
+            .lines()
+            .find_map(|line| {
+                let (name, value) = line.split_once(':')?;
+                name.trim().eq_ignore_ascii_case("content-length").then(|| value.trim().parse::<usize>().ok()).flatten()
+            })
+            .unwrap_or(0);
+        if bytes.len() < body_start + content_length {
+            continue;
+        }
+        let body = serde_json::from_slice(&bytes[body_start..body_start + content_length]).unwrap_or(Value::Null);
+        return Some((headers, body));
+    }
 }
 
 #[tokio::test]
@@ -1502,85 +1548,50 @@ async fn test_server_reply_with_auth_session_protocol_and_numeric_id() {
     let ping_verified = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let ping_verified_clone = ping_verified.clone();
 
+    let (ping_tx, ping_rx) = tokio::sync::mpsc::channel::<(String, Value)>(4);
+    let ping_rx = Arc::new(tokio::sync::Mutex::new(ping_rx));
     tokio::spawn(async move {
         while let Ok((mut socket, _)) = listener.accept().await {
+            let ping_tx = ping_tx.clone();
+            let ping_rx = ping_rx.clone();
             let p_ver = ping_verified_clone.clone();
             tokio::spawn(async move {
-                let mut buf = vec![0u8; 4096];
-                let n = socket.read(&mut buf).await.unwrap();
-                let req_str = String::from_utf8_lossy(&buf[..n]);
-
-                let body_start = req_str.find("\r\n\r\n").map(|i| i + 4).unwrap_or(n);
-                let body_str = &req_str[body_start..];
-                let json_body: Value = serde_json::from_str(body_str).unwrap_or(Value::Null);
-                let method = json_body.get("method").and_then(|v| v.as_str()).unwrap_or("");
-
-                if method == "initialize" {
-                    let resp = json!({
-                        "jsonrpc": "2.0",
-                        "id": 1,
-                        "result": {
-                            "protocolVersion": "2025-11-25",
-                            "capabilities": { "tools": {} },
-                            "serverInfo": { "name": "mock-reply-auth", "version": "1.0.0" }
-                        }
-                    });
-                    let resp_bytes = serde_json::to_vec(&resp).unwrap();
-                    let http_resp = format!(
-                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nMcp-Session-Id: sess-reply-99\r\nContent-Length: {}\r\n\r\n",
-                        resp_bytes.len()
-                    );
-                    socket.write_all(http_resp.as_bytes()).await.unwrap();
-                    socket.write_all(&resp_bytes).await.unwrap();
-                } else if method == "notifications/initialized" {
-                    socket.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n").await.unwrap();
-                } else if method == "tools/list" {
-                    // 1. Send server ping request down SSE stream with NUMERIC ID 12345
-                    let sse_header = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: keep-alive\r\n\r\n";
-                    socket.write_all(sse_header.as_bytes()).await.unwrap();
-
-                    let ping_req = json!({
-                        "jsonrpc": "2.0",
-                        "id": 12345,
-                        "method": "ping"
-                    });
-                    let sse_msg = format!("data: {}\n\n", serde_json::to_string(&ping_req).unwrap());
-                    socket.write_all(sse_msg.as_bytes()).await.unwrap();
-
-                    // Wait until client replies to ping before completing tools/list
-                    for _ in 0..50 {
-                        tokio::time::sleep(Duration::from_millis(50)).await;
-                        if p_ver.load(Ordering::SeqCst) {
-                            break;
-                        }
+                let Some((headers, body)) = read_http_json_request(&mut socket).await else { return; };
+                let method = body.get("method").and_then(Value::as_str).unwrap_or("");
+                match method {
+                    "initialize" => {
+                        let response = json!({ "jsonrpc": "2.0", "id": body.get("id").cloned().unwrap_or(Value::Null), "result": { "protocolVersion": "2025-11-25", "capabilities": { "tools": {} }, "serverInfo": { "name": "mock-reply-auth", "version": "1.0.0" } } });
+                        let bytes = serde_json::to_vec(&response).unwrap();
+                        let header = format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nMcp-Session-Id: sess-reply-99\r\nContent-Length: {}\r\n\r\n", bytes.len());
+                        socket.write_all(header.as_bytes()).await.unwrap();
+                        socket.write_all(&bytes).await.unwrap();
                     }
-
-                    if p_ver.load(Ordering::SeqCst) {
-                        let tools_resp = json!({
-                            "jsonrpc": "2.0",
-                            "id": 2,
-                            "result": { "tools": [{ "name": "verified_tool", "inputSchema": {} }] }
-                        });
-                        let sse_tools = format!("data: {}\n\n", serde_json::to_string(&tools_resp).unwrap());
-                        socket.write_all(sse_tools.as_bytes()).await.unwrap();
-                        tokio::time::sleep(Duration::from_millis(500)).await;
-                    }
-                } else if json_body.get("result").is_some() {
-                    // Server reply received! Check all 4 requirements:
-                    let has_auth = req_str.contains("authorization: Bearer secret-token")
-                        || req_str.contains("Authorization: Bearer secret-token");
-                    let has_session = req_str.contains("mcp-session-id: sess-reply-99")
-                        || req_str.contains("Mcp-Session-Id: sess-reply-99");
-                    let has_protocol = req_str.contains("mcp-protocol-version: 2025-11-25")
-                        || req_str.contains("MCP-Protocol-Version: 2025-11-25");
-                    let exact_numeric_id = json_body.get("id") == Some(&json!(12345));
-
-                    if has_auth && has_session && has_protocol && exact_numeric_id {
-                        p_ver.store(true, Ordering::SeqCst);
+                    "notifications/initialized" => {
                         socket.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n").await.unwrap();
-                    } else {
-                        socket.write_all(b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\n\r\n").await.unwrap();
                     }
+                    "tools/list" => {
+                        socket.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: keep-alive\r\n\r\n").await.unwrap();
+                        let ping = json!({ "jsonrpc": "2.0", "id": 12345, "method": "ping" });
+                        socket.write_all(format!("data: {}\n\n", ping).as_bytes()).await.unwrap();
+                        let verified = tokio::time::timeout(Duration::from_secs(2), ping_rx.lock().await.recv()).await.ok().flatten();
+                        if let Some((reply_headers, reply)) = verified {
+                            let valid = reply.get("id") == Some(&json!(12345))
+                                && reply_headers.to_ascii_lowercase().contains("authorization: bearer secret-token")
+                                && reply_headers.to_ascii_lowercase().contains("mcp-session-id: sess-reply-99")
+                                && reply_headers.to_ascii_lowercase().contains("mcp-protocol-version: 2025-11-25");
+                            if valid {
+                                p_ver.store(true, Ordering::SeqCst);
+                                let tools = json!({ "jsonrpc": "2.0", "id": body.get("id").cloned().unwrap_or(Value::Null), "result": { "tools": [{ "name": "verified_tool", "inputSchema": {} }] } });
+                                socket.write_all(format!("data: {}\n\n", tools).as_bytes()).await.unwrap();
+                            }
+                        }
+                        tokio::time::sleep(Duration::from_millis(200)).await;
+                    }
+                    _ if body.get("result").is_some() => {
+                        let _ = ping_tx.send((headers, body)).await;
+                        socket.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n").await.unwrap();
+                    }
+                    _ => {}
                 }
             });
         }
@@ -1604,6 +1615,66 @@ async fn test_server_reply_with_auth_session_protocol_and_numeric_id() {
     assert_eq!(tools.len(), 1);
     assert_eq!(tools[0].name, "verified_tool");
     assert!(ping_verified.load(Ordering::SeqCst), "Ping reply must have satisfied all auth/session/protocol/id checks");
+}
+
+#[tokio::test]
+async fn rmcp_resource_transport_error_does_not_leak_secret_url() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let secret = "RMCP_URL_QUERY_SECRET_7f3c";
+    tokio::spawn(async move {
+        while let Ok((mut socket, _)) = listener.accept().await {
+            tokio::spawn(async move {
+                let Some((_headers, body)) = read_http_json_request(&mut socket).await else { return };
+                let method = body.get("method").and_then(Value::as_str).unwrap_or_default();
+                let id = body.get("id").cloned().unwrap_or(Value::Null);
+                if method == "initialize" {
+                    let response = json!({
+                        "jsonrpc": "2.0",
+                        "id": id,
+                        "result": {
+                            "protocolVersion": "2025-11-25",
+                            "capabilities": { "resources": {} },
+                            "serverInfo": { "name": "redaction-fixture", "version": "1" }
+                        }
+                    });
+                    let payload = serde_json::to_vec(&response).unwrap();
+                    let head = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nMcp-Session-Id: redaction-session\r\nContent-Length: {}\r\n\r\n",
+                        payload.len()
+                    );
+                    socket.write_all(head.as_bytes()).await.unwrap();
+                    socket.write_all(&payload).await.unwrap();
+                } else if method == "notifications/initialized" {
+                    socket.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n").await.unwrap();
+                } else if method == "resources/read" {
+                    // Drop socket after accepted request. rmcp must expose category-only transport error.
+                } else {
+                    socket.write_all(b"HTTP/1.1 405 Method Not Allowed\r\nContent-Length: 0\r\n\r\n").await.unwrap();
+                }
+            });
+        }
+    });
+
+    let config = MCPServerConfig::Http(MCPHttpServerConfig {
+        url: format!("http://{addr}/mcp?token={secret}"),
+        headers: HashMap::new(),
+        timeout: Some(2_000),
+        request_id_format: None,
+        header_policy: None,
+        auth: None,
+        oauth: None,
+    });
+    let connection = connect_to_server("redaction", config).await.expect("connect");
+    let error = connection
+        .read_resource("test://resource")
+        .await
+        .expect_err("dropped resource response must fail");
+    match error {
+        McpError::Transport(message) => assert_eq!(message, "RMCP transport failure"),
+        other => panic!("expected category-only transport failure, got {other:?}"),
+    }
+    connection.close().await.expect("close");
 }
 
 #[tokio::test]
@@ -1776,7 +1847,7 @@ async fn test_utf8_multibyte_split_across_chunks() {
                         if method == "initialize" {
                             let resp = json!({
                                 "jsonrpc": "2.0",
-                                "id": 1,
+                                "id": json_body.get("id").cloned().unwrap_or(Value::Null),
                                 "result": {
                                     "protocolVersion": "2025-11-25",
                                     "capabilities": { "tools": {} },
@@ -1798,7 +1869,7 @@ async fn test_utf8_multibyte_split_across_chunks() {
 
                             let full_resp = json!({
                                 "jsonrpc": "2.0",
-                                "id": 2,
+                                "id": json_body.get("id").cloned().unwrap_or(Value::Null),
                                 "result": {
                                     "content": [{ "type": "text", "text": "café 🚀 тест" }],
                                     "isError": false
@@ -1812,6 +1883,7 @@ async fn test_utf8_multibyte_split_across_chunks() {
                             if socket.write_all(&bytes[..split_pos]).await.is_err() { return; }
                             tokio::time::sleep(Duration::from_millis(50)).await;
                             if socket.write_all(&bytes[split_pos..]).await.is_err() { return; }
+                            tokio::time::sleep(Duration::from_millis(200)).await;
                             return;
                         }
                     }
@@ -1856,31 +1928,21 @@ async fn test_notify_timeout_zero_disables_timeout() {
                 let mut buf = vec![0u8; 4096];
                 let n = socket.read(&mut buf).await.unwrap();
                 let req_str = String::from_utf8_lossy(&buf[..n]);
-
                 let body_start = req_str.find("\r\n\r\n").map(|i| i + 4).unwrap_or(n);
                 let body_str = &req_str[body_start..];
                 let json_body: Value = serde_json::from_str(body_str).unwrap_or(Value::Null);
                 let method = json_body.get("method").and_then(|v| v.as_str()).unwrap_or("");
-
                 if method == "initialize" {
                     let resp = json!({
                         "jsonrpc": "2.0",
-                        "id": 1,
-                        "result": {
-                            "protocolVersion": "2025-11-25",
-                            "capabilities": { "tools": {} },
-                            "serverInfo": { "name": "mock-slow-notif", "version": "1.0.0" }
-                        }
+                        "id": json_body.get("id").cloned().unwrap_or(Value::Null),
+                        "result": { "protocolVersion": "2025-11-25", "capabilities": { "tools": {} }, "serverInfo": { "name": "mock-slow-notif", "version": "1.0.0" } }
                     });
                     let resp_bytes = serde_json::to_vec(&resp).unwrap();
-                    let http_resp = format!(
-                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n",
-                        resp_bytes.len()
-                    );
-                    socket.write_all(http_resp.as_bytes()).await.unwrap();
+                    let header = format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n", resp_bytes.len());
+                    socket.write_all(header.as_bytes()).await.unwrap();
                     socket.write_all(&resp_bytes).await.unwrap();
                 } else if method == "notifications/initialized" {
-                    // Delay response by 300ms
                     tokio::time::sleep(Duration::from_millis(300)).await;
                     socket.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n").await.unwrap();
                 }
@@ -1964,7 +2026,7 @@ async fn test_http_multiline_sse_data_joined_correctly() {
                 if method == "initialize" {
                     let resp = json!({
                         "jsonrpc": "2.0",
-                        "id": 1,
+                        "id": json_body.get("id").cloned().unwrap_or(Value::Null),
                         "result": {
                             "protocolVersion": "2025-11-25",
                             "capabilities": { "tools": {} },
@@ -1984,13 +2046,13 @@ async fn test_http_multiline_sse_data_joined_correctly() {
                     let http_resp = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\r\n";
                     socket.write_all(http_resp.as_bytes()).await.unwrap();
 
-                    // Stream response split across multiple `data:` lines before \n\n
-                    let sse_multiline = concat!(
-                        "data: {\"jsonrpc\": \"2.0\",\n",
-                        "data: \"id\": 2,\n",
-                        "data: \"result\": {\"content\": [{\"type\": \"text\", \"text\": \"multiline success\"}], \"isError\": false}}\n\n"
+                    let request_id = json_body.get("id").cloned().unwrap_or(Value::Null);
+                    let sse_multiline = format!(
+                        "data: {{\"jsonrpc\": \"2.0\",\ndata: \"id\": {},\ndata: \"result\": {{\"content\": [{{\"type\": \"text\", \"text\": \"multiline success\"}}], \"isError\": false}}}}\n\n",
+                        request_id
                     );
                     socket.write_all(sse_multiline.as_bytes()).await.unwrap();
+                    tokio::time::sleep(Duration::from_millis(200)).await;
                 }
             });
         }
@@ -2024,16 +2086,29 @@ async fn test_untrusted_frame_exceeding_bound_rejected() {
         while let Ok((mut socket, _)) = listener.accept().await {
             tokio::spawn(async move {
                 let mut buf = vec![0u8; 4096];
-                let _ = socket.read(&mut buf).await.unwrap();
-
-                // Send 500 status with an overlong 17 MiB body
-                let header = "HTTP/1.1 500 Internal Server Error\r\nContent-Length: 17825792\r\n\r\n";
-                socket.write_all(header.as_bytes()).await.unwrap();
-                let chunk = vec![b'A'; 65536];
-                for _ in 0..(17 * 1024 * 1024 / 65536 + 1) {
-                    if socket.write_all(&chunk).await.is_err() {
-                        break;
+                let n = socket.read(&mut buf).await.unwrap();
+                let req = String::from_utf8_lossy(&buf[..n]);
+                let body_start = req.find("\r\n\r\n").map(|i| i + 4).unwrap_or(n);
+                let body: Value = serde_json::from_str(&req[body_start..]).unwrap_or(Value::Null);
+                let method = body.get("method").and_then(Value::as_str).unwrap_or("");
+                match method {
+                    "initialize" => {
+                        let response = json!({ "jsonrpc": "2.0", "id": body.get("id").cloned().unwrap_or(Value::Null), "result": { "protocolVersion": "2025-11-25", "capabilities": { "tools": {} }, "serverInfo": { "name": "oversize", "version": "1.0.0" } } });
+                        let bytes = serde_json::to_vec(&response).unwrap();
+                        let header = format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n", bytes.len());
+                        socket.write_all(header.as_bytes()).await.unwrap();
+                        socket.write_all(&bytes).await.unwrap();
                     }
+                    "notifications/initialized" => { socket.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n").await.unwrap(); }
+                    "tools/list" => {
+                        let body_len = 17 * 1024 * 1024;
+                        let header = format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {body_len}\r\n\r\n");
+                        if socket.write_all(header.as_bytes()).await.is_ok() {
+                            let chunk = vec![b'A'; 64 * 1024];
+                            for _ in 0..(body_len / chunk.len()) { if socket.write_all(&chunk).await.is_err() { break; } }
+                        }
+                    }
+                    _ => {}
                 }
             });
         }
@@ -2049,10 +2124,11 @@ async fn test_untrusted_frame_exceeding_bound_rejected() {
         oauth: None,
     });
 
-    let err = connect_to_server("oversize_srv", config).await.unwrap_err();
+    let conn = connect_to_server("oversize_srv", config).await.expect("initialize must fit bound");
+    let err = conn.list_tools().await.expect_err("17 MiB successful body must exceed rmcp 16 MiB bound");
     assert!(
-        matches!(err, McpError::Transport(_) | McpError::Http { .. }),
-        "Expected bounded rejection of oversize HTTP body, got: {:?}",
+        matches!(err, McpError::Transport(_) | McpError::Protocol(_)),
+        "Expected bounded rejection of oversized successful body, got: {:?}",
         err
     );
 }

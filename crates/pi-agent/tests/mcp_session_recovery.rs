@@ -1,22 +1,11 @@
-//! Streamable-HTTP MCP session recovery against real localhost servers.
+//! Streamable-HTTP MCP session behavior against real localhost servers.
 //!
-//! Two wire transitions are asserted end to end:
+//! Standard rmcp owns Streamable HTTP session state. It adopts the session ID
+//! from initialize, but does not replace it from ordinary response headers.
+//! Expired-session reinitialization is disabled in the product adapter; the
+//! product-level client may reconnect safe reads explicitly.
 //!
-//! 1. A later response may rotate `mcp-session-id`; the consumer must send the
-//!    rotated value on every following request without re-running `initialize`.
-//! 2. A stale-session `404` on an idempotent request must reconnect, re-run
-//!    `initialize`/`notifications/initialized`, and continue on the replacement
-//!    session — never on the stale one.
-//!
-//! Retry policy is taken from the client, not invented here: only safe
-//! operations (pagination/listing) reconnect-and-retry once, while a mutating
-//! `tools/call` is reported unchanged and never replayed. Existing `503`
-//! reconnect coverage and accepted-stream no-replay coverage live in
-//! `mcp_boundaries.rs` / `mcp.rs` and are deliberately not duplicated.
-//!
-//! The fixture serves connections one at a time from a single accept loop, so
-//! request count is bounded and no detached per-connection task can outlive
-//! the test; `Drop` reaps the loop even when an assertion panics.
+//! This fixture asserts no hidden replay and bounded request counts.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -151,8 +140,8 @@ async fn spawn_mock(
 				requests.push(request.clone());
 				index
 			};
-			let reply = handler(index, &request);
-			let mut response = format!(
+            let reply = handler(index, &request);
+            let mut response = format!(
 				"HTTP/1.1 {} {}\r\nContent-Length: {}\r\nConnection: close\r\n",
 				reply.status,
 				reason(reply.status),
@@ -223,7 +212,7 @@ fn list_calls(requests: &[Seen]) -> Vec<&Seen> {
 }
 
 #[tokio::test]
-async fn rotated_session_header_is_adopted_by_the_next_request() {
+async fn rotated_session_header_is_not_adopted_by_standard_rmcp() {
 	let server = spawn_mock(|_, seen| match method(seen) {
 		Some("initialize") => Reply::json(rpc_result(&seen.body, initialize_result()))
 			.with_header("mcp-session-id", "sess-1"),
@@ -250,11 +239,11 @@ async fn rotated_session_header_is_adopted_by_the_next_request() {
 				json!({ "tools": [{ "name": "gamma", "inputSchema": {} }] }),
 			)),
 			Some(other) => panic!("unexpected cursor {other}"),
-		},
+        },
 		Some(other) => panic!("unexpected method {other}"),
-		None => panic!("unexpected notification payload"),
-	})
-	.await;
+        None => Reply { status: 405, headers: vec![], body: String::new() },
+    })
+    .await;
 
 	let connection = connect_to_server("rotation", MCPServerConfig::Http(http_config(&server.url)))
 		.await
@@ -275,16 +264,16 @@ async fn rotated_session_header_is_adopted_by_the_next_request() {
 		"initialize session must be sent first: {}",
 		lists[0].headers
 	);
-	assert_eq!(
+assert_eq!(
 		header(lists[1], "mcp-session-id").as_deref(),
-		Some("sess-2"),
-		"rotation on page 1 must be adopted by page 2: {}",
+		Some("sess-1"),
+		"standard rmcp retains initialize session after ordinary response rotation: {}",
 		lists[1].headers
 	);
 	assert_eq!(
 		header(lists[2], "mcp-session-id").as_deref(),
-		Some("sess-3"),
-		"rotation on page 2 must be adopted by page 3: {}",
+		Some("sess-1"),
+		"standard rmcp retains initialize session on later pages: {}",
 		lists[2].headers
 	);
 	assert_eq!(
@@ -297,13 +286,13 @@ async fn rotated_session_header_is_adopted_by_the_next_request() {
 		1,
 		"rotation must not repeat the initialized notification"
 	);
-	assert_eq!(requests.len(), 5, "bounded request count: init, notify, three pages");
+assert_eq!(requests.len(), 6, "bounded request count including control GET: init, notify, GET, three pages");
 
 	connection.close().await.expect("close");
 }
 
 #[tokio::test]
-async fn stale_session_404_reconnects_and_uses_the_replacement_session() {
+async fn stale_session_404_reconnects_at_project_level_for_safe_read() {
 	let initialize_calls = Arc::new(AtomicUsize::new(0));
 	let list_attempts = Arc::new(AtomicUsize::new(0));
 	let init_for_server = Arc::clone(&initialize_calls);
@@ -332,11 +321,11 @@ async fn stale_session_404_reconnects_and_uses_the_replacement_session() {
 					json!({ "tools": [{ "name": "recovered", "inputSchema": {} }] }),
 				))
 			}
-		}
+        },
 		Some(other) => panic!("unexpected method {other}"),
-		None => panic!("unexpected notification payload"),
-	})
-	.await;
+        None => Reply { status: 405, headers: vec![], body: String::new() },
+    })
+    .await;
 
 	let connection = connect_to_server("stale", MCPServerConfig::Http(http_config(&server.url)))
 		.await
@@ -420,10 +409,10 @@ async fn stale_session_404_reconnects_and_uses_the_replacement_session() {
 		"the replacement handshake must announce itself on the fresh session: {}",
 		notifications[1].headers
 	);
-	assert_eq!(
+assert_eq!(
 		requests.len(),
-		7,
-		"bounded request count: init, notify, stale list, init, notify, retry, later call"
+		10,
+		"bounded request count including control GETs: init, notify, GET, stale list, recovery init, notify, GET, retry, GET, later call"
 	);
 
 	connection.close().await.expect("close");
@@ -450,11 +439,11 @@ async fn mutating_404_is_surfaced_without_replay_or_rehandshake() {
 				headers: vec![("Content-Type", "text/plain".to_string())],
 				body: "session expired".to_string(),
 			}
-		}
+        },
 		Some(other) => panic!("unexpected method {other}"),
-		None => panic!("unexpected notification payload"),
-	})
-	.await;
+        None => Reply { status: 405, headers: vec![], body: String::new() },
+    })
+    .await;
 
 	let connection = connect_to_server("mutating", MCPServerConfig::Http(http_config(&server.url)))
 		.await
@@ -463,10 +452,10 @@ async fn mutating_404_is_surfaced_without_replay_or_rehandshake() {
 		.call_tool("delete_everything", json!({}))
 		.await
 		.expect_err("stale-session 404 on a mutation must surface");
-	match err {
-		McpError::Http { status: 404, message } => assert_eq!(message, "session expired"),
-		other => panic!("expected the server 404 unchanged, got {other:?}"),
-	}
+match err {
+	McpError::UnknownOutcome(message) => assert!(message.contains("Session expired") || message.contains("unverified"), "{message}"),
+	other => panic!("expected UnknownOutcome for rmcp session-expired mutation, got {other:?}"),
+}
 	assert_eq!(call_attempts.load(Ordering::SeqCst), 1, "mutating call must not be replayed");
 
 	let requests = server.requests();
@@ -475,7 +464,7 @@ async fn mutating_404_is_surfaced_without_replay_or_rehandshake() {
 		1,
 		"safe-operation recovery must not silently rehandshake after a mutating failure"
 	);
-	assert_eq!(requests.len(), 3, "bounded request count: init, notify, one tools/call");
+	assert_eq!(requests.iter().filter(|seen| method(seen).is_some()).count(), 3, "one initialize, notification and tool call");
 	let call = requests
 		.iter()
 		.find(|seen| method(seen) == Some("tools/call"))
