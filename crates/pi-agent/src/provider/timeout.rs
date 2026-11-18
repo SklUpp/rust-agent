@@ -309,6 +309,7 @@ mod tests {
 	use std::sync::atomic::{AtomicUsize, Ordering};
 
 	use super::*;
+	use crate::StreamChunk;
 
 	fn config(timeout_ms: u64, max_retries: u32) -> RequestTimeoutConfig {
 		RequestTimeoutConfig {
