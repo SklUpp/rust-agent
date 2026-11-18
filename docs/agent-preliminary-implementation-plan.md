@@ -8,15 +8,18 @@
 
 ## Актуальный план первого работающего агента
 
-Этот раздел задаёт порядок для согласованного первого сквозного пути и заменяет противоречащие ему исторические предложения ниже. Требования остальных этапов не отменяются. Основание — раздел «Первый работающий агент» и уточнения в `agent-architecture-decisions.md`; наличие кода или прежний результат CI не подтверждают соответствие текущего рабочего дерева.
+Первый сквозной путь закрыт: **9Router → агент → инструмент → SQLite → CLI**. Проверено в CI (`44317748386`, зелёный: полный host-набор тестов, persistent shell, CLI против локального OpenAI-compatible фикстура, сборка `aarch64-linux-android`) и вживую на Termux бинарником из CI при живом 9Router: инструмент `read` вернул точное содержимое файла, сессия сохранена (`sessions`/`branches`/`messages`/`executions`), `--resume` загрузил историю без повторного вызова инструмента, SIGINT оставил черновик 2628 символов, следующий ход показал баннер восстановления и очистил черновик.
 
-1. **Установить исходное состояние.** Сверить рабочее дерево и незакоммиченные изменения, существующие `ModelProvider`, OpenAI-compatible адаптер, CLI/runtime, SQLite persistence и восстановление вызовов. Не изменять пользовательские файлы и не смешивать незавершённые MCP HTTP изменения с готовым функционалом. Составить перечень конкретных расхождений с принятой спецификацией до правок.
-2. **Провайдер и основной цикл.** Использовать существующий контракт модели, если он допускает замену адаптера без изменений цикла, инструментов и SQLite; устранить выявленную связанность минимальными правками. Собрать CLI → runtime → 9Router → streaming response через общие типы. Подключить настройки timeout и ограниченного повтора модельного запроса; ошибки выводить пользователю.
-3. **Инструмент и сохранение.** Проверить фактический порядок policy → durable intent → выполнение → durable outcome → следующий запрос модели. Исправить только обнаруженные разрывы: при ошибке сохранения не запускать новые запросы и инструменты; после внешнего эффекта не представлять ошибку записи как отмену эффекта. При восстановлении intent без outcome показывать неизвестный исход с корректной связью call/result, не повторяя инструмент автоматически.
-4. **Сессия и проверка.** Проверить сохранение и повторное открытие сессии, затем сценарий прерывания после intent с наблюдением отсутствия повторного эффекта. Выполнить реальные запросы через 9Router с инструментом на Termux; проверить соответствующую сборку и поведение Linux. Зафиксировать команды, результаты и ограничения; секреты в вывод не включать. Тяжёлые сборки и полные наборы тестов запускать в CI, локально — только разрешённые лёгкие проверки.
-5. **Ревью и следующие этапы.** Проверить изменения независимо, включая security review при изменении границ доверия или обработки секретов. После прохождения основного пути продолжить остальные принятые возможности, включая отдельное исправление и проверку MCP HTTP lifecycle. Не объявлять MCP готовым на основании проверок более раннего состояния.
+Дальнейший порядок:
 
-До выполнения каждого шага сверять актуальный код и переиспользовать существующие проверки; новые тесты добавлять для наблюдаемых рисков, а не повторять уже доказанные сценарии. Миграцию схемы и остальные изменения не выполнять только ради совпадения имён, если соответствующий контракт ещё не проверен.
+1. **MCP Streamable HTTP lifecycle** — отдельно: довести reconnect/close, cancel и deadline, независимое ревью, затем CI. Stdio-результаты HTTP не подтверждают.
+2. **S4 durable `task`** — admission и crash recovery до снятия fail-closed; затем producer generation и FIFO writer barrier для cached revive.
+3. **S5 SQLITE_BUSY** — граница до statements и cancellation-aware контракт; повтор вокруг неоднозначного commit запрещён.
+4. **S3 процессы** — доказать TERM→KILL группе и межпроцессный lease; shell не является sandbox под тем же UID.
+5. **S9 pipeline, S8 semantic matrix, S10 export/inspector, S11 параллельные писатели, S12 hooks/packaging.**
+6. **Отдельно:** единый D67 redactor известных секретов (`aho-corasick` + потоковая обработка границ чанков), миграция `~/.omp` → `~/.aragent` без удаления источника, `/retry`/`Alt+R`, license/NOTICE audit.
+
+Тяжёлые сборки и полные наборы тестов — в CI: локальная сборка на Termux тянет `aws-lc-sys`/`cmake` из зависимостей MCP HTTP. Живой прогон на устройстве допустим коротким smoke-скриптом. Коммит/push — по согласованию.
 
 ## 0. Цель и не-цели
 
@@ -96,34 +99,40 @@
 Каждый срез — рабочий вертикальный проход, не scaffolding. Порядок: **S1 (compilation/provider, без внешних эффектов) → S2 (первый реальный tool vertical после intent/outcome) → S3 → S4 → S5**; далее S6–S10 частично параллельно; S11 после S3+S2; S12 — насквозь. **Правило S4/S11:** до S11-iso workers — без записи в общий workspace (read-only) либо последовательные исполнители под единственным workspace-owner; параллельные пишущие workers — acceptance S11.
 
 ### S1. Ядро: loop-разрез + provider/compilation smoke (без внешних эффектов)
+**Статус 2026-11-18: done.** `ModelProvider`/`StreamAssembler`/адаптер в `pi-agent`, loop не тянет shell/AST/iso/MCP transports; CI прогоняет CLI против локального OpenAI-compatible фикстура, живой 9Router-stream проверен на Termux.
 - Файлы: `pi-agent` — contract-модуль из `tools/mod.rs:101-215`; `tools/registry.rs` (обрыв `:5,47-52`, `mcp/naming` к registry `:112-122`); delivery-модуль из `supervisor.rs:123-174`; `provider.rs` — HTTP adapter внутренним модулем; `lib.rs:1-52` — экспорт только контракта; **`state.rs:1352-1390` env allowlist (D27)**. `omp-cli` — product toolset module (`builtin_tools` сюда).
 - Donor API: `AgentLoop`, `ToolRegistry`, `ToolScheduler`, `ModelProvider`/`StreamAssembler`/`OpenAiCompatibleProvider`, `Tool`/`ToolError`.
 - Acceptance: compile-proof (loop-closure не тянет pi-shell/pi-ast/pi-iso/MCP transports); provider smoke через **throwaway/fake provider server** (без секретных API-ключей): streaming, fragmented tool args/IDs, length-границы, truncated args не превращаются в исполняемые calls; **никаких tool-эффектов не выполняется** — D33/D34 требуют intent/outcome persistence до эффекта, реальный tool vertical — S2; bash не наследует env провайдера.
 - Почему первым: loop должен компилироваться и стримить до всего; эффекты — только после durable-границ S2.
 
 ### S2. SQLite authority + единый session owner + первый реальный tool vertical
+**Статус 2026-11-18: done для первого сквозного пути.** Intent до эффекта, outcome после, восстановление без blind retry, `resume` и очистка черновика в транзакции вставки подтверждены CI и живым прогоном (5 сообщений, 1 execution, повторный запрос — без повторного инструмента).
 - Файлы: `omp-cli` — новый `store/` (rusqlite writer-task; подтверждение — awaited store result) и session owner (слияние `main.rs:2534-3200` + `rpc/session.rs:2740-3277`, fail-closed D34); intent-точка в admission-пути (расширение `scheduler.rs:85-158` через owner, не SQL внутри Tool).
 - Donor API: Goose session-manager паттерн; JSONL readers — import only; донорский `TurnAck` — опциональная деталь, не требование.
 - Acceptance: **первый настоящий tool call с внешним эффектом выполняется только после durable intent и получает durable outcome** (D33/D34) — вертикаль model→tool→effect→result→answer; crash-инъекция между (message, intent, effect, outcome): intent без outcome → «не подтверждено», никакого blind retry; ошибка записи блокирует следующий вызов/запрос с показом причины (D34); local и headless — один persistence path; нет второго live JSONL; durable active leaf независим от поздних off-branch результатов.
 - Почему вторым: без intent/outcome-границ эффекты недопустимы (D33/D34); всё дальнейшее пишет через owner.
 
 ### S3. Исполнение: per-agent shell, процессы, FS-policy, writer coordinator
+**Статус 2026-11-18: partial.** `brush` (vendored) + `pi-shell`/`pi-builtins`, persistent shell и env allowlist проверяются в CI; writer coordinator и version token есть в `pi-agent`. Не доказано: TERM→KILL для всех потомков, межпроцессный lease.
 - Файлы: `tools/mod.rs:654-685` BashTool → per-agent shell handle (donor — выбор между original `Session` (pin `035e4f9`) и fork `Shell` (pin `3008cfd`), не взаимозаменяемые); `tools/process.rs:403-459` ProcessBackend reuse; `omp-cli` — shell_state модуль (D76), fs_policy (D82 visibility всех проектов; vault exclusion D27; aliases/symlink/rename проверка), writer coordinator (межпроцессный lease D23), version token (strong full raw-file hash, proposal; не CAS) в write/edit/formatter путях.
 - Donor API: `Session/RunOptions/RunOutcome` (original) и/или `Shell::{new,run,abort}` (fork); portable-pty + cancel-контракт; Bashkit Fs-adapter — implementation detail поверх реальных shared files (не вторая namespace).
 - Acceptance: две shell делят файлы, но не cwd/env (state не течёт между агентами); stale edit → reject/перечитывание (D44), никакого silent fuzzy rebase; TERM→grace→KILL; второй writer блокируется coordinator-ом; shell env — allowlist; exit in-process не валит runtime.
 - Shell default (live vs serialized supported-state) — **decision parent** (gate G-shell §5); обе ветки удовлетворяют D76 в границах runtime-жизни; transparent hibernation не заявляется ни в одной (D87).
 
 ### S4. Workers + durable delivery + артефакты
+**Статус 2026-11-18: partial.** Субагенты, delivery и артефакты работают; durable `task` остаётся fail-closed до доказанных admission и crash recovery, cached durable revive — до producer generation и FIFO barrier.
 - Файлы: product-side supervisor (сборка из `supervisor.rs` донора без LSP/DAP/eval), delivery-consumers (durable pending queue вместо in-memory `take_*`), адаптация `tools/agent_output.rs` под D81 (см. §2.4).
 - **Ограничение до S11:** параллельных пишущих workers нет — workers read-only либо последовательные под workspace-owner; полная acceptance параллельной записи/iso-writer — в S11.
 - Donor API: `ChildRecord`/`BackgroundResultSink`/`BackgroundDelivery`, `finalizeSubprocessOutput` (TS executor) как шаблон D79, `Mailbox` типы.
 - Acceptance: конец/stop ответа parent не останавливает worker (D68); wake-off сохраняет результат; restart пере-предлагает pending с дедупликацией; артефакт опубликован до DB-ссылки (D81), no-clobber; контекст worker — представление истории (VFS URI router), не дубль файла.
 
 ### S5. Batch/бюджеты/координация ресурсов
+**Статус 2026-11-18: partial.** Admission и лимиты есть; SQLITE_BUSY retry не реализован — повтор вокруг неоднозначного commit недопустим, нужна граница до statements.
 - Файлы: расширение admission (перепроверка после ожиданий, dependency-группировка batch), бюджеты D26 (steps/time/tokens/parallel/depth/output), agent-slot limiter + очередь D67 (лишние слоты не занимают сохранённые агенты), provider request limiter — отдельный счётчик; явный SQLITE_BUSY retry/backoff протокол store (busy-free не гарантирован ни topology, ни одним writer — см. §7.4).
 - Acceptance: mixed failure/cancel сохраняет call/result pairing и порядок; queued-cancel до старта → «не запускался»; зависимые вызовы не параллелятся; лимиты/очередь видны parent и пользователю; overrun → сохранить состояние + причина + продолжение с новым бюджетом (D26), не вечный auto-retry; busy-события видимы и обработаны, не «timeout скрывает».
 
 ### S6. Конфиг/инструкции/роли/trust + hooks-seams
+**Статус 2026-11-18: partial.** Слои конфига, generated settings schema, `arag config get/set/list` и reload есть; hooks-seams и исполняемый hooks runtime не сделаны.
 - Файлы: config layering (D15: встроенные → user → project → запуск → сессия; LLM-инструкции отдельно от машинного конфига), instruction scopes D48 (общий/project/частный; nested-каталоги), role profiles D51 (Markdown+YAML), trust store D20 (project hooks/MCP/commands — только после явного trust; сохраняемое решение; revoke), policy recheck D29 (новые deny — перед каждым действием, включая субагентов; effective versions в store), hooks **lifecycle seams** (точки расширения pre/post tool, turn, delivery).
 - **Hooks staging:** S6 = только seams; **исполняемый hooks runtime (D57 целиком) — отдельный этап после выбора пользователем runtime/формата** (gate, §6). Seams ≠ «hooks done»: D57 не объявляется выполненным по одним seams.
 - Donor API: original discovery/settings/role loader semantics; fork Markdown/YAML profiles + config_cmd + schema metadata; `HookToolWrapper` — reference preexec/revalidation. Не переносить: basename-фильтр AGENTS.md, unconditional project hooks.
@@ -131,28 +140,34 @@
 - Gate: Cedar (G-auth) — optional engine; fallback hand-coded rules сохраняет ту же поверхность allow/deny + host-owned ask/trust/ceilings. Разделение полномочий: tool description hash / env-токены — не sandbox и не authority (D92: concerns разделены, env token не идентичность).
 
 ### S7. MCP (параллелимо после S2)
+**Статус 2026-11-18: partial.** Stdio на `rmcp 3.9.0` проверен; Streamable HTTP в рабочем дереве не завершён, в коммиты не входит и готовым не считается.
 - Файлы: `mcp/` adapter модуль поверх rmcp; registry naming (`mcp/naming.rs`); trust-check до stdio spawn.
 - Acceptance: spawn без trust — отказ до запуска; имена привязаны к server identity (collision не вызывает чужой сервер); бинарные resources с типами/MIME (не «всё в base64-text»); sampling/elicitation — через policy/budgets; cancel ≠ отмена remote effect (unknown outcome записывается); capability matrix выбранной версии задокументирована (D54 «полный» = выбранный matrix, не «всё сразу»).
 
 ### S8. Код-анализ + карта проекта (параллелимо)
+**Статус 2026-11-18: partial.** `read`/`glob`/`grep`/AST-инструменты и форматтер на границе хода есть; matrix язык×операция для semantic backends не собрана.
 - Файлы: read/search/index/ast-инструменты (вырезка из `tools/mod.rs`/`read.rs`/`ast_*`/glob/grep), path filters D66 (ignore/globset; `literal_separator(true)`), repo map D75 (из индекса, не весь индекс в контекст), formatter через writer coordinator D45, **semantic backends** (Oxc, библиотеки rust-analyzer, SCIP и др. — по доказанным API) с матрицей покрытия язык×операция.
 - Acceptance: чтение показывает symbols/blocks + дочитывание; stale index помечен; правки всегда version-checked; **rename/refactor/resolve реализуются по покрытию языка через semantic backends — требование сохраняется, не сужается до tags/syntax**; heuristic-пометка только там, где backend действительно отсутствует (D35/D91); форматтер — писатель через тот же coordinator.
 
 ### S9. Память + skills (параллелимо)
+**Статус 2026-11-18: partial.** Память, skills и CLI есть; extraction/consolidation pipeline целиком не реализован.
 - Файлы: memory tables (scope: общий/проектный; source: user-asserted vs agent-inferred), CRUD + просмотр/удаление (D53), skills catalog (D52: names+descriptions → lazy full text; ручной вызов; загрузка не исполняет), custom commands = skills (D58), **полный extraction/learning pipeline** (D14: фоновое извлечение опыта, consolidation, генерация переиспользуемых skills из опыта — автоматизация настраивается; Mem0 — reference алгоритмов, не обязательный runtime).
 - Acceptance: **pipeline целиком, не только CRUD**: extraction quality на примерах; provenance user vs inferred; consolidation/derived propagation; жизненный цикл сгенерированного skill (создание → проверка → использование → удаление/пересмотр); удаление memory не трогает историю; skill collision/traversal отклоняются; retrieval baseline — lexical (FTS5 gate G-fts; fallback exact/substring search; lexical baseline ≠ запрет vectors D89), vectors (lancedb embedded) — optional supplement; derived-индекс rebuildable и синхронизирован с deletion/retention.
 
 ### S10. TUI/CLI/headless + UI-поверхность
+**Статус 2026-11-18: partial.** Один runtime для TUI/CLI/headless/RPC/ACP; headless `-p`, resume, `/history` и configurator есть. Export/import и inspector не проверены.
 - Файлы: adapters к command/event контракту D37; TUI renderer (Ratatui-кандидат, gate G-tui; не port ANSI renderer original); CLI D62 (text/JSON/NDJSON stream; stderr служебное, stdout данные); worker viewer D63; display modes D25; configurator D69 (TUI + текстовый конфиг + read-only CLI view); session list/search D73 (FTS по истории — derived); context inspector D74 (оценка токенов ≠ usage); export/import D55 (версия формата; credentials не экспортируются).
 - Acceptance: один runtime loop во всех режимах; detach не останавливает runtime (D08); чистый NDJSON stdout; resize/Unicode/IME/long output на Termux smoke; секреты скрыты в inspector; один активный клиент (D56).
 
 ### S11. Изоляция/интеграция/merge/checkpoints
+**Статус 2026-11-18: partial.** StagedApply, checkpoints, auto-apply и конфликт-flow есть; параллельные пишущие workers и merge engine не доказаны.
 - Файлы: isolation snapshot (D28: база — внутренний snapshot фактических файлов, не HEAD/index), integration (base/current/result, проверка версии target, bounded recompute D11), ветвление диалога + restore D17/D64, конфликт-flow к parent (D28).
 - **Precondition:** iso-часть этого среза открывает параллельных пишущих workers (снятие ограничения S4).
 - Donor API: `OutputIdAllocator`-паттерн no-clobber для snapshot-объектов; движок — **gate G-jj / G-merge** (§5, D85: jj vs own store остаётся gate); imara-diff только для отображения diff.
 - Acceptance: параллельные пишущие workers с iso-workspaces и merge-интеграцией; dirty/non-Git snapshot integration; конфликт сохраняет варианты + владельца ожидания, без auto ours/theirs; ошибка механизма ≠ merge conflict; повторное применение только при свежей цели; не перезаписывает чужие внешние изменения молча.
 
 ### S12. Compaction/контекст, уведомления, диагностика, поставка
+**Статус 2026-11-18: partial.** Compaction, diagnostics SQLite, CI для Linux и aarch64-linux-android есть; notifications hooks и packaging-контракт не завершены.
 - Файлы: `compaction.rs` (донор-семантика как исходная реализация; D18: архив полный, compaction меняет projection; пороги настраиваемые, defaults — отложены; **revision/epoch маркировка проекции**, cache-prefix инвалидация по версии конфига/toolset — направление D90), notifications D65 (TUI индикатор/звук; hooks/notifier наружу), diagnostics D72 (redaction обязательна; **состав безопасного payload отчёта открыт** — не blanket-запрет истории/вывода, конкретный состав — отложенное решение), packaging D71 (один binary + рабочие каталоги; Termux/Bionic отдельный артефакт; CI: cross-Android toolchain matrix, bundled C — cc; **конкретные NDK/API floor — compatibility proof при реализации**, текущие значения CI донора — факт, не требование), budgets UI (D26), обновления — отложены пользователем.
 - Acceptance: compaction не удаляет архив и не теряет текущую задачу/незавершённое (D18); смена epoch видима и не выдаётся за бесплатный cache hit; отчёты/логи без credentials (redaction); init каталогов D71 создатся при установке; CI собирает Linux + aarch64-linux-android с выбранным совместимым toolchain.
 
