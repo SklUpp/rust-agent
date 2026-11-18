@@ -372,25 +372,28 @@ fn map_service_error(error: rmcp::ServiceError, mutating: bool) -> McpError {
 			}
 		},
 		// A send that failed may have reached the server, so a mutating call is
-		// unverified. The transport's own message is kept either way: it is what
-		// distinguishes an HTTP status from a torn-down stream.
+		// unverified. Messages stay category-only: rmcp's transport error embeds
+		// the request URL (and with it any credential in the path or query), so
+		// it must not reach a tool result or a log line.
 		rmcp::ServiceError::TransportSend(error) => match http_status(&error) {
 			// The server answered with an error status: a definite HTTP
 			// failure, not an unverifiable stream break. rmcp keeps the status
-			// and no body, so this carries no secret material.
-			Some(status) => McpError::Http { status, message: format!("RMCP transport: {error}") },
+			// and no body, so surfacing it carries no secret material.
+			Some(status) => McpError::Http { status, message: "RMCP transport failure".to_string() },
 			None if mutating => {
-				McpError::UnknownOutcome(format!("RMCP tools/call delivery is unverified: {error}"))
+				McpError::UnknownOutcome("RMCP tools/call delivery is unverified".to_string())
 			},
-			None => McpError::Transport(format!("RMCP transport failure: {error}")),
+			None => McpError::Transport("RMCP transport failure".to_string()),
 		},
 		rmcp::ServiceError::TransportClosed if mutating => {
 			McpError::UnknownOutcome("RMCP tools/call delivery is unverified: transport closed".into())
 		},
 		rmcp::ServiceError::TransportClosed => {
-			McpError::Transport("RMCP transport failure: transport closed".into())
+			McpError::Transport("RMCP transport failure".to_string())
 		},
-		other => McpError::Transport(format!("RMCP transport failure: {other}")),
+		// Neither the variant name nor the body preview is echoed: both can
+		// carry a response body, which is not ours to copy into a transcript.
+		_ => McpError::Transport("RMCP transport failure".to_string()),
 	}
 }
 
