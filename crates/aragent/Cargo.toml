@@ -22,6 +22,9 @@ path = "src/main.rs"
 # `src/yaml.rs` so the binary keeps a small, offline-buildable dependency set and
 # avoids the archived `serde_yaml`.
 async-trait.workspace = true
+# Same version the lock already resolves (via grep-searcher/regex), so exact
+# credential matching adds no new crate to the build.
+aho-corasick = "1.1.5"
 base64.workspace = true
 clap.workspace = true
 flate2 = "1.1"

@@ -15,6 +15,7 @@ use serde::{Deserialize, Serialize};
 
 use super::error::{AuthError, AuthErrorKind};
 use super::http::Cancel;
+use super::known_secrets;
 use super::store::{Credential, StoredCredential};
 use super::{registry, AuthBackend};
 
@@ -218,6 +219,9 @@ impl ExactSecurityOAuthResolver {
 			.lock()
 			.map_err(|_| AuthError::new(AuthErrorKind::Storage, "auth store lock poisoned"))?;
 		let access = resolve_security_oauth_access(&backend, &self.pinned, force_refresh, cancel)?;
+		// Security-scan transcripts are agent-visible text: mask the exact
+		// token wherever it is later echoed.
+		known_secrets::register(&access.access_token);
 		Ok(Some(access.access_token))
 	}
 

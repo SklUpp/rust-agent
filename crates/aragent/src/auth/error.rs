@@ -181,6 +181,10 @@ pub fn redact(text: &str) -> String {
 	const SECRET_FIELDS: &[&str] =
 		&["access_token", "refresh_token", "id_token", "token", "secret", "password", "code", "code_verifier", "key"];
 
+	// Exact known values first: a field-shaped scan cannot see a credential
+	// embedded in a message string.
+	let known = crate::auth::known_secrets::redact(text);
+	let text: &str = &known;
 	let mut out = String::with_capacity(text.len());
 	let mut cursor = 0;
 	while let Some(rel) = text[cursor..].find('"') {
@@ -344,8 +348,11 @@ fn redact_bearer_tokens(text: &str) -> String {
 /// Mask bearer tokens, known provider secret prefixes, JWTs, and secret URL
 /// query parameters in arbitrary assistant prose/code without corrupting
 /// ordinary JSON keys (`"code"`, `"key"`) or identifiers (`skip_serializing_if`).
+/// Credentials this process resolved are masked first, by exact value: shape
+/// heuristics cannot see an opaque token, and that layer has no off switch.
 pub(crate) fn redact_free_text(text: &str) -> String {
-	let after_queries = redact_url_queries(text);
+	let known = crate::auth::known_secrets::redact(text);
+	let after_queries = redact_url_queries(&known);
 	let after_jwt = redact_strict_jwts(&after_queries);
 	redact_boundary_tokens(&after_jwt)
 }
@@ -633,6 +640,25 @@ mod tests {
 		assert!(!redacted.contains("tok123"));
 		assert!(!redacted.contains("eyJhbGciOiJIUzI1NiJ9"));
 		assert_eq!(redact_free_text(&redacted), redacted);
+	}
+
+	#[test]
+	fn redact_free_text_masks_registered_credentials_exactly() {
+		// A credential with no recognisable shape: only exact-value matching
+		// finds it, and the registry has to cover the encoded carriers too.
+		let secret = "Kq7fWpz2LmRt9XvB4nC";
+		crate::auth::known_secrets::register(secret);
+		let text = format!("request body: key={secret} retry=1");
+		let redacted = redact_free_text(&text);
+		assert!(!redacted.contains(secret), "registered value must be masked: {redacted}");
+		assert!(redacted.contains("retry=1"), "surrounding text survives: {redacted}");
+		assert_eq!(redact_free_text(&redacted), redacted);
+
+		let encoded =
+			base64::Engine::encode(&base64::engine::general_purpose::STANDARD, secret.as_bytes());
+		let carrier = format!("blob {encoded} end");
+		let redacted = redact_free_text(&carrier);
+		assert!(!redacted.contains(&encoded), "base64 carrier must be masked: {redacted}");
 	}
 
 	#[test]

@@ -35,6 +35,7 @@ pub mod device;
 pub mod error;
 pub mod flows;
 pub mod http;
+pub mod known_secrets;
 pub mod pkce;
 pub mod registry;
 pub mod security;
@@ -326,20 +327,30 @@ impl AuthBackend {
 
 		if let Some(stored) = self.select(stored_as, selection::OAUTH, session_id, |_| true)? {
 			let credential = self.materialize(provider_id, stored, cancel).await?;
-			return api_key_from(provider_id, &credential).map(Some);
+			return api_key_from(provider_id, &credential).map(|key| remember_resolved(Some(key)));
 		}
 		if let Some(stored) = self.select(stored_as, selection::API_KEY, session_id, selection::is_api_key_login)? {
-			return Ok(stored.credential.api_key_value().map(ToString::to_string));
+			return Ok(remember_resolved(stored.credential.api_key_value().map(ToString::to_string)));
 		}
 		if let Some(env) = self.env_api_key(provider_id) {
-			return Ok(Some(env));
+			return Ok(remember_resolved(Some(env)));
 		}
 		if let Some(stored) =
 			self.select(stored_as, selection::API_KEY, session_id, |row| !selection::is_api_key_login(row))?
 		{
-			return Ok(stored.credential.api_key_value().map(ToString::to_string));
+			return Ok(remember_resolved(stored.credential.api_key_value().map(ToString::to_string)));
 		}
 		Ok(None)
+	}
+
+	/// Record a credential at the moment it is resolved, so every later
+	/// redaction pass — draft persistence, tool output, error text — masks its
+	/// exact value, including forms no shape heuristic recognises.
+	fn remember_resolved(&self, key: Option<String>) -> Option<String> {
+		if let Some(value) = &key {
+			known_secrets::register(value);
+		}
+		key
 	}
 
 	/// Selected OAuth grant, refreshed under the lease when expired.
