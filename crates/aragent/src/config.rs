@@ -43,10 +43,16 @@ pub struct ProviderConfig {
 impl ProviderConfig {
 	/// Resolve `apiKey`: the stored value is an environment variable name when
 	/// that variable exists, otherwise the literal key.
+	///
+	/// The resolved value is a real credential, so it is registered for exact
+	/// redaction here: this is the one path a config-file key takes, and it
+	/// never passes through the credential store.
 	#[must_use]
 	pub fn resolve_api_key(&self) -> Option<String> {
 		let value = self.api_key.as_deref()?;
-		Some(env::var(value).unwrap_or_else(|_| value.to_string()))
+		let resolved = env::var(value).unwrap_or_else(|_| value.to_string());
+		crate::auth::known_secrets::register(&resolved);
+		Some(resolved)
 	}
 
 	fn merge(&mut self, overlay: Self) {
@@ -3407,6 +3413,20 @@ mod tests {
 
 		let _ = fs::remove_dir_all(root);
 	}
+	#[test]
+	fn config_api_key_is_registered_for_exact_redaction() {
+		// A key written literally into config.yml never touches the credential
+		// store, so `resolve_api_key` is the only place it can be registered.
+		let provider = ProviderConfig {
+			api_key: Some("cfg-file-key-9f2c4d71ab".to_string()),
+			..ProviderConfig::default()
+		};
+		let resolved = provider.resolve_api_key().expect("literal key");
+		assert_eq!(resolved, "cfg-file-key-9f2c4d71ab");
+		let redacted = crate::auth::error::redact_free_text("key=cfg-file-key-9f2c4d71ab end");
+		assert_eq!(redacted, "key=[REDACTED] end");
+	}
+
 	#[test]
 	fn model_request_timeout_parses_and_merges() {
 		let config = parse_config(
