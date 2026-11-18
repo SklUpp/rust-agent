@@ -327,18 +327,18 @@ impl AuthBackend {
 
 		if let Some(stored) = self.select(stored_as, selection::OAUTH, session_id, |_| true)? {
 			let credential = self.materialize(provider_id, stored, cancel).await?;
-			return api_key_from(provider_id, &credential).map(|key| remember_resolved(Some(key)));
+			return api_key_from(provider_id, &credential).map(|key| self.remember_resolved(Some(key)));
 		}
 		if let Some(stored) = self.select(stored_as, selection::API_KEY, session_id, selection::is_api_key_login)? {
-			return Ok(remember_resolved(stored.credential.api_key_value().map(ToString::to_string)));
+			return Ok(self.remember_resolved(stored.credential.api_key_value().map(ToString::to_string)));
 		}
 		if let Some(env) = self.env_api_key(provider_id) {
-			return Ok(remember_resolved(Some(env)));
+			return Ok(self.remember_resolved(Some(env)));
 		}
 		if let Some(stored) =
 			self.select(stored_as, selection::API_KEY, session_id, |row| !selection::is_api_key_login(row))?
 		{
-			return Ok(remember_resolved(stored.credential.api_key_value().map(ToString::to_string)));
+			return Ok(self.remember_resolved(stored.credential.api_key_value().map(ToString::to_string)));
 		}
 		Ok(None)
 	}

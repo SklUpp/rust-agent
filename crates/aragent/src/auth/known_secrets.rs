@@ -59,11 +59,6 @@ impl KnownSecrets {
 		Some(Self { automaton })
 	}
 
-	#[must_use]
-	pub fn is_empty(&self) -> bool {
-		self.automaton.is_empty()
-	}
-
 	/// Mask every known value in `text`; borrowed when nothing matches.
 	#[must_use]
 	pub fn redact<'a>(&self, text: &'a str) -> Cow<'a, str> {
@@ -155,11 +150,10 @@ pub fn redact(text: &str) -> Cow<'_, str> {
 	if text.is_empty() {
 		return Cow::Borrowed(text);
 	}
-	let Some(secrets) = compiled() else { return Cow::Borrowed(text) };
-	if secrets.is_empty() {
-		return Cow::Borrowed(text);
+	match compiled() {
+		Some(secrets) => secrets.redact(text),
+		None => Cow::Borrowed(text),
 	}
-	secrets.redact(text)
 }
 
 #[cfg(test)]
