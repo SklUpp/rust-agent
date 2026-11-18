@@ -1866,7 +1866,7 @@ impl SessionStore {
 	/// terminal assistant message clears it atomically. Storage or schema
 	/// failures propagate: a silent `None` here would hide a damaged draft
 	/// table behind a missing fragment.
-	pub fn recovered_partial_text(&self) -> StoreResult<Option<String>> {
+	pub fn recovered_partial_text(&self) -> crate::session_store::StoreResult<Option<String>> {
 		self
 			.durable
 			.as_ref()
