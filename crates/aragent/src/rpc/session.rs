@@ -593,8 +593,10 @@ impl RpcSession {
 		session.reconcile_goal_mode();
 		// Same one-shot recovery as the CLI path: peek (don't consume) so a
 		// crash before the next terminal message keeps the fragment.
-		session.interrupted_fragment =
-			session.store.recovered_partial_text().map_err(Error::new)?;
+		session.interrupted_fragment = session
+			.store
+			.recovered_partial_text()
+			.map_err(|error| Error::with_source("cannot read recovered stream draft", error))?;
 		Ok(session)
 	}
 
@@ -1429,7 +1431,10 @@ impl RpcSession {
 		self.last_assistant_text = None;
 		// New log, new fragment: a fresh session has no interrupted stream.
 		// Peek (fail closed) so a stray draft can never leak across sessions.
-		self.interrupted_fragment = self.store.recovered_partial_text().map_err(Error::new)?;
+		self.interrupted_fragment = self
+			.store
+			.recovered_partial_text()
+			.map_err(|error| Error::with_source("cannot read recovered stream draft", error))?;
 		self.checkpoint_host = CheckpointHost::new();
 		self.checkpoint_host.rehydrate(&self.store);
 		self.reset_advisor_boundary();
@@ -1437,7 +1442,10 @@ impl RpcSession {
 		// Session or branch changed: re-read the fragment for the new
 		// scope (peek keeps it crash-safe) so a stale fragment can never
 		// leak across sessions or branches. Storage failures fail closed.
-		self.interrupted_fragment = self.store.recovered_partial_text().map_err(Error::new)?;
+		self.interrupted_fragment = self
+			.store
+			.recovered_partial_text()
+			.map_err(|error| Error::with_source("cannot read recovered stream draft", error))?;
 		let target = self.session_scope_identity();
 		self.runner
 			.reopen_session(target.0.as_deref(), target.1.as_deref());
@@ -1549,7 +1557,10 @@ impl RpcSession {
 		// Session or branch changed: re-read the fragment for the new
 		// scope (peek keeps it crash-safe) so a stale fragment can never
 		// leak across sessions or branches. Storage failures fail closed.
-		self.interrupted_fragment = self.store.recovered_partial_text().map_err(Error::new)?;
+		self.interrupted_fragment = self
+			.store
+			.recovered_partial_text()
+			.map_err(|error| Error::with_source("cannot read recovered stream draft", error))?;
 		let target = self.session_scope_identity();
 		self.runner
 			.reopen_session(target.0.as_deref(), target.1.as_deref());
@@ -2513,7 +2524,10 @@ pub fn finish_turn(&mut self, prepared: &mut PreparedTurn, outcome: &TurnOutcome
 			// Completed persist cleared the store draft; an aborted stream may
 			// have left a fresh one. Storage failures propagate: hiding them
 			// would desync the banner from the store.
-			self.interrupted_fragment = self.store.recovered_partial_text().map_err(Error::new)?;
+			self.interrupted_fragment = self
+				.store
+				.recovered_partial_text()
+				.map_err(|error| Error::with_source("cannot read recovered stream draft", error))?;
 			self.refresh_history_from_store();
 		} else if rewound {
 			// Same as headless: the rewind turn is abandoned, so its record must
