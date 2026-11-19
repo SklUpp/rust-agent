@@ -2509,7 +2509,9 @@ pub fn validate_runtime_replay(messages: &[pi_agent::Message]) -> StoreResult<()
 				}
 			},
 			pi_agent::Role::User if !pending.is_empty() => {
-				return Err(StoreError::Corrupt("user message interrupts unresolved tool calls".into()));
+				return Err(StoreError::Corrupt(
+					"user message interrupts unresolved tool calls".into(),
+				));
 			},
 			_ => {},
 		}
@@ -2685,6 +2687,19 @@ pub fn database_path(session_dir: &Path) -> PathBuf {
 #[cfg(test)]
 mod tests {
 	use super::*;
+
+	#[test]
+	fn revision_digest_is_computed_over_the_masked_form() {
+		// Persistence masks the payload; the revision identity must therefore
+		// hash the masked text, or a branch cut followed by a resume-seed
+		// comparison rejects a valid history.
+		let secret = "digest-mask-secret-71ab2c";
+		crate::auth::known_secrets::register(secret);
+		let raw = SessionMessage::user(MessageContent::Text(format!("tool echoed {secret} here")), 7);
+		let masked =
+			SessionMessage::user(MessageContent::Text("tool echoed [REDACTED] here".to_string()), 7);
+		assert_eq!(session_digest(&raw), session_digest(&masked));
+	}
 
 	fn header(id: &str, parent: Option<&str>) -> SessionHeader {
 		SessionHeader {
