@@ -12,9 +12,14 @@
 //! rest of the longer secret in the output, so the residue leaks.
 //!
 //! Invariant: a value passed to [`register`] is masked for the rest of the
-//! process lifetime, in every later `redact_free_text` call, including text
-//! written to the session store and to diagnostics. There is no switch that
-//! turns this layer off.
+//! process lifetime in every later `redact_free_text` call. There is no switch
+//! that turns this layer off.
+//!
+//! Coverage is the text that goes through `redact_free_text`: stream drafts,
+//! message payloads at write time (and the durable revision digest), error
+//! text and memory lessons. Live streaming frames, the in-process message
+//! vector of the current turn, `executions`/`deliveries` payloads and rows
+//! written before a value was registered are outside it.
 //!
 //! Cost: one linear scan per redacted string, skipped entirely (borrowed
 //! output, no allocation) when no automaton is registered or nothing matches.
