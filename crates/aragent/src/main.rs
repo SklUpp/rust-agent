@@ -1049,8 +1049,11 @@ fn run() -> std::result::Result<(), CliError> {
 		session.api_key = session.config.resolve_api_key(&provider);
 		session.provider = Some(provider);
 	}
-	if requested_api_key.is_some() {
-		session.api_key = requested_api_key;
+	if let Some(key) = requested_api_key {
+		// A CLI-supplied key is a real credential and never passes through the
+		// credential store, so register it here for exact redaction.
+		crate::auth::known_secrets::register(&key);
+		session.api_key = Some(key);
 	}
 	session.refresh_root_endpoint();
 
