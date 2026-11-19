@@ -45,7 +45,7 @@ use serde_json::{Value, json};
 
 use crate::durable_session::StoredProjection;
 /// Current schema version. Bump only with a new branch in [`SqliteStore::initialize`].
-pub const SCHEMA_VERSION: i64 = 4;
+pub const SCHEMA_VERSION: i64 = 5;
 const SCHEMA_VERSION_DDL: &str = "
 	CREATE TABLE IF NOT EXISTS schema_version (
 		id INTEGER PRIMARY KEY CHECK (id = 1),
@@ -161,6 +161,27 @@ const SCHEMA_V4_MIGRATION_DDL: &str = "
 		updated_at_ms INTEGER NOT NULL
 	);
 	CREATE INDEX IF NOT EXISTS stream_drafts_session_idx ON stream_drafts(session_id);
+";
+
+/// Admission rows for child tasks. The row is written before the process/task
+/// side effect, so a crash can never leave work that has no durable record.
+/// `state` is the last known phase: `admitted` means the task may not have
+/// started, `started` means the side effect was requested, and the terminal
+/// states are written when the task finishes.
+const SCHEMA_V5_MIGRATION_DDL: &str = "
+	CREATE TABLE IF NOT EXISTS task_admissions (
+		task_id TEXT PRIMARY KEY,
+		parent_session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+		parent_branch_id TEXT NOT NULL REFERENCES branches(id) ON DELETE CASCADE,
+		worker_id TEXT NOT NULL,
+		producer_generation INTEGER NOT NULL CHECK (producer_generation >= 0),
+		state TEXT NOT NULL CHECK (state IN ('admitted', 'started', 'completed', 'failed', 'abandoned')),
+		spec_json TEXT NOT NULL,
+		created_at_ms INTEGER NOT NULL,
+		updated_at_ms INTEGER NOT NULL
+	);
+	CREATE UNIQUE INDEX IF NOT EXISTS task_admissions_worker_idx ON task_admissions(worker_id);
+	CREATE INDEX IF NOT EXISTS task_admissions_open_idx ON task_admissions(parent_session_id, state);
 ";
 
 /// Immutable fork-only classification of a copied tool-result message. Not an
@@ -1163,6 +1184,33 @@ pub struct ArtifactRecord {
 	pub created_at_ms: i64,
 }
 
+/// A child task reservation. Written before any spawn/first-call side effect so
+/// a crash cannot leave work with no durable record.
+#[derive(Debug, Clone, PartialEq)]
+pub struct NewTaskAdmission {
+	pub task_id: String,
+	pub parent_session_id: String,
+	pub parent_branch_id: String,
+	pub worker_id: String,
+	/// Monotonic producer generation captured at admission; survives restarts.
+	pub producer_generation: u64,
+	pub spec: Value,
+}
+
+/// A stored task admission row.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TaskAdmission {
+	pub task_id: String,
+	pub parent_session_id: String,
+	pub parent_branch_id: String,
+	pub worker_id: String,
+	pub producer_generation: u64,
+	pub state: String,
+	pub spec: Value,
+	pub created_at_ms: i64,
+	pub updated_at_ms: i64,
+}
+
 /// Synchronous SQLite session store. The runtime owns one instance on its
 /// writer thread; `Connection` is `Send` but not `Sync`.
 pub struct SqliteStore {
@@ -1395,6 +1443,7 @@ impl SqliteStore {
 				transaction.execute_batch(SCHEMA_V1_DDL)?;
 				transaction.execute_batch(SCHEMA_V3_MIGRATION_DDL)?;
 				transaction.execute_batch(SCHEMA_V4_MIGRATION_DDL)?;
+				transaction.execute_batch(SCHEMA_V5_MIGRATION_DDL)?;
 				transaction.execute(
 					"INSERT INTO schema_version (id, version) VALUES (1, ?1)",
 					params![SCHEMA_VERSION],
@@ -1404,6 +1453,7 @@ impl SqliteStore {
 				transaction.execute_batch(SCHEMA_V2_MIGRATION_DDL)?;
 				transaction.execute_batch(SCHEMA_V3_MIGRATION_DDL)?;
 				transaction.execute_batch(SCHEMA_V4_MIGRATION_DDL)?;
+				transaction.execute_batch(SCHEMA_V5_MIGRATION_DDL)?;
 				transaction.execute(
 					"UPDATE schema_version SET version = ?1 WHERE id = 1",
 					params![SCHEMA_VERSION],
@@ -1412,6 +1462,7 @@ impl SqliteStore {
 			Some(2) => {
 				transaction.execute_batch(SCHEMA_V3_MIGRATION_DDL)?;
 				transaction.execute_batch(SCHEMA_V4_MIGRATION_DDL)?;
+				transaction.execute_batch(SCHEMA_V5_MIGRATION_DDL)?;
 				transaction.execute(
 					"UPDATE schema_version SET version = ?1 WHERE id = 1",
 					params![SCHEMA_VERSION],
@@ -1419,6 +1470,14 @@ impl SqliteStore {
 			},
 			Some(3) => {
 				transaction.execute_batch(SCHEMA_V4_MIGRATION_DDL)?;
+				transaction.execute_batch(SCHEMA_V5_MIGRATION_DDL)?;
+				transaction.execute(
+					"UPDATE schema_version SET version = ?1 WHERE id = 1",
+					params![SCHEMA_VERSION],
+				)?;
+			},
+			Some(4) => {
+				transaction.execute_batch(SCHEMA_V5_MIGRATION_DDL)?;
 				transaction.execute(
 					"UPDATE schema_version SET version = ?1 WHERE id = 1",
 					params![SCHEMA_VERSION],
@@ -2943,6 +3002,187 @@ impl SqliteStore {
 		)?;
 		transaction.commit()?;
 		Ok(())
+	}
+
+	/// Reserve a child task before its side effect. A caller must not spawn,
+	/// start, or call a model before this returns `Ok`; a crash between this
+	/// write and the effect leaves an `admitted` row, never unreported work.
+	pub fn admit_task(&mut self, admission: NewTaskAdmission) -> StoreResult<()> {
+		validate_id("task id", &admission.task_id)?;
+		validate_id("parent session id", &admission.parent_session_id)?;
+		validate_id("parent branch id", &admission.parent_branch_id)?;
+		validate_id("worker id", &admission.worker_id)?;
+		let generation = i64::try_from(admission.producer_generation)
+			.map_err(|_| StoreError::Validation("producer generation exceeds i64::MAX".to_string()))?;
+		let mut spec = admission.spec;
+		crate::auth::error::redact_json_strings(&mut spec);
+		let spec_json = encode_json(&spec)?;
+		let now = now_ms();
+		self.connection.execute(
+			"INSERT INTO task_admissions \
+			 (task_id, parent_session_id, parent_branch_id, worker_id, producer_generation, \
+			  state, spec_json, created_at_ms, updated_at_ms) \
+			 VALUES (?1, ?2, ?3, ?4, ?5, 'admitted', ?6, ?7, ?7)",
+			params![
+				admission.task_id,
+				admission.parent_session_id,
+				admission.parent_branch_id,
+				admission.worker_id,
+				generation,
+				spec_json,
+				now
+			],
+		)?;
+		Ok(())
+	}
+
+	/// Record that the admitted task's side effect was requested.
+	pub fn mark_task_admission_started(&mut self, task_id: &str) -> StoreResult<()> {
+		validate_id("task id", task_id)?;
+		let changed = self.connection.execute(
+			"UPDATE task_admissions SET state = 'started', updated_at_ms = ?2 \
+			 WHERE task_id = ?1 AND state = 'admitted'",
+			params![task_id, now_ms()],
+		)?;
+		if changed == 1 {
+			return Ok(());
+		}
+		match self.task_admission(task_id)? {
+			Some(row) => {
+				Err(StoreError::Conflict(format!("task admission is already in state '{}'", row.state)))
+			},
+			None => Err(StoreError::NotFound(format!("unknown task admission '{task_id}'"))),
+		}
+	}
+
+	/// Write a terminal state. `completed`, `failed`, and `abandoned` are the
+	/// only accepted values; an already terminal row is a conflict, not a
+	/// silent overwrite.
+	pub fn finish_task_admission(&mut self, task_id: &str, state: &str) -> StoreResult<()> {
+		validate_id("task id", task_id)?;
+		if !matches!(state, "completed" | "failed" | "abandoned") {
+			return Err(StoreError::Validation(format!(
+				"task admission terminal state must be completed, failed, or abandoned, got '{state}'"
+			)));
+		}
+		let changed = self.connection.execute(
+			"UPDATE task_admissions SET state = ?2, updated_at_ms = ?3 \
+			 WHERE task_id = ?1 AND state IN ('admitted', 'started')",
+			params![task_id, state, now_ms()],
+		)?;
+		if changed == 1 {
+			return Ok(());
+		}
+		match self.task_admission(task_id)? {
+			Some(row) => Err(StoreError::Conflict(format!(
+				"task admission is already terminal in state '{}'",
+				row.state
+			))),
+			None => Err(StoreError::NotFound(format!("unknown task admission '{task_id}'"))),
+		}
+	}
+
+	/// One admission row by task id.
+	pub fn task_admission(&self, task_id: &str) -> StoreResult<Option<TaskAdmission>> {
+		let row: Option<(String, String, String, String, i64, String, String, i64, i64)> = self
+			.connection
+			.query_row(
+				"SELECT task_id, parent_session_id, parent_branch_id, worker_id, \
+				 producer_generation, state, spec_json, created_at_ms, updated_at_ms \
+				 FROM task_admissions WHERE task_id = ?1",
+				params![task_id],
+				|row| {
+					Ok((
+						row.get(0)?,
+						row.get(1)?,
+						row.get(2)?,
+						row.get(3)?,
+						row.get(4)?,
+						row.get(5)?,
+						row.get(6)?,
+						row.get(7)?,
+						row.get(8)?,
+					))
+				},
+			)
+			.optional()?;
+		row.map(
+			|(
+				task_id,
+				parent_session_id,
+				parent_branch_id,
+				worker_id,
+				producer_generation,
+				state,
+				spec_json,
+				created_at_ms,
+				updated_at_ms,
+			)| {
+				Ok(TaskAdmission {
+					task_id,
+					parent_session_id,
+					parent_branch_id,
+					worker_id,
+					producer_generation: u64::try_from(producer_generation).unwrap_or(0),
+					state,
+					spec: decode_json(&spec_json)?,
+					created_at_ms,
+					updated_at_ms,
+				})
+			},
+		)
+		.transpose()
+	}
+
+	/// Admissions that were never closed, oldest first. A crash leaves these
+	/// rows behind; recovery decides whether to resume or mark them abandoned.
+	pub fn open_task_admissions(&self, session_id: &str) -> StoreResult<Vec<TaskAdmission>> {
+		let mut statement = self.connection.prepare(
+			"SELECT task_id, parent_session_id, parent_branch_id, worker_id, \
+			 producer_generation, state, spec_json, created_at_ms, updated_at_ms \
+			 FROM task_admissions \
+			 WHERE parent_session_id = ?1 AND state IN ('admitted', 'started') \
+			 ORDER BY created_at_ms, task_id",
+		)?;
+		let rows = statement.query_map(params![session_id], |row| {
+			Ok((
+				row.get::<_, String>(0)?,
+				row.get::<_, String>(1)?,
+				row.get::<_, String>(2)?,
+				row.get::<_, String>(3)?,
+				row.get::<_, i64>(4)?,
+				row.get::<_, String>(5)?,
+				row.get::<_, String>(6)?,
+				row.get::<_, i64>(7)?,
+				row.get::<_, i64>(8)?,
+			))
+		})?;
+		let mut admissions = Vec::new();
+		for row in rows {
+			let (
+				task_id,
+				parent_session_id,
+				parent_branch_id,
+				worker_id,
+				producer_generation,
+				state,
+				spec_json,
+				created_at_ms,
+				updated_at_ms,
+			) = row?;
+			admissions.push(TaskAdmission {
+				task_id,
+				parent_session_id,
+				parent_branch_id,
+				worker_id,
+				producer_generation: u64::try_from(producer_generation).unwrap_or(0),
+				state,
+				spec: decode_json(&spec_json)?,
+				created_at_ms,
+				updated_at_ms,
+			});
+		}
+		Ok(admissions)
 	}
 
 	/// Insert a pending delivery that has no worker completion (peer mail).
@@ -10505,6 +10745,93 @@ mod tests {
 			header.payload
 		);
 		assert!(header.payload.to_string().contains("[REDACTED]"));
+		let _ = std::fs::remove_dir_all(dir);
+	}
+
+	#[test]
+	fn task_admission_is_durable_redacted_and_single_flight() {
+		let secret = "admission-secret-3c9e";
+		crate::auth::known_secrets::register(secret);
+		let (dir, path) = temp_db("task-admission");
+		let mut store = SqliteStore::open(&path).expect("open store");
+		store
+			.create_session(NewSession {
+				id: "s_adm".to_string(),
+				parent_session_id: None,
+				payload: json!({}),
+				initial_branch_id: "b1".to_string(),
+				initial_branch_payload: json!({}),
+			})
+			.expect("create session");
+		let admission = NewTaskAdmission {
+			task_id: "t_one".to_string(),
+			parent_session_id: "s_adm".to_string(),
+			parent_branch_id: "b1".to_string(),
+			worker_id: "w_adm".to_string(),
+			producer_generation: 7,
+			spec: json!({ "prompt": format!("use {secret}") }),
+		};
+		store.admit_task(admission.clone()).expect("admit");
+		let stored = store
+			.task_admission("t_one")
+			.expect("read")
+			.expect("present");
+		assert_eq!(stored.state, "admitted");
+		assert_eq!(stored.producer_generation, 7);
+		assert!(!stored.spec.to_string().contains(secret), "admission spec masked: {}", stored.spec);
+		assert_eq!(
+			store
+				.open_task_admissions("s_adm")
+				.expect("open list")
+				.len(),
+			1
+		);
+
+		// The same task id and the same worker id are single-flight.
+		assert!(store.admit_task(admission).is_err());
+		let duplicate_worker = NewTaskAdmission {
+			task_id: "t_other".to_string(),
+			parent_session_id: "s_adm".to_string(),
+			parent_branch_id: "b1".to_string(),
+			worker_id: "w_adm".to_string(),
+			producer_generation: 8,
+			spec: json!({}),
+		};
+		assert!(store.admit_task(duplicate_worker).is_err());
+
+		store
+			.mark_task_admission_started("t_one")
+			.expect("mark started");
+		assert!(store.mark_task_admission_started("t_one").is_err());
+		assert_eq!(
+			store
+				.task_admission("t_one")
+				.expect("read")
+				.expect("present")
+				.state,
+			"started"
+		);
+		store
+			.finish_task_admission("t_one", "completed")
+			.expect("finish");
+		assert!(
+			store
+				.open_task_admissions("s_adm")
+				.expect("open list")
+				.is_empty()
+		);
+		assert!(store.finish_task_admission("t_one", "failed").is_err());
+		assert!(store.finish_task_admission("t_one", "bogus").is_err());
+
+		// Durable across reopen: the admission is not in-memory state.
+		drop(store);
+		let store = SqliteStore::open(&path).expect("reopen");
+		let stored = store
+			.task_admission("t_one")
+			.expect("read")
+			.expect("present");
+		assert_eq!(stored.state, "completed");
+		assert_eq!(stored.producer_generation, 7);
 		let _ = std::fs::remove_dir_all(dir);
 	}
 
