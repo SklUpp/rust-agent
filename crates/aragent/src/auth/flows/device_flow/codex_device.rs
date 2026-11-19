@@ -12,8 +12,8 @@ use serde_json::json;
 use super::super::super::error::{AuthError, AuthErrorKind};
 use super::super::super::http::HttpRequest;
 use super::super::super::store::Credential;
-use super::super::oauth_code::codex;
 use super::super::Flow;
+use super::super::oauth_code::codex;
 use super::{number_field, publish, sleep, string_field};
 
 const DEVICE_MAX_POLLS: u32 = 120;
@@ -35,26 +35,38 @@ pub async fn login(flow: &Flow<'_>) -> Result<Credential, AuthError> {
 		)
 		.await?;
 	if !init.is_success() {
-		return Err(init.error_for(AuthErrorKind::DeviceAuth, provider, "Device authorization initiation"));
+		return Err(init.error_for(
+			AuthErrorKind::DeviceAuth,
+			provider,
+			"Device authorization initiation",
+		));
 	}
 	let payload = init.json(provider)?;
 	let device_auth_id = string_field(&payload, "device_auth_id").unwrap_or_default();
 	let user_code = string_field(&payload, "user_code").unwrap_or_default();
 	if device_auth_id.is_empty() || user_code.is_empty() {
-		return Err(AuthError::new(
-			AuthErrorKind::Validation,
-			"Device authorization response missing required fields",
-		)
-		.for_provider(provider));
+		return Err(
+			AuthError::new(
+				AuthErrorKind::Validation,
+				"Device authorization response missing required fields",
+			)
+			.for_provider(provider),
+		);
 	}
-	let interval_seconds = number_field(&payload, "interval").unwrap_or(DEFAULT_INTERVAL_SECONDS).max(1.0);
+	let interval_seconds = number_field(&payload, "interval")
+		.unwrap_or(DEFAULT_INTERVAL_SECONDS)
+		.max(1.0);
 	let interval_ms = (interval_seconds * 1000.0) as u64 + DEVICE_POLL_SAFETY_MARGIN_MS;
 
 	publish(flow, codex::DEVICE_AUTH_URL, &user_code);
 	flow.notice(format!("Waiting for browser authorization (code: {user_code})..."));
 
 	for poll in 0..DEVICE_MAX_POLLS {
-		let wait = if poll == 0 { interval_ms.min(DEVICE_POLL_INTERVAL_MS) } else { interval_ms };
+		let wait = if poll == 0 {
+			interval_ms.min(DEVICE_POLL_INTERVAL_MS)
+		} else {
+			interval_ms
+		};
 		sleep(flow, Duration::from_millis(wait)).await?;
 
 		let body = json!({ "device_auth_id": device_auth_id, "user_code": user_code });
@@ -76,11 +88,13 @@ pub async fn login(flow: &Flow<'_>) -> Result<Credential, AuthError> {
 		let authorization_code = string_field(&payload, "authorization_code").unwrap_or_default();
 		let code_verifier = string_field(&payload, "code_verifier").unwrap_or_default();
 		if authorization_code.is_empty() || code_verifier.is_empty() {
-			return Err(AuthError::new(
-				AuthErrorKind::Validation,
-				"Device token response missing authorization_code or code_verifier",
-			)
-			.for_provider(provider));
+			return Err(
+				AuthError::new(
+					AuthErrorKind::Validation,
+					"Device token response missing authorization_code or code_verifier",
+				)
+				.for_provider(provider),
+			);
 		}
 		flow.notice("Exchanging authorization code for tokens...");
 		// The stored provider is `openai-codex` (`storeCredentialsAs`); the
@@ -95,11 +109,13 @@ pub async fn login(flow: &Flow<'_>) -> Result<Credential, AuthError> {
 		.await;
 	}
 
-	Err(AuthError::new(
-		AuthErrorKind::Timeout,
-		"Device authorization timed out — user did not complete login in time",
+	Err(
+		AuthError::new(
+			AuthErrorKind::Timeout,
+			"Device authorization timed out — user did not complete login in time",
+		)
+		.for_provider(provider),
 	)
-	.for_provider(provider))
 }
 
 #[cfg(test)]

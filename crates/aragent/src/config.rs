@@ -13,9 +13,7 @@ use pi_agent::mcp::{
 	MCPHttpServerConfig, MCPServerConfig, MCPSseServerConfig, MCPStdioServerConfig, RequestIdFormat,
 	validate_server_config,
 };
-use pi_agent::tools::task_isolation::{
-	IsolationCommitStyle, IsolationMergeMode, IsolationMode,
-};
+use pi_agent::tools::task_isolation::{IsolationCommitStyle, IsolationMergeMode, IsolationMode};
 use pi_agent::tools::web_search::SearxngConfig;
 
 use crate::{
@@ -34,25 +32,46 @@ pub struct ProviderConfig {
 	pub base_url: Option<String>,
 	/// Env var name when it names one, otherwise a literal key. Resolution
 	/// happens in [`Config::resolve_api_key`].
-	pub api_key:  Option<String>,
-	pub api:      Option<String>,
-	pub auth:     Option<String>,
-	pub headers:  BTreeMap<String, String>,
+	pub api_key: Option<String>,
+	pub api: Option<String>,
+	pub auth: Option<String>,
+	pub headers: BTreeMap<String, String>,
+}
+
+/// `OPENAI_API_KEY`-shaped: the value names an environment variable rather than
+/// carrying a credential, so it must not become a redaction pattern itself.
+fn is_env_var_name(value: &str) -> bool {
+	value.len() <= 64
+		&& value
+			.bytes()
+			.all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit() || byte == b'_')
 }
 
 impl ProviderConfig {
 	/// Resolve `apiKey`: the stored value is an environment variable name when
 	/// that variable exists, otherwise the literal key.
 	///
-	/// The resolved value is a real credential, so it is registered for exact
+	/// The resolved value is a real credential and is registered for exact
 	/// redaction here: this is the one path a config-file key takes, and it
-	/// never passes through the credential store.
+	/// never passes through the credential store. An unresolved but env-shaped
+	/// value (`OPENAI_API_KEY` with the variable unset) is registered only when
+	/// it is not a plausible variable name — otherwise the name itself, which
+	/// appears in ordinary prose, would be masked for the process lifetime.
 	#[must_use]
 	pub fn resolve_api_key(&self) -> Option<String> {
 		let value = self.api_key.as_deref()?;
-		let resolved = env::var(value).unwrap_or_else(|_| value.to_string());
-		crate::auth::known_secrets::register(&resolved);
-		Some(resolved)
+		match env::var(value) {
+			Ok(resolved) => {
+				crate::auth::known_secrets::register(&resolved);
+				Some(resolved)
+			},
+			Err(_) => {
+				if !is_env_var_name(value) {
+					crate::auth::known_secrets::register(value);
+				}
+				Some(value.to_string())
+			},
+		}
 	}
 
 	fn merge(&mut self, overlay: Self) {
@@ -144,11 +163,11 @@ pub struct EditConfig {
 	pub enforce_seen_lines: Option<bool>,
 	/// `edit.mode` after the `atom`/`vim` → `hashline` migration; absent means
 	/// [`Self::mode`]'s `hashline` default.
-	pub mode:               Option<EditMode>,
+	pub mode: Option<EditMode>,
 	/// `edit.modelVariants`, raw and in file insertion order; typed variants
 	/// are derived in [`Self::variant_for_model`]. Merging is case-sensitive
 	/// like the upstream deep merge; only matching folds case.
-	pub model_variants:     ModelVariants,
+	pub model_variants: ModelVariants,
 }
 
 impl pi_agent::tools::edit_variants::EditModeSettings for Config {
@@ -191,7 +210,9 @@ impl EditConfig {
 
 	#[must_use]
 	pub fn enforce_seen_lines(&self) -> bool {
-		self.enforce_seen_lines.unwrap_or(Self::DEFAULT_ENFORCE_SEEN_LINES)
+		self
+			.enforce_seen_lines
+			.unwrap_or(Self::DEFAULT_ENFORCE_SEEN_LINES)
 	}
 
 	/// Configured `edit.mode`, or the `hashline` default.
@@ -322,7 +343,7 @@ pub struct LspConfig {
 	pub enabled: Option<bool>,
 	/// `lsp.shared`; absent means [`Self::DEFAULT_SHARED`] (one language
 	/// server per project through the daemon broker).
-	pub shared:  Option<bool>,
+	pub shared: Option<bool>,
 }
 
 impl LspConfig {
@@ -470,7 +491,7 @@ impl PrewalkConfig {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct GoalConfig {
 	/// `goal.enabled`; absent means [`Self::DEFAULT_ENABLED`].
-	pub enabled:            Option<bool>,
+	pub enabled: Option<bool>,
 	/// `goal.continuationModes`; absent means
 	/// [`Self::DEFAULT_CONTINUATION_MODES`] (`["interactive"]`, i.e. no headless
 	/// loop until the user opts in).
@@ -516,18 +537,18 @@ impl GoalConfig {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct EvalConfig {
 	/// `eval.py`; absent keeps the eval default (`true`).
-	pub python:             Option<bool>,
+	pub python: Option<bool>,
 	/// `eval.js`; absent keeps the eval default (`true`).
-	pub js:                 Option<bool>,
+	pub js: Option<bool>,
 	/// `eval.rb`; absent keeps the eval default (`false`).
-	pub ruby:               Option<bool>,
+	pub ruby: Option<bool>,
 	/// `eval.jl`; absent keeps the eval default (`false`).
-	pub julia:              Option<bool>,
+	pub julia: Option<bool>,
 	/// `python.kernelMode` (`session` or `per-call`).
 	pub python_kernel_mode: Option<pi_agent::eval::KernelMode>,
 	pub python_interpreter: Option<String>,
-	pub ruby_interpreter:   Option<String>,
-	pub julia_interpreter:  Option<String>,
+	pub ruby_interpreter: Option<String>,
+	pub julia_interpreter: Option<String>,
 	/// `eval.autoBackground.enabled`; absent keeps the upstream default
 	/// (`false`), so long cells stay foreground unless configured.
 	pub auto_background_enabled: Option<bool>,
@@ -573,9 +594,9 @@ impl EvalConfig {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct AutolearnConfig {
 	/// `autolearn.enabled`; absent means off.
-	pub enabled:        Option<bool>,
+	pub enabled: Option<bool>,
 	/// `autolearn.autoContinue`; absent means passive guidance only.
-	pub auto_continue:  Option<bool>,
+	pub auto_continue: Option<bool>,
 	/// `autolearn.minToolCalls`; absent means [`DEFAULT_MIN_TOOL_CALLS`].
 	pub min_tool_calls: Option<usize>,
 }
@@ -615,18 +636,18 @@ impl AutolearnConfig {
 /// `skills.*`: discovery toggles, custom roots and name filters.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SkillsConfig {
-	pub enabled:                 Option<bool>,
-	pub enable_skill_commands:   Option<bool>,
-	pub enable_codex_user:       Option<bool>,
-	pub enable_claude_user:      Option<bool>,
-	pub enable_claude_project:   Option<bool>,
-	pub enable_pi_user:          Option<bool>,
-	pub enable_pi_project:       Option<bool>,
-	pub enable_agents_user:      Option<bool>,
-	pub enable_agents_project:   Option<bool>,
-	pub custom_directories:      Option<Vec<PathBuf>>,
-	pub ignored_skills:          Option<Vec<String>>,
-	pub include_skills:          Option<Vec<String>>,
+	pub enabled: Option<bool>,
+	pub enable_skill_commands: Option<bool>,
+	pub enable_codex_user: Option<bool>,
+	pub enable_claude_user: Option<bool>,
+	pub enable_claude_project: Option<bool>,
+	pub enable_pi_user: Option<bool>,
+	pub enable_pi_project: Option<bool>,
+	pub enable_agents_user: Option<bool>,
+	pub enable_agents_project: Option<bool>,
+	pub custom_directories: Option<Vec<PathBuf>>,
+	pub ignored_skills: Option<Vec<String>>,
+	pub include_skills: Option<Vec<String>>,
 }
 
 impl SkillsConfig {
@@ -730,7 +751,6 @@ impl SkillsConfig {
 	}
 }
 
-
 /// `advisor.*`, `tier.advisor`, and `task.agentAdvisor`.
 ///
 /// The advisor is a second model that passively reviews each primary turn.
@@ -741,12 +761,12 @@ impl SkillsConfig {
 /// "never kill the session" behavior in the Rust reader.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct AdvisorSettings {
-	pub enabled:      Option<bool>,
+	pub enabled: Option<bool>,
 	/// `off` | `1` | `3` | `5`.
 	pub sync_backlog: Option<String>,
 	pub immune_turns: Option<i64>,
 	/// `none` | `inherit` | a concrete service tier.
-	pub tier:         Option<String>,
+	pub tier: Option<String>,
 	/// `task.agentAdvisor`: agent name -> `on` | `off` | model pattern.
 	pub agent_advisor: BTreeMap<String, String>,
 }
@@ -804,8 +824,8 @@ impl AdvisorSettings {
 /// each advisor's own loop.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ToolCallLoopGuardConfig {
-	pub enabled:      Option<bool>,
-	pub threshold:    Option<usize>,
+	pub enabled: Option<bool>,
+	pub threshold: Option<usize>,
 	pub exempt_tools: Option<Vec<String>>,
 }
 
@@ -829,9 +849,15 @@ impl ToolCallLoopGuardConfig {
 	}
 
 	fn merge(&mut self, overlay: Self) {
-		if overlay.enabled.is_some() { self.enabled = overlay.enabled; }
-		if overlay.threshold.is_some() { self.threshold = overlay.threshold; }
-		if overlay.exempt_tools.is_some() { self.exempt_tools = overlay.exempt_tools; }
+		if overlay.enabled.is_some() {
+			self.enabled = overlay.enabled;
+		}
+		if overlay.threshold.is_some() {
+			self.threshold = overlay.threshold;
+		}
+		if overlay.exempt_tools.is_some() {
+			self.exempt_tools = overlay.exempt_tools;
+		}
 	}
 }
 
@@ -844,7 +870,7 @@ impl ToolCallLoopGuardConfig {
 /// retried.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ModelRequestTimeoutConfig {
-	pub timeout_ms:  Option<u64>,
+	pub timeout_ms: Option<u64>,
 	pub max_retries: Option<u32>,
 }
 
@@ -869,21 +895,27 @@ impl ModelRequestTimeoutConfig {
 	/// Bounded reissues after a timeout only; absent means the default of two.
 	#[must_use]
 	pub fn max_retries(&self) -> u32 {
-		self.max_retries.unwrap_or(DEFAULT_MODEL_REQUEST_MAX_RETRIES)
+		self
+			.max_retries
+			.unwrap_or(DEFAULT_MODEL_REQUEST_MAX_RETRIES)
 	}
 
 	/// Effective `pi-agent` request-timeout configuration.
 	#[must_use]
 	pub fn effective(&self) -> pi_agent::provider::timeout::RequestTimeoutConfig {
 		pi_agent::provider::timeout::RequestTimeoutConfig {
-			timeout:     self.timeout(),
+			timeout: self.timeout(),
 			max_retries: self.max_retries(),
 		}
 	}
 
 	fn merge(&mut self, overlay: Self) {
-		if overlay.timeout_ms.is_some() { self.timeout_ms = overlay.timeout_ms; }
-		if overlay.max_retries.is_some() { self.max_retries = overlay.max_retries; }
+		if overlay.timeout_ms.is_some() {
+			self.timeout_ms = overlay.timeout_ms;
+		}
+		if overlay.max_retries.is_some() {
+			self.max_retries = overlay.max_retries;
+		}
 	}
 }
 
@@ -900,7 +932,7 @@ impl ModelRequestTimeoutConfig {
 pub struct StreamPartialDurabilityConfig {
 	pub memory_snapshot_chunks: Option<usize>,
 	pub persist_every_chunks: Option<usize>,
-	pub flush_interval_ms:    Option<u64>,
+	pub flush_interval_ms: Option<u64>,
 }
 
 impl StreamPartialDurabilityConfig {
@@ -909,9 +941,13 @@ impl StreamPartialDurabilityConfig {
 	pub fn effective(&self) -> pi_agent::state::StreamPartialConfig {
 		let base = pi_agent::state::StreamPartialConfig::default();
 		pi_agent::state::StreamPartialConfig {
-			memory_snapshot_chunks: self.memory_snapshot_chunks.unwrap_or(base.memory_snapshot_chunks),
-			persist_every_chunks: self.persist_every_chunks.unwrap_or(base.persist_every_chunks),
-			flush_interval_ms:    self.flush_interval_ms.unwrap_or(base.flush_interval_ms),
+			memory_snapshot_chunks: self
+				.memory_snapshot_chunks
+				.unwrap_or(base.memory_snapshot_chunks),
+			persist_every_chunks: self
+				.persist_every_chunks
+				.unwrap_or(base.persist_every_chunks),
+			flush_interval_ms: self.flush_interval_ms.unwrap_or(base.flush_interval_ms),
 		}
 		.normalized()
 	}
@@ -930,48 +966,48 @@ impl StreamPartialDurabilityConfig {
 }
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Config {
-	pub default_model:        Option<String>,
-	pub providers:            BTreeMap<String, ProviderConfig>,
-	pub system_prompt:        Option<String>,
+	pub default_model: Option<String>,
+	pub providers: BTreeMap<String, ProviderConfig>,
+	pub system_prompt: Option<String>,
 	pub append_system_prompt: Option<String>,
-	pub approval_mode:        Option<ApprovalMode>,
-	pub allow:                Vec<String>,
+	pub approval_mode: Option<ApprovalMode>,
+	pub allow: Vec<String>,
 	/// Allow entries the operator supplied at launch: CLI `--allow`,
 	/// `PI_CONFIG_FILES`, or explicit `--config` overlays. The MCP launch gate
 	/// requires these (or trusted `yolo`) before auto-launching a
 	/// project-defined/overridden stdio server; plain host config `allow` is
 	/// name-based and cannot authorize a repository-controlled command.
-	pub explicit_allow:       BTreeSet<String>,
-	pub cwd:                  Option<PathBuf>,
-	pub tools:                Option<Vec<String>>,
-	pub edit:                 EditConfig,
-	pub async_config:         AsyncConfig,
-	pub ask:                  AskConfig,
-	pub lsp:                  LspConfig,
-	pub debug:                DebugConfig,
+	pub explicit_allow: BTreeSet<String>,
+	pub cwd: Option<PathBuf>,
+	pub tools: Option<Vec<String>>,
+	pub edit: EditConfig,
+	pub async_config: AsyncConfig,
+	pub ask: AskConfig,
+	pub lsp: LspConfig,
+	pub debug: DebugConfig,
 	/// `diagnostics.*`: the local SQLite diagnostics trace.
-	pub diagnostics:          DiagnosticsConfig,
-	pub checkpoint:           CheckpointConfig,
+	pub diagnostics: DiagnosticsConfig,
+	pub checkpoint: CheckpointConfig,
 	/// `goal.*`: Goal Mode enablement and continuation policy.
-	pub goal:                 GoalConfig,
+	pub goal: GoalConfig,
 	/// `plan.*`: ACP plan-mode enablement.
-	pub plan:                 PlanConfig,
+	pub plan: PlanConfig,
 	/// `memory.backend`; `None` falls back to the legacy `memories.enabled`.
-	pub memory_backend:       Option<MemoryBackend>,
+	pub memory_backend: Option<MemoryBackend>,
 	/// Legacy `memories.enabled`, migrated to `memory.backend` by TS settings.
-	pub memories_enabled:     Option<bool>,
+	pub memories_enabled: Option<bool>,
 	/// `memories.summaryInjectionTokenLimit`; absent means 5000.
 	pub memories_summary_injection_token_limit: Option<usize>,
 	/// `autolearn.*`: post-stop capture settings.
-	pub autolearn:            AutolearnConfig,
+	pub autolearn: AutolearnConfig,
 	/// `skills.*`: discovery toggles and filters.
-	pub skills:               SkillsConfig,
+	pub skills: SkillsConfig,
 	/// `prewalk.*`: one-way model switch for fresh sessions.
-	pub prewalk:              PrewalkConfig,
+	pub prewalk: PrewalkConfig,
 	/// `security.enabled` (flat leaf; nested group for a typed home).
-	pub security:             crate::security::SecurityConfig,
+	pub security: crate::security::SecurityConfig,
 	/// `advisor.*`, `tier.advisor`, `task.agentAdvisor`.
-	pub advisor:              AdvisorSettings,
+	pub advisor: AdvisorSettings,
 	/// `model.toolCallLoopGuard.*`.
 	pub tool_call_loop_guard: ToolCallLoopGuardConfig,
 	/// `model.requestTimeout.*`: per-model-request timeout and bounded retry.
@@ -980,11 +1016,11 @@ pub struct Config {
 	/// assistant stream as a branch-scoped draft.
 	pub stream_partial: StreamPartialDurabilityConfig,
 	/// `eval.*` backend enablement and interpreter groups.
-	pub eval_config:          EvalConfig,
+	pub eval_config: EvalConfig,
 	/// `searxng.*`: the web-search endpoint and its credentials.
-	pub searxng:              SearxngConfig,
+	pub searxng: SearxngConfig,
 	/// `task.isolation.mode`; `None` means unset (defaults to `none`).
-	pub task_isolation_mode:  Option<IsolationMode>,
+	pub task_isolation_mode: Option<IsolationMode>,
 	/// `task.isolation.apply`; `None` means unset (defaults to `true`).
 	pub task_isolation_apply: Option<bool>,
 	/// `task.isolation.merge`; `None` means unset (defaults to `patch`).
@@ -992,55 +1028,55 @@ pub struct Config {
 	/// `task.isolation.commits`; `None` means unset (defaults to `generic`).
 	pub task_isolation_commits: Option<IsolationCommitStyle>,
 	/// Root `worktree.base`; relative paths are ignored, matching the schema.
-	pub worktree_base:        Option<PathBuf>,
+	pub worktree_base: Option<PathBuf>,
 	/// `tools.maxTimeout` in seconds; `0` means no global cap.
 	pub max_tool_timeout_secs: Option<u64>,
 	/// `readLineNumbers` (root schema key, not a `read` group leaf); absent
 	/// means `false`. Drives plain line numbers in read output.
-	pub read_line_numbers:    Option<bool>,
+	pub read_line_numbers: Option<bool>,
 	/// `modelRoles` aliases (`task`, `smol`, `slow`, ...). `default` also feeds
 	/// `default_model`.
-	pub model_roles:          BTreeMap<String, String>,
+	pub model_roles: BTreeMap<String, String>,
 	/// `extensions` roots searched for `<root>/agents`.
-	pub extensions:           Option<Vec<PathBuf>>,
+	pub extensions: Option<Vec<PathBuf>>,
 	/// `task.disabledAgents`.
-	pub disabled_agents:      Option<Vec<String>>,
+	pub disabled_agents: Option<Vec<String>>,
 	/// `disabledProviders`; path-scoped groups resolve against the run cwd in
 	/// [`Config::disabled_providers`].
-	pub disabled_providers:   Option<Vec<DisabledProviderEntry>>,
+	pub disabled_providers: Option<Vec<DisabledProviderEntry>>,
 	/// Top-level `disabledExtensions`; `skill:<name>` ids disable skills for
 	/// every surface that reads the session snapshot.
-	pub disabled_extensions:  Option<Vec<String>>,
+	pub disabled_extensions: Option<Vec<String>>,
 	/// `task.agentModelOverrides` (string or list per agent).
 	pub agent_model_overrides: BTreeMap<String, Vec<String>>,
 	/// `task.maxRecursionDepth`.
-	pub max_recursion_depth:  Option<i32>,
+	pub max_recursion_depth: Option<i32>,
 	/// `task.maxConcurrency`.
-	pub max_concurrency:      Option<usize>,
+	pub max_concurrency: Option<usize>,
 	/// `task.maxEffort`.
-	pub max_effort:           Option<String>,
+	pub max_effort: Option<String>,
 	/// Ephemeral `--external-thinking` (not persisted).
-	pub external_thinking:    bool,
+	pub external_thinking: bool,
 	/// Ephemeral `--service-tier` (OpenAI wire; `none`/empty omit).
-	pub service_tier:         Option<String>,
+	pub service_tier: Option<String>,
 	/// `tier.openai` / `tier.anthropic` / `tier.google` settings (TS
 	/// `buildServiceTierByFamily`). Values the family cannot realize are dropped
 	/// at parse time; explicit `"none"` / `null` is retained as a sentinel so
 	/// higher layers can clear a lower layer's configured tier, and dropped
 	/// when resolving the effective map in [`Config::configured_service_tiers`].
-	pub tier_openai:          Option<String>,
-	pub tier_anthropic:       Option<String>,
-	pub tier_google:          Option<String>,
+	pub tier_openai: Option<String>,
+	pub tier_anthropic: Option<String>,
+	pub tier_google: Option<String>,
 	/// Ephemeral `--add-dir` workspace roots, before `cwd` normalization.
-	pub add_dirs:             Vec<PathBuf>,
+	pub add_dirs: Vec<PathBuf>,
 	/// Ephemeral `--no-rules`.
-	pub no_rules:             bool,
+	pub no_rules: bool,
 	/// Ephemeral `--no-pty`.
-	pub no_pty:               bool,
+	pub no_pty: bool,
 	/// Ephemeral `--models` scope patterns; `None` when the flag is absent.
-	pub model_scope:          Option<Vec<String>>,
+	pub model_scope: Option<Vec<String>>,
 	/// Paths that contributed, base first.
-	pub sources:              Vec<PathBuf>,
+	pub sources: Vec<PathBuf>,
 }
 
 impl Config {
@@ -1050,10 +1086,16 @@ impl Config {
 	/// -> `off`. Unset everywhere means `off`.
 	#[must_use]
 	pub fn memory_backend(&self) -> MemoryBackend {
-		self.memory_backend
+		self
+			.memory_backend
 			.or_else(|| {
-				self.memories_enabled
-					.map(|enabled| if enabled { MemoryBackend::Local } else { MemoryBackend::Off })
+				self.memories_enabled.map(|enabled| {
+					if enabled {
+						MemoryBackend::Local
+					} else {
+						MemoryBackend::Off
+					}
+				})
 			})
 			.unwrap_or(MemoryBackend::Off)
 	}
@@ -1109,8 +1151,12 @@ impl Config {
 		self.prewalk.merge(overlay.prewalk);
 		self.security.merge(overlay.security);
 		self.advisor.merge(overlay.advisor);
-		self.tool_call_loop_guard.merge(overlay.tool_call_loop_guard);
-		self.model_request_timeout.merge(overlay.model_request_timeout);
+		self
+			.tool_call_loop_guard
+			.merge(overlay.tool_call_loop_guard);
+		self
+			.model_request_timeout
+			.merge(overlay.model_request_timeout);
 		self.stream_partial.merge(overlay.stream_partial);
 		self.eval_config.merge(overlay.eval_config);
 		// `searxng.*` merges per leaf so an explicit host overlay can add
@@ -1327,9 +1373,7 @@ impl Config {
 	/// re-enable a host that explicitly opted out. Operator overlays applied
 	/// after the project layers are unaffected.
 	fn drop_project_diagnostics_reenable(overlay: &mut Self, inherited: &Self) {
-		if overlay.diagnostics.enabled == Some(true)
-			&& inherited.diagnostics.enabled == Some(false)
-		{
+		if overlay.diagnostics.enabled == Some(true) && inherited.diagnostics.enabled == Some(false) {
 			overlay.diagnostics.enabled = None;
 		}
 	}
@@ -1352,10 +1396,7 @@ impl Config {
 					);
 				},
 				Err(_) => {
-					eprintln!(
-						"warning: skipping invalid project settings {}",
-						settings_path.display()
-					);
+					eprintln!("warning: skipping invalid project settings {}", settings_path.display());
 				},
 			}
 		}
@@ -1443,8 +1484,9 @@ impl Config {
 		}
 		let text = fs::read_to_string(path)
 			.map_err(|err| Error::with_source(format!("cannot read {}", path.display()), err))?;
-		let value = yaml::parse(&text)
-			.map_err(|err| Error::new(format!("{}: {}", path.display(), sanitize_yaml_error(&err.to_string()))))?;
+		let value = yaml::parse(&text).map_err(|err| {
+			Error::new(format!("{}: {}", path.display(), sanitize_yaml_error(&err.to_string())))
+		})?;
 		Self::from_value(&value, path)
 	}
 
@@ -1521,8 +1563,8 @@ impl Config {
 			("anthropic", self.tier_anthropic.as_deref()),
 			("google", self.tier_google.as_deref()),
 		] {
-			if let Some(tier) = value
-				.and_then(|value| crate::service_tier::family_value(family, value))
+			if let Some(tier) =
+				value.and_then(|value| crate::service_tier::family_value(family, value))
 			{
 				out.insert(family.to_string(), tier.to_string());
 			}
@@ -1554,8 +1596,7 @@ impl Config {
 				DisabledProviderEntry::All(id) => ids.push(id.clone()),
 				DisabledProviderEntry::Scoped { prefixes, providers } => {
 					let applies = prefixes.iter().any(|prefix| {
-						let prefix =
-							normalize_lexically(&resolve_layer_path(&base, Path::new(prefix)));
+						let prefix = normalize_lexically(&resolve_layer_path(&base, Path::new(prefix)));
 						cwd.starts_with(prefix)
 					});
 					if applies {
@@ -1673,9 +1714,9 @@ fn apply_nested_settings(config: &mut Config, value: &Value, path: &Path) -> Res
 					_ => match expect_text(item, "tier.advisor", path)? {
 						Some(value) if matches!(value.as_str(), "none" | "inherit") => Some(value),
 						Some(value)
-							if ["openai", "anthropic", "google"]
-								.iter()
-								.any(|family| crate::service_tier::family_value(family, &value).is_some()) =>
+							if ["openai", "anthropic", "google"].iter().any(|family| {
+								crate::service_tier::family_value(family, &value).is_some()
+							}) =>
 						{
 							Some(value)
 						},
@@ -1724,11 +1765,7 @@ fn apply_nested_settings(config: &mut Config, value: &Value, path: &Path) -> Res
 		config.disabled_providers = Some(parse_disabled_providers(disabled, path)?);
 	}
 	if let Some(disabled) = value.get("disabledExtensions") {
-		config.disabled_extensions = Some(expect_list_of_text(
-			disabled,
-			"disabledExtensions",
-			path,
-		)?);
+		config.disabled_extensions = Some(expect_list_of_text(disabled, "disabledExtensions", path)?);
 	}
 	if let Some(roles) = value.get("modelRoles").and_then(Value::as_map) {
 		for (role, pattern) in roles {
@@ -1807,7 +1844,9 @@ fn apply_nested_settings(config: &mut Config, value: &Value, path: &Path) -> Res
 			_ => {},
 		}
 	}
-	if let Some(item) = settings_leaf(value, "skills", "customDirectories", "skills.customDirectories") {
+	if let Some(item) =
+		settings_leaf(value, "skills", "customDirectories", "skills.customDirectories")
+	{
 		config.skills.custom_directories = Some(
 			expect_list_of_text(item, "skills.customDirectories", path)?
 				.into_iter()
@@ -1815,10 +1854,9 @@ fn apply_nested_settings(config: &mut Config, value: &Value, path: &Path) -> Res
 				.collect(),
 		);
 	}
-	for (leaf, dotted) in [
-		("ignoredSkills", "skills.ignoredSkills"),
-		("includeSkills", "skills.includeSkills"),
-	] {
+	for (leaf, dotted) in
+		[("ignoredSkills", "skills.ignoredSkills"), ("includeSkills", "skills.includeSkills")]
+	{
 		let Some(item) = settings_leaf(value, "skills", leaf, dotted) else {
 			continue;
 		};
@@ -1833,16 +1871,13 @@ fn apply_nested_settings(config: &mut Config, value: &Value, path: &Path) -> Res
 		for (key, item) in task {
 			match key.as_str() {
 				"disabledAgents" => {
-					config.disabled_agents = Some(expect_list_of_text(
-						item,
-						"task.disabledAgents",
-						path,
-					)?);
+					config.disabled_agents =
+						Some(expect_list_of_text(item, "task.disabledAgents", path)?);
 				},
 				"agentModelOverrides" => {
-					let overrides = item.as_map().ok_or_else(|| {
-						invalid(path, "task.agentModelOverrides", "expected a mapping")
-					})?;
+					let overrides = item
+						.as_map()
+						.ok_or_else(|| invalid(path, "task.agentModelOverrides", "expected a mapping"))?;
 					for (agent, patterns) in overrides {
 						config
 							.agent_model_overrides
@@ -1859,9 +1894,9 @@ fn apply_nested_settings(config: &mut Config, value: &Value, path: &Path) -> Res
 					config.max_effort = expect_text(item, "task.maxEffort", path)?;
 				},
 				"agentAdvisor" => {
-					let overrides = item.as_map().ok_or_else(|| {
-						invalid(path, "task.agentAdvisor", "expected a mapping")
-					})?;
+					let overrides = item
+						.as_map()
+						.ok_or_else(|| invalid(path, "task.agentAdvisor", "expected a mapping"))?;
 					for (agent, value) in overrides {
 						let Some(pattern) = value.to_text().filter(|value| !value.trim().is_empty())
 						else {
@@ -1890,7 +1925,8 @@ fn apply_nested_settings(config: &mut Config, value: &Value, path: &Path) -> Res
 			extensions
 				.iter()
 				.map(|item| {
-					item.to_text()
+					item
+						.to_text()
 						.map(PathBuf::from)
 						.ok_or_else(|| invalid(path, "extensions", "expected a sequence of paths"))
 				})
@@ -1923,7 +1959,9 @@ fn apply_nested_settings(config: &mut Config, value: &Value, path: &Path) -> Res
 	if let Some(enabled) = value.get("readLineNumbers") {
 		config.read_line_numbers = expect_bool(enabled, "readLineNumbers", path)?;
 	}
-	if let Some(enabled) = value.get("async").and_then(|async_settings| async_settings.get("enabled"))
+	if let Some(enabled) = value
+		.get("async")
+		.and_then(|async_settings| async_settings.get("enabled"))
 	{
 		config.async_config.enabled = expect_bool(enabled, "async.enabled", path)?;
 	}
@@ -2096,9 +2134,7 @@ fn apply_nested_settings(config: &mut Config, value: &Value, path: &Path) -> Res
 			},
 		}
 	}
-	if let Some(immune) =
-		settings_leaf(value, "advisor", "immuneTurns", "advisor.immuneTurns")
-	{
+	if let Some(immune) = settings_leaf(value, "advisor", "immuneTurns", "advisor.immuneTurns") {
 		match immune {
 			Value::Null => {},
 			Value::Int(value) if *value >= 0 => {
@@ -2134,8 +2170,7 @@ fn apply_nested_settings(config: &mut Config, value: &Value, path: &Path) -> Res
 			}
 		}
 	}
-	if let Some(modes) =
-		settings_leaf(value, "goal", "continuationModes", "goal.continuationModes")
+	if let Some(modes) = settings_leaf(value, "goal", "continuationModes", "goal.continuationModes")
 	{
 		config.goal.continuation_modes =
 			Some(expect_list_of_text(modes, "goal.continuationModes", path)?);
@@ -2158,25 +2193,19 @@ fn apply_nested_settings(config: &mut Config, value: &Value, path: &Path) -> Res
 		}
 	}
 	if let Some(mode) = settings_leaf(value, "python", "kernelMode", "python.kernelMode") {
-		config.eval_config.python_kernel_mode =
-			parse_kernel_mode(mode, "python.kernelMode", path)?;
+		config.eval_config.python_kernel_mode = parse_kernel_mode(mode, "python.kernelMode", path)?;
 	}
-	if let Some(interpreter) =
-		settings_leaf(value, "python", "interpreter", "python.interpreter")
-	{
-		config.eval_config.python_interpreter =
-			expect_text(interpreter, "python.interpreter", path)?
-				.filter(|value| !value.trim().is_empty());
+	if let Some(interpreter) = settings_leaf(value, "python", "interpreter", "python.interpreter") {
+		config.eval_config.python_interpreter = expect_text(interpreter, "python.interpreter", path)?
+			.filter(|value| !value.trim().is_empty());
 	}
 	if let Some(interpreter) = settings_leaf(value, "ruby", "interpreter", "ruby.interpreter") {
-		config.eval_config.ruby_interpreter =
-			expect_text(interpreter, "ruby.interpreter", path)?
-				.filter(|value| !value.trim().is_empty());
+		config.eval_config.ruby_interpreter = expect_text(interpreter, "ruby.interpreter", path)?
+			.filter(|value| !value.trim().is_empty());
 	}
 	if let Some(interpreter) = settings_leaf(value, "julia", "interpreter", "julia.interpreter") {
-		config.eval_config.julia_interpreter =
-			expect_text(interpreter, "julia.interpreter", path)?
-				.filter(|value| !value.trim().is_empty());
+		config.eval_config.julia_interpreter = expect_text(interpreter, "julia.interpreter", path)?
+			.filter(|value| !value.trim().is_empty());
 	}
 	if let Some(enabled) = settings_nested_leaf(
 		value,
@@ -2199,8 +2228,8 @@ fn apply_nested_settings(config: &mut Config, value: &Value, path: &Path) -> Res
 			expect_millis(threshold, "eval.autoBackground.thresholdMs", path)?;
 	}
 	if let Some(timeout) = settings_leaf(value, "tools", "maxTimeout", "tools.maxTimeout") {
-		config.max_tool_timeout_secs = expect_usize(timeout, "tools.maxTimeout", path)?
-			.map(|seconds| seconds as u64);
+		config.max_tool_timeout_secs =
+			expect_usize(timeout, "tools.maxTimeout", path)?.map(|seconds| seconds as u64);
 	}
 	if let Some(mode) =
 		settings_nested_leaf(value, "task", "isolation", "mode", "task.isolation.mode")
@@ -2210,8 +2239,7 @@ fn apply_nested_settings(config: &mut Config, value: &Value, path: &Path) -> Res
 	if let Some(apply) =
 		settings_nested_leaf(value, "task", "isolation", "apply", "task.isolation.apply")
 	{
-		config.task_isolation_apply =
-			expect_bool(apply, "task.isolation.apply", path)?;
+		config.task_isolation_apply = expect_bool(apply, "task.isolation.apply", path)?;
 	}
 	if let Some(merge) =
 		settings_nested_leaf(value, "task", "isolation", "merge", "task.isolation.merge")
@@ -2237,11 +2265,7 @@ fn apply_nested_settings(config: &mut Config, value: &Value, path: &Path) -> Res
 	Ok(())
 }
 
-fn parse_isolation_mode(
-	value: &Value,
-	key: &str,
-	path: &Path,
-) -> Result<Option<IsolationMode>> {
+fn parse_isolation_mode(value: &Value, key: &str, path: &Path) -> Result<Option<IsolationMode>> {
 	let Some(raw) = expect_text(value, key, path)? else {
 		return Ok(None);
 	};
@@ -2383,11 +2407,10 @@ fn parse_disabled_providers(value: &Value, path: &Path) -> Result<Vec<DisabledPr
 		match item {
 			Value::Str(id) => entries.push(DisabledProviderEntry::All(id.clone())),
 			Value::Map(_) => {
-				let prefixes: Vec<String> =
-					["path", "paths", "pathPrefix", "pathPrefixes"]
-						.iter()
-						.flat_map(|key| string_or_list(item.get(key)))
-						.collect();
+				let prefixes: Vec<String> = ["path", "paths", "pathPrefix", "pathPrefixes"]
+					.iter()
+					.flat_map(|key| string_or_list(item.get(key)))
+					.collect();
 				if prefixes.is_empty() {
 					continue;
 				}
@@ -2430,7 +2453,11 @@ fn parse_ask_timeout(value: &Value, key: &str, path: &Path) -> Result<Option<u64
 			if !value.is_finite() || *value < 0.0 {
 				return Err(invalid(path, key, "expected a non-negative number of seconds"));
 			}
-			if *value > 1000.0 { *value / 1000.0 } else { *value }
+			if *value > 1000.0 {
+				*value / 1000.0
+			} else {
+				*value
+			}
 		},
 		_ => return Err(invalid(path, key, "expected a number of seconds")),
 	};
@@ -2561,7 +2588,11 @@ pub(crate) fn sanitize_yaml_error(message: &str) -> String {
 		}
 	}
 	let trimmed = out.trim().trim_end_matches(':').trim().to_string();
-	if trimmed.is_empty() { "invalid YAML".to_string() } else { trimmed }
+	if trimmed.is_empty() {
+		"invalid YAML".to_string()
+	} else {
+		trimmed
+	}
 }
 
 pub(crate) fn json_to_value(json: &serde_json::Value) -> Value {
@@ -2572,9 +2603,7 @@ pub(crate) fn json_to_value(json: &serde_json::Value) -> Value {
 			.as_i64()
 			.map_or_else(|| Value::Float(number.as_f64().unwrap_or_default()), Value::Int),
 		serde_json::Value::String(value) => Value::Str(value.clone()),
-		serde_json::Value::Array(items) => {
-			Value::List(items.iter().map(json_to_value).collect())
-		},
+		serde_json::Value::Array(items) => Value::List(items.iter().map(json_to_value).collect()),
 		serde_json::Value::Object(map) => Value::Map(
 			map.iter()
 				.map(|(key, value)| (key.clone(), json_to_value(value)))
@@ -2760,20 +2789,20 @@ fn invalid(path: &Path, key: &str, expected: &str) -> Error {
 /// Discovered MCP server configuration with its declaration source.
 #[derive(Debug, Clone)]
 pub struct DiscoveredMcpServer {
-	pub name:        String,
-	pub config:      MCPServerConfig,
+	pub name: String,
+	pub config: MCPServerConfig,
 	pub source_path: PathBuf,
 	/// False when the file resolves into the project directory or came from a
 	/// project-level candidate. Untrusted servers are gated before any connect
 	/// and their `${ENV}` references are expanded only after approval.
-	pub trusted:     bool,
+	pub trusted: bool,
 }
 
 #[derive(Debug, Clone, Default)]
 pub struct McpDiscoveryReport {
-	pub servers:          Vec<DiscoveredMcpServer>,
+	pub servers: Vec<DiscoveredMcpServer>,
 	pub all_server_names: Vec<String>,
-	pub warnings:         Vec<String>,
+	pub warnings: Vec<String>,
 }
 
 /// Validate server name against
@@ -3302,7 +3331,6 @@ pub fn discover_mcp_servers_with_paths(cwd: &Path, agent_dir: &Path) -> McpDisco
 	all_names.sort();
 	report.all_server_names = all_names;
 
-
 	report
 }
 
@@ -3349,11 +3377,13 @@ mod tests {
 
 	#[test]
 	fn apply_nested_settings_preserves_none_and_null_clears() {
-		let yaml_val: Value =
-			yaml::parse("tier:
+		let yaml_val: Value = yaml::parse(
+			"tier:
   anthropic: none
   openai: null
-").expect("yaml");
+",
+		)
+		.expect("yaml");
 		let mut config = Config::default();
 		apply_nested_settings(&mut config, &yaml_val, Path::new("settings.json")).expect("parse");
 		assert_eq!(config.tier_anthropic.as_deref(), Some("none"));
@@ -3379,10 +3409,8 @@ mod tests {
 		let nanos = std::time::SystemTime::now()
 			.duration_since(std::time::UNIX_EPOCH)
 			.map_or(0, |elapsed| elapsed.as_nanos());
-		let root = std::env::temp_dir().join(format!(
-			"aragent-project-diagnostics-{}-{nanos}",
-			std::process::id()
-		));
+		let root = std::env::temp_dir()
+			.join(format!("aragent-project-diagnostics-{}-{nanos}", std::process::id()));
 		let settings_dir = root.join(".omp");
 		fs::create_dir_all(&settings_dir).expect("settings dir");
 		let settings = settings_dir.join("settings.json");
@@ -3429,19 +3457,15 @@ mod tests {
 
 	#[test]
 	fn model_request_timeout_parses_and_merges() {
-		let config = parse_config(
-			"model:\n  requestTimeout:\n    timeoutMs: 30000\n    maxRetries: 2\n",
-		)
-		.expect("request timeout");
-		assert_eq!(
-			config.model_request_timeout.timeout(),
-			Some(std::time::Duration::from_secs(30))
-		);
+		let config =
+			parse_config("model:\n  requestTimeout:\n    timeoutMs: 30000\n    maxRetries: 2\n")
+				.expect("request timeout");
+		assert_eq!(config.model_request_timeout.timeout(), Some(std::time::Duration::from_secs(30)));
 		assert_eq!(config.model_request_timeout.max_retries(), 2);
 		assert!(config.model_request_timeout.effective().is_enabled());
 
-		let disabled = parse_config("model:\n  requestTimeout:\n    timeoutMs: 0\n")
-			.expect("disabled timeout");
+		let disabled =
+			parse_config("model:\n  requestTimeout:\n    timeoutMs: 0\n").expect("disabled timeout");
 		assert_eq!(disabled.model_request_timeout.timeout(), None);
 		assert!(!disabled.model_request_timeout.effective().is_enabled());
 
@@ -3452,20 +3476,17 @@ mod tests {
 			Some(std::time::Duration::from_secs(300))
 		);
 		assert!(defaulted.model_request_timeout.effective().is_enabled());
-		assert_eq!(parse_config("").expect("empty").model_request_timeout, defaulted.model_request_timeout);
+		assert_eq!(
+			parse_config("").expect("empty").model_request_timeout,
+			defaulted.model_request_timeout
+		);
 
 		let mut base =
 			parse_config("model:\n  requestTimeout:\n    timeoutMs: 1000\n").expect("base");
-		base.merge(
-			parse_config("model:\n  requestTimeout:\n    maxRetries: 1\n").expect("overlay"),
-		);
-		assert_eq!(
-			base.model_request_timeout.timeout(),
-			Some(std::time::Duration::from_secs(1))
-		);
+		base.merge(parse_config("model:\n  requestTimeout:\n    maxRetries: 1\n").expect("overlay"));
+		assert_eq!(base.model_request_timeout.timeout(), Some(std::time::Duration::from_secs(1)));
 		assert_eq!(base.model_request_timeout.max_retries(), 1);
 	}
-
 
 	#[test]
 	fn tool_call_loop_guard_parser_accepts_threshold_one_and_yaml_lists() {
@@ -3567,8 +3588,8 @@ mod tests {
 		assert!(parse_config("memory:\n  backend: nope\n").is_err());
 
 		// Overlays replace only the leaves they set.
-		let mut base = parse_config("autolearn:\n  enabled: true\n  minToolCalls: 9\n")
-			.expect("base");
+		let mut base =
+			parse_config("autolearn:\n  enabled: true\n  minToolCalls: 9\n").expect("base");
 		let overlay = parse_config("autolearn:\n  autoContinue: true\n").expect("overlay");
 		base.merge(overlay);
 		assert!(base.autolearn.enabled());
@@ -3627,27 +3648,34 @@ mod tests {
 
 	#[test]
 	fn disabled_provider_scope_normalizes_dot_and_parent_components() {
-		let config = parse_config(
-			"disabledProviders:\n  - path: /work/project\n    providers: [acme]\n",
-		)
-		.expect("scoped");
+		let config =
+			parse_config("disabledProviders:\n  - path: /work/project\n    providers: [acme]\n")
+				.expect("scoped");
 		// cwd-side `..`/`.` collapse before the prefix check.
-		assert_eq!(
-			config.disabled_providers(Path::new("/work/../work/project/sub")),
-			["acme"]
-		);
+		assert_eq!(config.disabled_providers(Path::new("/work/../work/project/sub")), ["acme"]);
 		assert_eq!(config.disabled_providers(Path::new("/work/./project")), ["acme"]);
 		// Escaping the prefix must not disable anything.
-		assert!(config.disabled_providers(Path::new("/work/project/../other")).is_empty());
-		assert!(config.disabled_providers(Path::new("/work/project/..")).is_empty());
+		assert!(
+			config
+				.disabled_providers(Path::new("/work/project/../other"))
+				.is_empty()
+		);
+		assert!(
+			config
+				.disabled_providers(Path::new("/work/project/.."))
+				.is_empty()
+		);
 
 		// Prefix-side `..` collapses too.
-		let config = parse_config(
-			"disabledProviders:\n  - path: /work/../project\n    providers: [beta]\n",
-		)
-		.expect("scoped");
+		let config =
+			parse_config("disabledProviders:\n  - path: /work/../project\n    providers: [beta]\n")
+				.expect("scoped");
 		assert_eq!(config.disabled_providers(Path::new("/project/sub")), ["beta"]);
-		assert!(config.disabled_providers(Path::new("/project/../other")).is_empty());
+		assert!(
+			config
+				.disabled_providers(Path::new("/project/../other"))
+				.is_empty()
+		);
 	}
 
 	#[test]
@@ -3689,10 +3717,9 @@ mod tests {
 			"headless continuation is opt-in"
 		);
 
-		let explicit = parse_config(
-			"goal:\n  enabled: false\n  continuationModes:\n    - headless\n",
-		)
-		.expect("explicit");
+		let explicit =
+			parse_config("goal:\n  enabled: false\n  continuationModes:\n    - headless\n")
+				.expect("explicit");
 		assert!(!explicit.goal.enabled());
 		assert_eq!(explicit.goal.continuation_modes(), vec!["headless".to_string()]);
 		assert!(crate::goal::headless_continuation_allowed(&explicit.goal.continuation_modes()));
@@ -3802,10 +3829,7 @@ mod tests {
 		assert_eq!(config.eval_config.js, Some(true));
 		assert_eq!(config.eval_config.ruby, Some(true));
 		assert_eq!(config.eval_config.julia, Some(false));
-		assert_eq!(
-			config.eval_config.python_kernel_mode,
-			Some(pi_agent::eval::KernelMode::PerCall)
-		);
+		assert_eq!(config.eval_config.python_kernel_mode, Some(pi_agent::eval::KernelMode::PerCall));
 		assert_eq!(config.eval_config.python_interpreter.as_deref(), Some("/opt/py"));
 		assert_eq!(config.eval_config.ruby_interpreter.as_deref(), Some("/opt/rb"));
 		assert_eq!(config.max_tool_timeout_secs, Some(45));
@@ -3815,13 +3839,10 @@ mod tests {
 		assert_eq!(empty.eval_config.python_interpreter, None);
 
 		// Dotted schema paths work, nested wins, and a bad enum fails the load.
-		let dotted = parse_config("\"eval.py\": false\n\"python.kernelMode\": session\n")
-			.expect("dotted eval");
+		let dotted =
+			parse_config("\"eval.py\": false\n\"python.kernelMode\": session\n").expect("dotted eval");
 		assert_eq!(dotted.eval_config.python, Some(false));
-		assert_eq!(
-			dotted.eval_config.python_kernel_mode,
-			Some(pi_agent::eval::KernelMode::Session)
-		);
+		assert_eq!(dotted.eval_config.python_kernel_mode, Some(pi_agent::eval::KernelMode::Session));
 		let both = parse_config("eval:\n  py: true\n\"eval.py\": false\n").expect("both");
 		assert_eq!(both.eval_config.python, Some(true), "nested wins over dotted");
 		assert!(parse_config("python:\n  kernelMode: sometimes\n").is_err());
@@ -3842,10 +3863,9 @@ mod tests {
 		assert_eq!(default.eval_config.auto_background_enabled, None);
 		assert_eq!(default.eval_config.auto_background_threshold_ms, None);
 
-		let nested = parse_config(
-			"eval:\n  autoBackground:\n    enabled: true\n    thresholdMs: 250\n",
-		)
-		.expect("nested auto-background");
+		let nested =
+			parse_config("eval:\n  autoBackground:\n    enabled: true\n    thresholdMs: 250\n")
+				.expect("nested auto-background");
 		assert_eq!(nested.eval_config.auto_background_enabled, Some(true));
 		assert_eq!(nested.eval_config.auto_background_threshold_ms, Some(250));
 
@@ -3862,24 +3882,18 @@ mod tests {
 			 \"eval.autoBackground.enabled\": true\n",
 		)
 		.expect("both");
-		assert_eq!(
-			both.eval_config.auto_background_enabled,
-			Some(false),
-			"nested wins over dotted"
-		);
+		assert_eq!(both.eval_config.auto_background_enabled, Some(false), "nested wins over dotted");
 
 		// `number` accepts floats and clamps non-positive values to immediate
 		// background, matching `resolveAutoBackgroundWaitMs`.
-		let boundaries = parse_config(
-			"eval:\n  autoBackground:\n    thresholdMs: 12.9\n",
-		)
-		.expect("float threshold");
+		let boundaries = parse_config("eval:\n  autoBackground:\n    thresholdMs: 12.9\n")
+			.expect("float threshold");
 		assert_eq!(boundaries.eval_config.auto_background_threshold_ms, Some(12));
 		let immediate = parse_config("eval:\n  autoBackground:\n    thresholdMs: -5\n")
 			.expect("negative threshold");
 		assert_eq!(immediate.eval_config.auto_background_threshold_ms, Some(0));
-		let zero = parse_config("eval:\n  autoBackground:\n    thresholdMs: 0\n")
-			.expect("zero threshold");
+		let zero =
+			parse_config("eval:\n  autoBackground:\n    thresholdMs: 0\n").expect("zero threshold");
 		assert_eq!(zero.eval_config.auto_background_threshold_ms, Some(0));
 
 		// Wrong types fail at the trust boundary.
@@ -3892,19 +3906,18 @@ mod tests {
 		}
 		// A non-object subgroup shadows its dotted leaves, like the upstream
 		// group-shadow guard.
-		let shadow = parse_config(
-			"eval:\n  autoBackground: false\n\"eval.autoBackground.enabled\": true\n",
-		)
-		.expect("subgroup shadow");
+		let shadow =
+			parse_config("eval:\n  autoBackground: false\n\"eval.autoBackground.enabled\": true\n")
+				.expect("subgroup shadow");
 		assert_eq!(shadow.eval_config.auto_background_enabled, None);
 
 		// Per-layer merge: a higher layer owns the threshold it sets and leaves
 		// the other key inherited.
-		let mut layered = parse_config(
-			"eval:\n  autoBackground:\n    enabled: true\n    thresholdMs: 250\n",
-		)
-		.expect("base");
-		layered.merge(parse_config("eval:\n  autoBackground:\n    thresholdMs: 500\n").expect("overlay"));
+		let mut layered =
+			parse_config("eval:\n  autoBackground:\n    enabled: true\n    thresholdMs: 250\n")
+				.expect("base");
+		layered
+			.merge(parse_config("eval:\n  autoBackground:\n    thresholdMs: 500\n").expect("overlay"));
 		assert_eq!(layered.eval_config.auto_background_enabled, Some(true));
 		assert_eq!(layered.eval_config.auto_background_threshold_ms, Some(500));
 
@@ -3984,10 +3997,8 @@ mod tests {
 
 		// `atom`/`vim` migrate to `hashline` in the mode and each variant value;
 		// quoted dotted `"edit.mode"` is the same leaf.
-		let legacy = parse_config(
-			"edit:\n  mode: vim\n  modelVariants:\n    atom-model: atom\n",
-		)
-		.expect("legacy");
+		let legacy = parse_config("edit:\n  mode: vim\n  modelVariants:\n    atom-model: atom\n")
+			.expect("legacy");
 		assert_eq!(legacy.edit.mode(), EditMode::Hashline);
 		assert_eq!(legacy.edit.variant_for_model("atom-model-1"), Some(EditMode::Hashline));
 		let dotted_mode = parse_config("\"edit.mode\": atom\n").expect("dotted mode");
@@ -4008,8 +4019,10 @@ mod tests {
 		let ModelVariants::Entries(layered_entries) = &layered.edit.model_variants else {
 			panic!("layered variants: {:?}", layered.edit.model_variants);
 		};
-		let patterns: Vec<&str> =
-			layered_entries.iter().map(|(pattern, _)| pattern.as_str()).collect();
+		let patterns: Vec<&str> = layered_entries
+			.iter()
+			.map(|(pattern, _)| pattern.as_str())
+			.collect();
 		assert_eq!(patterns, ["claude", "gpt", "gemini"]);
 		assert_eq!(layered.edit.variant_for_model("claude-3"), Some(EditMode::Replace));
 		assert_eq!(layered.edit.variant_for_model("gpt-4"), Some(EditMode::Sloppy));
@@ -4039,18 +4052,16 @@ mod tests {
 		// Untyped `modelVariants` values stay raw until matching (upstream
 		// `#getEditVariantEntries`), so a value repaired by a later layer keeps
 		// its position and the first matching pattern still wins.
-		let mut repaired =
-			parse_config("edit:\n  modelVariants:\n    m: bogus\n    gpt: patch\n")
-				.expect("repaired base");
+		let mut repaired = parse_config("edit:\n  modelVariants:\n    m: bogus\n    gpt: patch\n")
+			.expect("repaired base");
 		repaired.merge(
 			parse_config("edit:\n  modelVariants:\n    m: replace\n").expect("repaired overlay"),
 		);
 		assert_eq!(repaired.edit.variant_for_model("m-gpt-4"), Some(EditMode::Replace));
 		let mut non_string =
 			parse_config("edit:\n  modelVariants:\n    m: 1\n    gpt: patch\n").expect("raw base");
-		non_string.merge(
-			parse_config("edit:\n  modelVariants:\n    m: replace\n").expect("raw overlay"),
-		);
+		non_string
+			.merge(parse_config("edit:\n  modelVariants:\n    m: replace\n").expect("raw overlay"));
 		assert_eq!(non_string.edit.variant_for_model("m-gpt-4"), Some(EditMode::Replace));
 
 		// Untyped entries and non-object groups yield no variant; a non-object
@@ -4080,8 +4091,7 @@ mod tests {
 		assert_eq!(cleared.edit.model_variants, ModelVariants::NotAMap);
 		assert_eq!(cleared.edit.variant_for_model("gpt-4"), None);
 
-		let mut kept =
-			parse_config("edit:\n  modelVariants:\n    gpt: patch\n").expect("kept base");
+		let mut kept = parse_config("edit:\n  modelVariants:\n    gpt: patch\n").expect("kept base");
 		kept.merge(
 			Config::from_settings_value(
 				&json_to_value(&serde_json::json!({ "edit": { "modelVariants": {} } })),
@@ -4122,8 +4132,7 @@ mod tests {
 		assert_eq!(default.async_config.enabled, None);
 		assert!(default.async_config.enabled());
 
-		let explicit_false =
-			parse_config("async:\n  enabled: false\n").expect("explicit false");
+		let explicit_false = parse_config("async:\n  enabled: false\n").expect("explicit false");
 		assert_eq!(explicit_false.async_config.enabled, Some(false));
 		assert!(!explicit_false.async_config.enabled());
 
@@ -4178,7 +4187,10 @@ mod tests {
 		.expect("cli");
 		config.apply_runtime(&cli);
 		assert_eq!(config.approval_mode, Some(ApprovalMode::Yolo));
-		assert_eq!(config.tools.as_deref(), Some(["bash".to_string(), "edit".to_string()].as_slice()));
+		assert_eq!(
+			config.tools.as_deref(),
+			Some(["bash".to_string(), "edit".to_string()].as_slice())
+		);
 		assert_eq!(config.allow, ["cli-allow", "config-allow"]);
 		// Only the operator flag carries launch-time provenance; the file layer
 		// entry does not, so it cannot authorize a project MCP command.

@@ -74,21 +74,34 @@ impl KnownSecrets {
 			Some(mut out) => {
 				out.push_str(&text[last..]);
 				Cow::Owned(out)
-			}
+			},
 			None => Cow::Borrowed(text),
 		}
 	}
 }
 
-/// The carrier forms a credential shows up in: as issued, percent-encoded in
-/// a pasted URL, and base64 inside an envelope or a `data:` payload.
+/// The carrier forms a credential shows up in: as issued, percent-encoded in a
+/// pasted URL (either hex case), and base64 of the value itself, standard or
+/// URL-safe, padded or not.
+///
+/// This matches an encoded blob that *is* the value. Base64 of a token embedded
+/// at an arbitrary offset inside a larger structure (`Basic base64(user:token)`,
+/// a JWT payload) is different bytes and needs the raw form or a decode step;
+/// that is out of scope here and stated as such.
 fn variants(value: &str) -> Vec<String> {
 	let mut out = vec![value.to_string()];
-	let percent = percent_encode(value);
-	if percent != value {
-		out.push(percent);
+	for lowercase in [false, true] {
+		let percent = percent_encode(value, lowercase);
+		if percent != value {
+			out.push(percent);
+		}
 	}
-	for engine in [base64::engine::general_purpose::STANDARD, base64::engine::general_purpose::STANDARD_NO_PAD] {
+	for engine in [
+		base64::engine::general_purpose::STANDARD,
+		base64::engine::general_purpose::STANDARD_NO_PAD,
+		base64::engine::general_purpose::URL_SAFE,
+		base64::engine::general_purpose::URL_SAFE_NO_PAD,
+	] {
 		let encoded = base64::Engine::encode(&engine, value.as_bytes());
 		if encoded.len() >= MIN_SECRET_LEN {
 			out.push(encoded);
@@ -97,7 +110,7 @@ fn variants(value: &str) -> Vec<String> {
 	out
 }
 
-fn percent_encode(value: &str) -> String {
+fn percent_encode(value: &str, lowercase: bool) -> String {
 	const UNRESERVED: &[u8] = b"-._~";
 	let mut out = String::with_capacity(value.len() * 3);
 	for byte in value.as_bytes() {
@@ -105,7 +118,11 @@ fn percent_encode(value: &str) -> String {
 			out.push(char::from(*byte));
 		} else {
 			out.push('%');
-			out.push_str(&format!("{byte:02X}"));
+			if lowercase {
+				out.push_str(&format!("{byte:02x}"));
+			} else {
+				out.push_str(&format!("{byte:02X}"));
+			}
 		}
 	}
 	out
@@ -137,7 +154,8 @@ pub fn register(value: &str) {
 fn compiled() -> Option<Arc<KnownSecrets>> {
 	let mut registry = REGISTRY.lock().unwrap_or_else(PoisonError::into_inner);
 	if registry.dirty {
-		registry.compiled = KnownSecrets::new(registry.values.iter().map(String::as_str)).map(Arc::new);
+		registry.compiled =
+			KnownSecrets::new(registry.values.iter().map(String::as_str)).map(Arc::new);
 		registry.dirty = false;
 	}
 	registry.compiled.clone()
@@ -168,10 +186,7 @@ mod tests {
 	fn masks_known_value_and_keeps_surrounding_text() {
 		let matcher = secrets(&["sk-live-abcdef123456"]);
 		let text = "request failed: Authorization=sk-live-abcdef123456 (retry later)";
-		assert_eq!(
-			matcher.redact(text),
-			"request failed: Authorization=[REDACTED] (retry later)"
-		);
+		assert_eq!(matcher.redact(text), "request failed: Authorization=[REDACTED] (retry later)");
 	}
 
 	#[test]
@@ -185,11 +200,19 @@ mod tests {
 	fn masks_percent_encoded_and_base64_forms() {
 		let secret = "tok/en+with space123";
 		let matcher = secrets(&[secret]);
-		let percent = percent_encode(secret);
+		let percent = percent_encode(secret, false);
 		assert_ne!(percent, secret);
 		assert_eq!(matcher.redact(&format!("u={percent}")), "u=[REDACTED]");
-		let b64 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, secret.as_bytes());
+		let b64 =
+			base64::Engine::encode(&base64::engine::general_purpose::STANDARD, secret.as_bytes());
 		assert_eq!(matcher.redact(&format!("blob {b64}")), "blob [REDACTED]");
+		let url_safe = base64::Engine::encode(
+			&base64::engine::general_purpose::URL_SAFE_NO_PAD,
+			secret.as_bytes(),
+		);
+		assert_eq!(matcher.redact(&format!("blob {url_safe}")), "blob [REDACTED]");
+		let lower = percent_encode(secret, true);
+		assert_eq!(matcher.redact(&format!("u={lower}")), "u=[REDACTED]");
 	}
 
 	#[test]

@@ -46,7 +46,11 @@ pub async fn login(flow: &Flow<'_>) -> Result<Credential, AuthError> {
 }
 
 /// `exchangeDevinCliToken`: JSON `{code, code_verifier}` → `{token}`.
-async fn exchange_cli_token(flow: &Flow<'_>, code: &str, verifier: &str) -> Result<Credential, AuthError> {
+async fn exchange_cli_token(
+	flow: &Flow<'_>,
+	code: &str,
+	verifier: &str,
+) -> Result<Credential, AuthError> {
 	let payload = flow
 		.http
 		.post_json(
@@ -58,13 +62,19 @@ async fn exchange_cli_token(flow: &Flow<'_>, code: &str, verifier: &str) -> Resu
 			AuthErrorKind::TokenExchange,
 		)
 		.await?;
-	let token = payload.get("token").and_then(serde_json::Value::as_str).unwrap_or_default().to_string();
+	let token = payload
+		.get("token")
+		.and_then(serde_json::Value::as_str)
+		.unwrap_or_default()
+		.to_string();
 	if token.is_empty() {
-		return Err(AuthError::new(
-			AuthErrorKind::Validation,
-			"Devin CLI token exchange returned an empty token",
-		)
-		.for_provider("devin"));
+		return Err(
+			AuthError::new(
+				AuthErrorKind::Validation,
+				"Devin CLI token exchange returned an empty token",
+			)
+			.for_provider("devin"),
+		);
 	}
 	Ok(Credential::ApiKey { key: token, source_login: true })
 }
@@ -85,7 +95,9 @@ mod tests {
 				("code_challenge_method", "S256"),
 			],
 		);
-		assert!(url.starts_with("https://app.devin.ai/auth/cli/continue?redirect_uri=http%3A%2F%2F127.0.0.1%3A59653%2Fcallback"));
+		assert!(url.starts_with(
+			"https://app.devin.ai/auth/cli/continue?redirect_uri=http%3A%2F%2F127.0.0.1%3A59653%2Fcallback"
+		));
 		assert!(url.contains("prompt=select_account"));
 		assert!(url.contains("code_challenge_method=S256"));
 	}

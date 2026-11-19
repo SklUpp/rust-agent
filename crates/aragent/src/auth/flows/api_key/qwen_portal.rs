@@ -1,10 +1,10 @@
 //! Qwen Portal login (`registry/qwen-portal.ts`): one pasted OAuth token/API
 //! key validated against the portal's OpenAI-compatible endpoint.
 
-use super::super::Flow;
 use super::super::super::error::AuthError;
 use super::super::super::registry::Validation;
 use super::super::super::store::Credential;
+use super::super::Flow;
 use super::validate;
 
 const AUTH_URL: &str = "https://chat.qwen.ai";
@@ -38,10 +38,10 @@ mod tests {
 	/// pasted-key prompt with one scripted reply.
 	#[derive(Default)]
 	struct Recorder {
-		opened:           Mutex<Vec<AuthUrlInfo>>,
-		prompts:          Mutex<Vec<InputPrompt>>,
-		notices:          Mutex<Vec<String>>,
-		reply:            Mutex<Option<InputReply>>,
+		opened: Mutex<Vec<AuthUrlInfo>>,
+		prompts: Mutex<Vec<InputPrompt>>,
+		notices: Mutex<Vec<String>>,
+		reply: Mutex<Option<InputReply>>,
 		/// Cancel from inside the prompt: the user pasted *and* the login died.
 		cancel_on_prompt: bool,
 	}

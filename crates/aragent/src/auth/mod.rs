@@ -48,7 +48,9 @@ use error::{AuthError, AuthErrorKind};
 use http::{Cancel, HttpClient};
 use registry::ProviderEntry;
 use selection::{CredentialRanking, SelectionState};
-use store::{Credential, CredentialStore, OAuthCredentials, StoredCredential, REFRESH_LEASE_TTL_MS};
+use store::{
+	Credential, CredentialStore, OAuthCredentials, REFRESH_LEASE_TTL_MS, StoredCredential,
+};
 
 /// `onAuth` payload: the URL the host should open, an optional loopback-only
 /// shortcut, and provider instructions (never secret).
@@ -194,10 +196,16 @@ impl AuthBackend {
 		blocked_until_ms: i64,
 		block_scope: Option<&str>,
 	) -> Result<(), AuthError> {
-		let entry = registry::find(provider_id).ok_or_else(|| AuthError::unknown_provider(provider_id))?;
+		let entry =
+			registry::find(provider_id).ok_or_else(|| AuthError::unknown_provider(provider_id))?;
 		let provider_key = selection::provider_type_key(registry::storage_provider(entry), "oauth");
-		self.selection
-			.mark_blocked(&self.store, &provider_key, credential_id, blocked_until_ms, block_scope)
+		self.selection.mark_blocked(
+			&self.store,
+			&provider_key,
+			credential_id,
+			blocked_until_ms,
+			block_scope,
+		)
 	}
 
 	/// `getOAuthProviders()`: the login list in upstream order.
@@ -231,7 +239,8 @@ impl AuthBackend {
 		callbacks: Arc<dyn LoginCallbacks>,
 		cancel: &Cancel,
 	) -> Result<LoginOutcome, AuthError> {
-		let entry = registry::find(provider_id).ok_or_else(|| AuthError::unknown_provider(provider_id))?;
+		let entry =
+			registry::find(provider_id).ok_or_else(|| AuthError::unknown_provider(provider_id))?;
 		let credential = self.run_flow(entry, callbacks, cancel)?;
 		// A cancelled login never persists a token that finished racing the cancel.
 		cancel.check(entry.id)?;
@@ -249,7 +258,11 @@ impl AuthBackend {
 		Ok(match credential {
 			Credential::OAuth(creds) => LoginOutcome::OAuth {
 				provider: stored_as.to_string(),
-				identity: creds.email.or(creds.account_id).or(creds.project_id).or(creds.org_id),
+				identity: creds
+					.email
+					.or(creds.account_id)
+					.or(creds.project_id)
+					.or(creds.org_id),
 			},
 			Credential::ApiKey { .. } => LoginOutcome::ApiKey { provider: stored_as.to_string() },
 		})
@@ -257,14 +270,20 @@ impl AuthBackend {
 
 	/// Delete the stored credential(s) for a provider id (`logout`).
 	pub fn logout(&self, provider_id: &str) -> Result<usize, AuthError> {
-		let entry = registry::find(provider_id).ok_or_else(|| AuthError::unknown_provider(provider_id))?;
-		self.store.delete_provider(registry::storage_provider(entry))
+		let entry =
+			registry::find(provider_id).ok_or_else(|| AuthError::unknown_provider(provider_id))?;
+		self
+			.store
+			.delete_provider(registry::storage_provider(entry))
 	}
 
 	/// Registry `envKeys` fallback (`getEnvApiKey`, single-variable resolvers).
 	#[must_use]
 	pub fn env_api_key(&self, provider_id: &str) -> Option<String> {
-		let keys = ENV_KEYS.iter().find(|(id, _)| *id == provider_id).map(|(_, keys)| *keys)?;
+		let keys = ENV_KEYS
+			.iter()
+			.find(|(id, _)| *id == provider_id)
+			.map(|(_, keys)| *keys)?;
 		keys.iter().find_map(|key| {
 			std::env::var(key)
 				.ok()
@@ -322,23 +341,32 @@ impl AuthBackend {
 		session_id: Option<&str>,
 		cancel: &Cancel,
 	) -> Result<Option<String>, AuthError> {
-		let Some(entry) = registry::find(provider_id) else { return Ok(None) };
+		let Some(entry) = registry::find(provider_id) else {
+			return Ok(None);
+		};
 		let stored_as = registry::storage_provider(entry);
 
 		if let Some(stored) = self.select(stored_as, selection::OAUTH, session_id, |_| true)? {
 			let credential = self.materialize(provider_id, stored, cancel).await?;
-			return api_key_from(provider_id, &credential).map(|key| self.remember_resolved(Some(key)));
+			return api_key_from(provider_id, &credential)
+				.map(|key| self.remember_resolved(Some(key)));
 		}
-		if let Some(stored) = self.select(stored_as, selection::API_KEY, session_id, selection::is_api_key_login)? {
-			return Ok(self.remember_resolved(stored.credential.api_key_value().map(ToString::to_string)));
+		if let Some(stored) =
+			self.select(stored_as, selection::API_KEY, session_id, selection::is_api_key_login)?
+		{
+			return Ok(
+				self.remember_resolved(stored.credential.api_key_value().map(ToString::to_string))
+			);
 		}
 		if let Some(env) = self.env_api_key(provider_id) {
 			return Ok(self.remember_resolved(Some(env)));
 		}
-		if let Some(stored) =
-			self.select(stored_as, selection::API_KEY, session_id, |row| !selection::is_api_key_login(row))?
-		{
-			return Ok(self.remember_resolved(stored.credential.api_key_value().map(ToString::to_string)));
+		if let Some(stored) = self.select(stored_as, selection::API_KEY, session_id, |row| {
+			!selection::is_api_key_login(row)
+		})? {
+			return Ok(
+				self.remember_resolved(stored.credential.api_key_value().map(ToString::to_string))
+			);
 		}
 		Ok(None)
 	}
@@ -360,25 +388,34 @@ impl AuthBackend {
 		stored: StoredCredential,
 		cancel: &Cancel,
 	) -> Result<Credential, AuthError> {
-		let Credential::OAuth(creds) = stored.credential.clone() else { return Ok(stored.credential) };
+		let Credential::OAuth(creds) = stored.credential.clone() else {
+			return Ok(stored.credential);
+		};
 		if now_ms() < effective_expiry(provider_id, &creds) {
 			return Ok(Credential::OAuth(creds));
 		}
-		self.refresh_core(provider_id, stored.id, &stored.data, &creds, cancel).await
+		self
+			.refresh_core(provider_id, stored.id, &stored.data, &creds, cancel)
+			.await
 	}
 
 	/// `peekApiKey`: the same precedence without refreshing and without the
 	/// usage-ranked hook — a read-only probe (`doctor`, status displays).
 	pub fn peek_api_key(&self, provider_id: &str) -> Result<Option<String>, AuthError> {
-		let Some(entry) = registry::find(provider_id) else { return Ok(None) };
+		let Some(entry) = registry::find(provider_id) else {
+			return Ok(None);
+		};
 		let stored_as = registry::storage_provider(entry);
 
 		if let Some(stored) = self.select(stored_as, selection::OAUTH, None, |_| true)? {
 			if let Credential::OAuth(creds) = &stored.credential {
 				if now_ms() < effective_expiry(provider_id, creds) {
+					known_secrets::register(&creds.access);
+					known_secrets::register(&creds.refresh);
 					if provider_id == "github-copilot" {
 						let mut envelope = serde_json::Map::new();
-						envelope.insert("token".to_string(), serde_json::Value::String(creds.access.clone()));
+						envelope
+							.insert("token".to_string(), serde_json::Value::String(creds.access.clone()));
 						if let Some(enterprise_url) = &creds.enterprise_url {
 							envelope.insert(
 								"enterpriseUrl".to_string(),
@@ -386,22 +423,35 @@ impl AuthBackend {
 							);
 						}
 						if let Some(api_endpoint) = &creds.api_endpoint {
-							envelope.insert("apiEndpoint".to_string(), serde_json::Value::String(api_endpoint.clone()));
+							envelope.insert(
+								"apiEndpoint".to_string(),
+								serde_json::Value::String(api_endpoint.clone()),
+							);
 						}
-						return Ok(Some(serde_json::Value::Object(envelope).to_string()));
+						return Ok(
+							self.remember_resolved(Some(serde_json::Value::Object(envelope).to_string()))
+						);
 					}
-					return Ok(Some(creds.access.clone()));
+					return Ok(self.remember_resolved(Some(creds.access.clone())));
 				}
 			}
 		}
-		if let Some(stored) = self.select(stored_as, selection::API_KEY, None, selection::is_api_key_login)? {
-			return Ok(stored.credential.api_key_value().map(ToString::to_string));
+		if let Some(stored) =
+			self.select(stored_as, selection::API_KEY, None, selection::is_api_key_login)?
+		{
+			return Ok(
+				self.remember_resolved(stored.credential.api_key_value().map(ToString::to_string))
+			);
 		}
 		if let Some(env) = self.env_api_key(provider_id) {
-			return Ok(Some(env));
+			return Ok(self.remember_resolved(Some(env)));
 		}
-		if let Some(stored) = self.select(stored_as, selection::API_KEY, None, |row| !selection::is_api_key_login(row))? {
-			return Ok(stored.credential.api_key_value().map(ToString::to_string));
+		if let Some(stored) = self
+			.select(stored_as, selection::API_KEY, None, |row| !selection::is_api_key_login(row))?
+		{
+			return Ok(
+				self.remember_resolved(stored.credential.api_key_value().map(ToString::to_string))
+			);
 		}
 		Ok(None)
 	}
@@ -490,10 +540,10 @@ impl AuthBackend {
 		force_refresh: bool,
 		cancel: &Cancel,
 	) -> Result<(security::SecurityOAuthAccount, String), AuthError> {
-		let unavailable = || {
-			AuthError::config(provider_id, "The pinned security OAuth credential is unavailable")
-		};
-		let entry = registry::find(provider_id).ok_or_else(|| AuthError::unknown_provider(provider_id))?;
+		let unavailable =
+			|| AuthError::config(provider_id, "The pinned security OAuth credential is unavailable");
+		let entry =
+			registry::find(provider_id).ok_or_else(|| AuthError::unknown_provider(provider_id))?;
 		let stored_as = registry::storage_provider(entry);
 		let Some(stored) = self.store.active_by_id(credential_id)? else {
 			return Err(unavailable());
@@ -508,7 +558,8 @@ impl AuthBackend {
 			));
 		};
 		if force_refresh || now_ms() >= effective_expiry(provider_id, &creds) {
-			self.refresh_core(provider_id, credential_id, &stored.data, &creds, cancel)
+			self
+				.refresh_core(provider_id, credential_id, &stored.data, &creds, cancel)
 				.await?;
 		}
 		// Re-read the exact row: the refreshed access token and the identity
@@ -567,7 +618,8 @@ impl AuthBackend {
 		observed: &OAuthCredentials,
 		cancel: &Cancel,
 	) -> Result<Credential, AuthError> {
-		let entry = registry::find(provider_id).ok_or_else(|| AuthError::unknown_provider(provider_id))?;
+		let entry =
+			registry::find(provider_id).ok_or_else(|| AuthError::unknown_provider(provider_id))?;
 		let callbacks: Arc<dyn LoginCallbacks> = Arc::new(NoCallbacks);
 		let http = HttpClient::new();
 		// Cancellation-aware wait; a row deleted/disabled meanwhile is refused.
@@ -635,7 +687,9 @@ impl AuthBackend {
 				// this call still owns an unexpired lease. Rate limits, outages,
 				// parse/network failures and cancellation keep the credential.
 				if err.is_definitive() && lease.renew().unwrap_or(false) {
-					self.store.disable_if_matches(id, &expected, err.kind.as_str(), lease.owner())?;
+					self
+						.store
+						.disable_if_matches(id, &expected, err.kind.as_str(), lease.owner())?;
 				}
 				return Err(err);
 			},
@@ -647,7 +701,10 @@ impl AuthBackend {
 		if !lease.renew()? {
 			return Err(AuthError::config(provider_id, "refresh ownership was lost"));
 		}
-		if !self.store.update_if_matches(id, &expected, &refreshed, lease.owner())? {
+		if !self
+			.store
+			.update_if_matches(id, &expected, &refreshed, lease.owner())?
+		{
 			// Another writer won the CAS: use its value when it is fresh.
 			if let Some(current) = self.store.active_by_id(id)? {
 				if let Credential::OAuth(creds) = &current.credential {
@@ -679,11 +736,10 @@ impl AuthBackend {
 			});
 			match handle.join() {
 				Ok(result) => result,
-				Err(_) => Err(AuthError::new(
-					AuthErrorKind::Configuration,
-					"provider login task panicked",
-				)
-				.for_provider(entry.id)),
+				Err(_) => Err(
+					AuthError::new(AuthErrorKind::Configuration, "provider login task panicked")
+						.for_provider(entry.id),
+				),
 			}
 		})
 	}
@@ -795,7 +851,9 @@ impl AuthHandle {
 }
 
 /// Spawn `work` on a dedicated OS thread and return the receiving half.
-fn off_thread_future<T, F>(work: F) -> Result<tokio::sync::oneshot::Receiver<Result<T, AuthError>>, AuthError>
+fn off_thread_future<T, F>(
+	work: F,
+) -> Result<tokio::sync::oneshot::Receiver<Result<T, AuthError>>, AuthError>
 where
 	F: FnOnce() -> Result<T, AuthError> + Send + 'static,
 	T: Send + 'static,
@@ -806,7 +864,9 @@ where
 		.spawn(move || {
 			let _ = tx.send(work());
 		})
-		.map_err(|err| AuthError::new(AuthErrorKind::Configuration, format!("cannot spawn auth worker: {err}")))?;
+		.map_err(|err| {
+			AuthError::new(AuthErrorKind::Configuration, format!("cannot spawn auth worker: {err}"))
+		})?;
 	Ok(rx)
 }
 
@@ -854,7 +914,9 @@ fn lock_backend<'a>(
 		match backend.try_lock() {
 			Ok(guard) => return Ok(guard),
 			Err(std::sync::TryLockError::Poisoned(err)) => return Ok(err.into_inner()),
-			Err(std::sync::TryLockError::WouldBlock) => std::thread::sleep(std::time::Duration::from_millis(20)),
+			Err(std::sync::TryLockError::WouldBlock) => {
+				std::thread::sleep(std::time::Duration::from_millis(20))
+			},
 		}
 	}
 }
@@ -875,24 +937,36 @@ fn runtime() -> Result<tokio::runtime::Runtime, AuthError> {
 	tokio::runtime::Builder::new_current_thread()
 		.enable_all()
 		.build()
-		.map_err(|err| AuthError::new(AuthErrorKind::Configuration, format!("cannot start auth runtime: {err}")))
+		.map_err(|err| {
+			AuthError::new(AuthErrorKind::Configuration, format!("cannot start auth runtime: {err}"))
+		})
 }
 
 /// `getOAuthApiKey`: bearer value, or the structured JSON envelope for the
 /// providers whose transport needs the extra metadata.
 fn api_key_from(provider: &str, credential: &Credential) -> Result<String, AuthError> {
 	match credential {
-		Credential::ApiKey { key, .. } => Ok(key.clone()),
+		Credential::ApiKey { key, .. } => {
+			known_secrets::register(key);
+			Ok(key.clone())
+		},
 		Credential::OAuth(creds) => {
+			// Register the tokens themselves, not only whatever envelope this
+			// returns: a provider that echoes the bare access token would else
+			// leave it unmasked.
+			known_secrets::register(&creds.access);
+			known_secrets::register(&creds.refresh);
 			let expiry = effective_expiry(provider, creds);
 			if now_ms() >= expiry {
-				return Err(AuthError::new(
-					AuthErrorKind::Validation,
-					format!(
-						"OAuth credential for {provider} is expired and must be refreshed before the API key is read"
-					),
-				)
-				.for_provider(provider));
+				return Err(
+					AuthError::new(
+						AuthErrorKind::Validation,
+						format!(
+							"OAuth credential for {provider} is expired and must be refreshed before the API key is read"
+						),
+					)
+					.for_provider(provider),
+				);
 			}
 			if STRUCTURED_API_KEY_PROVIDERS.contains(&provider) {
 				let envelope = serde_json::json!({
@@ -932,7 +1006,9 @@ fn effective_expiry(provider: &str, creds: &OAuthCredentials) -> i64 {
 fn jwt_expiry(token: &str) -> Option<i64> {
 	use base64::Engine as _;
 	let payload = token.split('.').nth(1)?;
-	let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(payload).ok()?;
+	let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+		.decode(payload)
+		.ok()?;
 	let value: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
 	let exp = value.get("exp")?.as_i64()?;
 	Some(exp.saturating_mul(1000).saturating_sub(5 * 60 * 1000))
@@ -971,7 +1047,12 @@ mod tests {
 			if cancel.is_cancelled() {
 				return InputReply::Cancelled;
 			}
-			self.answers.lock().expect("lock").pop().unwrap_or(InputReply::Cancelled)
+			self
+				.answers
+				.lock()
+				.expect("lock")
+				.pop()
+				.unwrap_or(InputReply::Cancelled)
 		}
 	}
 
@@ -1001,7 +1082,10 @@ mod tests {
 			.upsert("anthropic", &credential("anthropic", "tok"))
 			.expect("upsert");
 		let providers = backend.providers().expect("providers");
-		let anthropic = providers.iter().find(|provider| provider.id == "anthropic").expect("entry");
+		let anthropic = providers
+			.iter()
+			.find(|provider| provider.id == "anthropic")
+			.expect("entry");
 		assert!(anthropic.configured);
 		assert_eq!(anthropic.auth_type, "oauth");
 	}
@@ -1017,7 +1101,12 @@ mod tests {
 			.expect("upsert");
 		assert_eq!(backend.api_key_for("deepseek").expect("lookup").as_deref(), Some("sk-test"));
 		// Unknown ids are not login providers: no key, no error.
-		assert_eq!(backend.api_key_for("definitely-not-a-provider").expect("lookup"), None);
+		assert_eq!(
+			backend
+				.api_key_for("definitely-not-a-provider")
+				.expect("lookup"),
+			None
+		);
 	}
 
 	#[test]
@@ -1038,7 +1127,10 @@ mod tests {
 				}),
 			)
 			.expect("upsert");
-		let key = backend.api_key_for("github-copilot").expect("lookup").expect("key");
+		let key = backend
+			.api_key_for("github-copilot")
+			.expect("lookup")
+			.expect("key");
 		let envelope: serde_json::Value = serde_json::from_str(&key).expect("json");
 		assert_eq!(envelope["token"], "gh-token");
 		assert_eq!(envelope["enterpriseUrl"], "company.ghe.com");
@@ -1146,7 +1238,9 @@ mod tests {
 		let backend = AuthBackend::in_memory().expect("store");
 		let callbacks: Arc<dyn LoginCallbacks> = Arc::new(Recorder::default());
 		let cancel = Cancel::new();
-		let err = backend.login("nope", callbacks, &cancel).expect_err("unknown");
+		let err = backend
+			.login("nope", callbacks, &cancel)
+			.expect_err("unknown");
 		assert_eq!(err.kind, AuthErrorKind::UnknownProvider);
 		assert!(err.message.contains("nope"));
 	}
@@ -1157,7 +1251,9 @@ mod tests {
 		let callbacks: Arc<dyn LoginCallbacks> = Arc::new(Recorder::default());
 		let cancel = Cancel::new();
 		cancel.cancel();
-		let err = backend.login("anthropic", callbacks, &cancel).expect_err("cancelled");
+		let err = backend
+			.login("anthropic", callbacks, &cancel)
+			.expect_err("cancelled");
 		assert_eq!(err.kind, AuthErrorKind::Cancelled);
 	}
 
@@ -1169,7 +1265,10 @@ mod tests {
 			.store
 			.upsert("zai", &Credential::ApiKey { key: "k".to_string(), source_login: false })
 			.expect("upsert");
-		assert_eq!(registry::storage_provider(registry::find("zai-coding-plan").expect("entry")), "zai");
+		assert_eq!(
+			registry::storage_provider(registry::find("zai-coding-plan").expect("entry")),
+			"zai"
+		);
 		assert!(!backend.providers().expect("providers").is_empty());
 	}
 
@@ -1177,9 +1276,19 @@ mod tests {
 	fn recorder_callbacks_never_see_tokens() {
 		let callbacks = Recorder::default();
 		callbacks.notice("line");
-		assert!(callbacks.notices.lock().expect("lock").iter().all(|line| !line.contains("sk-")));
+		assert!(
+			callbacks
+				.notices
+				.lock()
+				.expect("lock")
+				.iter()
+				.all(|line| !line.contains("sk-"))
+		);
 		assert_eq!(
-			callbacks.input(&InputPrompt { message: "m".into(), placeholder: None, allow_empty: false }, &Cancel::new()),
+			callbacks.input(
+				&InputPrompt { message: "m".into(), placeholder: None, allow_empty: false },
+				&Cancel::new()
+			),
 			InputReply::Cancelled
 		);
 	}

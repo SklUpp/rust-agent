@@ -33,10 +33,13 @@ const FAR_FUTURE_MS: i64 = 10 * 365 * 24 * 60 * 60 * 1000;
 const PROVIDER: &str = "github-copilot";
 
 pub async fn login(flow: &Flow<'_>) -> Result<Credential, AuthError> {
-	let input = flow.ask("GitHub Enterprise URL/domain (blank for github.com)", "company.ghe.com", true)?;
+	let input =
+		flow.ask("GitHub Enterprise URL/domain (blank for github.com)", "company.ghe.com", true)?;
 	let domain = normalize_domain(&input)?;
 	let enterprise_domain = normalize_enterprise_domain(&input, domain.as_deref());
-	let host = domain.filter(|host| !is_public_github_host(host)).unwrap_or_else(|| "github.com".to_string());
+	let host = domain
+		.filter(|host| !is_public_github_host(host))
+		.unwrap_or_else(|| "github.com".to_string());
 
 	let device = start_device_flow(flow, &host).await?;
 	publish(flow, &device.verification_uri, &device.user_code);
@@ -62,8 +65,10 @@ pub async fn refresh(
 ) -> Result<Credential, AuthError> {
 	let provider = flow.provider();
 	if credentials.access.trim().is_empty() {
-		return Err(AuthError::new(AuthErrorKind::TokenRefresh, "stored credential has no GitHub token")
-			.for_provider(provider));
+		return Err(
+			AuthError::new(AuthErrorKind::TokenRefresh, "stored credential has no GitHub token")
+				.for_provider(provider),
+		);
 	}
 	Ok(Credential::OAuth(OAuthCredentials {
 		expires: now_ms() + FAR_FUTURE_MS,
@@ -98,10 +103,16 @@ async fn start_device_flow(flow: &Flow<'_>, host: &str) -> Result<DeviceCode, Au
 	let verification_uri = string_field(&payload, "verification_uri").unwrap_or_default();
 	let interval = payload.get("interval").and_then(Value::as_f64);
 	let expires_in = payload.get("expires_in").and_then(Value::as_f64);
-	if device_code.is_empty() || user_code.is_empty() || verification_uri.is_empty() || interval.is_none() || expires_in.is_none()
+	if device_code.is_empty()
+		|| user_code.is_empty()
+		|| verification_uri.is_empty()
+		|| interval.is_none()
+		|| expires_in.is_none()
 	{
-		return Err(AuthError::new(AuthErrorKind::Validation, "Invalid device code response fields")
-			.for_provider(PROVIDER));
+		return Err(
+			AuthError::new(AuthErrorKind::Validation, "Invalid device code response fields")
+				.for_provider(PROVIDER),
+		);
 	}
 	Ok(DeviceCode {
 		device_code,
@@ -112,7 +123,11 @@ async fn start_device_flow(flow: &Flow<'_>, host: &str) -> Result<DeviceCode, Au
 	})
 }
 
-async fn poll_access_token(flow: &Flow<'_>, host: &str, device: &DeviceCode) -> Result<String, AuthError> {
+async fn poll_access_token(
+	flow: &Flow<'_>,
+	host: &str,
+	device: &DeviceCode,
+) -> Result<String, AuthError> {
 	let deadline = Duration::from_millis((device.expires_in.max(0.0) * 1000.0) as u64);
 	let started = std::time::Instant::now();
 	let mut interval_ms = (device.interval_seconds * POLL_SCALE_MS).max(POLL_FLOOR_MS);
@@ -144,14 +159,22 @@ async fn poll_access_token(flow: &Flow<'_>, host: &str, device: &DeviceCode) -> 
 				return Ok(token);
 			}
 		}
-		match string_field(&payload, "error").as_deref().unwrap_or_default() {
+		match string_field(&payload, "error")
+			.as_deref()
+			.unwrap_or_default()
+		{
 			"authorization_pending" => {},
 			"slow_down" => {
 				slow_downs += 1;
-				let retry = payload.get("interval").and_then(Value::as_f64).filter(|seconds| *seconds > 0.0);
+				let retry = payload
+					.get("interval")
+					.and_then(Value::as_f64)
+					.filter(|seconds| *seconds > 0.0);
 				interval_ms = match retry {
 					Some(seconds) => (seconds * POLL_SCALE_MS).max(POLL_FLOOR_MS),
-					None => (interval_ms + SLOW_DOWN_INCREMENT_SECONDS * POLL_SCALE_MS).max(POLL_FLOOR_MS),
+					None => {
+						(interval_ms + SLOW_DOWN_INCREMENT_SECONDS * POLL_SCALE_MS).max(POLL_FLOOR_MS)
+					},
 				};
 				multiplier = SLOW_DOWN_POLL_MULTIPLIER;
 			},
@@ -187,8 +210,13 @@ async fn discover_api_endpoint(flow: &Flow<'_>, token: &str) -> Result<Option<St
 	if !response.is_success() {
 		return Ok(None);
 	}
-	let Ok(payload) = response.json(PROVIDER) else { return Ok(None) };
-	let Some(endpoint) = payload.get("endpoints").and_then(|endpoints| endpoints.get("api")).and_then(Value::as_str)
+	let Ok(payload) = response.json(PROVIDER) else {
+		return Ok(None);
+	};
+	let Some(endpoint) = payload
+		.get("endpoints")
+		.and_then(|endpoints| endpoints.get("api"))
+		.and_then(Value::as_str)
 	else {
 		return Ok(None);
 	};
@@ -211,10 +239,16 @@ fn normalize_api_endpoint(input: &str) -> Option<String> {
 #[must_use]
 pub fn copilot_base_url(enterprise_domain: Option<&str>) -> String {
 	const PUBLIC: &str = "https://api.githubcopilot.com";
-	let Some(input) = enterprise_domain.map(str::trim).filter(|value| !value.is_empty()) else {
+	let Some(input) = enterprise_domain
+		.map(str::trim)
+		.filter(|value| !value.is_empty())
+	else {
 		return PUBLIC.to_string();
 	};
-	let normalized = normalize_domain(input).ok().flatten().unwrap_or_else(|| input.to_lowercase());
+	let normalized = normalize_domain(input)
+		.ok()
+		.flatten()
+		.unwrap_or_else(|| input.to_lowercase());
 	if normalized.is_empty() || is_public_github_host(&normalized) {
 		return PUBLIC.to_string();
 	}
@@ -296,8 +330,10 @@ fn normalize_domain(input: &str) -> Result<Option<String>, AuthError> {
 		.unwrap_or_default()
 		.to_ascii_lowercase();
 	if host.is_empty() || !host.contains('.') && host != "localhost" && !host.contains(':') {
-		return Err(AuthError::new(AuthErrorKind::Validation, "Invalid GitHub Enterprise URL/domain")
-			.for_provider(PROVIDER));
+		return Err(
+			AuthError::new(AuthErrorKind::Validation, "Invalid GitHub Enterprise URL/domain")
+				.for_provider(PROVIDER),
+		);
 	}
 	Ok(Some(host))
 }
@@ -324,9 +360,14 @@ mod tests {
 	#[test]
 	fn domain_normalization_matches_upstream() {
 		assert_eq!(normalize_domain("").expect("ok"), None);
-		assert_eq!(normalize_domain("company.ghe.com").expect("ok").as_deref(), Some("company.ghe.com"));
 		assert_eq!(
-			normalize_domain("https://company.ghe.com/login").expect("ok").as_deref(),
+			normalize_domain("company.ghe.com").expect("ok").as_deref(),
+			Some("company.ghe.com")
+		);
+		assert_eq!(
+			normalize_domain("https://company.ghe.com/login")
+				.expect("ok")
+				.as_deref(),
 			Some("company.ghe.com")
 		);
 		assert!(normalize_domain("not a domain").is_err());

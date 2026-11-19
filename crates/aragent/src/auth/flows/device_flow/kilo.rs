@@ -32,25 +32,33 @@ pub async fn login(flow: &Flow<'_>) -> Result<Credential, AuthError> {
 		.await?;
 	if !response.is_success() {
 		if response.status == 429 {
-			return Err(AuthError::new(
-				AuthErrorKind::Polling,
-				"Too many pending authorization requests. Please try again later.",
-			)
-			.for_provider(provider)
-			.with_status(429));
+			return Err(
+				AuthError::new(
+					AuthErrorKind::Polling,
+					"Too many pending authorization requests. Please try again later.",
+				)
+				.for_provider(provider)
+				.with_status(429),
+			);
 		}
-		return Err(response.error_for(AuthErrorKind::DeviceAuth, provider, "Failed to initiate device authorization"));
+		return Err(response.error_for(
+			AuthErrorKind::DeviceAuth,
+			provider,
+			"Failed to initiate device authorization",
+		));
 	}
 	let payload = response.json(provider)?;
 	let user_code = string_field(&payload, "code").unwrap_or_default();
 	let verification_url = string_field(&payload, "verificationUrl").unwrap_or_default();
 	let expires_in = number_field(&payload, "expiresIn").unwrap_or_default();
 	if user_code.is_empty() || verification_url.is_empty() || expires_in <= 0.0 {
-		return Err(AuthError::new(
-			AuthErrorKind::Validation,
-			"Kilo device authorization response missing required fields",
-		)
-		.for_provider(provider));
+		return Err(
+			AuthError::new(
+				AuthErrorKind::Validation,
+				"Kilo device authorization response missing required fields",
+			)
+			.for_provider(provider),
+		);
 	}
 	publish(flow, &verification_url, &user_code);
 
@@ -73,14 +81,19 @@ pub async fn login(flow: &Flow<'_>) -> Result<Credential, AuthError> {
 		match response.status {
 			202 => {},
 			403 => {
-				return Err(AuthError::new(AuthErrorKind::DeviceAuth, "Authorization was denied").for_provider(provider));
+				return Err(
+					AuthError::new(AuthErrorKind::DeviceAuth, "Authorization was denied")
+						.for_provider(provider),
+				);
 			},
 			410 => {
-				return Err(AuthError::new(
-					AuthErrorKind::DeviceAuth,
-					"Authorization code expired. Please try again.",
-				)
-				.for_provider(provider));
+				return Err(
+					AuthError::new(
+						AuthErrorKind::DeviceAuth,
+						"Authorization code expired. Please try again.",
+					)
+					.for_provider(provider),
+				);
 			},
 			status if (200..300).contains(&status) => {
 				let payload = response.json(provider)?;
@@ -95,19 +108,27 @@ pub async fn login(flow: &Flow<'_>) -> Result<Credential, AuthError> {
 					}));
 				}
 				if status == "denied" {
-					return Err(AuthError::new(AuthErrorKind::DeviceAuth, "Authorization was denied")
-						.for_provider(provider));
+					return Err(
+						AuthError::new(AuthErrorKind::DeviceAuth, "Authorization was denied")
+							.for_provider(provider),
+					);
 				}
 				if status == "expired" {
-					return Err(AuthError::new(
-						AuthErrorKind::DeviceAuth,
-						"Authorization code expired. Please try again.",
-					)
-					.for_provider(provider));
+					return Err(
+						AuthError::new(
+							AuthErrorKind::DeviceAuth,
+							"Authorization code expired. Please try again.",
+						)
+						.for_provider(provider),
+					);
 				}
 			},
 			_ => {
-				return Err(response.error_for(AuthErrorKind::Polling, provider, "Failed to poll device authorization"));
+				return Err(response.error_for(
+					AuthErrorKind::Polling,
+					provider,
+					"Failed to poll device authorization",
+				));
 			},
 		}
 
@@ -118,7 +139,10 @@ pub async fn login(flow: &Flow<'_>) -> Result<Credential, AuthError> {
 		sleep(flow, remaining.min(Duration::from_millis(POLL_INTERVAL_MS))).await?;
 	}
 
-	Err(AuthError::new(AuthErrorKind::Timeout, "Authentication timed out. Please try again.").for_provider(provider))
+	Err(
+		AuthError::new(AuthErrorKind::Timeout, "Authentication timed out. Please try again.")
+			.for_provider(provider),
+	)
 }
 
 #[cfg(test)]

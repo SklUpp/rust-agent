@@ -46,12 +46,10 @@ pub async fn login(flow: &Flow<'_>) -> Result<Credential, AuthError> {
 
 	let email = flow.require("Enter your Perplexity email address", "user@example.com")?;
 	flow.notice("Sending login code to your email...");
-	let mut request = HttpRequest::json(
-		SIGNIN_EMAIL_URL,
-		json!({ "email": email, "csrfToken": csrf_token }),
-	)
-	.header("X-App-ApiVersion", API_VERSION)
-	.header("User-Agent", APP_USER_AGENT);
+	let mut request =
+		HttpRequest::json(SIGNIN_EMAIL_URL, json!({ "email": email, "csrfToken": csrf_token }))
+			.header("X-App-ApiVersion", API_VERSION)
+			.header("User-Agent", APP_USER_AGENT);
 	jar.apply(&mut request);
 	let sent = send(flow, &mut jar, request, "send login code").await?;
 	if !sent.is_success() {
@@ -70,8 +68,14 @@ pub async fn login(flow: &Flow<'_>) -> Result<Credential, AuthError> {
 	let verified = send(flow, &mut jar, request, "OTP verification").await?;
 	let payload = verified.json("perplexity")?;
 
-	let error_code = payload.get("error_code").and_then(serde_json::Value::as_str).unwrap_or_default();
-	let status = payload.get("status").and_then(serde_json::Value::as_str).unwrap_or_default();
+	let error_code = payload
+		.get("error_code")
+		.and_then(serde_json::Value::as_str)
+		.unwrap_or_default();
+	let status = payload
+		.get("status")
+		.and_then(serde_json::Value::as_str)
+		.unwrap_or_default();
 	let token = payload
 		.get("challenge_token")
 		.and_then(serde_json::Value::as_str)
@@ -79,19 +83,33 @@ pub async fn login(flow: &Flow<'_>) -> Result<Credential, AuthError> {
 		.or_else(|| payload.get("token").and_then(serde_json::Value::as_str))
 		.unwrap_or_default()
 		.to_string();
-	if !verified.is_success() || token.is_empty() || !error_code.is_empty() || (!status.is_empty() && status != "success") {
+	if !verified.is_success()
+		|| token.is_empty()
+		|| !error_code.is_empty()
+		|| (!status.is_empty() && status != "success")
+	{
 		let reason = payload
 			.get("text")
 			.and_then(serde_json::Value::as_str)
 			.filter(|value| !value.is_empty())
-			.unwrap_or(if error_code.is_empty() { status } else { error_code });
-		let reason = if reason.is_empty() { "OTP verification failed".to_string() } else { reason.to_string() };
-		return Err(AuthError::new(
-			AuthErrorKind::Validation,
-			format!("Perplexity OTP verification failed: {reason}"),
-		)
-		.for_provider("perplexity")
-		.with_status(verified.status));
+			.unwrap_or(if error_code.is_empty() {
+				status
+			} else {
+				error_code
+			});
+		let reason = if reason.is_empty() {
+			"OTP verification failed".to_string()
+		} else {
+			reason.to_string()
+		};
+		return Err(
+			AuthError::new(
+				AuthErrorKind::Validation,
+				format!("Perplexity OTP verification failed: {reason}"),
+			)
+			.for_provider("perplexity")
+			.with_status(verified.status),
+		);
 	}
 
 	Ok(Credential::OAuth(OAuthCredentials {
@@ -129,7 +147,9 @@ impl CookieJar {
 	fn remember(&mut self, response: &HttpResponse) -> Result<(), AuthError> {
 		for header in &response.set_cookies {
 			let pair = header.split(';').next().unwrap_or_default().trim();
-			let Some((name, value)) = pair.split_once('=') else { continue };
+			let Some((name, value)) = pair.split_once('=') else {
+				continue;
+			};
 			let name = name.trim();
 			if name.is_empty() {
 				continue;
@@ -141,7 +161,9 @@ impl CookieJar {
 			if expired {
 				self.values.remove(name);
 			} else {
-				self.values.insert(name.to_string(), value.trim().to_string());
+				self
+					.values
+					.insert(name.to_string(), value.trim().to_string());
 			}
 		}
 		Ok(())
@@ -164,7 +186,9 @@ impl CookieJar {
 /// `getJwtExpiry`: an `exp` claim wins (minus the 5-minute safety margin), and
 /// a token without one is treated as non-expiring.
 fn jwt_expiry(token: &str) -> i64 {
-	let Some(exp) = jwt_claims(token).and_then(|payload| payload.get("exp").and_then(serde_json::Value::as_i64)) else {
+	let Some(exp) =
+		jwt_claims(token).and_then(|payload| payload.get("exp").and_then(serde_json::Value::as_i64))
+	else {
 		return NEVER_EXPIRES;
 	};
 	exp.saturating_mul(1000).saturating_sub(EXPIRY_SKEW_MS)
@@ -173,7 +197,9 @@ fn jwt_expiry(token: &str) -> i64 {
 fn jwt_claims(token: &str) -> Option<serde_json::Value> {
 	use base64::Engine as _;
 	let payload = token.split('.').nth(1)?;
-	let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(payload).ok()?;
+	let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+		.decode(payload)
+		.ok()?;
 	serde_json::from_slice(&bytes).ok()
 }
 
@@ -201,7 +227,12 @@ mod tests {
 
 		let mut request = HttpRequest::get("https://example.test");
 		jar.apply(&mut request);
-		assert!(request.headers.iter().any(|(name, value)| name == "Cookie" && value == "a=1"));
+		assert!(
+			request
+				.headers
+				.iter()
+				.any(|(name, value)| name == "Cookie" && value == "a=1")
+		);
 	}
 
 	#[test]

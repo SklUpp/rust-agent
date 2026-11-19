@@ -160,7 +160,11 @@ const fn oauth(
 	}
 }
 
-const fn device(id: &'static str, name: &'static str, store_as: Option<&'static str>) -> ProviderEntry {
+const fn device(
+	id: &'static str,
+	name: &'static str,
+	store_as: Option<&'static str>,
+) -> ProviderEntry {
 	ProviderEntry {
 		id,
 		name,
@@ -332,7 +336,11 @@ const MOONSHOT: ApiKeySpec = ApiKeySpec {
 	placeholder: "sk-...",
 	allow_empty: false,
 	empty_fallback: None,
-	validation: Validation::Models { provider: "moonshot", url: ModelsUrl::Moonshot, project_header: false },
+	validation: Validation::Models {
+		provider: "moonshot",
+		url: ModelsUrl::Moonshot,
+		project_header: false,
+	},
 };
 
 const CEREBRAS: ApiKeySpec = ApiKeySpec {
@@ -801,13 +809,7 @@ const GMI_CLOUD: ApiKeySpec = ApiKeySpec {
 /// Providers whose `login` requires an interactive sequence rather than one
 /// pasted value (`Paste`-style logins live in `ApiKeySpec`).
 pub const PROVIDERS: &[ProviderEntry] = &[
-	oauth(
-		"openai-codex",
-		"ChatGPT Plus/Pro (Codex Subscription)",
-		Some(1455),
-		true,
-		None,
-	),
+	oauth("openai-codex", "ChatGPT Plus/Pro (Codex Subscription)", Some(1455), true, None),
 	oauth("anthropic", "Anthropic (Claude Pro/Max)", Some(54545), true, None),
 	key("zai", "Z.AI (GLM Coding Plan)", &ZAI),
 	oauth("zai-coding-plan", "Z.AI (GLM Coding Plan · Sign in)", Some(54548), true, Some("zai")),
@@ -816,20 +818,8 @@ pub const PROVIDERS: &[ProviderEntry] = &[
 	device("github-copilot", "GitHub Copilot", None),
 	custom("cursor", "Cursor (Claude, GPT, etc.)"),
 	oauth("devin", "Devin", Some(59653), true, None),
-	oauth(
-		"google-antigravity",
-		"Antigravity (Gemini 3, Claude, GPT-OSS)",
-		Some(51121),
-		true,
-		None,
-	),
-	oauth(
-		"google-gemini-cli",
-		"Google Cloud Code Assist (Gemini CLI)",
-		Some(8085),
-		true,
-		None,
-	),
+	oauth("google-antigravity", "Antigravity (Gemini 3, Claude, GPT-OSS)", Some(51121), true, None),
+	oauth("google-gemini-cli", "Google Cloud Code Assist (Gemini CLI)", Some(8085), true, None),
 	device("openai-codex-device", "ChatGPT Plus/Pro (Codex, headless/device)", Some("openai-codex")),
 	key("xai", "xAI API", &XAI_API_KEY),
 	device("xai-oauth", "xAI Grok OAuth (SuperGrok or X Premium+)", None),
@@ -925,14 +915,20 @@ mod tests {
 	fn ids_that_differ_from_their_module_are_preserved() {
 		assert_eq!(find("gitlab-duo-agent").map(|entry| entry.name), Some("GitLab Duo Agent"));
 		assert_eq!(find("zai-coding-plan").and_then(|entry| entry.store_as), Some("zai"));
-		assert_eq!(find("openai-codex-device").and_then(|entry| entry.store_as), Some("openai-codex"));
+		assert_eq!(
+			find("openai-codex-device").and_then(|entry| entry.store_as),
+			Some("openai-codex")
+		);
 		assert_eq!(find("llama.cpp").map(|entry| entry.kind), Some(LoginKind::ApiKey));
 	}
 
 	#[test]
 	fn callback_ports_match_auth_broker_map() {
-		let ports: Vec<(&str, Option<u16>)> =
-			PROVIDERS.iter().filter(|entry| entry.callback_port.is_some()).map(|entry| (entry.id, entry.callback_port)).collect();
+		let ports: Vec<(&str, Option<u16>)> = PROVIDERS
+			.iter()
+			.filter(|entry| entry.callback_port.is_some())
+			.map(|entry| (entry.id, entry.callback_port))
+			.collect();
 		assert_eq!(
 			ports,
 			vec![
@@ -951,7 +947,11 @@ mod tests {
 
 	#[test]
 	fn paste_code_flows_match_upstream_set() {
-		let paste: Vec<&str> = PROVIDERS.iter().filter(|entry| entry.paste_code).map(|entry| entry.id).collect();
+		let paste: Vec<&str> = PROVIDERS
+			.iter()
+			.filter(|entry| entry.paste_code)
+			.map(|entry| entry.id)
+			.collect();
 		assert_eq!(
 			paste,
 			vec![

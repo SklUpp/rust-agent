@@ -66,17 +66,23 @@ async fn poll(flow: &Flow<'_>, uuid: &str, verifier: &str) -> Result<(String, St
 			CURSOR_POLL_URL,
 			&[("uuid", uuid), ("verifier", verifier)],
 		);
-		let response = match flow.http.send(HttpRequest::get(url), flow.cancel, "cursor").await {
+		let response = match flow
+			.http
+			.send(HttpRequest::get(url), flow.cancel, "cursor")
+			.await
+		{
 			Ok(response) => response,
 			Err(err) if err.kind == AuthErrorKind::Cancelled => return Err(err),
 			Err(_) => {
 				consecutive_errors += 1;
 				if consecutive_errors >= 3 {
-					return Err(AuthError::new(
-						AuthErrorKind::Polling,
-						"Too many consecutive errors during Cursor auth polling",
-					)
-					.for_provider("cursor"));
+					return Err(
+						AuthError::new(
+							AuthErrorKind::Polling,
+							"Too many consecutive errors during Cursor auth polling",
+						)
+						.for_provider("cursor"),
+					);
 				}
 				continue;
 			},
@@ -92,16 +98,29 @@ async fn poll(flow: &Flow<'_>, uuid: &str, verifier: &str) -> Result<(String, St
 		}
 		return Err(response.error_for(AuthErrorKind::Polling, "cursor", "Cursor auth poll"));
 	}
-	Err(AuthError::new(AuthErrorKind::Timeout, "Cursor authentication polling timeout").for_provider("cursor"))
+	Err(
+		AuthError::new(AuthErrorKind::Timeout, "Cursor authentication polling timeout")
+			.for_provider("cursor"),
+	)
 }
 
 fn parse_tokens(response: &HttpResponse) -> Result<(String, String), AuthError> {
 	let payload = response.json("cursor")?;
-	let access = payload.get("accessToken").and_then(serde_json::Value::as_str).unwrap_or_default().to_string();
-	let refresh = payload.get("refreshToken").and_then(serde_json::Value::as_str).unwrap_or_default().to_string();
+	let access = payload
+		.get("accessToken")
+		.and_then(serde_json::Value::as_str)
+		.unwrap_or_default()
+		.to_string();
+	let refresh = payload
+		.get("refreshToken")
+		.and_then(serde_json::Value::as_str)
+		.unwrap_or_default()
+		.to_string();
 	if access.is_empty() {
-		return Err(AuthError::new(AuthErrorKind::Validation, "Cursor poll response missing accessToken")
-			.for_provider("cursor"));
+		return Err(
+			AuthError::new(AuthErrorKind::Validation, "Cursor poll response missing accessToken")
+				.for_provider("cursor"),
+		);
 	}
 	Ok((access, refresh))
 }
@@ -110,10 +129,16 @@ pub async fn refresh(
 	flow: &Flow<'_>,
 	credentials: &OAuthCredentials,
 ) -> Result<Credential, AuthError> {
-	let secret = if credentials.refresh.is_empty() { &credentials.access } else { &credentials.refresh };
+	let secret = if credentials.refresh.is_empty() {
+		&credentials.access
+	} else {
+		&credentials.refresh
+	};
 	if secret.is_empty() {
-		return Err(AuthError::new(AuthErrorKind::TokenRefresh, "stored credential has no refresh token")
-			.for_provider("cursor"));
+		return Err(
+			AuthError::new(AuthErrorKind::TokenRefresh, "stored credential has no refresh token")
+				.for_provider("cursor"),
+		);
 	}
 	let payload = flow
 		.http
@@ -126,10 +151,16 @@ pub async fn refresh(
 			AuthErrorKind::TokenRefresh,
 		)
 		.await?;
-	let access = payload.get("accessToken").and_then(serde_json::Value::as_str).unwrap_or_default().to_string();
+	let access = payload
+		.get("accessToken")
+		.and_then(serde_json::Value::as_str)
+		.unwrap_or_default()
+		.to_string();
 	if access.is_empty() {
-		return Err(AuthError::new(AuthErrorKind::Validation, "Cursor refresh response missing accessToken")
-			.for_provider("cursor"));
+		return Err(
+			AuthError::new(AuthErrorKind::Validation, "Cursor refresh response missing accessToken")
+				.for_provider("cursor"),
+		);
 	}
 	let refresh = payload
 		.get("refreshToken")
@@ -147,7 +178,8 @@ pub async fn refresh(
 /// Cursor access tokens are JWTs; a missing or malformed `exp` falls back to
 /// one hour so the refresh lease still has a deadline.
 fn token_expiry(token: &str) -> i64 {
-	let exp = jwt_claims(token).and_then(|payload| payload.get("exp").and_then(serde_json::Value::as_i64));
+	let exp =
+		jwt_claims(token).and_then(|payload| payload.get("exp").and_then(serde_json::Value::as_i64));
 	match exp {
 		Some(exp) => exp.saturating_mul(1000).saturating_sub(EXPIRY_SKEW_MS),
 		None => now_ms().saturating_add(FALLBACK_TTL_MS),
@@ -167,7 +199,9 @@ pub fn access_token_user_id(token: &str) -> Option<String> {
 
 fn jwt_claims(token: &str) -> Option<serde_json::Value> {
 	let payload = token.split('.').nth(1)?;
-	let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(payload).ok()?;
+	let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+		.decode(payload)
+		.ok()?;
 	serde_json::from_slice(&bytes).ok()
 }
 
@@ -215,6 +249,9 @@ mod tests {
 			CURSOR_LOGIN_URL,
 			&[("challenge", "ch"), ("uuid", "u"), ("mode", "login"), ("redirectTarget", "cli")],
 		);
-		assert_eq!(url, "https://cursor.com/loginDeepControl?challenge=ch&uuid=u&mode=login&redirectTarget=cli");
+		assert_eq!(
+			url,
+			"https://cursor.com/loginDeepControl?challenge=ch&uuid=u&mode=login&redirectTarget=cli"
+		);
 	}
 }

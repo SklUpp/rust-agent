@@ -75,7 +75,13 @@ pub struct AuthError {
 
 impl AuthError {
 	pub fn new(kind: AuthErrorKind, message: impl AsRef<str>) -> Self {
-		Self { kind, provider: None, status: None, message: redact(message.as_ref()), grant_dead: false }
+		Self {
+			kind,
+			provider: None,
+			status: None,
+			message: redact(message.as_ref()),
+			grant_dead: false,
+		}
 	}
 
 	pub fn for_provider(mut self, provider: &str) -> Self {
@@ -141,7 +147,10 @@ impl AuthError {
 		!self.is_definitive()
 			&& matches!(
 				self.kind,
-				AuthErrorKind::Timeout | AuthErrorKind::Polling | AuthErrorKind::Http | AuthErrorKind::Validation
+				AuthErrorKind::Timeout
+					| AuthErrorKind::Polling
+					| AuthErrorKind::Http
+					| AuthErrorKind::Validation
 			)
 	}
 }
@@ -178,8 +187,17 @@ impl From<std::io::Error> for AuthError {
 /// Covers the two shapes that actually leak: JSON fields whose name says
 /// token/secret/key, and bare bearer/API-key-looking tokens in log lines.
 pub fn redact(text: &str) -> String {
-	const SECRET_FIELDS: &[&str] =
-		&["access_token", "refresh_token", "id_token", "token", "secret", "password", "code", "code_verifier", "key"];
+	const SECRET_FIELDS: &[&str] = &[
+		"access_token",
+		"refresh_token",
+		"id_token",
+		"token",
+		"secret",
+		"password",
+		"code",
+		"code_verifier",
+		"key",
+	];
 
 	// Exact known values first: a field-shaped scan cannot see a credential
 	// embedded in a message string.
@@ -268,7 +286,9 @@ fn redact_query_span(text: &str, secret_keys: &[&str]) -> String {
 	let mut out = String::with_capacity(text.len());
 	let mut index = 0usize;
 	while index < text.len() {
-		let Some(ch) = text[index..].chars().next() else { break };
+		let Some(ch) = text[index..].chars().next() else {
+			break;
+		};
 		if ch != '?' && ch != '&' {
 			out.push(ch);
 			index += ch.len_utf8();
@@ -289,7 +309,10 @@ fn redact_query_span(text: &str, secret_keys: &[&str]) -> String {
 			.find(|c: char| c == '&' || c == '#' || c.is_whitespace() || matches!(c, '"' | '\'' | ')'))
 			.map(|rel| value_start + rel)
 			.unwrap_or(text.len());
-		if secret_keys.iter().any(|known| known.eq_ignore_ascii_case(key.trim())) {
+		if secret_keys
+			.iter()
+			.any(|known| known.eq_ignore_ascii_case(key.trim()))
+		{
 			out.push_str("[REDACTED]");
 		} else {
 			out.push_str(&text[value_start..value_end]);
@@ -321,7 +344,8 @@ fn redact_jwts(text: &str) -> String {
 }
 
 fn redact_bearer_tokens(text: &str) -> String {
-	const SCHEMES: &[&str] = &["Bearer ", "sk-", "sk_", "xai-", "nvapi-", "gho_", "csk-", "fw_", "bt_", "fpk_"];
+	const SCHEMES: &[&str] =
+		&["Bearer ", "sk-", "sk_", "xai-", "nvapi-", "gho_", "csk-", "fw_", "bt_", "fpk_"];
 
 	let mut out = String::with_capacity(text.len());
 	let mut rest = text;
@@ -355,6 +379,25 @@ pub(crate) fn redact_free_text(text: &str) -> String {
 	let after_queries = redact_url_queries(&known);
 	let after_jwt = redact_strict_jwts(&after_queries);
 	redact_boundary_tokens(&after_jwt)
+}
+
+/// Mask every string value inside a stored JSON payload.
+///
+/// Message payloads are what the UI renders and what the model replays, so a
+/// credential echoed by a tool result or a provider error must be masked
+/// before the row is written, not only in the stream draft.
+pub(crate) fn redact_json_strings(value: &mut serde_json::Value) {
+	match value {
+		serde_json::Value::String(text) => {
+			let redacted = redact_free_text(text);
+			if redacted != *text {
+				*text = redacted;
+			}
+		},
+		serde_json::Value::Array(items) => items.iter_mut().for_each(redact_json_strings),
+		serde_json::Value::Object(map) => map.values_mut().for_each(redact_json_strings),
+		_ => {},
+	}
 }
 
 fn redact_strict_jwts(text: &str) -> String {
@@ -428,13 +471,11 @@ fn redact_boundary_tokens(text: &str) -> String {
 		("bt_", 20),
 	];
 
-
 	let bytes = text.as_bytes();
 	let mut out = String::with_capacity(text.len());
 	let mut i = 0usize;
 	'outer: while i < bytes.len() {
-		let at_boundary =
-			i == 0 || (!bytes[i - 1].is_ascii_alphanumeric() && bytes[i - 1] != b'_');
+		let at_boundary = i == 0 || (!bytes[i - 1].is_ascii_alphanumeric() && bytes[i - 1] != b'_');
 		if at_boundary {
 			for &(prefix, min_tail) in PREFIXES {
 				if let Some(tail) = text[i..].strip_prefix(prefix) {
@@ -476,9 +517,12 @@ pub fn is_invalid_grant_body(body: &str) -> bool {
 		"invalid_client",
 		"unauthorized_client",
 	];
-	let Ok(json) = serde_json::from_str::<serde_json::Value>(body.trim()) else { return false };
+	let Ok(json) = serde_json::from_str::<serde_json::Value>(body.trim()) else {
+		return false;
+	};
 	["error", "error_code", "type"].iter().any(|field| {
-		json.get(*field)
+		json
+			.get(*field)
 			.and_then(serde_json::Value::as_str)
 			.map(|code| code.trim().to_ascii_lowercase())
 			.is_some_and(|code| DEAD.contains(&code.as_str()))
@@ -523,7 +567,9 @@ const KNOWN_OAUTH_ERROR_IDENTIFIERS: &[&str] = &[
 /// The allowlisted lowercase identifier for `text`, if it is one of ours.
 pub(crate) fn oauth_error_identifier(text: &str) -> Option<String> {
 	let candidate = text.trim().to_ascii_lowercase();
-	KNOWN_OAUTH_ERROR_IDENTIFIERS.contains(&candidate.as_str()).then_some(candidate)
+	KNOWN_OAUTH_ERROR_IDENTIFIERS
+		.contains(&candidate.as_str())
+		.then_some(candidate)
 }
 
 /// Summarise a token-endpoint error: only allowlisted OAuth identifiers
@@ -541,7 +587,11 @@ pub fn summarize_error_body(body: &str) -> String {
 	};
 	let mut parts: Vec<String> = Vec::new();
 	for field in ["error", "error_code", "type"] {
-		let Some(code) = json.get(field).and_then(serde_json::Value::as_str).and_then(oauth_error_identifier) else {
+		let Some(code) = json
+			.get(field)
+			.and_then(serde_json::Value::as_str)
+			.and_then(oauth_error_identifier)
+		else {
 			continue;
 		};
 		if !parts.contains(&code) {
@@ -584,13 +634,37 @@ mod tests {
 		// Nothing disables a credential unless the provider said it is dead.
 		assert!(!AuthError::new(AuthErrorKind::TokenRefresh, "invalid response").is_definitive());
 		assert!(!AuthError::new(AuthErrorKind::Validation, "malformed body").is_definitive());
-		assert!(!AuthError::new(AuthErrorKind::Http, "busy").with_status(429).is_definitive());
-		assert!(!AuthError::new(AuthErrorKind::Http, "down").with_status(503).is_definitive());
-		assert!(!AuthError::new(AuthErrorKind::Http, "waf").with_status(403).is_definitive());
-		assert!(AuthError::new(AuthErrorKind::TokenRefresh, "revoked").with_grant_dead().is_definitive());
-		assert!(!AuthError::cancelled("zai").with_grant_dead().is_definitive());
+		assert!(
+			!AuthError::new(AuthErrorKind::Http, "busy")
+				.with_status(429)
+				.is_definitive()
+		);
+		assert!(
+			!AuthError::new(AuthErrorKind::Http, "down")
+				.with_status(503)
+				.is_definitive()
+		);
+		assert!(
+			!AuthError::new(AuthErrorKind::Http, "waf")
+				.with_status(403)
+				.is_definitive()
+		);
+		assert!(
+			AuthError::new(AuthErrorKind::TokenRefresh, "revoked")
+				.with_grant_dead()
+				.is_definitive()
+		);
+		assert!(
+			!AuthError::cancelled("zai")
+				.with_grant_dead()
+				.is_definitive()
+		);
 
-		assert!(AuthError::new(AuthErrorKind::Http, "busy").with_status(429).is_transient());
+		assert!(
+			AuthError::new(AuthErrorKind::Http, "busy")
+				.with_status(429)
+				.is_transient()
+		);
 		assert!(AuthError::new(AuthErrorKind::Timeout, "slow").is_transient());
 	}
 

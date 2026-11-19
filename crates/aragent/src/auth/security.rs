@@ -17,7 +17,7 @@ use super::error::{AuthError, AuthErrorKind};
 use super::http::Cancel;
 use super::known_secrets;
 use super::store::{Credential, StoredCredential};
-use super::{registry, AuthBackend};
+use super::{AuthBackend, registry};
 
 /// Durable identity of the OAuth row a security scan is pinned to
 /// (`SecurityAccountRef` in the security contracts).
@@ -50,16 +50,20 @@ impl SecurityOAuthAccount {
 		if matches {
 			return Ok(());
 		}
-		Err(AuthError::new(
-			AuthErrorKind::Configuration,
-			"Security scan authentication identity mismatch",
+		Err(
+			AuthError::new(
+				AuthErrorKind::Configuration,
+				"Security scan authentication identity mismatch",
+			)
+			.for_provider(&self.provider),
 		)
-		.for_provider(&self.provider))
 	}
 }
 
 fn account_field_matches(pinned: &Option<String>, resolved: &Option<String>) -> bool {
-	pinned.as_ref().is_none_or(|pinned| Some(pinned) == resolved.as_ref())
+	pinned
+		.as_ref()
+		.is_none_or(|pinned| Some(pinned) == resolved.as_ref())
 }
 
 /// Resolved access token plus the durable identity it came from.
@@ -116,7 +120,7 @@ pub fn select_security_account(
 					format!(
 						"Multiple OAuth accounts are available for {provider}; supply credentialId to pin one exact account"
 					),
-				))
+				));
 			},
 		},
 	};
@@ -129,7 +133,10 @@ fn oauth_rows(backend: &AuthBackend, stored_as: &str) -> Result<Vec<StoredCreden
 	Ok(rows)
 }
 
-fn account_from_row(provider: &str, row: &StoredCredential) -> Result<SecurityOAuthAccount, AuthError> {
+fn account_from_row(
+	provider: &str,
+	row: &StoredCredential,
+) -> Result<SecurityOAuthAccount, AuthError> {
 	let Credential::OAuth(creds) = &row.credential else {
 		return Err(AuthError::config(provider, "selected credential is not an OAuth account"));
 	};
@@ -155,12 +162,8 @@ pub fn resolve_security_oauth_access(
 	cancel: &Cancel,
 ) -> Result<SecurityOAuthAccess, AuthError> {
 	let provider = pinned.provider.as_str();
-	let (resolved, access_token) = backend.resolve_exact_oauth_access(
-		provider,
-		pinned.credential_id,
-		force_refresh,
-		cancel,
-	)?;
+	let (resolved, access_token) =
+		backend.resolve_exact_oauth_access(provider, pinned.credential_id, force_refresh, cancel)?;
 	pinned.assert_matches(&resolved)?;
 	Ok(SecurityOAuthAccess { account: resolved, access_token })
 }
@@ -208,11 +211,13 @@ impl ExactSecurityOAuthResolver {
 		cancel: &Cancel,
 	) -> Result<Option<String>, AuthError> {
 		if provider != self.pinned.provider {
-			return Err(AuthError::new(
-				AuthErrorKind::Configuration,
-				"Security scan authentication provider mismatch",
-			)
-			.for_provider(&self.pinned.provider));
+			return Err(
+				AuthError::new(
+					AuthErrorKind::Configuration,
+					"Security scan authentication provider mismatch",
+				)
+				.for_provider(&self.pinned.provider),
+			);
 		}
 		let backend = self
 			.backend
@@ -277,7 +282,9 @@ mod tests {
 		resolved.email = None;
 		pinned.assert_matches(&resolved).expect("both absent");
 		resolved.email = Some("late@example.test".to_string());
-		pinned.assert_matches(&resolved).expect("unrecorded field is not compared");
+		pinned
+			.assert_matches(&resolved)
+			.expect("unrecorded field is not compared");
 	}
 
 	#[test]

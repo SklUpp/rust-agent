@@ -9,13 +9,13 @@
 
 use serde_json::json;
 
-use super::super::api_key::{api_key_as_oauth, validate};
-use super::super::Flow;
 use super::super::super::callback::encode_component;
 use super::super::super::error::{AuthError, AuthErrorKind};
 use super::super::super::http::HttpRequest;
 use super::super::super::registry::Validation;
 use super::super::super::store::{Credential, OAuthCredentials};
+use super::super::Flow;
+use super::super::api_key::{api_key_as_oauth, validate};
 
 const CODING_PLAN_DEFAULT_AUTH_URL: &str = "https://modelstudio.console.alibabacloud.com/";
 const CODING_PLAN_CHINA_AUTH_URL: &str = "https://bailian.console.aliyun.com/?tab=model#/api-key";
@@ -26,11 +26,17 @@ const CODING_PLAN_MODEL: &str = "qwen3.5-plus";
 const TOKEN_PLAN_INTERNATIONAL_AUTH_URL: &str =
 	"https://home.qwencloud.com/billing/subscription/token-plan-individual";
 const TOKEN_PLAN_CHINA_AUTH_URL: &str = "https://www.aliyun.com/benefit/scene/tokenplan";
-const TOKEN_PLAN_BASE_URL: &str = "https://token-plan.ap-southeast-1.maas.aliyuncs.com/compatible-mode/v1";
-const TOKEN_PLAN_CN_BASE_URL: &str = "https://token-plan.cn-beijing.maas.aliyuncs.com/compatible-mode/v1";
+const TOKEN_PLAN_BASE_URL: &str =
+	"https://token-plan.ap-southeast-1.maas.aliyuncs.com/compatible-mode/v1";
+const TOKEN_PLAN_CN_BASE_URL: &str =
+	"https://token-plan.cn-beijing.maas.aliyuncs.com/compatible-mode/v1";
 
 pub async fn login(flow: &Flow<'_>, token_plan: bool) -> Result<Credential, AuthError> {
-	if token_plan { login_token_plan(flow).await } else { login_coding_plan(flow).await }
+	if token_plan {
+		login_token_plan(flow).await
+	} else {
+		login_coding_plan(flow).await
+	}
 }
 
 async fn login_coding_plan(flow: &Flow<'_>) -> Result<Credential, AuthError> {
@@ -80,7 +86,11 @@ async fn login_coding_plan(flow: &Flow<'_>) -> Result<Credential, AuthError> {
 	} else {
 		validate(
 			flow,
-			Validation::Chat { provider: "Alibaba Coding Plan", base_url: validation_base, model: CODING_PLAN_MODEL },
+			Validation::Chat {
+				provider: "Alibaba Coding Plan",
+				base_url: validation_base,
+				model: CODING_PLAN_MODEL,
+			},
 			&key,
 		)
 		.await?;
@@ -134,7 +144,11 @@ async fn login_token_plan(flow: &Flow<'_>) -> Result<Credential, AuthError> {
 	validate_models(flow, &format!("{base_url}/models"), &key).await?;
 
 	let china = base_url == TOKEN_PLAN_CN_BASE_URL;
-	let host = if china { "bailian-cs.console.aliyun.com" } else { "cs-data.qwencloud.com" };
+	let host = if china {
+		"bailian-cs.console.aliyun.com"
+	} else {
+		"cs-data.qwencloud.com"
+	};
 	let cookie_prompt = format!(
 		"Optional quota reporting: open browser DevTools → Network, reload the Token Plan page, filter for api.json, and select the {host}/data/api.json request whose api query ends in /tokenplan/personal/api/v2/usage. Copy Request Headers → Cookie, then paste the complete name=value; ... value here, or press Enter to skip."
 	);
@@ -189,14 +203,22 @@ fn serialize_token_plan_credential(token: &str, cookie: &str, base_url: Option<&
 
 async fn validate_models(flow: &Flow<'_>, models_url: &str, key: &str) -> Result<(), AuthError> {
 	let request = HttpRequest::get(models_url).bearer(key);
-	let response = flow.http.send(request, flow.cancel, flow.provider()).await?;
+	let response = flow
+		.http
+		.send(request, flow.cancel, flow.provider())
+		.await?;
 	if response.is_success() {
 		return Ok(());
 	}
 	if matches!(response.status, 401 | 403) {
-		return Err(AuthError::new(AuthErrorKind::Validation, "API key rejected. Check the key and try again.")
+		return Err(
+			AuthError::new(
+				AuthErrorKind::Validation,
+				"API key rejected. Check the key and try again.",
+			)
 			.for_provider(flow.provider())
-			.with_status(response.status));
+			.with_status(response.status),
+		);
 	}
 	Err(response.error_for(AuthErrorKind::Validation, flow.provider(), "key validation"))
 }
@@ -229,7 +251,11 @@ mod tests {
 	#[test]
 	fn cookie_header_prefix_is_stripped_like_upstream() {
 		let raw = " Cookie: a=b; c=d ";
-		let stripped = raw.trim().strip_prefix("Cookie:").map(str::trim).unwrap_or(raw.trim());
+		let stripped = raw
+			.trim()
+			.strip_prefix("Cookie:")
+			.map(str::trim)
+			.unwrap_or(raw.trim());
 		assert_eq!(stripped, "a=b; c=d");
 		// `encode_component` is the same encoder used for authorize URLs.
 		assert_eq!(encode_component("a b"), "a+b");

@@ -68,14 +68,7 @@ pub async fn login(flow: &Flow<'_>) -> Result<super::super::super::store::Creden
 	headers.push(("Content-Type".to_string(), "application/json".to_string()));
 	let payload = flow
 		.http
-		.post_json(
-			TOKEN_URL,
-			body,
-			headers,
-			flow.cancel,
-			"anthropic",
-			AuthErrorKind::TokenExchange,
-		)
+		.post_json(TOKEN_URL, body, headers, flow.cancel, "anthropic", AuthErrorKind::TokenExchange)
 		.await?;
 
 	let tokens = TokenResponse::parse(&payload)?;
@@ -98,8 +91,10 @@ pub async fn refresh(
 	credentials: &OAuthCredentials,
 ) -> Result<super::super::super::store::Credential, AuthError> {
 	if credentials.refresh.is_empty() {
-		return Err(AuthError::new(AuthErrorKind::TokenRefresh, "stored credential has no refresh token")
-			.for_provider("anthropic"));
+		return Err(
+			AuthError::new(AuthErrorKind::TokenRefresh, "stored credential has no refresh token")
+				.for_provider("anthropic"),
+		);
 	}
 	let client_id = super::decode_constant("anthropic client id", CLIENT_ID_B64)?;
 	let body = json!({
@@ -147,16 +142,27 @@ struct TokenResponse {
 
 impl TokenResponse {
 	fn parse(payload: &serde_json::Value) -> Result<Self, AuthError> {
-		let access_token = payload.get("access_token").and_then(serde_json::Value::as_str).unwrap_or_default().to_string();
-		let refresh_token =
-			payload.get("refresh_token").and_then(serde_json::Value::as_str).unwrap_or_default().to_string();
-		let expires_in = payload.get("expires_in").and_then(serde_json::Value::as_i64);
+		let access_token = payload
+			.get("access_token")
+			.and_then(serde_json::Value::as_str)
+			.unwrap_or_default()
+			.to_string();
+		let refresh_token = payload
+			.get("refresh_token")
+			.and_then(serde_json::Value::as_str)
+			.unwrap_or_default()
+			.to_string();
+		let expires_in = payload
+			.get("expires_in")
+			.and_then(serde_json::Value::as_i64);
 		if access_token.is_empty() || refresh_token.is_empty() || expires_in.is_none() {
-			return Err(AuthError::new(
-				AuthErrorKind::Validation,
-				"Anthropic token response missing required fields",
-			)
-			.for_provider("anthropic"));
+			return Err(
+				AuthError::new(
+					AuthErrorKind::Validation,
+					"Anthropic token response missing required fields",
+				)
+				.for_provider("anthropic"),
+			);
 		}
 		let account = payload.get("account");
 		let organization = payload.get("organization");
@@ -173,7 +179,10 @@ impl TokenResponse {
 }
 
 fn string_at(value: Option<&serde_json::Value>, key: &str) -> Option<String> {
-	value.and_then(|value| value.get(key)).and_then(serde_json::Value::as_str).map(ToString::to_string)
+	value
+		.and_then(|value| value.get(key))
+		.and_then(serde_json::Value::as_str)
+		.map(ToString::to_string)
 }
 
 fn non_empty(value: Option<String>) -> Option<String> {
@@ -200,10 +209,22 @@ async fn fill_identity_from_bootstrap(flow: &Flow<'_>, credentials: &mut OAuthCr
 		Ok(response) if response.is_success() => {
 			if let Ok(payload) = serde_json::from_str::<serde_json::Value>(&response.body) {
 				let account = payload.get("oauth_account");
-				credentials.account_id = credentials.account_id.clone().or_else(|| string_at(account, "account_uuid"));
-				credentials.email = credentials.email.clone().or_else(|| string_at(account, "account_email"));
-				credentials.org_id = credentials.org_id.clone().or_else(|| string_at(account, "organization_uuid"));
-				credentials.org_name = credentials.org_name.clone().or_else(|| string_at(account, "organization_name"));
+				credentials.account_id = credentials
+					.account_id
+					.clone()
+					.or_else(|| string_at(account, "account_uuid"));
+				credentials.email = credentials
+					.email
+					.clone()
+					.or_else(|| string_at(account, "account_email"));
+				credentials.org_id = credentials
+					.org_id
+					.clone()
+					.or_else(|| string_at(account, "organization_uuid"));
+				credentials.org_name = credentials
+					.org_name
+					.clone()
+					.or_else(|| string_at(account, "organization_name"));
 				credentials.authorized_at = Some(now_ms());
 			}
 		},
@@ -227,7 +248,12 @@ mod tests {
 	#[test]
 	fn token_response_requires_full_grant() {
 		let short = json!({ "access_token": "a", "refresh_token": "r" });
-		assert_eq!(TokenResponse::parse(&short).expect_err("missing expires").kind, AuthErrorKind::Validation);
+		assert_eq!(
+			TokenResponse::parse(&short)
+				.expect_err("missing expires")
+				.kind,
+			AuthErrorKind::Validation
+		);
 
 		let full = json!({
 			"access_token": "a",

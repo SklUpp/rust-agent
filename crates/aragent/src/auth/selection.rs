@@ -42,7 +42,12 @@ pub fn provider_type_key(provider: &str, credential_type: &str) -> String {
 pub trait CredentialRanking: Send + Sync {
 	/// Return the index (into `candidates`) to use, or `None` to keep the
 	/// block-aware order.
-	fn select(&self, provider: &str, candidates: &[StoredCredential], order: &[usize]) -> Option<usize>;
+	fn select(
+		&self,
+		provider: &str,
+		candidates: &[StoredCredential],
+		order: &[usize],
+	) -> Option<usize>;
 }
 
 /// In-memory half of the selection state: round-robin counters and unscoped
@@ -61,9 +66,15 @@ impl SelectionState {
 			return vec![0];
 		}
 		let start = match session_id {
-			Some(session_id) => usize::try_from(xxhash_rust::xxh32::xxh32(session_id.as_bytes(), 0)).unwrap_or(0) % total,
+			Some(session_id) => {
+				usize::try_from(xxhash_rust::xxh32::xxh32(session_id.as_bytes(), 0)).unwrap_or(0)
+					% total
+			},
 			None => {
-				let mut counters = self.round_robin.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+				let mut counters = self
+					.round_robin
+					.lock()
+					.unwrap_or_else(std::sync::PoisonError::into_inner);
 				let next = (counters.get(provider_key).copied().unwrap_or(-1) + 1) % total as i64;
 				counters.insert(provider_key.to_string(), next);
 				usize::try_from(next).unwrap_or(0)
@@ -85,7 +96,8 @@ impl SelectionState {
 	) -> Result<Option<i64>, AuthError> {
 		let mut blocked: Option<i64> = self.memory_blocked_until(provider_key, credential_id, now_ms);
 		for scope in scopes {
-			let scoped = self.memory_blocked_until(&scoped_key(provider_key, scope), credential_id, now_ms);
+			let scoped =
+				self.memory_blocked_until(&scoped_key(provider_key, scope), credential_id, now_ms);
 			blocked = max_option(blocked, scoped);
 		}
 		blocked = max_option(blocked, store.get_block(credential_id, provider_key, "")?);
@@ -95,10 +107,22 @@ impl SelectionState {
 		Ok(blocked)
 	}
 
-	fn memory_blocked_until(&self, backoff_key: &str, credential_id: i64, now_ms: i64) -> Option<i64> {
-		let mut windows = self.backoff.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-		let Some(entries) = windows.get_mut(backoff_key) else { return None };
-		let Some(until) = entries.get(&credential_id).copied() else { return None };
+	fn memory_blocked_until(
+		&self,
+		backoff_key: &str,
+		credential_id: i64,
+		now_ms: i64,
+	) -> Option<i64> {
+		let mut windows = self
+			.backoff
+			.lock()
+			.unwrap_or_else(std::sync::PoisonError::into_inner);
+		let Some(entries) = windows.get_mut(backoff_key) else {
+			return None;
+		};
+		let Some(until) = entries.get(&credential_id).copied() else {
+			return None;
+		};
 		if until <= now_ms {
 			entries.remove(&credential_id);
 			if entries.is_empty() {
@@ -118,7 +142,9 @@ impl SelectionState {
 		scopes: &[&str],
 		now_ms: i64,
 	) -> Result<bool, AuthError> {
-		Ok(self.blocked_until(store, provider_key, credential_id, scopes, now_ms)?.is_some())
+		Ok(self
+			.blocked_until(store, provider_key, credential_id, scopes, now_ms)?
+			.is_some())
 	}
 
 	/// `#markCredentialBlocked`: extend (never shorten) the window in memory and
@@ -133,12 +159,24 @@ impl SelectionState {
 	) -> Result<(), AuthError> {
 		let backoff_key = scoped_key(provider_key, block_scope.unwrap_or_default());
 		{
-			let mut windows = self.backoff.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+			let mut windows = self
+				.backoff
+				.lock()
+				.unwrap_or_else(std::sync::PoisonError::into_inner);
 			let entries = windows.entry(backoff_key).or_default();
-			let next = entries.get(&credential_id).copied().unwrap_or(0).max(blocked_until_ms);
+			let next = entries
+				.get(&credential_id)
+				.copied()
+				.unwrap_or(0)
+				.max(blocked_until_ms);
 			entries.insert(credential_id, next);
 		}
-		store.upsert_block(credential_id, provider_key, block_scope.unwrap_or_default(), blocked_until_ms)
+		store.upsert_block(
+			credential_id,
+			provider_key,
+			block_scope.unwrap_or_default(),
+			blocked_until_ms,
+		)
 	}
 }
 
@@ -194,7 +232,9 @@ pub fn select(
 
 	let now = now_ms();
 	for index in &order {
-		let Some(candidate) = candidates.get(*index) else { continue };
+		let Some(candidate) = candidates.get(*index) else {
+			continue;
+		};
 		if !state.is_blocked(store, &provider_key, candidate.id, block_scopes, now)? {
 			return Ok(Some(candidate.clone()));
 		}
@@ -250,7 +290,11 @@ mod tests {
 	fn single_and_empty_candidates_short_circuit() {
 		let store = CredentialStore::in_memory().expect("store");
 		let state = SelectionState::default();
-		assert!(select(&store, &state, "anthropic", API_KEY, None, &[], |_| true, None).expect("none").is_none());
+		assert!(
+			select(&store, &state, "anthropic", API_KEY, None, &[], |_| true, None)
+				.expect("none")
+				.is_none()
+		);
 
 		store.upsert("anthropic", &key("k1", true)).expect("upsert");
 		let chosen = select(&store, &state, "anthropic", API_KEY, None, &[], |_| true, None)
@@ -297,15 +341,26 @@ mod tests {
 		let state = SelectionState::default();
 		let key_name = provider_type_key("anthropic", API_KEY);
 		let id = store.upsert("anthropic", &key("k1", true)).expect("upsert");
-		state.mark_blocked(&store, &key_name, id, now_ms() - 1, None).expect("mark");
-		assert!(!state.is_blocked(&store, &key_name, id, &[], now_ms()).expect("blocked"));
+		state
+			.mark_blocked(&store, &key_name, id, now_ms() - 1, None)
+			.expect("mark");
+		assert!(
+			!state
+				.is_blocked(&store, &key_name, id, &[], now_ms())
+				.expect("blocked")
+		);
 	}
 
 	#[test]
 	fn ranking_hook_wins_when_it_answers() {
 		struct PickLast;
 		impl CredentialRanking for PickLast {
-			fn select(&self, _provider: &str, candidates: &[StoredCredential], _order: &[usize]) -> Option<usize> {
+			fn select(
+				&self,
+				_provider: &str,
+				candidates: &[StoredCredential],
+				_order: &[usize],
+			) -> Option<usize> {
 				candidates.len().checked_sub(1)
 			}
 		}
@@ -314,9 +369,10 @@ mod tests {
 		let state = SelectionState::default();
 		store.upsert("anthropic", &key("k1", true)).expect("upsert");
 		store.upsert("anthropic", &key("k2", true)).expect("upsert");
-		let chosen = select(&store, &state, "anthropic", API_KEY, None, &[], |_| true, Some(&PickLast))
-			.expect("rows")
-			.expect("row");
+		let chosen =
+			select(&store, &state, "anthropic", API_KEY, None, &[], |_| true, Some(&PickLast))
+				.expect("rows")
+				.expect("row");
 		assert_eq!(chosen.credential.api_key_value(), Some("k2"));
 	}
 
@@ -324,11 +380,16 @@ mod tests {
 	fn login_filter_separates_login_keys() {
 		let store = CredentialStore::in_memory().expect("store");
 		let state = SelectionState::default();
-		store.upsert("anthropic", &key("static", false)).expect("upsert");
-		store.upsert("anthropic", &key("login", true)).expect("upsert");
-		let login = select(&store, &state, "anthropic", API_KEY, None, &[], super::is_api_key_login, None)
-			.expect("rows")
-			.expect("row");
+		store
+			.upsert("anthropic", &key("static", false))
+			.expect("upsert");
+		store
+			.upsert("anthropic", &key("login", true))
+			.expect("upsert");
+		let login =
+			select(&store, &state, "anthropic", API_KEY, None, &[], super::is_api_key_login, None)
+				.expect("rows")
+				.expect("row");
 		assert_eq!(login.credential.api_key_value(), Some("login"));
 	}
 }

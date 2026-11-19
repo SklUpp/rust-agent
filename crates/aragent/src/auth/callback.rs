@@ -129,7 +129,9 @@ impl CallbackServer {
 		if config.callback_hostname == "localhost" {
 			match TcpListener::bind((Ipv6Addr::LOCALHOST, port)) {
 				Ok(listener) => listeners.push(listener),
-				Err(err) if err.kind() == std::io::ErrorKind::AddrInUse && config.preferred_port != 0 => {
+				Err(err)
+					if err.kind() == std::io::ErrorKind::AddrInUse && config.preferred_port != 0 =>
+				{
 					// Nothing has been spawned yet, so the IPv4 port is released
 					// with `listeners` instead of leaking a listener thread.
 					return Err(AuthError::config(
@@ -162,7 +164,16 @@ impl CallbackServer {
 
 		let redirect_uri = build_redirect_uri(config, port);
 		let launch_url = launch_url_if_safe(config, port);
-		Ok(Self { port, redirect_uri, launch_url, receiver, pending_auth_url, stop, threads, manual_only: false })
+		Ok(Self {
+			port,
+			redirect_uri,
+			launch_url,
+			receiver,
+			pending_auth_url,
+			stop,
+			threads,
+			manual_only: false,
+		})
 	}
 
 	#[must_use]
@@ -396,7 +407,9 @@ fn handle_connection(
 	stop: &AtomicBool,
 ) {
 	let _ = stream.set_write_timeout(Some(Duration::from_secs(2)));
-	let Some(request_line) = read_request_line(&mut stream, stop) else { return };
+	let Some(request_line) = read_request_line(&mut stream, stop) else {
+		return;
+	};
 	let mut parts = request_line.split_whitespace();
 	let _method = parts.next().unwrap_or_default();
 	let target = parts.next().unwrap_or_default();
@@ -421,9 +434,20 @@ fn handle_connection(
 	}
 
 	let params = parse_query(query);
-	let code = params.iter().find(|(name, _)| name == "code").map(|(_, value)| value.clone());
-	let state = params.iter().find(|(name, _)| name == "state").map(|(_, value)| value.clone()).unwrap_or_default();
-	let error = params.iter().find(|(name, _)| name == "error").map(|(_, value)| value.clone()).unwrap_or_default();
+	let code = params
+		.iter()
+		.find(|(name, _)| name == "code")
+		.map(|(_, value)| value.clone());
+	let state = params
+		.iter()
+		.find(|(name, _)| name == "state")
+		.map(|(_, value)| value.clone())
+		.unwrap_or_default();
+	let error = params
+		.iter()
+		.find(|(name, _)| name == "error")
+		.map(|(_, value)| value.clone())
+		.unwrap_or_default();
 	let state_matches = expected_state.is_empty() || constant_time_eq(&state, expected_state);
 
 	if !error.is_empty() {
@@ -436,7 +460,10 @@ fn handle_connection(
 				|| "provider denied the request".to_string(),
 				|identifier| format!("provider denied the request ({identifier})"),
 			);
-			let _ = sender.send(Err(AuthError::new(AuthErrorKind::DeviceAuth, format!("Authorization failed: {detail}"))));
+			let _ = sender.send(Err(AuthError::new(
+				AuthErrorKind::DeviceAuth,
+				format!("Authorization failed: {detail}"),
+			)));
 		}
 		respond(&mut stream, 500, "Authorization failed");
 		return;
@@ -534,7 +561,12 @@ pub fn parse_callback_input(input: &str) -> (Option<String>, Option<String>) {
 
 	let find_in_query = |query: &str| {
 		let params = parse_query(query);
-		let find = |name: &str| params.iter().find(|(key, _)| key == name).map(|(_, value)| value.clone());
+		let find = |name: &str| {
+			params
+				.iter()
+				.find(|(key, _)| key == name)
+				.map(|(_, value)| value.clone())
+		};
 		(find("code"), find("state"))
 	};
 
@@ -573,7 +605,9 @@ pub fn encode_component(value: &str) -> String {
 	let mut out = String::with_capacity(value.len());
 	for byte in value.as_bytes() {
 		match byte {
-			b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'*' => out.push(char::from(*byte)),
+			b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'*' => {
+				out.push(char::from(*byte))
+			},
 			b' ' => out.push('+'),
 			_ => out.push_str(&format!("%{byte:02X}")),
 		}
@@ -598,7 +632,8 @@ mod tests {
 
 	#[test]
 	fn parses_full_redirect_and_bare_code() {
-		let (code, state) = parse_callback_input("http://localhost:54545/callback?code=abc%2B1&state=deadbeef");
+		let (code, state) =
+			parse_callback_input("http://localhost:54545/callback?code=abc%2B1&state=deadbeef");
 		assert_eq!(code.as_deref(), Some("abc+1"));
 		assert_eq!(state.as_deref(), Some("deadbeef"));
 
@@ -612,7 +647,10 @@ mod tests {
 	#[test]
 	fn encodes_like_url_search_params() {
 		assert_eq!(
-			with_query("https://x/auth", &[("scope", "a b"), ("redirect_uri", "http://127.0.0.1:1/cb")]),
+			with_query(
+				"https://x/auth",
+				&[("scope", "a b"), ("redirect_uri", "http://127.0.0.1:1/cb")]
+			),
 			"https://x/auth?scope=a+b&redirect_uri=http%3A%2F%2F127.0.0.1%3A1%2Fcb"
 		);
 	}
@@ -621,7 +659,10 @@ mod tests {
 	fn launch_url_suppressed_for_non_loopback_redirect() {
 		let mut config = CallbackConfig::new(1455, "/auth/callback");
 		config.redirect_uri = Some("http://localhost:1455/auth/callback".to_string());
-		assert_eq!(launch_url_if_safe(&config, 1455).as_deref(), Some("http://localhost:1455/launch"));
+		assert_eq!(
+			launch_url_if_safe(&config, 1455).as_deref(),
+			Some("http://localhost:1455/launch")
+		);
 
 		config.redirect_uri = Some("vscode://oauth/callback".to_string());
 		assert_eq!(launch_url_if_safe(&config, 1455), None);
@@ -666,7 +707,8 @@ mod tests {
 		let server = CallbackServer::start(&config, "expected", "test").expect("bind loopback");
 		let port = server.port();
 		let mut client = TcpStream::connect((Ipv4Addr::LOCALHOST, port)).expect("connect");
-		write!(client, "GET /callback?code=x&state=forged HTTP/1.1\r\nHost: localhost\r\n\r\n").expect("request");
+		write!(client, "GET /callback?code=x&state=forged HTTP/1.1\r\nHost: localhost\r\n\r\n")
+			.expect("request");
 		let _ = client.flush();
 		std::thread::sleep(Duration::from_millis(120));
 		assert!(server.poll().is_none(), "state mismatch must not resolve the flow");

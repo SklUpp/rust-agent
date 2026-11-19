@@ -69,10 +69,16 @@ async fn exchange_key(flow: &Flow<'_>, code: &str, verifier: &str) -> Result<Str
 			AuthErrorKind::TokenExchange,
 		)
 		.await?;
-	let key = payload.get("key").and_then(serde_json::Value::as_str).unwrap_or_default().to_string();
+	let key = payload
+		.get("key")
+		.and_then(serde_json::Value::as_str)
+		.unwrap_or_default()
+		.to_string();
 	if key.is_empty() {
-		return Err(AuthError::new(AuthErrorKind::Validation, "OpenRouter key exchange returned an empty key")
-			.for_provider("openrouter"));
+		return Err(
+			AuthError::new(AuthErrorKind::Validation, "OpenRouter key exchange returned an empty key")
+				.for_provider("openrouter"),
+		);
 	}
 	Ok(key)
 }
@@ -80,18 +86,22 @@ async fn exchange_key(flow: &Flow<'_>, code: &str, verifier: &str) -> Result<Str
 /// `/api/v1/auth/key` is the canonical "who am I" endpoint; `/models` accepts
 /// any bearer, so it cannot reject a wrong key.
 async fn validate_api_key(flow: &Flow<'_>, key: &str) -> Result<(), AuthError> {
-	let request = HttpRequest::get(KEY_INFO_URL).bearer(key).header("Accept", "application/json");
+	let request = HttpRequest::get(KEY_INFO_URL)
+		.bearer(key)
+		.header("Accept", "application/json");
 	let response = flow.http.send(request, flow.cancel, "openrouter").await?;
 	if response.is_success() {
 		return Ok(());
 	}
 	if matches!(response.status, 401 | 403) {
-		return Err(AuthError::new(
-			AuthErrorKind::Validation,
-			"API key rejected by OpenRouter. Check the key and try again.",
-		)
-		.for_provider("openrouter")
-		.with_status(response.status));
+		return Err(
+			AuthError::new(
+				AuthErrorKind::Validation,
+				"API key rejected by OpenRouter. Check the key and try again.",
+			)
+			.for_provider("openrouter")
+			.with_status(response.status),
+		);
 	}
 	Err(response.error_for(AuthErrorKind::Validation, "openrouter", "OpenRouter key validation"))
 }
@@ -104,7 +114,11 @@ mod tests {
 	fn authorize_url_carries_pkce_and_no_client_id() {
 		let url = crate::auth::callback::with_query(
 			AUTHORIZE_URL,
-			&[("callback_url", "http://localhost:54549/callback"), ("code_challenge", "ch"), ("code_challenge_method", "S256")],
+			&[
+				("callback_url", "http://localhost:54549/callback"),
+				("code_challenge", "ch"),
+				("code_challenge_method", "S256"),
+			],
 		);
 		assert_eq!(
 			url,

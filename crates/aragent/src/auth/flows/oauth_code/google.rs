@@ -50,11 +50,9 @@ struct Config {
 
 // The upstream sources ship these base64-encoded (`atob(...)`); the literals stay
 // encoded here and are decoded by `decode_constant`, so parity is auditable.
-const GEMINI_CLIENT_ID_B64: &str =
-	"NjgxMjU1ODA5Mzk1LW9vOGZ0Mm9wcmRybnA5ZTNhcWY2YXYzaG1kaWIxMzVqLmFwcHMuZ29vZ2xldXNlcmNvbnRlbnQuY29t";
+const GEMINI_CLIENT_ID_B64: &str = "NjgxMjU1ODA5Mzk1LW9vOGZ0Mm9wcmRybnA5ZTNhcWY2YXYzaG1kaWIxMzVqLmFwcHMuZ29vZ2xldXNlcmNvbnRlbnQuY29t";
 const GEMINI_CLIENT_SECRET_B64: &str = "R09DU1BYLTR1SGdNUG0tMW83U2stZ2VWNkN1NWNsWEZzeGw=";
-const ANTIGRAVITY_CLIENT_ID_B64: &str =
-	"MTA3MTAwNjA2MDU5MS10bWhzc2luMmgyMWxjcmUyMzV2dG9sb2poNGc0MDNlcC5hcHBzLmdvb2dsZXVzZXJjb250ZW50LmNvbQ==";
+const ANTIGRAVITY_CLIENT_ID_B64: &str = "MTA3MTAwNjA2MDU5MS10bWhzc2luMmgyMWxjcmUyMzV2dG9sb2poNGc0MDNlcC5hcHBzLmdvb2dsZXVzZXJjb250ZW50LmNvbQ==";
 const ANTIGRAVITY_CLIENT_SECRET_B64: &str = "R09DU1BYLUs1OEZXUjQ4NkxkTEoxbUxCOHNYQzR6NnFEQWY=";
 
 impl Client {
@@ -64,7 +62,10 @@ impl Client {
 			Self::GeminiCli => Config {
 				provider: "google-gemini-cli",
 				client_id: super::decode_constant("gemini client id", GEMINI_CLIENT_ID_B64)?,
-				client_secret: super::decode_constant("gemini client secret", GEMINI_CLIENT_SECRET_B64)?,
+				client_secret: super::decode_constant(
+					"gemini client secret",
+					GEMINI_CLIENT_SECRET_B64,
+				)?,
 				scopes: "https://www.googleapis.com/auth/cloud-platform \
 					https://www.googleapis.com/auth/userinfo.email \
 					https://www.googleapis.com/auth/userinfo.profile",
@@ -74,7 +75,10 @@ impl Client {
 			Self::Antigravity => Config {
 				provider: "google-antigravity",
 				client_id: super::decode_constant("antigravity client id", ANTIGRAVITY_CLIENT_ID_B64)?,
-				client_secret: super::decode_constant("antigravity client secret", ANTIGRAVITY_CLIENT_SECRET_B64)?,
+				client_secret: super::decode_constant(
+					"antigravity client secret",
+					ANTIGRAVITY_CLIENT_SECRET_B64,
+				)?,
 				scopes: "https://www.googleapis.com/auth/cloud-platform \
 					https://www.googleapis.com/auth/userinfo.email \
 					https://www.googleapis.com/auth/userinfo.profile \
@@ -128,12 +132,16 @@ pub async fn login(flow: &Flow<'_>, client: Client) -> Result<Credential, AuthEr
 	let refresh = string_field(&payload, "refresh_token").unwrap_or_default();
 	let expires_in = payload.get("expires_in").and_then(Value::as_i64);
 	let (Some(expires_in), false) = (expires_in, access.is_empty()) else {
-		return Err(AuthError::new(AuthErrorKind::Validation, "Google token response missing required fields")
-			.for_provider(config.provider));
+		return Err(
+			AuthError::new(AuthErrorKind::Validation, "Google token response missing required fields")
+				.for_provider(config.provider),
+		);
 	};
 	if refresh.is_empty() {
-		return Err(AuthError::new(AuthErrorKind::Validation, "No refresh token received. Please try again.")
-			.for_provider(config.provider));
+		return Err(
+			AuthError::new(AuthErrorKind::Validation, "No refresh token received. Please try again.")
+				.for_provider(config.provider),
+		);
 	}
 
 	flow.notice("Getting user info...");
@@ -160,13 +168,18 @@ pub async fn login(flow: &Flow<'_>, client: Client) -> Result<Credential, AuthEr
 	}))
 }
 
-pub async fn refresh(flow: &Flow<'_>, credentials: &OAuthCredentials) -> Result<Credential, AuthError> {
+pub async fn refresh(
+	flow: &Flow<'_>,
+	credentials: &OAuthCredentials,
+) -> Result<Credential, AuthError> {
 	let Some(project_id) = credentials.project_id.clone() else {
 		return Err(AuthError::config(flow.provider(), "Google Cloud credentials missing projectId"));
 	};
 	if credentials.refresh.is_empty() {
-		return Err(AuthError::new(AuthErrorKind::TokenRefresh, "stored credential has no refresh token")
-			.for_provider(flow.provider()));
+		return Err(
+			AuthError::new(AuthErrorKind::TokenRefresh, "stored credential has no refresh token")
+				.for_provider(flow.provider()),
+		);
 	}
 	let config = match flow.provider() {
 		"google-antigravity" => Client::Antigravity.config()?,
@@ -183,10 +196,18 @@ pub async fn refresh(flow: &Flow<'_>, credentials: &OAuthCredentials) -> Result<
 		.post_form(TOKEN_URL, fields, flow.cancel, config.provider, AuthErrorKind::TokenRefresh)
 		.await?;
 	let access = string_field(&payload, "access_token").unwrap_or_default();
-	let expires_in = payload.get("expires_in").and_then(Value::as_i64).unwrap_or_default();
+	let expires_in = payload
+		.get("expires_in")
+		.and_then(Value::as_i64)
+		.unwrap_or_default();
 	if access.is_empty() {
-		return Err(AuthError::new(AuthErrorKind::Validation, "Google token refresh response missing access_token")
-			.for_provider(config.provider));
+		return Err(
+			AuthError::new(
+				AuthErrorKind::Validation,
+				"Google token refresh response missing access_token",
+			)
+			.for_provider(config.provider),
+		);
 	}
 	Ok(Credential::OAuth(OAuthCredentials {
 		access,
@@ -221,10 +242,8 @@ fn gemini_headers(access: &str) -> Vec<(String, String)> {
 		"x86_64" => "x64",
 		other => other,
 	};
-	let user_agent = format!(
-		"GeminiCLI/{version}/{model} ({}; {arch}; terminal)",
-		std::env::consts::OS
-	);
+	let user_agent =
+		format!("GeminiCLI/{version}/{model} ({}; {arch}; terminal)", std::env::consts::OS);
 	vec![
 		("Authorization".to_string(), format!("Bearer {access}")),
 		("Content-Type".to_string(), "application/json".to_string()),
@@ -237,13 +256,13 @@ fn gemini_headers(access: &str) -> Vec<(String, String)> {
 }
 
 /// `ANTIGRAVITY_VERSION_MANIFEST_URL` / fetch timeout from `gemini-headers.ts`.
-const ANTIGRAVITY_VERSION_MANIFEST_URL: &str =
-	"https://antigravity-hub-auto-updater-974169037036.us-central1.run.app/manifest/latest-arm64-mac.yml";
+const ANTIGRAVITY_VERSION_MANIFEST_URL: &str = "https://antigravity-hub-auto-updater-974169037036.us-central1.run.app/manifest/latest-arm64-mac.yml";
 const ANTIGRAVITY_VERSION_FETCH_TIMEOUT_MS: u64 = 5_000;
 
 /// Process-lifetime cache for the manifest-discovered version
 /// (`discoveredAntigravityVersion`).
-static DISCOVERED_ANTIGRAVITY_VERSION: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+static DISCOVERED_ANTIGRAVITY_VERSION: std::sync::Mutex<Option<String>> =
+	std::sync::Mutex::new(None);
 
 /// `ensureAntigravityVersion`: refresh the version from the update manifest once
 /// per process, skipping everything when `PI_AI_ANTIGRAVITY_VERSION` is set.
@@ -267,7 +286,13 @@ async fn ensure_antigravity_version(flow: &Flow<'_>) {
 		.header("Cache-Control", "no-cache")
 		.header("User-Agent", "electron-builder")
 		.timeout(std::time::Duration::from_millis(ANTIGRAVITY_VERSION_FETCH_TIMEOUT_MS));
-	let Ok(response) = flow.http.send(request, flow.cancel, "google-antigravity").await else { return };
+	let Ok(response) = flow
+		.http
+		.send(request, flow.cancel, "google-antigravity")
+		.await
+	else {
+		return;
+	};
 	if !response.is_success() {
 		return;
 	}
@@ -283,7 +308,9 @@ async fn ensure_antigravity_version(flow: &Flow<'_>) {
 /// electron-builder update manifest; anything else is `None`.
 fn parse_antigravity_manifest_version(manifest: &str) -> Option<String> {
 	for line in manifest.lines() {
-		let Some((key, value)) = line.split_once(':') else { continue };
+		let Some((key, value)) = line.split_once(':') else {
+			continue;
+		};
 		if key.trim() != "version" {
 			continue;
 		}
@@ -303,7 +330,10 @@ fn parse_antigravity_manifest_version(manifest: &str) -> Option<String> {
 
 fn is_semver_triplet(value: &str) -> bool {
 	let parts: Vec<&str> = value.split('.').collect();
-	parts.len() == 3 && parts.iter().all(|part| !part.is_empty() && part.bytes().all(|byte| byte.is_ascii_digit()))
+	parts.len() == 3
+		&& parts
+			.iter()
+			.all(|part| !part.is_empty() && part.bytes().all(|byte| byte.is_ascii_digit()))
 }
 
 /// `getAntigravityVersion`: env override → manifest-discovered → pinned fallback.
@@ -328,7 +358,10 @@ fn antigravity_headers(access: &str) -> Vec<(String, String)> {
 	vec![
 		("Authorization".to_string(), format!("Bearer {access}")),
 		("Content-Type".to_string(), "application/json".to_string()),
-		("User-Agent".to_string(), format!("antigravity/hub/{version} (aidev_client; os_type={os}; arch={arch}; cl={cl})")),
+		(
+			"User-Agent".to_string(),
+			format!("antigravity/hub/{version} (aidev_client; os_type={os}; arch={arch}; cl={cl})"),
+		),
 	]
 }
 
@@ -368,8 +401,13 @@ async fn discover_gemini_project(flow: &Flow<'_>, access: &str) -> Result<String
 		return Err(response.error_for(AuthErrorKind::Discovery, provider, "loadCodeAssist"));
 	};
 
-	if payload.get("currentTier").is_some_and(|tier| !tier.is_null()) {
-		if let Some(project) = string_field(&payload, "cloudaicompanionProject").filter(|value| !value.is_empty()) {
+	if payload
+		.get("currentTier")
+		.is_some_and(|tier| !tier.is_null())
+	{
+		if let Some(project) =
+			string_field(&payload, "cloudaicompanionProject").filter(|value| !value.is_empty())
+		{
 			return Ok(project);
 		}
 		return env_project.ok_or_else(gemini_project_env_error);
@@ -405,11 +443,8 @@ async fn discover_gemini_project(flow: &Flow<'_>, access: &str) -> Result<String
 			metadata["duetProject"] = json!(project);
 		}
 	}
-	let request = cloud_code_request(
-		&format!("{ENDPOINT}/v1internal:onboardUser"),
-		onboard,
-		headers.clone(),
-	);
+	let request =
+		cloud_code_request(&format!("{ENDPOINT}/v1internal:onboardUser"), onboard, headers.clone());
 	let response = flow.http.send(request, flow.cancel, provider).await?;
 	if !response.is_success() {
 		return Err(response.error_for(AuthErrorKind::Provisioning, provider, "onboardUser"));
@@ -418,8 +453,13 @@ async fn discover_gemini_project(flow: &Flow<'_>, access: &str) -> Result<String
 	if operation.get("done").and_then(Value::as_bool) != Some(true) {
 		let name = string_field(&operation, "name").unwrap_or_default();
 		if name.is_empty() {
-			return Err(AuthError::new(AuthErrorKind::Provisioning, "onboardUser returned an operation without a name")
-				.for_provider(provider));
+			return Err(
+				AuthError::new(
+					AuthErrorKind::Provisioning,
+					"onboardUser returned an operation without a name",
+				)
+				.for_provider(provider),
+			);
 		}
 		operation = poll_gemini_operation(flow, ENDPOINT, &name, headers).await?;
 	}
@@ -452,23 +492,31 @@ async fn poll_gemini_operation(
 	for attempt in 1..=GEMINI_POLL_ATTEMPTS {
 		flow.check()?;
 		tokio::time::sleep(std::time::Duration::from_millis(GEMINI_POLL_INTERVAL_MS)).await;
-		flow.notice(format!("Waiting for project provisioning (attempt {attempt}/{GEMINI_POLL_ATTEMPTS})..."));
+		flow.notice(format!(
+			"Waiting for project provisioning (attempt {attempt}/{GEMINI_POLL_ATTEMPTS})..."
+		));
 		let mut request = HttpRequest::get(format!("{endpoint}/v1internal/{name}"));
 		request.headers.extend(headers.clone());
 		let response = flow.http.send(request, flow.cancel, provider).await?;
 		if !response.is_success() {
-			return Err(response.error_for(AuthErrorKind::Polling, provider, "Failed to poll operation"));
+			return Err(response.error_for(
+				AuthErrorKind::Polling,
+				provider,
+				"Failed to poll operation",
+			));
 		}
 		let payload = response.json(provider)?;
 		if payload.get("done").and_then(Value::as_bool) == Some(true) {
 			return Ok(payload);
 		}
 	}
-	Err(AuthError::new(
-		AuthErrorKind::Timeout,
-		format!("Project provisioning did not complete after {GEMINI_POLL_ATTEMPTS} attempts"),
+	Err(
+		AuthError::new(
+			AuthErrorKind::Timeout,
+			format!("Project provisioning did not complete after {GEMINI_POLL_ATTEMPTS} attempts"),
+		)
+		.for_provider(provider),
 	)
-	.for_provider(provider))
 }
 
 /// `discoverProject` for Antigravity: loadCodeAssist ➜ free-tier eligibility ➜
@@ -483,11 +531,18 @@ async fn discover_antigravity_project(flow: &Flow<'_>, access: &str) -> Result<S
 
 	let mut payload = load_code_assist(flow, ENDPOINT, &headers).await?;
 	if payload.get("paidTier").is_none_or(Value::is_null) {
-		if let Some(project) = string_field(&payload, "cloudaicompanionProject").filter(|value| !value.is_empty()) {
-			payload = post_load_code_assist(flow, ENDPOINT, &headers, json!({
-				"cloudaicompanionProject": project,
-				"metadata": { "ideType": "ANTIGRAVITY" },
-			}))
+		if let Some(project) =
+			string_field(&payload, "cloudaicompanionProject").filter(|value| !value.is_empty())
+		{
+			payload = post_load_code_assist(
+				flow,
+				ENDPOINT,
+				&headers,
+				json!({
+					"cloudaicompanionProject": project,
+					"metadata": { "ideType": "ANTIGRAVITY" },
+				}),
+			)
 			.await?;
 		}
 	}
@@ -503,8 +558,11 @@ async fn discover_antigravity_project(flow: &Flow<'_>, access: &str) -> Result<S
 	string_field(&refreshed, "cloudaicompanionProject")
 		.filter(|value| !value.is_empty())
 		.ok_or_else(|| {
-			AuthError::new(AuthErrorKind::Provisioning, "loadCodeAssist did not return a cloudaicompanionProject")
-				.for_provider(provider)
+			AuthError::new(
+				AuthErrorKind::Provisioning,
+				"loadCodeAssist did not return a cloudaicompanionProject",
+			)
+			.for_provider(provider)
 		})
 }
 
@@ -513,7 +571,13 @@ async fn load_code_assist(
 	endpoint: &str,
 	headers: &[(String, String)],
 ) -> Result<Value, AuthError> {
-	post_load_code_assist(flow, endpoint, headers, json!({ "metadata": { "ideType": "ANTIGRAVITY" } })).await
+	post_load_code_assist(
+		flow,
+		endpoint,
+		headers,
+		json!({ "metadata": { "ideType": "ANTIGRAVITY" } }),
+	)
+	.await
 }
 
 async fn post_load_code_assist(
@@ -525,9 +589,16 @@ async fn post_load_code_assist(
 	let mut request = HttpRequest::json(format!("{endpoint}/v1internal:loadCodeAssist"), body)
 		.timeout(std::time::Duration::from_secs(30));
 	request.headers.extend(headers.iter().cloned());
-	let response = flow.http.send(request, flow.cancel, "google-antigravity").await?;
+	let response = flow
+		.http
+		.send(request, flow.cancel, "google-antigravity")
+		.await?;
 	if response.status != 200 {
-		return Err(response.error_for(AuthErrorKind::Provisioning, "google-antigravity", "loadCodeAssist"));
+		return Err(response.error_for(
+			AuthErrorKind::Provisioning,
+			"google-antigravity",
+			"loadCodeAssist",
+		));
 	}
 	response.json("google-antigravity")
 }
@@ -536,14 +607,22 @@ fn assert_free_tier_eligible(payload: &Value) -> Result<(), AuthError> {
 	let allowed = payload
 		.get("allowedTiers")
 		.and_then(Value::as_array)
-		.is_some_and(|tiers| tiers.iter().any(|tier| string_field(tier, "id").as_deref() == Some(TIER_FREE)));
+		.is_some_and(|tiers| {
+			tiers
+				.iter()
+				.any(|tier| string_field(tier, "id").as_deref() == Some(TIER_FREE))
+		});
 	if allowed {
 		return Ok(());
 	}
 	let ineligible = payload
 		.get("ineligibleTiers")
 		.and_then(Value::as_array)
-		.and_then(|tiers| tiers.iter().find(|tier| string_field(tier, "tierId").as_deref() == Some(TIER_FREE)));
+		.and_then(|tiers| {
+			tiers
+				.iter()
+				.find(|tier| string_field(tier, "tierId").as_deref() == Some(TIER_FREE))
+		});
 	let Some(tier) = ineligible else {
 		return Ok(());
 	};
@@ -572,9 +651,16 @@ async fn onboard_antigravity(
 	)
 	.timeout(deadline);
 	request.headers.extend(headers.iter().cloned());
-	let response = flow.http.send(request, flow.cancel, "google-antigravity").await?;
+	let response = flow
+		.http
+		.send(request, flow.cancel, "google-antigravity")
+		.await?;
 	if response.status != 200 {
-		return Err(response.error_for(AuthErrorKind::Provisioning, "google-antigravity", "onboardUser"));
+		return Err(response.error_for(
+			AuthErrorKind::Provisioning,
+			"google-antigravity",
+			"onboardUser",
+		));
 	}
 	let mut operation = response.json("google-antigravity")?;
 
@@ -584,47 +670,73 @@ async fn onboard_antigravity(
 				// Untrusted provider prose: the operation name and kind are
 				// already fixed text, so nothing from `error` is echoed.
 				let _ = error;
-				return Err(AuthError::new(AuthErrorKind::Provisioning, "OnboardUser operation failed")
-					.for_provider("google-antigravity"));
+				return Err(
+					AuthError::new(AuthErrorKind::Provisioning, "OnboardUser operation failed")
+						.for_provider("google-antigravity"),
+				);
 			}
 			if operation.get("response").is_none_or(Value::is_null) {
-				return Err(AuthError::new(AuthErrorKind::Provisioning, "failed to unmarshal OnboardUserResponse")
-					.for_provider("google-antigravity"));
+				return Err(
+					AuthError::new(
+						AuthErrorKind::Provisioning,
+						"failed to unmarshal OnboardUserResponse",
+					)
+					.for_provider("google-antigravity"),
+				);
 			}
 			return Ok(());
 		}
 
-		let remaining = deadline.checked_sub(started.elapsed()).filter(|remaining| !remaining.is_zero()).ok_or_else(|| {
-			AuthError::new(
-				AuthErrorKind::Timeout,
-				format!("onboardUser timed out after {ANTIGRAVITY_ONBOARD_TIMEOUT_MS}ms"),
-			)
-			.for_provider("google-antigravity")
-		})?;
+		let remaining = deadline
+			.checked_sub(started.elapsed())
+			.filter(|remaining| !remaining.is_zero())
+			.ok_or_else(|| {
+				AuthError::new(
+					AuthErrorKind::Timeout,
+					format!("onboardUser timed out after {ANTIGRAVITY_ONBOARD_TIMEOUT_MS}ms"),
+				)
+				.for_provider("google-antigravity")
+			})?;
 		flow.check()?;
-		tokio::time::sleep(remaining.min(std::time::Duration::from_millis(ANTIGRAVITY_POLL_INTERVAL_MS))).await;
+		tokio::time::sleep(
+			remaining.min(std::time::Duration::from_millis(ANTIGRAVITY_POLL_INTERVAL_MS)),
+		)
+		.await;
 		flow.check()?;
 
 		let name = string_field(&operation, "name").unwrap_or_default();
 		if name.is_empty() {
-			return Err(AuthError::new(
-				AuthErrorKind::Provisioning,
-				"onboardUser returned an operation without a name",
-			)
-			.for_provider("google-antigravity"));
+			return Err(
+				AuthError::new(
+					AuthErrorKind::Provisioning,
+					"onboardUser returned an operation without a name",
+				)
+				.for_provider("google-antigravity"),
+			);
 		}
-		let remaining = deadline.checked_sub(started.elapsed()).filter(|remaining| !remaining.is_zero()).ok_or_else(|| {
-			AuthError::new(
-				AuthErrorKind::Timeout,
-				format!("onboardUser timed out after {ANTIGRAVITY_ONBOARD_TIMEOUT_MS}ms"),
-			)
-			.for_provider("google-antigravity")
-		})?;
-		let mut request = HttpRequest::get(format!("{endpoint}/v1internal/{name}")).timeout(remaining);
+		let remaining = deadline
+			.checked_sub(started.elapsed())
+			.filter(|remaining| !remaining.is_zero())
+			.ok_or_else(|| {
+				AuthError::new(
+					AuthErrorKind::Timeout,
+					format!("onboardUser timed out after {ANTIGRAVITY_ONBOARD_TIMEOUT_MS}ms"),
+				)
+				.for_provider("google-antigravity")
+			})?;
+		let mut request =
+			HttpRequest::get(format!("{endpoint}/v1internal/{name}")).timeout(remaining);
 		request.headers.extend(headers.iter().cloned());
-		let response = flow.http.send(request, flow.cancel, "google-antigravity").await?;
+		let response = flow
+			.http
+			.send(request, flow.cancel, "google-antigravity")
+			.await?;
 		if response.status != 200 {
-			return Err(response.error_for(AuthErrorKind::Provisioning, "google-antigravity", "onboardUser operation"));
+			return Err(response.error_for(
+				AuthErrorKind::Provisioning,
+				"google-antigravity",
+				"onboardUser operation",
+			));
 		}
 		operation = response.json("google-antigravity")?;
 	}
@@ -641,7 +753,9 @@ fn is_vpc_sc_affected(response: &crate::auth::http::HttpResponse) -> bool {
 		.and_then(|error| error.get("details"))
 		.and_then(Value::as_array)
 		.is_some_and(|details| {
-			details.iter().any(|detail| string_field(detail, "reason").as_deref() == Some("SECURITY_POLICY_VIOLATED"))
+			details.iter().any(|detail| {
+				string_field(detail, "reason").as_deref() == Some("SECURITY_POLICY_VIOLATED")
+			})
 		})
 }
 
@@ -666,11 +780,18 @@ fn gemini_project_env_error() -> AuthError {
 }
 
 fn env_or(key: &str, fallback: &'static str) -> String {
-	std::env::var(key).ok().map(|value| value.trim().to_string()).filter(|value| !value.is_empty()).unwrap_or_else(|| fallback.to_string())
+	std::env::var(key)
+		.ok()
+		.map(|value| value.trim().to_string())
+		.filter(|value| !value.is_empty())
+		.unwrap_or_else(|| fallback.to_string())
 }
 
 fn string_field(value: &Value, key: &str) -> Option<String> {
-	value.get(key).and_then(Value::as_str).map(ToString::to_string)
+	value
+		.get(key)
+		.and_then(Value::as_str)
+		.map(ToString::to_string)
 }
 
 fn now_ms() -> i64 {
@@ -714,7 +835,9 @@ mod tests {
 				("prompt", "consent"),
 			],
 		);
-		assert!(url.starts_with("https://accounts.google.com/o/oauth2/v2/auth?client_id=681255809395-"));
+		assert!(
+			url.starts_with("https://accounts.google.com/o/oauth2/v2/auth?client_id=681255809395-")
+		);
 		assert!(url.contains("access_type=offline") && url.contains("prompt=consent"));
 		assert!(url.contains("response_type=code"));
 	}
@@ -723,7 +846,8 @@ mod tests {
 	fn vpc_sc_detail_is_recognised() {
 		let response = crate::auth::http::HttpResponse {
 			status: 403,
-			body: json!({ "error": { "details": [{ "reason": "SECURITY_POLICY_VIOLATED" }] } }).to_string(),
+			body: json!({ "error": { "details": [{ "reason": "SECURITY_POLICY_VIOLATED" }] } })
+				.to_string(),
 			set_cookies: Vec::new(),
 		};
 		assert!(is_vpc_sc_affected(&response));

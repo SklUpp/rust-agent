@@ -116,7 +116,8 @@ pub async fn run(
 					let _ = sender.send(Err(AuthError::new(AuthErrorKind::PromptRequired, message)));
 				},
 				super::super::InputReply::Cancelled => {
-					let _ = sender.send(Err(AuthError::new(AuthErrorKind::Cancelled, "Login cancelled")));
+					let _ =
+						sender.send(Err(AuthError::new(AuthErrorKind::Cancelled, "Login cancelled")));
 				},
 			}
 		});
@@ -134,7 +135,8 @@ pub async fn run(
 				let outcome = signal?;
 				if !constant_time_eq(&outcome.state, expected_state) && !expected_state.is_empty() {
 					return Err(
-						AuthError::new(AuthErrorKind::Validation, "OAuth state mismatch").for_provider(provider)
+						AuthError::new(AuthErrorKind::Validation, "OAuth state mismatch")
+							.for_provider(provider),
 					);
 				}
 				return Ok(CodeExchange { code: outcome.code, state: outcome.state, redirect_uri });
@@ -169,7 +171,11 @@ pub async fn run(
 						// `callback-server.ts:222-227` discards the callback state and
 						// passes the generated `state` to `exchangeToken`, so a bare
 						// pasted code still exchanges with the state this flow minted.
-						return Ok(CodeExchange { code, state: expected_state.to_string(), redirect_uri });
+						return Ok(CodeExchange {
+							code,
+							state: expected_state.to_string(),
+							redirect_uri,
+						});
 					},
 					Ok(Err(err)) => return Err(err.for_provider(provider)),
 					Err(TryRecvError::Disconnected) => return Err(AuthError::cancelled(provider)),
@@ -178,7 +184,10 @@ pub async fn run(
 			}
 
 			if started.elapsed() >= spec.timeout {
-				return Err(AuthError::new(AuthErrorKind::Timeout, "OAuth flow timed out").for_provider(provider));
+				return Err(
+					AuthError::new(AuthErrorKind::Timeout, "OAuth flow timed out")
+						.for_provider(provider),
+				);
 			}
 			tokio::time::sleep(Duration::from_millis(40)).await;
 		}
@@ -198,8 +207,8 @@ pub async fn run(
 /// retires with a prompt thread still alive.
 struct ManualWait {
 	receiver: mpsc::Receiver<Result<String, AuthError>>,
-	worker:   Option<std::thread::JoinHandle<()>>,
-	cancel:   Cancel,
+	worker: Option<std::thread::JoinHandle<()>>,
+	cancel: Cancel,
 }
 
 impl Drop for ManualWait {
@@ -221,10 +230,18 @@ impl Drop for ManualWait {
 /// the one place that decodes it. Failures name the constant, never its value.
 pub fn decode_constant(label: &str, encoded: &str) -> Result<String, AuthError> {
 	use base64::Engine as _;
-	let compact: String = encoded.chars().filter(|character| !character.is_whitespace()).collect();
+	let compact: String = encoded
+		.chars()
+		.filter(|character| !character.is_whitespace())
+		.collect();
 	let bytes = base64::engine::general_purpose::STANDARD
 		.decode(compact.as_bytes())
-		.map_err(|error| AuthError::new(AuthErrorKind::Configuration, format!("invalid base64 for {label}: {error}")))?;
+		.map_err(|error| {
+			AuthError::new(
+				AuthErrorKind::Configuration,
+				format!("invalid base64 for {label}: {error}"),
+			)
+		})?;
 	String::from_utf8(bytes)
 		.map_err(|_| AuthError::new(AuthErrorKind::Configuration, format!("{label} is not UTF-8")))
 }
@@ -255,9 +272,9 @@ mod tests {
 	/// only the flow's cancellation token can close".
 	#[derive(Default)]
 	struct RecordingCallbacks {
-		prompt_seen:     AtomicBool,
+		prompt_seen: AtomicBool,
 		prompt_returned: AtomicBool,
-		reply:           Mutex<Option<InputReply>>,
+		reply: Mutex<Option<InputReply>>,
 	}
 
 	impl LoginCallbacks for RecordingCallbacks {
@@ -269,7 +286,12 @@ mod tests {
 
 		fn input(&self, _prompt: &InputPrompt, cancel: &Cancel) -> InputReply {
 			self.prompt_seen.store(true, Ordering::SeqCst);
-			let reply = self.reply.lock().expect("reply").take().unwrap_or(InputReply::Cancelled);
+			let reply = self
+				.reply
+				.lock()
+				.expect("reply")
+				.take()
+				.unwrap_or(InputReply::Cancelled);
 			if matches!(reply, InputReply::Cancelled) {
 				while !cancel.is_cancelled() {
 					std::thread::sleep(Duration::from_millis(5));
@@ -337,10 +359,7 @@ mod tests {
 			let redirect = Arc::clone(&redirect);
 			run(&flow, &spec, TEST_STATE, move |redirect_uri| {
 				*redirect.lock().expect("redirect") = Some(redirect_uri.to_string());
-				(
-					format!("https://example.invalid/authorize?redirect_uri={redirect_uri}"),
-					None,
-				)
+				(format!("https://example.invalid/authorize?redirect_uri={redirect_uri}"), None)
 			})
 			.await
 			.expect("the browser callback wins")
@@ -359,7 +378,8 @@ mod tests {
 		let entry = registry::find("devin").expect("devin entry");
 		let http = HttpClient::new();
 		let recorder = Arc::new(RecordingCallbacks::default());
-		*recorder.reply.lock().expect("reply") = Some(InputReply::Value(format!("pasted-code#{TEST_STATE}")));
+		*recorder.reply.lock().expect("reply") =
+			Some(InputReply::Value(format!("pasted-code#{TEST_STATE}")));
 		let callbacks: Arc<dyn LoginCallbacks> = recorder.clone();
 		let cancel = Cancel::new();
 		let flow = Flow { entry, http: &http, callbacks: &callbacks, cancel: &cancel };
@@ -407,7 +427,8 @@ mod tests {
 		let entry = registry::find("devin").expect("devin entry");
 		let http = HttpClient::new();
 		let recorder = Arc::new(RecordingCallbacks::default());
-		*recorder.reply.lock().expect("reply") = Some(InputReply::Value("pasted-code#other-state".to_string()));
+		*recorder.reply.lock().expect("reply") =
+			Some(InputReply::Value("pasted-code#other-state".to_string()));
 		let callbacks: Arc<dyn LoginCallbacks> = recorder.clone();
 		let cancel = Cancel::new();
 		let flow = Flow { entry, http: &http, callbacks: &callbacks, cancel: &cancel };
@@ -455,7 +476,10 @@ mod tests {
 		.expect_err("the flow is cancelled");
 		canceller.join().expect("canceller");
 		assert_eq!(error.kind, AuthErrorKind::Cancelled);
-		assert!(recorder.prompt_returned.load(Ordering::SeqCst), "the prompt worker is joined on cancel");
+		assert!(
+			recorder.prompt_returned.load(Ordering::SeqCst),
+			"the prompt worker is joined on cancel"
+		);
 	}
 
 	#[test]

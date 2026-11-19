@@ -7,12 +7,12 @@
 
 use serde_json::json;
 
-use super::super::Flow;
-use super::validate;
 use super::super::super::error::{AuthError, AuthErrorKind};
 use super::super::super::http::HttpRequest;
 use super::super::super::registry::{Validation, XiaomiRegion};
 use super::super::super::store::Credential;
+use super::super::Flow;
+use super::validate;
 
 const STANDARD_AUTH_URL: &str = "https://platform.xiaomimimo.com/#/console/api-keys";
 const TOKEN_PLAN_AUTH_URL: &str = "https://platform.xiaomimimo.com/console/plan-manage";
@@ -76,9 +76,11 @@ pub(super) async fn validate_region(
 		match flow.http.send(request, flow.cancel, flow.provider()).await {
 			Ok(response) if response.is_success() => return Ok(()),
 			Ok(response) if response.status == 401 => {
-				last_error = Some(
-					response.error_for(AuthErrorKind::Validation, flow.provider(), &format!("{} API key validation", flow.entry.name)),
-				);
+				last_error = Some(response.error_for(
+					AuthErrorKind::Validation,
+					flow.provider(),
+					&format!("{} API key validation", flow.entry.name),
+				));
 			},
 			Ok(response) => {
 				return Err(response.error_for(
@@ -92,8 +94,11 @@ pub(super) async fn validate_region(
 		}
 	}
 	Err(last_error.unwrap_or_else(|| {
-		AuthError::new(AuthErrorKind::Validation, format!("{} API key validation failed", flow.entry.name))
-			.for_provider(flow.provider())
+		AuthError::new(
+			AuthErrorKind::Validation,
+			format!("{} API key validation failed", flow.entry.name),
+		)
+		.for_provider(flow.provider())
 	}))
 }
 

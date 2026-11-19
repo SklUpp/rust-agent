@@ -42,7 +42,12 @@ impl Flow<'_> {
 	}
 
 	/// Ask for one value. Cancellation is an error, never an empty answer.
-	pub fn ask(&self, message: &str, placeholder: &str, allow_empty: bool) -> Result<String, AuthError> {
+	pub fn ask(
+		&self,
+		message: &str,
+		placeholder: &str,
+		allow_empty: bool,
+	) -> Result<String, AuthError> {
 		self.check()?;
 		let prompt = InputPrompt {
 			message: message.to_string(),
@@ -54,7 +59,9 @@ impl Flow<'_> {
 				self.check()?;
 				Ok(value.trim().to_string())
 			},
-			InputReply::Rejected(message) => Err(AuthError::new(AuthErrorKind::PromptRequired, message)),
+			InputReply::Rejected(message) => {
+				Err(AuthError::new(AuthErrorKind::PromptRequired, message))
+			},
 			InputReply::Cancelled => Err(AuthError::cancelled(self.entry.id)),
 		}
 	}
@@ -63,7 +70,10 @@ impl Flow<'_> {
 	pub fn require(&self, message: &str, placeholder: &str) -> Result<String, AuthError> {
 		let value = self.ask(message, placeholder, false)?;
 		if value.is_empty() {
-			return Err(AuthError::new(AuthErrorKind::Validation, "A value is required").for_provider(self.entry.id));
+			return Err(
+				AuthError::new(AuthErrorKind::Validation, "A value is required")
+					.for_provider(self.entry.id),
+			);
 		}
 		Ok(value)
 	}
@@ -136,8 +146,12 @@ pub async fn login(flow: &Flow<'_>) -> Result<super::store::Credential, AuthErro
 		"devin" => oauth_code::devin::login(flow).await,
 		"gitlab-duo" => oauth_code::gitlab::login(flow, false).await,
 		"gitlab-duo-agent" => oauth_code::gitlab::login(flow, true).await,
-		"google-gemini-cli" => oauth_code::google::login(flow, oauth_code::google::Client::GeminiCli).await,
-		"google-antigravity" => oauth_code::google::login(flow, oauth_code::google::Client::Antigravity).await,
+		"google-gemini-cli" => {
+			oauth_code::google::login(flow, oauth_code::google::Client::GeminiCli).await
+		},
+		"google-antigravity" => {
+			oauth_code::google::login(flow, oauth_code::google::Client::Antigravity).await
+		},
 		"cursor" => oauth_code::cursor::login(flow).await,
 		"perplexity" => oauth_code::perplexity::login(flow).await,
 		"alibaba-coding-plan" => api_key::alibaba::login(flow, false).await,
@@ -145,9 +159,15 @@ pub async fn login(flow: &Flow<'_>) -> Result<super::store::Credential, AuthErro
 		"qwen-portal" => api_key::qwen_portal::login(flow).await,
 		"cloudflare-ai-gateway" => api_key::cloudflare::login(flow).await,
 		"xiaomi" => api_key::xiaomi::login(flow, None).await,
-		"xiaomi-token-plan-sgp" => api_key::xiaomi::login(flow, Some(super::registry::XiaomiRegion::Sgp)).await,
-		"xiaomi-token-plan-ams" => api_key::xiaomi::login(flow, Some(super::registry::XiaomiRegion::Ams)).await,
-		"xiaomi-token-plan-cn" => api_key::xiaomi::login(flow, Some(super::registry::XiaomiRegion::Cn)).await,
+		"xiaomi-token-plan-sgp" => {
+			api_key::xiaomi::login(flow, Some(super::registry::XiaomiRegion::Sgp)).await
+		},
+		"xiaomi-token-plan-ams" => {
+			api_key::xiaomi::login(flow, Some(super::registry::XiaomiRegion::Ams)).await
+		},
+		"xiaomi-token-plan-cn" => {
+			api_key::xiaomi::login(flow, Some(super::registry::XiaomiRegion::Cn)).await
+		},
 		"kimi-code" => device_flow::kimi::login(flow).await,
 		"github-copilot" => device_flow::copilot::login(flow).await,
 		"kilo" => device_flow::kilo::login(flow).await,
@@ -165,18 +185,25 @@ pub async fn refresh(
 	match flow.entry.id {
 		"openai-codex" | "openai-codex-device" => oauth_code::codex::refresh(flow, credentials).await,
 		"anthropic" => oauth_code::anthropic::refresh(flow, credentials).await,
-		"openrouter" => Err(AuthError::config("openrouter", "OpenRouter credentials use a static API key, not a refresh grant")),
+		"openrouter" => Err(AuthError::config(
+			"openrouter",
+			"OpenRouter credentials use a static API key, not a refresh grant",
+		)),
 		"gitlab-duo" | "gitlab-duo-agent" => oauth_code::gitlab::refresh(flow, credentials).await,
-		"google-gemini-cli" | "google-antigravity" => oauth_code::google::refresh(flow, credentials).await,
+		"google-gemini-cli" | "google-antigravity" => {
+			oauth_code::google::refresh(flow, credentials).await
+		},
 		"cursor" => oauth_code::cursor::refresh(flow, credentials).await,
 		"github-copilot" => device_flow::copilot::refresh(flow, credentials).await,
 		"kimi-code" => device_flow::kimi::refresh(flow, credentials).await,
 		"xai-oauth" => device_flow::xai::refresh(flow, credentials).await,
-		other => Err(AuthError::new(
-			AuthErrorKind::Configuration,
-			"this provider has no refresh grant; run login again",
-		)
-		.for_provider(other)),
+		other => Err(
+			AuthError::new(
+				AuthErrorKind::Configuration,
+				"this provider has no refresh grant; run login again",
+			)
+			.for_provider(other),
+		),
 	}
 }
 
@@ -186,7 +213,8 @@ pub fn supports_refresh(provider: &str) -> bool {
 	matches!(
 		provider,
 		"openai-codex"
-			| "openai-codex-device" | "anthropic"
+			| "openai-codex-device"
+			| "anthropic"
 			| "cursor"
 			| "github-copilot"
 			| "gitlab-duo"

@@ -12,11 +12,11 @@ pub mod xiaomi;
 
 use serde_json::json;
 
-use super::Flow;
 use super::super::error::{AuthError, AuthErrorKind};
 use super::super::http::{Cancel, HttpRequest};
 use super::super::registry::{ApiKeySpec, ModelsUrl, Validation};
 use super::super::store::Credential;
+use super::Flow;
 
 const USER_AGENT_PROBE: &str = "Accept: application/json";
 
@@ -26,7 +26,11 @@ pub async fn login(flow: &Flow<'_>, spec: &ApiKeySpec) -> Result<Credential, Aut
 	}
 
 	let raw = flow.ask(spec.prompt, spec.placeholder, spec.allow_empty)?;
-	let mut key = if flow.entry.id == "deepseek" { normalize_deepseek_key(&raw)? } else { raw };
+	let mut key = if flow.entry.id == "deepseek" {
+		normalize_deepseek_key(&raw)?
+	} else {
+		raw
+	};
 
 	if key.is_empty() {
 		match spec.empty_fallback {
@@ -95,7 +99,9 @@ pub async fn validate(flow: &Flow<'_>, validation: Validation, key: &str) -> Res
 					format!("{base}/models")
 				},
 			};
-			let mut request = HttpRequest::get(url).bearer(key).header("Accept", USER_AGENT_PROBE);
+			let mut request = HttpRequest::get(url)
+				.bearer(key)
+				.header("Accept", USER_AGENT_PROBE);
 			if project_header {
 				let project = std::env::var("COREWEAVE_PROJECT")
 					.ok()
@@ -113,10 +119,15 @@ pub async fn validate(flow: &Flow<'_>, validation: Validation, key: &str) -> Res
 			ensure_ok(&response, provider, label, false)
 		},
 		Validation::Tolerant { provider: label, base_url, model } => {
-			let response = flow.http.send(chat_request(base_url, model, key), flow.cancel, provider).await?;
+			let response = flow
+				.http
+				.send(chat_request(base_url, model, key), flow.cancel, provider)
+				.await?;
 			ensure_ok(&response, provider, label, true)
 		},
-		Validation::Xiaomi { token_plan_region } => xiaomi::validate_region(flow, token_plan_region, key).await,
+		Validation::Xiaomi { token_plan_region } => {
+			xiaomi::validate_region(flow, token_plan_region, key).await
+		},
 	}
 }
 
@@ -147,12 +158,14 @@ fn ensure_ok(
 		return Ok(());
 	}
 	if matches!(response.status, 401 | 403) {
-		return Err(AuthError::new(
-			AuthErrorKind::Validation,
-			format!("API key rejected by {label}. Check the key and try again."),
-		)
-		.for_provider(provider)
-		.with_status(response.status));
+		return Err(
+			AuthError::new(
+				AuthErrorKind::Validation,
+				format!("API key rejected by {label}. Check the key and try again."),
+			)
+			.for_provider(provider)
+			.with_status(response.status),
+		);
 	}
 	if tolerant {
 		return Ok(());
@@ -191,7 +204,12 @@ mod tests {
 	fn chat_probe_targets_openai_compatible_path() {
 		let request = chat_request("https://api.example/v1/", "m", "k");
 		assert_eq!(request.url, "https://api.example/v1/chat/completions");
-		assert!(request.headers.iter().any(|(name, value)| name == "Authorization" && value == "Bearer k"));
+		assert!(
+			request
+				.headers
+				.iter()
+				.any(|(name, value)| name == "Authorization" && value == "Bearer k")
+		);
 	}
 
 	#[test]

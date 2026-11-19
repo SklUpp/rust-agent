@@ -33,18 +33,24 @@ pub async fn login(flow: &Flow<'_>) -> Result<Credential, AuthError> {
 	);
 	let response = flow.http.send(request, flow.cancel, PROVIDER).await?;
 	if !response.is_success() {
-		return Err(response.error_for(AuthErrorKind::DeviceAuth, PROVIDER, "Kimi device authorization"));
+		return Err(response.error_for(
+			AuthErrorKind::DeviceAuth,
+			PROVIDER,
+			"Kimi device authorization",
+		));
 	}
 	let payload = response.json(PROVIDER)?;
 	let user_code = string_field(&payload, "user_code").unwrap_or_default();
 	let device_code = string_field(&payload, "device_code").unwrap_or_default();
 	let verification_uri = string_field(&payload, "verification_uri").unwrap_or_default();
 	if user_code.is_empty() || device_code.is_empty() || verification_uri.is_empty() {
-		return Err(AuthError::new(
-			AuthErrorKind::Validation,
-			"Kimi device authorization response missing required fields",
-		)
-		.for_provider(PROVIDER));
+		return Err(
+			AuthError::new(
+				AuthErrorKind::Validation,
+				"Kimi device authorization response missing required fields",
+			)
+			.for_provider(PROVIDER),
+		);
 	}
 	let verification_complete = non_empty(string_field(&payload, "verification_uri_complete"))
 		.unwrap_or_else(|| verification_uri.clone());
@@ -79,21 +85,30 @@ pub async fn login(flow: &Flow<'_>) -> Result<Credential, AuthError> {
 		if response.is_success() && string_field(&payload, "access_token").is_some() {
 			return Ok(Credential::OAuth(parse_tokens(&payload, None)?));
 		}
-		match string_field(&payload, "error").as_deref().unwrap_or_default() {
+		match string_field(&payload, "error")
+			.as_deref()
+			.unwrap_or_default()
+		{
 			"authorization_pending" => {},
 			"slow_down" => {
 				wait_ms += 5_000;
-				if let Some(retry_ms) = number_field(&payload, "interval").map(|seconds| (seconds * 1000.0) as u64) {
+				if let Some(retry_ms) =
+					number_field(&payload, "interval").map(|seconds| (seconds * 1000.0) as u64)
+				{
 					wait_ms = wait_ms.max(retry_ms);
 				}
 			},
 			"expired_token" => {
-				return Err(AuthError::new(AuthErrorKind::Validation, "Kimi device authorization expired")
-					.for_provider(PROVIDER));
+				return Err(
+					AuthError::new(AuthErrorKind::Validation, "Kimi device authorization expired")
+						.for_provider(PROVIDER),
+				);
 			},
 			"access_denied" => {
-				return Err(AuthError::new(AuthErrorKind::Validation, "Kimi device authorization denied")
-					.for_provider(PROVIDER));
+				return Err(
+					AuthError::new(AuthErrorKind::Validation, "Kimi device authorization denied")
+						.for_provider(PROVIDER),
+				);
 			},
 			error => {
 				return Err(super::classify_poll_error(PROVIDER, error, response.status));
@@ -109,10 +124,15 @@ pub async fn login(flow: &Flow<'_>) -> Result<Credential, AuthError> {
 	Err(AuthError::new(AuthErrorKind::Timeout, "Kimi device flow timed out").for_provider(PROVIDER))
 }
 
-pub async fn refresh(flow: &Flow<'_>, credentials: &OAuthCredentials) -> Result<Credential, AuthError> {
+pub async fn refresh(
+	flow: &Flow<'_>,
+	credentials: &OAuthCredentials,
+) -> Result<Credential, AuthError> {
 	if credentials.refresh.is_empty() {
-		return Err(AuthError::new(AuthErrorKind::TokenRefresh, "stored credential has no refresh token")
-			.for_provider(PROVIDER));
+		return Err(
+			AuthError::new(AuthErrorKind::TokenRefresh, "stored credential has no refresh token")
+				.for_provider(PROVIDER),
+		);
 	}
 	let host = oauth_host();
 	let request = form_request(
@@ -132,22 +152,28 @@ pub async fn refresh(flow: &Flow<'_>, credentials: &OAuthCredentials) -> Result<
 	Ok(Credential::OAuth(parse_tokens(&payload, Some(&credentials.refresh))?))
 }
 
-fn parse_tokens(payload: &Value, refresh_fallback: Option<&str>) -> Result<OAuthCredentials, AuthError> {
+fn parse_tokens(
+	payload: &Value,
+	refresh_fallback: Option<&str>,
+) -> Result<OAuthCredentials, AuthError> {
 	let access = string_field(payload, "access_token").unwrap_or_default();
 	let expires_in = payload.get("expires_in").and_then(Value::as_i64);
 	let (Some(expires_in), false) = (expires_in, access.is_empty()) else {
-		return Err(AuthError::new(AuthErrorKind::Validation, "Kimi token response missing required fields")
-			.for_provider(PROVIDER));
+		return Err(
+			AuthError::new(AuthErrorKind::Validation, "Kimi token response missing required fields")
+				.for_provider(PROVIDER),
+		);
 	};
 	let refresh = non_empty(string_field(payload, "refresh_token"))
 		.or_else(|| refresh_fallback.map(ToString::to_string))
 		.ok_or_else(|| {
-			AuthError::new(AuthErrorKind::Validation, "Kimi token response missing refresh token").for_provider(PROVIDER)
+			AuthError::new(AuthErrorKind::Validation, "Kimi token response missing refresh token")
+				.for_provider(PROVIDER)
 		})?;
 	let claims = jwt_claims(&access);
-	let account_id = claims
-		.as_ref()
-		.and_then(|claims| non_empty(string_field(claims, "user_id")).or_else(|| non_empty(string_field(claims, "sub"))));
+	let account_id = claims.as_ref().and_then(|claims| {
+		non_empty(string_field(claims, "user_id")).or_else(|| non_empty(string_field(claims, "sub")))
+	});
 	Ok(OAuthCredentials {
 		access,
 		refresh,
@@ -169,8 +195,13 @@ fn oauth_host() -> String {
 	DEFAULT_OAUTH_HOST.to_string()
 }
 
-fn form_request(url: String, fields: Vec<(String, String)>, headers: &[(String, String)]) -> HttpRequest {
-	let mut request = HttpRequest::form(url, fields).header("Content-Type", "application/x-www-form-urlencoded");
+fn form_request(
+	url: String,
+	fields: Vec<(String, String)>,
+	headers: &[(String, String)],
+) -> HttpRequest {
+	let mut request =
+		HttpRequest::form(url, fields).header("Content-Type", "application/x-www-form-urlencoded");
 	request.headers.extend(headers.iter().cloned());
 	request
 }
@@ -186,10 +217,8 @@ fn headers_with(device_id: &str) -> Vec<(String, String)> {
 	let version = env!("CARGO_PKG_VERSION");
 	let release = std::fs::read_to_string("/proc/sys/kernel/osrelease").unwrap_or_default();
 	let os_version = sanitize(&release, "unknown");
-	let model = sanitize(
-		&format!("{} {} {}", os_label(), release.trim(), std::env::consts::ARCH),
-		"unknown",
-	);
+	let model =
+		sanitize(&format!("{} {} {}", os_label(), release.trim(), std::env::consts::ARCH), "unknown");
 	vec![
 		("User-Agent".to_string(), format!("KimiCLI/{version}")),
 		("X-Msh-Platform".to_string(), "kimi_cli".to_string()),
@@ -220,9 +249,16 @@ fn hostname() -> String {
 
 /// Strip non-printable/non-ASCII bytes; header values must stay ASCII.
 fn sanitize(value: &str, fallback: &str) -> String {
-	let cleaned: String = value.chars().filter(|ch| ch.is_ascii() && !ch.is_ascii_control()).collect();
+	let cleaned: String = value
+		.chars()
+		.filter(|ch| ch.is_ascii() && !ch.is_ascii_control())
+		.collect();
 	let cleaned = cleaned.trim();
-	if cleaned.is_empty() { fallback.to_string() } else { cleaned.to_string() }
+	if cleaned.is_empty() {
+		fallback.to_string()
+	} else {
+		cleaned.to_string()
+	}
 }
 
 /// Persisted device id (`crypto.randomUUID().replace(/-/g,"")`), 0600. A write
@@ -284,11 +320,9 @@ mod tests {
 	fn account_id_comes_from_jwt() {
 		use base64::Engine as _;
 		let engine = base64::engine::general_purpose::URL_SAFE_NO_PAD;
-		let access = format!(
-			"h.{}.s",
-			engine.encode(br#"{"user_id":"user-1","sub":"sub-1"}"#)
-		);
-		let payload = serde_json::json!({ "access_token": access, "refresh_token": "r", "expires_in": 60 });
+		let access = format!("h.{}.s", engine.encode(br#"{"user_id":"user-1","sub":"sub-1"}"#));
+		let payload =
+			serde_json::json!({ "access_token": access, "refresh_token": "r", "expires_in": 60 });
 		let parsed = parse_tokens(&payload, None).expect("parsed");
 		assert_eq!(parsed.account_id.as_deref(), Some("user-1"));
 	}
@@ -296,9 +330,17 @@ mod tests {
 	#[test]
 	fn headers_are_ascii_and_identify_the_cli() {
 		let headers = headers_with("device-1");
-		assert!(headers.iter().any(|(name, value)| name == "X-Msh-Platform" && value == "kimi_cli"));
+		assert!(
+			headers
+				.iter()
+				.any(|(name, value)| name == "X-Msh-Platform" && value == "kimi_cli")
+		);
 		assert!(headers.iter().all(|(_, value)| value.is_ascii()));
-		assert!(headers.iter().any(|(name, value)| name == "X-Msh-Device-Id" && value == "device-1"));
+		assert!(
+			headers
+				.iter()
+				.any(|(name, value)| name == "X-Msh-Device-Id" && value == "device-1")
+		);
 	}
 
 	#[test]

@@ -27,7 +27,10 @@ const CALLBACK_PATH: &str = "/callback";
 const NEVER_EXPIRES: i64 = 8_640_000_000_000_000;
 
 fn env_or(key: &str, fallback: &'static str) -> String {
-	std::env::var(key).ok().filter(|value| !value.is_empty()).unwrap_or_else(|| fallback.to_string())
+	std::env::var(key)
+		.ok()
+		.filter(|value| !value.is_empty())
+		.unwrap_or_else(|| fallback.to_string())
 }
 
 pub async fn login(flow: &Flow<'_>) -> Result<Credential, AuthError> {
@@ -63,7 +66,14 @@ pub async fn login(flow: &Flow<'_>) -> Result<Credential, AuthError> {
 	});
 	let payload = flow
 		.http
-		.post_json(token_url.as_str(), body, Vec::new(), flow.cancel, "zai", AuthErrorKind::TokenExchange)
+		.post_json(
+			token_url.as_str(),
+			body,
+			Vec::new(),
+			flow.cancel,
+			"zai",
+			AuthErrorKind::TokenExchange,
+		)
 		.await
 		.map_err(|err| {
 			AuthError::new(
@@ -74,9 +84,11 @@ pub async fn login(flow: &Flow<'_>) -> Result<Credential, AuthError> {
 		})?;
 	let data = unwrap_envelope(&payload, "token exchange")?;
 
-	let oauth_access = trimmed(data.get("zai").and_then(|zai| zai.get("access_token"))).ok_or_else(|| {
-		AuthError::new(AuthErrorKind::Validation, "Z.ai token response missing access token").for_provider("zai")
-	})?;
+	let oauth_access =
+		trimmed(data.get("zai").and_then(|zai| zai.get("access_token"))).ok_or_else(|| {
+			AuthError::new(AuthErrorKind::Validation, "Z.ai token response missing access token")
+				.for_provider("zai")
+		})?;
 	let minted = mint_api_key(flow, &oauth_access).await?;
 	let user = data.get("user");
 	Ok(Credential::OAuth(OAuthCredentials {
@@ -84,11 +96,13 @@ pub async fn login(flow: &Flow<'_>) -> Result<Credential, AuthError> {
 		refresh: String::new(),
 		expires: NEVER_EXPIRES,
 		email: trimmed(user.and_then(|user| user.get("email"))),
-		account_id: user.and_then(|user| user.get("id")).and_then(|id| match id {
-			Value::String(value) => Some(value.clone()),
-			Value::Number(number) => Some(number.to_string()),
-			_ => None,
-		}),
+		account_id: user
+			.and_then(|user| user.get("id"))
+			.and_then(|id| match id {
+				Value::String(value) => Some(value.clone()),
+				Value::Number(number) => Some(number.to_string()),
+				_ => None,
+			}),
 		..OAuthCredentials::default()
 	}))
 }
@@ -97,11 +111,13 @@ pub async fn login(flow: &Flow<'_>) -> Result<Credential, AuthError> {
 /// is success; bodies without a status wrapper pass through unchanged.
 fn unwrap_envelope(body: &Value, operation: &str) -> Result<Map<String, Value>, AuthError> {
 	let Some(object) = body.as_object() else {
-		return Err(AuthError::new(
-			AuthErrorKind::TokenExchange,
-			format!("Z.ai {operation} response was not a JSON object"),
-		)
-		.for_provider("zai"));
+		return Err(
+			AuthError::new(
+				AuthErrorKind::TokenExchange,
+				format!("Z.ai {operation} response was not a JSON object"),
+			)
+			.for_provider("zai"),
+		);
 	};
 	let wrapped = object.contains_key("code") || object.contains_key("success");
 	if !wrapped {
@@ -121,20 +137,21 @@ fn unwrap_envelope(body: &Value, operation: &str) -> Result<Map<String, Value>, 
 			.map(ToString::to_string)
 			.or_else(|| object.get("code").map(Value::to_string))
 			.unwrap_or_else(|| "unknown error".to_string());
-		return Err(AuthError::new(
-			AuthErrorKind::TokenExchange,
-			format!("Z.ai {operation} failed: {reason}"),
-		)
-		.for_provider("zai"));
+		return Err(
+			AuthError::new(AuthErrorKind::TokenExchange, format!("Z.ai {operation} failed: {reason}"))
+				.for_provider("zai"),
+		);
 	}
 	match object.get("data") {
 		Some(Value::Object(data)) => Ok(data.clone()),
 		Some(Value::Null) | None => Ok(Map::new()),
-		Some(other) => Err(AuthError::new(
-			AuthErrorKind::TokenExchange,
-			format!("Z.ai {operation} returned unexpected data: {}", redact_shape(other)),
-		)
-		.for_provider("zai")),
+		Some(other) => Err(
+			AuthError::new(
+				AuthErrorKind::TokenExchange,
+				format!("Z.ai {operation} returned unexpected data: {}", redact_shape(other)),
+			)
+			.for_provider("zai"),
+		),
 	}
 }
 
@@ -172,28 +189,51 @@ async fn mint_api_key(flow: &Flow<'_>, oauth_access: &str) -> Result<String, Aut
 	let biz_token = trimmed(data.get("access_token"))
 		.or_else(|| trimmed(data.get("accessToken")))
 		.ok_or_else(|| {
-			AuthError::new(AuthErrorKind::TokenExchange, "Z.ai business login returned no access token")
-				.for_provider("zai")
+			AuthError::new(
+				AuthErrorKind::TokenExchange,
+				"Z.ai business login returned no access token",
+			)
+			.for_provider("zai")
 		})?;
 
-	let customer = get_biz(flow, format!("{biz_base}/api/biz/customer/getCustomerInfo"), &biz_token, "customer lookup").await?;
-	let organizations = customer.get("organizations").and_then(Value::as_array).cloned().unwrap_or_default();
+	let customer = get_biz(
+		flow,
+		format!("{biz_base}/api/biz/customer/getCustomerInfo"),
+		&biz_token,
+		"customer lookup",
+	)
+	.await?;
+	let organizations = customer
+		.get("organizations")
+		.and_then(Value::as_array)
+		.cloned()
+		.unwrap_or_default();
 	let org = pick_default(&organizations);
-	let projects = org.and_then(|org| org.get("projects")).and_then(Value::as_array).cloned().unwrap_or_default();
+	let projects = org
+		.and_then(|org| org.get("projects"))
+		.and_then(Value::as_array)
+		.cloned()
+		.unwrap_or_default();
 	let project = pick_default(&projects);
 	let organization_id = trimmed(org.and_then(|org| org.get("organizationId")));
 	let project_id = trimmed(project.and_then(|project| project.get("projectId")));
 	let (Some(organization_id), Some(project_id)) = (organization_id, project_id) else {
-		return Err(AuthError::new(
-			AuthErrorKind::TokenExchange,
-			"Z.ai key provisioning failed: no organization/project on account",
-		)
-		.for_provider("zai"));
+		return Err(
+			AuthError::new(
+				AuthErrorKind::TokenExchange,
+				"Z.ai key provisioning failed: no organization/project on account",
+			)
+			.for_provider("zai"),
+		);
 	};
 
-	let keys_url = format!("{biz_base}/api/biz/v1/organization/{organization_id}/projects/{project_id}/api_keys");
+	let keys_url = format!(
+		"{biz_base}/api/biz/v1/organization/{organization_id}/projects/{project_id}/api_keys"
+	);
 	let listed = get_biz(flow, keys_url.clone(), &biz_token, "api key list").await?;
-	let existing = as_key_array(&listed).into_iter().find(|key| key.get("name").and_then(Value::as_str) == Some(KEY_NAME));
+	let existing = as_key_array(&listed)
+		.into_iter()
+		.find(|key| key.get("name").and_then(Value::as_str) == Some(KEY_NAME));
 	let record = match existing {
 		Some(record) => Value::Object(record),
 		None => {
@@ -212,25 +252,32 @@ async fn mint_api_key(flow: &Flow<'_>, oauth_access: &str) -> Result<String, Aut
 		},
 	};
 	let api_key = trimmed(record.get("apiKey")).ok_or_else(|| {
-		AuthError::new(AuthErrorKind::TokenExchange, "Z.ai key provisioning returned no apiKey").for_provider("zai")
+		AuthError::new(AuthErrorKind::TokenExchange, "Z.ai key provisioning returned no apiKey")
+			.for_provider("zai")
 	})?;
 
-	let copy_url = format!(
-		"{keys_url}/copy/{}",
-		super::super::super::callback::encode_component(&api_key)
-	);
+	let copy_url =
+		format!("{keys_url}/copy/{}", super::super::super::callback::encode_component(&api_key));
 	let copied = get_biz(flow, copy_url, &biz_token, "api key copy").await?;
 	let secret = trimmed(copied.get("secretKey")).ok_or_else(|| {
-		AuthError::new(AuthErrorKind::TokenExchange, "Z.ai key provisioning returned no secretKey").for_provider("zai")
+		AuthError::new(AuthErrorKind::TokenExchange, "Z.ai key provisioning returned no secretKey")
+			.for_provider("zai")
 	})?;
 	Ok(format!("{api_key}.{secret}"))
 }
 
-async fn get_biz(flow: &Flow<'_>, url: String, biz_token: &str, operation: &str) -> Result<Map<String, Value>, AuthError> {
+async fn get_biz(
+	flow: &Flow<'_>,
+	url: String,
+	biz_token: &str,
+	operation: &str,
+) -> Result<Map<String, Value>, AuthError> {
 	let payload = flow
 		.http
 		.get_json(
-			super::super::super::http::HttpRequest::get(url).bearer(biz_token).header("Accept", "application/json"),
+			super::super::super::http::HttpRequest::get(url)
+				.bearer(biz_token)
+				.header("Accept", "application/json"),
 			flow.cancel,
 			"zai",
 		)
@@ -256,7 +303,10 @@ fn as_key_array(value: &Map<String, Value>) -> Vec<Map<String, Value>> {
 		.cloned()
 		.or_else(|| direct.into_iter().find(Value::is_array));
 	match candidate {
-		Some(Value::Array(items)) => items.into_iter().filter_map(|item| item.as_object().cloned()).collect(),
+		Some(Value::Array(items)) => items
+			.into_iter()
+			.filter_map(|item| item.as_object().cloned())
+			.collect(),
 		_ => Vec::new(),
 	}
 }
@@ -293,15 +343,29 @@ mod tests {
 		let map = wrapped.as_object().expect("object");
 		assert_eq!(as_key_array(map).len(), 1);
 		let bare = json!([{ "name": "oh-my-pi" }]);
-		let map = bare.as_object().cloned().map(|_| Map::new()).unwrap_or_default();
+		let map = bare
+			.as_object()
+			.cloned()
+			.map(|_| Map::new())
+			.unwrap_or_default();
 		assert!(as_key_array(&map).is_empty());
 	}
 
 	#[test]
 	fn default_entries_prefer_is_default_then_first() {
-		let entries = vec![json!({ "organizationId": "a" }), json!({ "organizationId": "b", "isDefault": true })];
-		assert_eq!(trimmed(pick_default(&entries).and_then(|entry| entry.get("organizationId"))).as_deref(), Some("b"));
+		let entries = vec![
+			json!({ "organizationId": "a" }),
+			json!({ "organizationId": "b", "isDefault": true }),
+		];
+		assert_eq!(
+			trimmed(pick_default(&entries).and_then(|entry| entry.get("organizationId"))).as_deref(),
+			Some("b")
+		);
 		let no_default = vec![json!({ "organizationId": "a" }), json!({ "organizationId": "b" })];
-		assert_eq!(trimmed(pick_default(&no_default).and_then(|entry| entry.get("organizationId"))).as_deref(), Some("a"));
+		assert_eq!(
+			trimmed(pick_default(&no_default).and_then(|entry| entry.get("organizationId")))
+				.as_deref(),
+			Some("a")
+		);
 	}
 }

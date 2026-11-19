@@ -7,10 +7,10 @@
 
 use serde_json::Value;
 
+use super::super::super::device::{DevicePoll, poll_device_code};
 use super::super::super::error::{AuthError, AuthErrorKind};
 use super::super::super::http::{HttpRequest, HttpResponse};
 use super::super::super::store::{Credential, OAuthCredentials};
-use super::super::super::device::{DevicePoll, poll_device_code};
 use super::super::Flow;
 use super::{jwt_claims, non_empty, now_ms, number_field, publish, string_field};
 
@@ -42,9 +42,14 @@ pub async fn login(flow: &Flow<'_>) -> Result<Credential, AuthError> {
 	Ok(Credential::OAuth(credentials))
 }
 
-pub async fn refresh(flow: &Flow<'_>, credentials: &OAuthCredentials) -> Result<Credential, AuthError> {
+pub async fn refresh(
+	flow: &Flow<'_>,
+	credentials: &OAuthCredentials,
+) -> Result<Credential, AuthError> {
 	if credentials.refresh.trim().is_empty() {
-		return Err(AuthError::new(AuthErrorKind::Validation, "missing refresh_token").for_provider(PROVIDER));
+		return Err(
+			AuthError::new(AuthErrorKind::Validation, "missing refresh_token").for_provider(PROVIDER),
+		);
 	}
 	let token_endpoint = discover_token_endpoint(flow).await?;
 	let request = form(
@@ -60,7 +65,8 @@ pub async fn refresh(flow: &Flow<'_>, credentials: &OAuthCredentials) -> Result<
 		return Err(response.error_for(AuthErrorKind::TokenRefresh, PROVIDER, "xAI token refresh"));
 	}
 	let payload = response.json(PROVIDER)?;
-	let refreshed = parse_tokens(&payload, "xAI token refresh response", Some(&credentials.refresh))?;
+	let refreshed =
+		parse_tokens(&payload, "xAI token refresh response", Some(&credentials.refresh))?;
 	Ok(Credential::OAuth(with_identity(flow, refreshed).await?))
 }
 
@@ -74,26 +80,37 @@ struct DeviceAuthorization {
 
 async fn discover_token_endpoint(flow: &Flow<'_>) -> Result<String, AuthError> {
 	let request = HttpRequest::get(DISCOVERY_URL).header("Accept", "application/json");
-	let response = flow.http.send(request, flow.cancel, PROVIDER).await.map_err(|err| {
-		AuthError::new(AuthErrorKind::Discovery, format!("xAI OIDC discovery failed: {}", err.message))
+	let response = flow
+		.http
+		.send(request, flow.cancel, PROVIDER)
+		.await
+		.map_err(|err| {
+			AuthError::new(
+				AuthErrorKind::Discovery,
+				format!("xAI OIDC discovery failed: {}", err.message),
+			)
 			.for_provider(PROVIDER)
-	})?;
+		})?;
 	if response.status != 200 {
-		return Err(AuthError::new(
-			AuthErrorKind::Discovery,
-			format!("xAI OIDC discovery returned status {}.", response.status),
-		)
-		.for_provider(PROVIDER)
-		.with_status(response.status));
+		return Err(
+			AuthError::new(
+				AuthErrorKind::Discovery,
+				format!("xAI OIDC discovery returned status {}.", response.status),
+			)
+			.for_provider(PROVIDER)
+			.with_status(response.status),
+		);
 	}
 	let payload = response.json(PROVIDER)?;
 	let endpoint = string_field(&payload, "token_endpoint").unwrap_or_default();
 	if endpoint.trim().is_empty() {
-		return Err(AuthError::new(
-			AuthErrorKind::Validation,
-			"xAI OIDC discovery response was missing token_endpoint.",
-		)
-		.for_provider(PROVIDER));
+		return Err(
+			AuthError::new(
+				AuthErrorKind::Validation,
+				"xAI OIDC discovery response was missing token_endpoint.",
+			)
+			.for_provider(PROVIDER),
+		);
 	}
 	validate_xai_endpoint(endpoint.trim(), "token_endpoint")
 }
@@ -101,10 +118,15 @@ async fn discover_token_endpoint(flow: &Flow<'_>) -> Result<String, AuthError> {
 /// Only `https://x.ai` / `https://*.x.ai` are acceptable for xAI endpoints.
 fn validate_xai_endpoint(url: &str, field: &str) -> Result<String, AuthError> {
 	let invalid = || {
-		AuthError::new(AuthErrorKind::Validation, format!("Invalid xAI {field}: {url}")).for_provider(PROVIDER)
+		AuthError::new(AuthErrorKind::Validation, format!("Invalid xAI {field}: {url}"))
+			.for_provider(PROVIDER)
 	};
 	let rest = url.strip_prefix("https://").ok_or_else(invalid)?;
-	let host = rest.split(['/', '?', '#']).next().unwrap_or_default().to_ascii_lowercase();
+	let host = rest
+		.split(['/', '?', '#'])
+		.next()
+		.unwrap_or_default()
+		.to_ascii_lowercase();
 	let host = host.split(':').next().unwrap_or_default();
 	if host.is_empty() || !(host == "x.ai" || host.ends_with(".x.ai")) {
 		return Err(invalid());
@@ -115,27 +137,52 @@ fn validate_xai_endpoint(url: &str, field: &str) -> Result<String, AuthError> {
 async fn request_device_authorization(flow: &Flow<'_>) -> Result<DeviceAuthorization, AuthError> {
 	let request = form(
 		DEVICE_CODE_URL,
-		vec![("client_id".to_string(), CLIENT_ID.to_string()), ("scope".to_string(), SCOPE.to_string())],
+		vec![
+			("client_id".to_string(), CLIENT_ID.to_string()),
+			("scope".to_string(), SCOPE.to_string()),
+		],
 	);
 	let response = flow.http.send(request, flow.cancel, PROVIDER).await?;
 	if !response.is_success() {
-		return Err(response.error_for(AuthErrorKind::DeviceAuth, PROVIDER, "xAI device-code request"));
+		return Err(response.error_for(
+			AuthErrorKind::DeviceAuth,
+			PROVIDER,
+			"xAI device-code request",
+		));
 	}
 	let payload = response.json(PROVIDER)?;
-	let device_code = string_field(&payload, "device_code").unwrap_or_default().trim().to_string();
-	let user_code = string_field(&payload, "user_code").unwrap_or_default().trim().to_string();
-	let verification_uri = string_field(&payload, "verification_uri").unwrap_or_default().trim().to_string();
-	let complete = string_field(&payload, "verification_uri_complete").unwrap_or_default().trim().to_string();
+	let device_code = string_field(&payload, "device_code")
+		.unwrap_or_default()
+		.trim()
+		.to_string();
+	let user_code = string_field(&payload, "user_code")
+		.unwrap_or_default()
+		.trim()
+		.to_string();
+	let verification_uri = string_field(&payload, "verification_uri")
+		.unwrap_or_default()
+		.trim()
+		.to_string();
+	let complete = string_field(&payload, "verification_uri_complete")
+		.unwrap_or_default()
+		.trim()
+		.to_string();
 	let expires_in = number_field(&payload, "expires_in").unwrap_or_default();
 	let interval = number_field(&payload, "interval").unwrap_or_default();
-	if device_code.is_empty() || user_code.is_empty() || verification_uri.is_empty() || complete.is_empty() || expires_in <= 0.0
+	if device_code.is_empty()
+		|| user_code.is_empty()
+		|| verification_uri.is_empty()
+		|| complete.is_empty()
+		|| expires_in <= 0.0
 		|| interval <= 0.0
 	{
-		return Err(AuthError::new(
-			AuthErrorKind::Validation,
-			"xAI device-code response missing or invalid required fields.",
-		)
-		.for_provider(PROVIDER));
+		return Err(
+			AuthError::new(
+				AuthErrorKind::Validation,
+				"xAI device-code response missing or invalid required fields.",
+			)
+			.for_provider(PROVIDER),
+		);
 	}
 	validate_xai_endpoint(&verification_uri, "verification_uri")?;
 	validate_xai_endpoint(&complete, "verification_uri_complete")?;
@@ -170,41 +217,57 @@ async fn poll_token(
 	let response = flow.http.send(request, flow.cancel, PROVIDER).await?;
 	let payload = response.json(PROVIDER).unwrap_or(Value::Null);
 	if response.is_success() {
-		return parse_tokens(&payload, "xAI device-code token response", None).map(DevicePoll::Complete);
+		return parse_tokens(&payload, "xAI device-code token response", None)
+			.map(DevicePoll::Complete);
 	}
-	match string_field(&payload, "error").as_deref().unwrap_or_default() {
+	match string_field(&payload, "error")
+		.as_deref()
+		.unwrap_or_default()
+	{
 		"authorization_pending" => Ok(DevicePoll::Pending),
 		"slow_down" => Ok(DevicePoll::SlowDown),
 		error => {
 			let detail = crate::auth::error::oauth_error_identifier(error)
 				.unwrap_or_else(|| "provider rejected the device request".to_string());
-			Err(AuthError::new(
-				AuthErrorKind::Polling,
-				format!("xAI device-code token polling failed: {detail}"),
+			Err(
+				AuthError::new(
+					AuthErrorKind::Polling,
+					format!("xAI device-code token polling failed: {detail}"),
+				)
+				.for_provider(PROVIDER)
+				.with_status(response.status),
 			)
-			.for_provider(PROVIDER)
-			.with_status(response.status))
 		},
 	}
 }
 
-fn parse_tokens(payload: &Value, label: &str, refresh_fallback: Option<&str>) -> Result<OAuthCredentials, AuthError> {
+fn parse_tokens(
+	payload: &Value,
+	label: &str,
+	refresh_fallback: Option<&str>,
+) -> Result<OAuthCredentials, AuthError> {
 	let access = string_field(payload, "access_token").unwrap_or_default();
 	let refresh = non_empty(string_field(payload, "refresh_token"))
 		.or_else(|| refresh_fallback.map(ToString::to_string))
 		.unwrap_or_default();
 	let expires_in = payload.get("expires_in").and_then(Value::as_i64);
 	if access.is_empty() {
-		return Err(AuthError::new(AuthErrorKind::Validation, format!("{label} missing access_token"))
-			.for_provider(PROVIDER));
+		return Err(
+			AuthError::new(AuthErrorKind::Validation, format!("{label} missing access_token"))
+				.for_provider(PROVIDER),
+		);
 	}
 	if refresh.is_empty() {
-		return Err(AuthError::new(AuthErrorKind::Validation, format!("{label} missing refresh_token"))
-			.for_provider(PROVIDER));
+		return Err(
+			AuthError::new(AuthErrorKind::Validation, format!("{label} missing refresh_token"))
+				.for_provider(PROVIDER),
+		);
 	}
 	let Some(expires_in) = expires_in else {
-		return Err(AuthError::new(AuthErrorKind::Validation, format!("{label} missing expires_in"))
-			.for_provider(PROVIDER));
+		return Err(
+			AuthError::new(AuthErrorKind::Validation, format!("{label} missing expires_in"))
+				.for_provider(PROVIDER),
+		);
 	};
 	Ok(OAuthCredentials {
 		access,
@@ -216,14 +279,19 @@ fn parse_tokens(payload: &Value, label: &str, refresh_fallback: Option<&str>) ->
 
 /// `fetchXAIOAuthIdentity`: a failed userinfo call keeps the JWT subject, but a
 /// cancelled login propagates instead of completing with partial identity.
-async fn with_identity(flow: &Flow<'_>, mut credentials: OAuthCredentials) -> Result<OAuthCredentials, AuthError> {
+async fn with_identity(
+	flow: &Flow<'_>,
+	mut credentials: OAuthCredentials,
+) -> Result<OAuthCredentials, AuthError> {
 	if let Some(identity) = fetch_identity(flow, &credentials.access).await? {
 		credentials.account_id = non_empty(identity.0).or(credentials.account_id);
-		credentials.email = non_empty(identity.1).map(|email| email.to_lowercase()).or(credentials.email);
+		credentials.email = non_empty(identity.1)
+			.map(|email| email.to_lowercase())
+			.or(credentials.email);
 	}
 	if credentials.account_id.is_none() {
-		credentials.account_id = jwt_claims(&credentials.access)
-			.and_then(|claims| non_empty(string_field(&claims, "sub")));
+		credentials.account_id =
+			jwt_claims(&credentials.access).and_then(|claims| non_empty(string_field(&claims, "sub")));
 	}
 	Ok(credentials)
 }
@@ -243,7 +311,9 @@ async fn fetch_identity(
 	if !response.is_success() {
 		return Ok(None);
 	}
-	let Ok(payload) = response.json(PROVIDER) else { return Ok(None) };
+	let Ok(payload) = response.json(PROVIDER) else {
+		return Ok(None);
+	};
 	let subject = non_empty(string_field(&payload, "sub"));
 	let email = non_empty(string_field(&payload, "email"));
 	if subject.is_none() && email.is_none() {
@@ -262,7 +332,9 @@ mod tests {
 		assert!(validate_xai_endpoint("https://x.ai/token", "token_endpoint").is_ok());
 		assert!(validate_xai_endpoint("http://auth.x.ai/token", "token_endpoint").is_err());
 		assert!(validate_xai_endpoint("https://evil.test/token", "token_endpoint").is_err());
-		assert!(validate_xai_endpoint("https://auth.x.ai.evil.test/token", "token_endpoint").is_err());
+		assert!(
+			validate_xai_endpoint("https://auth.x.ai.evil.test/token", "token_endpoint").is_err()
+		);
 	}
 
 	#[test]
@@ -270,7 +342,12 @@ mod tests {
 		let missing_refresh = serde_json::json!({ "access_token": "a", "expires_in": 60 });
 		assert!(parse_tokens(&missing_refresh, "label", None).is_err());
 		let fallback = serde_json::json!({ "access_token": "a", "expires_in": 60 });
-		assert_eq!(parse_tokens(&fallback, "label", Some("r")).expect("refresh").refresh, "r");
+		assert_eq!(
+			parse_tokens(&fallback, "label", Some("r"))
+				.expect("refresh")
+				.refresh,
+			"r"
+		);
 		let missing_expiry = serde_json::json!({ "access_token": "a", "refresh_token": "r" });
 		assert!(parse_tokens(&missing_expiry, "label", None).is_err());
 	}

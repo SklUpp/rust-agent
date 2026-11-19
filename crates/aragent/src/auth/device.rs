@@ -37,9 +37,12 @@ where
 	F: FnMut() -> Fut,
 	Fut: Future<Output = Result<DevicePoll<T>, AuthError>>,
 {
-	let deadline = expires_in_seconds.map(|seconds| tokio::time::Instant::now() + Duration::from_secs(seconds));
+	let deadline =
+		expires_in_seconds.map(|seconds| tokio::time::Instant::now() + Duration::from_secs(seconds));
 	let mut interval_ms =
-		Duration::from_secs_f64(interval_seconds.unwrap_or(DEFAULT_INTERVAL_SECONDS)).as_millis().max(u128::from(MINIMUM_INTERVAL_MS)) as u64;
+		Duration::from_secs_f64(interval_seconds.unwrap_or(DEFAULT_INTERVAL_SECONDS))
+			.as_millis()
+			.max(u128::from(MINIMUM_INTERVAL_MS)) as u64;
 	let mut slow_down_responses = 0u32;
 
 	loop {

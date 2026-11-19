@@ -104,7 +104,11 @@ mod tests {
 	fn state_is_32_lowercase_hex() {
 		let state = random_state().expect("os randomness");
 		assert_eq!(state.len(), 32);
-		assert!(state.chars().all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()));
+		assert!(
+			state
+				.chars()
+				.all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase())
+		);
 	}
 
 	#[test]

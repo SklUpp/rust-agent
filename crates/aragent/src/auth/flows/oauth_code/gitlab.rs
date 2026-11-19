@@ -21,7 +21,11 @@ const SCOPES: &str = "api";
 const EXPIRY_SKEW_MS: i64 = 5 * 60 * 1000;
 
 pub async fn login(flow: &Flow<'_>, workflow: bool) -> Result<Credential, AuthError> {
-	if workflow { login_workflow(flow).await } else { login_duo(flow).await }
+	if workflow {
+		login_workflow(flow).await
+	} else {
+		login_duo(flow).await
+	}
 }
 
 async fn login_duo(flow: &Flow<'_>) -> Result<Credential, AuthError> {
@@ -60,7 +64,8 @@ async fn login_duo(flow: &Flow<'_>) -> Result<Credential, AuthError> {
 		("code_verifier".to_string(), pkce.verifier),
 		("redirect_uri".to_string(), redirect_uri),
 	];
-	exchange_form(flow, fields, "GitLab OAuth token exchange failed", AuthErrorKind::TokenExchange).await
+	exchange_form(flow, fields, "GitLab OAuth token exchange failed", AuthErrorKind::TokenExchange)
+		.await
 }
 
 async fn login_workflow(flow: &Flow<'_>) -> Result<Credential, AuthError> {
@@ -68,7 +73,8 @@ async fn login_workflow(flow: &Flow<'_>) -> Result<Credential, AuthError> {
 	let state = super::super::super::pkce::random_state()?;
 	// No listener can receive a `vscode://` redirect; a random loopback port is
 	// bound only so the shared engine has a uniform shape.
-	let callback = CallbackConfig::new(0, DUO_CALLBACK_PATH).with_redirect_uri(WORKFLOW_REDIRECT_URI);
+	let callback =
+		CallbackConfig::new(0, DUO_CALLBACK_PATH).with_redirect_uri(WORKFLOW_REDIRECT_URI);
 	let spec = CodeFlowSpec::new(callback)
 		.with_instructions(
 			"Complete GitLab login in your browser. This uses GitLab's official VS Code OAuth application. If the redirect opens VS Code instead of returning to Aragent, copy the full vscode://gitlab.gitlab-workflow/authentication?... callback URL from VS Code/browser and paste it back into Aragent.",
@@ -98,22 +104,36 @@ async fn login_workflow(flow: &Flow<'_>) -> Result<Credential, AuthError> {
 		("code".to_string(), exchange.code),
 		("code_verifier".to_string(), pkce.verifier),
 	];
-	exchange_form(flow, fields, "GitLab Duo Workflow OAuth token exchange failed", AuthErrorKind::TokenExchange)
-		.await
+	exchange_form(
+		flow,
+		fields,
+		"GitLab Duo Workflow OAuth token exchange failed",
+		AuthErrorKind::TokenExchange,
+	)
+	.await
 }
 
-pub async fn refresh(flow: &Flow<'_>, credentials: &OAuthCredentials) -> Result<Credential, AuthError> {
+pub async fn refresh(
+	flow: &Flow<'_>,
+	credentials: &OAuthCredentials,
+) -> Result<Credential, AuthError> {
 	let workflow = flow.provider() == "gitlab-duo-agent";
 	if credentials.refresh.is_empty() {
-		return Err(AuthError::new(AuthErrorKind::TokenRefresh, "stored credential has no refresh token")
-			.for_provider(flow.provider()));
+		return Err(
+			AuthError::new(AuthErrorKind::TokenRefresh, "stored credential has no refresh token")
+				.for_provider(flow.provider()),
+		);
 	}
 	let mut fields = vec![
-		("client_id".to_string(), if workflow { WORKFLOW_CLIENT_ID.to_string() } else { duo_client_id() }),
 		(
-			"grant_type".to_string(),
-			"refresh_token".to_string(),
+			"client_id".to_string(),
+			if workflow {
+				WORKFLOW_CLIENT_ID.to_string()
+			} else {
+				duo_client_id()
+			},
 		),
+		("grant_type".to_string(), "refresh_token".to_string()),
 		("refresh_token".to_string(), credentials.refresh.clone()),
 	];
 	if workflow {
@@ -142,33 +162,56 @@ async fn exchange_form(
 		)
 		.await?;
 	if !response.is_success() {
-		return Err(AuthError::new(
-			kind,
-			format!("{failure}: {} {}", response.status, super::super::super::error::summarize_error_body(&response.body)),
-		)
-		.for_provider(flow.provider())
-		.with_status(response.status));
+		return Err(
+			AuthError::new(
+				kind,
+				format!(
+					"{failure}: {} {}",
+					response.status,
+					super::super::super::error::summarize_error_body(&response.body)
+				),
+			)
+			.for_provider(flow.provider())
+			.with_status(response.status),
+		);
 	}
 	let payload = response.json(flow.provider())?;
 	map_token_response(&payload, flow.provider())
 }
 
-fn map_token_response(payload: &serde_json::Value, provider: &str) -> Result<Credential, AuthError> {
-	let access = payload.get("access_token").and_then(serde_json::Value::as_str).unwrap_or_default();
-	let refresh = payload.get("refresh_token").and_then(serde_json::Value::as_str).unwrap_or_default();
-	let expires_in = payload.get("expires_in").and_then(serde_json::Value::as_i64);
+fn map_token_response(
+	payload: &serde_json::Value,
+	provider: &str,
+) -> Result<Credential, AuthError> {
+	let access = payload
+		.get("access_token")
+		.and_then(serde_json::Value::as_str)
+		.unwrap_or_default();
+	let refresh = payload
+		.get("refresh_token")
+		.and_then(serde_json::Value::as_str)
+		.unwrap_or_default();
+	let expires_in = payload
+		.get("expires_in")
+		.and_then(serde_json::Value::as_i64);
 	if access.is_empty() || refresh.is_empty() || expires_in.is_none() {
-		return Err(AuthError::new(
-			AuthErrorKind::Validation,
-			"GitLab OAuth token response missing required fields",
-		)
-		.for_provider(provider));
+		return Err(
+			AuthError::new(
+				AuthErrorKind::Validation,
+				"GitLab OAuth token response missing required fields",
+			)
+			.for_provider(provider),
+		);
 	}
-	let created_at_ms = payload.get("created_at").and_then(serde_json::Value::as_i64).map(|seconds| seconds * 1000);
+	let created_at_ms = payload
+		.get("created_at")
+		.and_then(serde_json::Value::as_i64)
+		.map(|seconds| seconds * 1000);
 	Ok(Credential::OAuth(OAuthCredentials {
 		access: access.to_string(),
 		refresh: refresh.to_string(),
-		expires: created_at_ms.unwrap_or_else(now_ms) + expires_in.unwrap_or(0) * 1000 - EXPIRY_SKEW_MS,
+		expires: created_at_ms.unwrap_or_else(now_ms) + expires_in.unwrap_or(0) * 1000
+			- EXPIRY_SKEW_MS,
 		..OAuthCredentials::default()
 	}))
 }
@@ -185,20 +228,36 @@ fn duo_client_id() -> String {
 /// `resolveCallbackOptions`: honour `GITLAB_REDIRECT_URI` exactly, including its
 /// loopback host/port, and reject an HTTPS loopback (the listener is plaintext).
 fn duo_callback_config() -> Result<CallbackConfig, AuthError> {
-	let raw = std::env::var("GITLAB_REDIRECT_URI").ok().map(|value| value.trim().to_string()).filter(|value| !value.is_empty());
+	let raw = std::env::var("GITLAB_REDIRECT_URI")
+		.ok()
+		.map(|value| value.trim().to_string())
+		.filter(|value| !value.is_empty());
 	let Some(raw) = raw else {
 		return Ok(CallbackConfig::new(DUO_CALLBACK_PORT, DUO_CALLBACK_PATH));
 	};
 	if !(raw.starts_with("http://") || raw.starts_with("https://")) {
-		return Err(AuthError::config("gitlab-duo", format!("GITLAB_REDIRECT_URI must use http:// or https://, got: {raw}")));
+		return Err(AuthError::config(
+			"gitlab-duo",
+			format!("GITLAB_REDIRECT_URI must use http:// or https://, got: {raw}"),
+		));
 	}
 	let (scheme, rest) = raw.split_once("://").unwrap_or((&raw, ""));
 	let authority = rest.split('/').next().unwrap_or("");
-	let host = authority.rsplit_once('@').map_or(authority, |(_, host)| host);
-	let host = host.trim_start_matches('[').split(']').next().unwrap_or(host);
+	let host = authority
+		.rsplit_once('@')
+		.map_or(authority, |(_, host)| host);
+	let host = host
+		.trim_start_matches('[')
+		.split(']')
+		.next()
+		.unwrap_or(host);
 	let host = host.split(':').next().unwrap_or(host);
 	let path = &rest[authority.len()..];
-	let path = if path.is_empty() { DUO_CALLBACK_PATH } else { path };
+	let path = if path.is_empty() {
+		DUO_CALLBACK_PATH
+	} else {
+		path
+	};
 	let is_loopback = matches!(host, "localhost" | "127.0.0.1" | "::1");
 	if is_loopback && scheme != "http" {
 		return Err(AuthError::config(
@@ -210,8 +269,13 @@ fn duo_callback_config() -> Result<CallbackConfig, AuthError> {
 		.rsplit_once(':')
 		.and_then(|(_, port)| port.parse::<u16>().ok())
 		.unwrap_or(if scheme == "https" { 443 } else { 80 });
-	let config = CallbackConfig::new(if is_loopback { port } else { 0 }, path).with_redirect_uri(&raw);
-	Ok(if is_loopback { config.with_hostname(host) } else { config })
+	let config =
+		CallbackConfig::new(if is_loopback { port } else { 0 }, path).with_redirect_uri(&raw);
+	Ok(if is_loopback {
+		config.with_hostname(host)
+	} else {
+		config
+	})
 }
 
 fn now_ms() -> i64 {
@@ -234,7 +298,8 @@ mod tests {
 	#[test]
 	fn maps_created_at_seconds_into_expiry_with_skew() {
 		let payload = json!({ "access_token": "a", "refresh_token": "r", "expires_in": 3600, "created_at": 1000 });
-		let Credential::OAuth(creds) = map_token_response(&payload, "gitlab-duo").expect("mapped") else {
+		let Credential::OAuth(creds) = map_token_response(&payload, "gitlab-duo").expect("mapped")
+		else {
 			panic!("oauth expected");
 		};
 		assert_eq!(creds.expires, 1000 * 1000 + 3600 * 1000 - EXPIRY_SKEW_MS);
@@ -244,7 +309,9 @@ mod tests {
 	fn rejects_incomplete_token_response() {
 		let payload = json!({ "access_token": "a" });
 		assert_eq!(
-			map_token_response(&payload, "gitlab-duo").expect_err("missing fields").kind,
+			map_token_response(&payload, "gitlab-duo")
+				.expect_err("missing fields")
+				.kind,
 			AuthErrorKind::Validation
 		);
 	}

@@ -68,8 +68,9 @@ pub struct OAuthCredentials {
 impl OAuthCredentials {
 	/// The stored JSON object, without the `type` discriminant.
 	fn data_json(&self) -> Result<String, AuthError> {
-		serde_json::to_string(self)
-			.map_err(|err| AuthError::new(AuthErrorKind::Storage, format!("cannot encode credential: {err}")))
+		serde_json::to_string(self).map_err(|err| {
+			AuthError::new(AuthErrorKind::Storage, format!("cannot encode credential: {err}"))
+		})
 	}
 
 	/// Everything except the token material — safe for `LoginProvider` display.
@@ -205,7 +206,9 @@ impl CredentialStore {
 		self.connection.busy_timeout(Duration::from_millis(5_000))?;
 		if self.path.as_os_str() != ":memory:" {
 			self.connection.pragma_update(None, "journal_mode", "WAL")?;
-			self.connection.pragma_update(None, "synchronous", "NORMAL")?;
+			self
+				.connection
+				.pragma_update(None, "synchronous", "NORMAL")?;
 		}
 		// One transaction: a failure leaves the file untouched instead of half
 		// migrated tables with a version row that claims otherwise.
@@ -352,10 +355,14 @@ impl CredentialStore {
 		let existing = {
 			let rows = self.rows_for(provider)?;
 			match credential {
-				Credential::ApiKey { key, .. } => rows.into_iter().find(|row| stored_api_key(row).as_deref() == Some(key.as_str())),
+				Credential::ApiKey { key, .. } => rows
+					.into_iter()
+					.find(|row| stored_api_key(row).as_deref() == Some(key.as_str())),
 				Credential::OAuth(_) => {
 					if identity_key.is_some() {
-						rows.into_iter().find(|row| row.identity_key == identity_key)
+						rows
+							.into_iter()
+							.find(|row| row.identity_key == identity_key)
 					} else {
 						// Identity-less OAuth grant (e.g. a minted static key): one
 						// active row per provider, refreshed in place.
@@ -448,7 +455,8 @@ impl CredentialStore {
 
 	/// Stored `data` for an active row; `None` when the row is gone or disabled.
 	pub fn data_if_active(&self, id: i64) -> Result<Option<String>, AuthError> {
-		self.connection
+		self
+			.connection
 			.query_row(
 				"SELECT data FROM auth_credentials WHERE id = ? AND disabled_cause IS NULL",
 				params![id],
@@ -493,7 +501,12 @@ impl CredentialStore {
 	}
 
 	/// `getCredentialBlock`: unexpired block window, or `None` after pruning.
-	pub fn get_block(&self, credential_id: i64, provider_key: &str, block_scope: &str) -> Result<Option<i64>, AuthError> {
+	pub fn get_block(
+		&self,
+		credential_id: i64,
+		provider_key: &str,
+		block_scope: &str,
+	) -> Result<Option<i64>, AuthError> {
 		let blocked_until = self
 			.connection
 			.query_row(
@@ -535,8 +548,10 @@ impl CredentialStore {
 		loop {
 			cancel.check("auth")?;
 			if self.data_if_active(credential_id)?.is_none() {
-				return Err(AuthError::new(AuthErrorKind::Storage, "credential is no longer active")
-					.for_provider("auth"));
+				return Err(
+					AuthError::new(AuthErrorKind::Storage, "credential is no longer active")
+						.for_provider("auth"),
+				);
 			}
 			let now = now_ms();
 			if self.try_acquire_lease(credential_id, &owner, now)? == 1 {
@@ -564,7 +579,12 @@ impl CredentialStore {
 		}
 	}
 
-	fn try_acquire_lease(&self, credential_id: i64, owner: &str, now: i64) -> Result<usize, AuthError> {
+	fn try_acquire_lease(
+		&self,
+		credential_id: i64,
+		owner: &str,
+		now: i64,
+	) -> Result<usize, AuthError> {
 		let expires = now + REFRESH_LEASE_TTL_MS;
 		Ok(self.connection.execute(
 			&format!(
@@ -826,7 +846,11 @@ fn infer_schema_version(columns: &[String]) -> i64 {
 
 /// `#migrateAuthSchema`: the exact ordered TS migration chain, run inside the
 /// caller's transaction. The version row advances only after these succeed.
-fn migrate_auth_schema(connection: &Connection, from_version: i64, columns: &[String]) -> Result<(), AuthError> {
+fn migrate_auth_schema(
+	connection: &Connection,
+	from_version: i64,
+	columns: &[String],
+) -> Result<(), AuthError> {
 	if from_version < 1 {
 		migrate_v0_to_v1(connection, columns)?;
 	}
@@ -883,10 +907,18 @@ fn migrate_v0_to_v1(connection: &Connection, columns: &[String]) -> Result<(), A
 /// `#migrateAuthSchemaV1OrV2ToV3` / `#migrateAuthSchemaV3ToV4`: rebuild the
 /// table with the v7 column set, preserving ids, disabled causes and (v3→v4)
 /// identity keys.
-fn rebuild_credentials(connection: &Connection, temporary: &str, keep_identity: bool) -> Result<(), AuthError> {
+fn rebuild_credentials(
+	connection: &Connection,
+	temporary: &str,
+	keep_identity: bool,
+) -> Result<(), AuthError> {
 	connection.execute_batch(&format!("ALTER TABLE auth_credentials RENAME TO {temporary};"))?;
 	connection.execute_batch(AUTH_CREDENTIALS_DDL)?;
-	let identity = if keep_identity { "identity_key" } else { "NULL" };
+	let identity = if keep_identity {
+		"identity_key"
+	} else {
+		"NULL"
+	};
 	connection.execute_batch(&format!(
 		"INSERT INTO auth_credentials (id, provider, credential_type, data, disabled_cause, identity_key, created_at, updated_at)
 		 SELECT id, provider, credential_type, data, disabled_cause, {identity}, created_at, updated_at
@@ -947,10 +979,16 @@ fn backfill_identity_keys(connection: &Connection) -> Result<(), AuthError> {
 	})?;
 	for row in rows {
 		let row = row?;
-		let Some(credential) = deserialize(&row) else { continue };
-		let Some(key) = identity_key(&row.provider, &credential) else { continue };
+		let Some(credential) = deserialize(&row) else {
+			continue;
+		};
+		let Some(key) = identity_key(&row.provider, &credential) else {
+			continue;
+		};
 		connection.execute(
-			&format!("UPDATE auth_credentials SET identity_key = ?, updated_at = {SQLITE_NOW_EPOCH} WHERE id = ?"),
+			&format!(
+				"UPDATE auth_credentials SET identity_key = ?, updated_at = {SQLITE_NOW_EPOCH} WHERE id = ?"
+			),
 			params![key, row.id],
 		)?;
 	}
@@ -1000,10 +1038,13 @@ fn deserialize(row: &Row) -> Option<Credential> {
 	match row.credential_type.as_str() {
 		"api_key" => {
 			let key = value.get("key")?.as_str()?.to_string();
-			let source_login = value.get("source").and_then(serde_json::Value::as_str) == Some("login");
+			let source_login =
+				value.get("source").and_then(serde_json::Value::as_str) == Some("login");
 			Some(Credential::ApiKey { key, source_login })
 		},
-		"oauth" => serde_json::from_value::<OAuthCredentials>(value).ok().map(Credential::OAuth),
+		"oauth" => serde_json::from_value::<OAuthCredentials>(value)
+			.ok()
+			.map(Credential::OAuth),
 		_ => None,
 	}
 }
@@ -1020,14 +1061,19 @@ fn stored_api_key(row: &Row) -> Option<String> {
 /// whose one email can hold several subscriptions.
 #[must_use]
 pub fn identity_key(provider: &str, credential: &Credential) -> Option<String> {
-	let Credential::OAuth(creds) = credential else { return None };
+	let Credential::OAuth(creds) = credential else {
+		return None;
+	};
 	let account = trimmed(&creds.account_id).map(|id| format!("account:{id}"));
 	let email = trimmed(&creds.email).map(|email| format!("email:{}", email.to_lowercase()));
 	let project = trimmed(&creds.project_id).map(|id| format!("project:{id}"));
 	let org = trimmed(&creds.org_id).map(|id| format!("org:{id}"));
 
 	if matches!(provider, "anthropic" | "openai-codex") {
-		let base = email.clone().or_else(|| account.clone()).or_else(|| project.clone());
+		let base = email
+			.clone()
+			.or_else(|| account.clone())
+			.or_else(|| project.clone());
 		return match (base, org) {
 			(Some(base), Some(org)) => Some(format!("{base}|{org}")),
 			(Some(base), None) => Some(base),
@@ -1038,7 +1084,10 @@ pub fn identity_key(provider: &str, credential: &Credential) -> Option<String> {
 }
 
 fn trimmed(value: &Option<String>) -> Option<&str> {
-	value.as_deref().map(str::trim).filter(|value| !value.is_empty())
+	value
+		.as_deref()
+		.map(str::trim)
+		.filter(|value| !value.is_empty())
 }
 
 fn now_ms() -> i64 {
@@ -1075,7 +1124,9 @@ mod tests {
 	#[test]
 	fn stores_and_reads_back_oauth_row() {
 		let store = CredentialStore::in_memory().expect("store");
-		let id = store.upsert("openai-codex", &oauth("a1", "r1", "acct")).expect("upsert");
+		let id = store
+			.upsert("openai-codex", &oauth("a1", "r1", "acct"))
+			.expect("upsert");
 		let stored = store.get("openai-codex").expect("get").expect("row");
 		assert_eq!(stored.id, id);
 		assert_eq!(stored.identity_key.as_deref(), Some("email:acct@example.com"));
@@ -1102,42 +1153,64 @@ mod tests {
 	#[test]
 	fn upsert_updates_same_identity_and_keeps_multi_account() {
 		let store = CredentialStore::in_memory().expect("store");
-		let first = store.upsert("openai-codex", &oauth("a1", "r1", "acct")).expect("insert");
-		store.upsert("openai-codex", &oauth("a2", "r2", "acct")).expect("update");
+		let first = store
+			.upsert("openai-codex", &oauth("a1", "r1", "acct"))
+			.expect("insert");
+		store
+			.upsert("openai-codex", &oauth("a2", "r2", "acct"))
+			.expect("update");
 		let rows = store.list_active("openai-codex").expect("list");
 		assert_eq!(rows.len(), 1, "same identity is one row");
 		assert_eq!(rows[0].id, first);
 
-		store.upsert("openai-codex", &oauth("a3", "r3", "other")).expect("second account");
+		store
+			.upsert("openai-codex", &oauth("a3", "r3", "other"))
+			.expect("second account");
 		assert_eq!(store.list_active("openai-codex").expect("list").len(), 2);
 	}
 
 	#[test]
 	fn cas_update_rejects_stale_data() {
 		let store = CredentialStore::in_memory().expect("store");
-		let id = store.upsert("anthropic", &oauth("a1", "r1", "acct")).expect("insert");
+		let id = store
+			.upsert("anthropic", &oauth("a1", "r1", "acct"))
+			.expect("insert");
 		let row = store.get("anthropic").expect("get").expect("row");
-		let lease = store.acquire_lease_blocking(id, &Cancel::new()).expect("lease");
-		assert!(store
-			.update_if_matches(id, &row.data, &oauth("a2", "r2", "acct"), lease.owner())
-			.expect("cas"));
-		assert!(!store
-			.update_if_matches(id, &row.data, &oauth("a3", "r3", "acct"), lease.owner())
-			.expect("stale cas"));
+		let lease = store
+			.acquire_lease_blocking(id, &Cancel::new())
+			.expect("lease");
+		assert!(
+			store
+				.update_if_matches(id, &row.data, &oauth("a2", "r2", "acct"), lease.owner())
+				.expect("cas")
+		);
+		assert!(
+			!store
+				.update_if_matches(id, &row.data, &oauth("a3", "r3", "acct"), lease.owner())
+				.expect("stale cas")
+		);
 	}
 
 	#[test]
 	fn disable_requires_matching_data_and_hides_row() {
 		let store = CredentialStore::in_memory().expect("store");
-		let id = store.upsert("anthropic", &oauth("a1", "r1", "acct")).expect("insert");
+		let id = store
+			.upsert("anthropic", &oauth("a1", "r1", "acct"))
+			.expect("insert");
 		let row = store.get("anthropic").expect("get").expect("row");
-		let lease = store.acquire_lease_blocking(id, &Cancel::new()).expect("lease");
-		assert!(!store
-			.disable_if_matches(id, "{\"other\":true}", "invalid_grant", lease.owner())
-			.expect("mismatch"));
-		assert!(store
-			.disable_if_matches(id, &row.data, "invalid_grant", lease.owner())
-			.expect("disable"));
+		let lease = store
+			.acquire_lease_blocking(id, &Cancel::new())
+			.expect("lease");
+		assert!(
+			!store
+				.disable_if_matches(id, "{\"other\":true}", "invalid_grant", lease.owner())
+				.expect("mismatch")
+		);
+		assert!(
+			store
+				.disable_if_matches(id, &row.data, "invalid_grant", lease.owner())
+				.expect("disable")
+		);
 		assert!(store.get("anthropic").expect("get").is_none());
 		assert_eq!(store.delete_provider("anthropic").expect("delete"), 1);
 	}
@@ -1149,11 +1222,20 @@ mod tests {
 			org_id: Some("org".into()),
 			..OAuthCredentials::default()
 		};
-		assert_eq!(identity_key("openai-codex", &Credential::OAuth(creds.clone())).as_deref(), Some("account:acct|org:org"));
-		assert_eq!(identity_key("zai", &Credential::OAuth(creds.clone())).as_deref(), Some("account:acct"));
+		assert_eq!(
+			identity_key("openai-codex", &Credential::OAuth(creds.clone())).as_deref(),
+			Some("account:acct|org:org")
+		);
+		assert_eq!(
+			identity_key("zai", &Credential::OAuth(creds.clone())).as_deref(),
+			Some("account:acct")
+		);
 		creds.account_id = None;
 		creds.email = Some(" User@Example.com ".into());
-		assert_eq!(identity_key("anthropic", &Credential::OAuth(creds)).as_deref(), Some("email:user@example.com|org:org"));
+		assert_eq!(
+			identity_key("anthropic", &Credential::OAuth(creds)).as_deref(),
+			Some("email:user@example.com|org:org")
+		);
 	}
 
 	#[test]
@@ -1163,7 +1245,9 @@ mod tests {
 			.connection
 			.execute_batch("CREATE TABLE settings (key TEXT PRIMARY KEY, value TEXT NOT NULL); INSERT INTO settings VALUES ('a','b');")
 			.expect("seed");
-		store.upsert("zai", &oauth("a", "r", "acct")).expect("upsert");
+		store
+			.upsert("zai", &oauth("a", "r", "acct"))
+			.expect("upsert");
 		let value: String = store
 			.connection
 			.query_row("SELECT value FROM settings WHERE key = 'a'", [], |row| row.get(0))
@@ -1174,7 +1258,9 @@ mod tests {
 	#[tokio::test]
 	async fn lease_is_exclusive_and_expires() {
 		let store = CredentialStore::in_memory().expect("store");
-		let id = store.upsert("zai", &oauth("a", "r", "acct")).expect("upsert");
+		let id = store
+			.upsert("zai", &oauth("a", "r", "acct"))
+			.expect("upsert");
 		let lease = store.acquire_lease(id).await.expect("lease");
 		assert!(lease.renew().expect("renew"));
 		drop(lease);
@@ -1219,7 +1305,8 @@ mod tests {
 			refresh: "r".into(),
 			..OAuthCredentials::default()
 		};
-		let mut refreshed = OAuthCredentials { access: "new".into(), expires: 10, ..OAuthCredentials::default() };
+		let mut refreshed =
+			OAuthCredentials { access: "new".into(), expires: 10, ..OAuthCredentials::default() };
 		refreshed.inherit_metadata(&previous);
 		assert_eq!(refreshed.project_id.as_deref(), Some("proj"));
 		assert_eq!(refreshed.authorized_at, Some(7));
@@ -1230,30 +1317,61 @@ mod tests {
 	#[test]
 	fn blocks_persist_extend_and_prune() {
 		let store = CredentialStore::in_memory().expect("store");
-		let id = store.upsert("zai", &oauth("a", "r", "acct")).expect("upsert");
-		store.upsert_block(id, "zai:oauth", "", now_ms() + 60_000).expect("block");
-		assert!(store.get_block(id, "zai:oauth", "").expect("read").is_some());
+		let id = store
+			.upsert("zai", &oauth("a", "r", "acct"))
+			.expect("upsert");
+		store
+			.upsert_block(id, "zai:oauth", "", now_ms() + 60_000)
+			.expect("block");
+		assert!(
+			store
+				.get_block(id, "zai:oauth", "")
+				.expect("read")
+				.is_some()
+		);
 		// A shorter window never shortens the existing block.
-		store.upsert_block(id, "zai:oauth", "", now_ms() - 1).expect("shorter");
-		assert!(store.get_block(id, "zai:oauth", "").expect("read").is_some());
+		store
+			.upsert_block(id, "zai:oauth", "", now_ms() - 1)
+			.expect("shorter");
+		assert!(
+			store
+				.get_block(id, "zai:oauth", "")
+				.expect("read")
+				.is_some()
+		);
 		assert_eq!(store.prune_blocks(now_ms() + 120_000).expect("prune"), 1);
-		assert!(store.get_block(id, "zai:oauth", "").expect("gone").is_none());
+		assert!(
+			store
+				.get_block(id, "zai:oauth", "")
+				.expect("gone")
+				.is_none()
+		);
 	}
 
 	#[test]
 	fn lease_wait_honours_cancel_and_refuses_inactive_rows() {
 		let store = CredentialStore::in_memory().expect("store");
-		let id = store.upsert("zai", &oauth("a", "r", "acct")).expect("upsert");
+		let id = store
+			.upsert("zai", &oauth("a", "r", "acct"))
+			.expect("upsert");
 
 		let cancelled = Cancel::new();
 		cancelled.cancel();
 		assert_eq!(
-			store.acquire_lease_blocking(id, &cancelled).err().expect("cancelled").kind,
+			store
+				.acquire_lease_blocking(id, &cancelled)
+				.err()
+				.expect("cancelled")
+				.kind,
 			AuthErrorKind::Cancelled
 		);
 
 		assert_eq!(
-			store.acquire_lease_blocking(id + 1_000, &Cancel::new()).err().expect("inactive").kind,
+			store
+				.acquire_lease_blocking(id + 1_000, &Cancel::new())
+				.err()
+				.expect("inactive")
+				.kind,
 			AuthErrorKind::Storage
 		);
 	}
@@ -1261,16 +1379,32 @@ mod tests {
 	#[test]
 	fn cas_requires_unexpired_lease_ownership() {
 		let store = CredentialStore::in_memory().expect("store");
-		let id = store.upsert("zai", &oauth("a", "r", "acct")).expect("upsert");
+		let id = store
+			.upsert("zai", &oauth("a", "r", "acct"))
+			.expect("upsert");
 		let expected = store.data_if_active(id).expect("data").expect("active");
 		let refreshed = oauth("b", "r", "acct");
 
 		// No lease: the write is refused even though the row is unchanged.
-		assert!(!store.update_if_matches(id, &expected, &refreshed, "not-the-owner").expect("cas"));
+		assert!(
+			!store
+				.update_if_matches(id, &expected, &refreshed, "not-the-owner")
+				.expect("cas")
+		);
 		assert!(store.data_if_active(id).expect("data").is_some());
 
-		let lease = store.acquire_lease_blocking(id, &Cancel::new()).expect("lease");
-		assert!(store.update_if_matches(id, &expected, &refreshed, lease.owner()).expect("cas"));
-		assert!(!store.update_if_matches(id, &expected, &refreshed, lease.owner()).expect("stale expected"));
+		let lease = store
+			.acquire_lease_blocking(id, &Cancel::new())
+			.expect("lease");
+		assert!(
+			store
+				.update_if_matches(id, &expected, &refreshed, lease.owner())
+				.expect("cas")
+		);
+		assert!(
+			!store
+				.update_if_matches(id, &expected, &refreshed, lease.owner())
+				.expect("stale expected")
+		);
 	}
 }

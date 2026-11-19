@@ -14,8 +14,8 @@ pub mod xai;
 
 use serde_json::Value;
 
-use super::Flow;
 use super::super::error::{AuthError, AuthErrorKind};
+use super::Flow;
 
 /// `onAuth(... instructions)`: the URL is opened by the host and the code is
 /// echoed as a notice so a headless client can still complete the login.
@@ -25,7 +25,10 @@ pub(super) fn publish(flow: &Flow<'_>, url: &str, user_code: &str) {
 }
 
 pub(super) fn string_field(value: &Value, key: &str) -> Option<String> {
-	value.get(key).and_then(Value::as_str).map(ToString::to_string)
+	value
+		.get(key)
+		.and_then(Value::as_str)
+		.map(ToString::to_string)
 }
 
 pub(super) fn number_field(value: &Value, key: &str) -> Option<f64> {
@@ -37,7 +40,9 @@ pub(super) fn number_field(value: &Value, key: &str) -> Option<f64> {
 }
 
 pub(super) fn non_empty(value: Option<String>) -> Option<String> {
-	value.map(|value| value.trim().to_string()).filter(|value| !value.is_empty())
+	value
+		.map(|value| value.trim().to_string())
+		.filter(|value| !value.is_empty())
 }
 
 /// JWT payload without verification — identity decoration only, never a trust
@@ -45,7 +50,9 @@ pub(super) fn non_empty(value: Option<String>) -> Option<String> {
 pub(super) fn jwt_claims(token: &str) -> Option<Value> {
 	use base64::Engine as _;
 	let payload = token.split('.').nth(1)?;
-	let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(payload).ok()?;
+	let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+		.decode(payload)
+		.ok()?;
 	serde_json::from_slice(&bytes).ok()
 }
 

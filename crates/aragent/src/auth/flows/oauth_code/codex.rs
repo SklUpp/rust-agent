@@ -16,7 +16,8 @@ use super::{CodeFlowSpec, Flow, run};
 pub(crate) const CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
 pub(crate) const AUTHORIZE_URL: &str = "https://auth.openai.com/oauth/authorize";
 pub(crate) const TOKEN_URL: &str = "https://auth.openai.com/oauth/token";
-pub(crate) const DEVICE_USERCODE_URL: &str = "https://auth.openai.com/api/accounts/deviceauth/usercode";
+pub(crate) const DEVICE_USERCODE_URL: &str =
+	"https://auth.openai.com/api/accounts/deviceauth/usercode";
 pub(crate) const DEVICE_TOKEN_URL: &str = "https://auth.openai.com/api/accounts/deviceauth/token";
 pub(crate) const DEVICE_REDIRECT_URI: &str = "https://auth.openai.com/deviceauth/callback";
 pub(crate) const DEVICE_AUTH_URL: &str = "https://auth.openai.com/codex/device";
@@ -47,7 +48,14 @@ pub async fn login(flow: &Flow<'_>) -> Result<Credential, AuthError> {
 	})
 	.await?;
 
-	exchange_code(flow, &exchange.code, &pkce.verifier, &exchange.redirect_uri, AuthErrorKind::TokenExchange).await
+	exchange_code(
+		flow,
+		&exchange.code,
+		&pkce.verifier,
+		&exchange.redirect_uri,
+		AuthErrorKind::TokenExchange,
+	)
+	.await
 }
 
 /// `createOpenAICodexAuthorizationUrl`.
@@ -86,32 +94,54 @@ pub(crate) async fn exchange_code(
 	let response = flow
 		.http
 		.send(
-			super::super::super::http::HttpRequest::form(TOKEN_URL, fields).timeout(TOKEN_REQUEST_TIMEOUT),
+			super::super::super::http::HttpRequest::form(TOKEN_URL, fields)
+				.timeout(TOKEN_REQUEST_TIMEOUT),
 			flow.cancel,
 			"openai-codex",
 		)
 		.await?;
 	if !response.is_success() {
-		return Err(AuthError::new(
-			kind,
-			format!("Token exchange failed: {}", format_token_error(response.status, &response.body)),
-		)
-		.for_provider("openai-codex")
-		.with_status(response.status));
+		return Err(
+			AuthError::new(
+				kind,
+				format!(
+					"Token exchange failed: {}",
+					format_token_error(response.status, &response.body)
+				),
+			)
+			.for_provider("openai-codex")
+			.with_status(response.status),
+		);
 	}
 	let payload = response.json("openai-codex")?;
-	let access = payload.get("access_token").and_then(serde_json::Value::as_str).unwrap_or_default().to_string();
-	let refresh = payload.get("refresh_token").and_then(serde_json::Value::as_str).unwrap_or_default().to_string();
-	let expires_in = payload.get("expires_in").and_then(serde_json::Value::as_i64);
-	let id_token = payload.get("id_token").and_then(serde_json::Value::as_str).map(ToString::to_string);
+	let access = payload
+		.get("access_token")
+		.and_then(serde_json::Value::as_str)
+		.unwrap_or_default()
+		.to_string();
+	let refresh = payload
+		.get("refresh_token")
+		.and_then(serde_json::Value::as_str)
+		.unwrap_or_default()
+		.to_string();
+	let expires_in = payload
+		.get("expires_in")
+		.and_then(serde_json::Value::as_i64);
+	let id_token = payload
+		.get("id_token")
+		.and_then(serde_json::Value::as_str)
+		.map(ToString::to_string);
 	if access.is_empty() || refresh.is_empty() || expires_in.is_none() {
-		return Err(AuthError::new(AuthErrorKind::Validation, "Token response missing required fields")
-			.for_provider("openai-codex"));
+		return Err(
+			AuthError::new(AuthErrorKind::Validation, "Token response missing required fields")
+				.for_provider("openai-codex"),
+		);
 	}
 	let profile = TokenProfile::from_tokens(&access, id_token.as_deref());
-	let account_id = profile
-		.account_id
-		.ok_or_else(|| AuthError::new(AuthErrorKind::Validation, "Failed to extract accountId from token").for_provider("openai-codex"))?;
+	let account_id = profile.account_id.ok_or_else(|| {
+		AuthError::new(AuthErrorKind::Validation, "Failed to extract accountId from token")
+			.for_provider("openai-codex")
+	})?;
 
 	Ok(Credential::OAuth(OAuthCredentials {
 		access,
@@ -125,10 +155,15 @@ pub(crate) async fn exchange_code(
 	}))
 }
 
-pub async fn refresh(flow: &Flow<'_>, credentials: &OAuthCredentials) -> Result<Credential, AuthError> {
+pub async fn refresh(
+	flow: &Flow<'_>,
+	credentials: &OAuthCredentials,
+) -> Result<Credential, AuthError> {
 	if credentials.refresh.is_empty() {
-		return Err(AuthError::new(AuthErrorKind::TokenRefresh, "stored credential has no refresh token")
-			.for_provider("openai-codex"));
+		return Err(
+			AuthError::new(AuthErrorKind::TokenRefresh, "stored credential has no refresh token")
+				.for_provider("openai-codex"),
+		);
 	}
 	let fields = vec![
 		("grant_type".to_string(), "refresh_token".to_string()),
@@ -138,33 +173,57 @@ pub async fn refresh(flow: &Flow<'_>, credentials: &OAuthCredentials) -> Result<
 	let response = flow
 		.http
 		.send(
-			super::super::super::http::HttpRequest::form(TOKEN_URL, fields).timeout(TOKEN_REQUEST_TIMEOUT),
+			super::super::super::http::HttpRequest::form(TOKEN_URL, fields)
+				.timeout(TOKEN_REQUEST_TIMEOUT),
 			flow.cancel,
 			"openai-codex",
 		)
 		.await?;
 	if !response.is_success() {
-		return Err(AuthError::new(
-			AuthErrorKind::TokenRefresh,
-			format!("OpenAI Codex token refresh failed: {}", format_token_error(response.status, &response.body)),
-		)
-		.for_provider("openai-codex")
-		.with_status(response.status));
+		return Err(
+			AuthError::new(
+				AuthErrorKind::TokenRefresh,
+				format!(
+					"OpenAI Codex token refresh failed: {}",
+					format_token_error(response.status, &response.body)
+				),
+			)
+			.for_provider("openai-codex")
+			.with_status(response.status),
+		);
 	}
 	let payload = response.json("openai-codex")?;
-	let access = payload.get("access_token").and_then(serde_json::Value::as_str).unwrap_or_default().to_string();
-	let refresh_token = payload.get("refresh_token").and_then(serde_json::Value::as_str).unwrap_or_default().to_string();
-	let expires_in = payload.get("expires_in").and_then(serde_json::Value::as_i64);
+	let access = payload
+		.get("access_token")
+		.and_then(serde_json::Value::as_str)
+		.unwrap_or_default()
+		.to_string();
+	let refresh_token = payload
+		.get("refresh_token")
+		.and_then(serde_json::Value::as_str)
+		.unwrap_or_default()
+		.to_string();
+	let expires_in = payload
+		.get("expires_in")
+		.and_then(serde_json::Value::as_i64);
 	if access.is_empty() || refresh_token.is_empty() || expires_in.is_none() {
-		return Err(AuthError::new(AuthErrorKind::Validation, "Token response missing required fields")
-			.for_provider("openai-codex"));
+		return Err(
+			AuthError::new(AuthErrorKind::Validation, "Token response missing required fields")
+				.for_provider("openai-codex"),
+		);
 	}
 	let profile = TokenProfile::from_tokens(&access, None);
 	Ok(Credential::OAuth(OAuthCredentials {
 		access,
-		refresh: if refresh_token.is_empty() { credentials.refresh.clone() } else { refresh_token },
+		refresh: if refresh_token.is_empty() {
+			credentials.refresh.clone()
+		} else {
+			refresh_token
+		},
 		expires: now_ms() + expires_in.unwrap_or(0) * 1000,
-		account_id: profile.account_id.or_else(|| credentials.account_id.clone()),
+		account_id: profile
+			.account_id
+			.or_else(|| credentials.account_id.clone()),
 		email: profile.email,
 		org_id: credentials.org_id.clone(),
 		org_name: credentials.org_name.clone(),
@@ -198,8 +257,12 @@ impl TokenProfile {
 	pub fn from_tokens(access_token: &str, id_token: Option<&str>) -> Self {
 		let payload = decode_jwt(access_token);
 		let id_payload = id_token.and_then(decode_jwt);
-		let auth = payload.as_ref().and_then(|payload| payload.get(JWT_CLAIM_PATH));
-		let id_auth = id_payload.as_ref().and_then(|payload| payload.get(JWT_CLAIM_PATH));
+		let auth = payload
+			.as_ref()
+			.and_then(|payload| payload.get(JWT_CLAIM_PATH));
+		let id_auth = id_payload
+			.as_ref()
+			.and_then(|payload| payload.get(JWT_CLAIM_PATH));
 		let account_id = auth
 			.and_then(|auth| auth.get("chatgpt_account_id"))
 			.and_then(serde_json::Value::as_str)

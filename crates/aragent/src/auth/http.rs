@@ -27,7 +27,9 @@ pub struct Cancel {
 
 impl std::fmt::Debug for Cancel {
 	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-		f.debug_struct("Cancel").field("cancelled", &self.is_cancelled()).finish()
+		f.debug_struct("Cancel")
+			.field("cancelled", &self.is_cancelled())
+			.finish()
 	}
 }
 
@@ -49,7 +51,8 @@ impl Cancel {
 
 	#[must_use]
 	pub fn is_cancelled(&self) -> bool {
-		self.flag.load(Ordering::SeqCst) || self.external.as_ref().is_some_and(|predicate| predicate())
+		self.flag.load(Ordering::SeqCst)
+			|| self.external.as_ref().is_some_and(|predicate| predicate())
 	}
 
 	pub fn check(&self, provider: &str) -> Result<(), AuthError> {
@@ -99,7 +102,9 @@ impl HttpRequest {
 
 	#[must_use]
 	pub fn bearer(mut self, token: &str) -> Self {
-		self.headers.push(("Authorization".to_string(), format!("Bearer {token}")));
+		self
+			.headers
+			.push(("Authorization".to_string(), format!("Bearer {token}")));
 		self
 	}
 
@@ -129,7 +134,10 @@ impl HttpResponse {
 		serde_json::from_str(&self.body).map_err(|err| {
 			AuthError::new(
 				AuthErrorKind::Validation,
-				format!("invalid JSON from provider endpoint: {err}; body={}", summarize_error_body(&self.body)),
+				format!(
+					"invalid JSON from provider endpoint: {err}; body={}",
+					summarize_error_body(&self.body)
+				),
 			)
 			.for_provider(provider)
 		})
@@ -141,16 +149,23 @@ impl HttpResponse {
 	/// grant dead; rate limits, outages and malformed bodies stay retryable.
 	pub fn error_for(&self, kind: AuthErrorKind, provider: &str, operation: &str) -> AuthError {
 		let summary = summarize_error_body(&self.body);
-		let suffix = if summary.is_empty() { String::new() } else { format!(": {summary}") };
-		let error = AuthError::new(kind, format!("{operation} failed (HTTP {}){suffix}", self.status))
-			.for_provider(provider)
-			.with_status(self.status);
+		let suffix = if summary.is_empty() {
+			String::new()
+		} else {
+			format!(": {summary}")
+		};
+		let error =
+			AuthError::new(kind, format!("{operation} failed (HTTP {}){suffix}", self.status))
+				.for_provider(provider)
+				.with_status(self.status);
 		if matches!(self.status, 400 | 401 | 403)
 			&& matches!(
 				kind,
-				AuthErrorKind::TokenRefresh | AuthErrorKind::TokenExchange | AuthErrorKind::Http | AuthErrorKind::Validation
-			)
-			&& super::error::is_invalid_grant_body(&self.body)
+				AuthErrorKind::TokenRefresh
+					| AuthErrorKind::TokenExchange
+					| AuthErrorKind::Http
+					| AuthErrorKind::Validation
+			) && super::error::is_invalid_grant_body(&self.body)
 		{
 			return error.with_grant_dead();
 		}
@@ -219,8 +234,11 @@ impl HttpClient {
 		let send = async move {
 			let response = builder.send().await.map_err(|err| {
 				// `redact` strips credentials from URLs and message fragments.
-				AuthError::new(AuthErrorKind::Http, format!("request failed: {}", redact(&err.to_string())))
-					.for_provider(provider)
+				AuthError::new(
+					AuthErrorKind::Http,
+					format!("request failed: {}", redact(&err.to_string())),
+				)
+				.for_provider(provider)
 			})?;
 			let status = response.status().as_u16();
 			let set_cookies = response
@@ -233,7 +251,8 @@ impl HttpClient {
 			// The body read is part of the raced future: cancellation drops the
 			// response and closes the socket instead of waiting out the timeout.
 			let body = response.text().await.map_err(|err| {
-				AuthError::new(AuthErrorKind::Http, format!("cannot read response: {err}")).for_provider(provider)
+				AuthError::new(AuthErrorKind::Http, format!("cannot read response: {err}"))
+					.for_provider(provider)
 			})?;
 			Ok::<HttpResponse, AuthError>(HttpResponse { status, body, set_cookies })
 		};
@@ -281,7 +300,9 @@ impl HttpClient {
 		provider: &str,
 		kind: AuthErrorKind,
 	) -> Result<Value, AuthError> {
-		let response = self.send(HttpRequest::form(url, fields), cancel, provider).await?;
+		let response = self
+			.send(HttpRequest::form(url, fields), cancel, provider)
+			.await?;
 		if !response.is_success() {
 			return Err(response.error_for(kind, provider, "token endpoint request"));
 		}
