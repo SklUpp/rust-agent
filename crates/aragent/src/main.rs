@@ -7,10 +7,8 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
-use clap::Parser;
 use aragent::{
-	Error, Result,
-	acp,
+	Error, Result, acp,
 	agent::{self, AgentRunner, ExtraTool, RunRequest},
 	agents,
 	approve::{ApprovalMode, Approvals},
@@ -19,26 +17,22 @@ use aragent::{
 	catalog::Catalog,
 	completions,
 	config::Config,
-	config_cmd,
-	daemon_broker,
+	config_cmd, daemon_broker,
 	deadline::{self, Deadline},
-	dirs,
-	file_mentions,
+	dirs, file_mentions,
 	foreign_session::{self, ForeignSessionSource, ForeignSessionStore},
 	goal::{self, GoalMode, GoalModeState, GoalPersist, GoalRuntime, RestorePlan, TokenCounters},
 	goal_tool::{GOAL_TOOL_NAME, GoalTool},
-	local_cmd,
-	local_memory,
-	local_models,
+	local_cmd, local_memory, local_models,
 	memory_protocol::MemoryUrlHandler,
 	output::{self, OutputMode, Reporter, session_id},
-	plan_yolo,
-	prewalk,
-	process_cli,
-	profile,
+	plan_yolo, prewalk, process_cli, profile,
 	prompts::{self, Prompts},
 	repl,
-	rpc::{RpcMode, session::{RpcLaunch, SteerFn, SteeringMessage}},
+	rpc::{
+		RpcMode,
+		session::{RpcLaunch, SteerFn, SteeringMessage},
+	},
 	runtime::{self, PiAgentRunner},
 	session::{
 		self, ContentPart, MessageContent, MessageEntry, SessionHeader, SessionMessage,
@@ -47,9 +41,9 @@ use aragent::{
 	session_checkpoint::CheckpointHost,
 	skill_protocol::SkillUrlHandler,
 	skills::{self, LoadOptions, SkillSnapshot},
-	tool_commands,
-	worktree_cmd,
+	tool_commands, worktree_cmd,
 };
+use clap::Parser;
 
 struct CliError {
 	message: String,
@@ -58,17 +52,11 @@ struct CliError {
 
 impl CliError {
 	fn fail(msg: impl Into<String>) -> Self {
-		Self {
-			message: msg.into(),
-			code: aragent::EXIT_FAILURE,
-		}
+		Self { message: msg.into(), code: aragent::EXIT_FAILURE }
 	}
 
 	fn usage(msg: impl Into<String>) -> Self {
-		Self {
-			message: msg.into(),
-			code: aragent::EXIT_USAGE,
-		}
+		Self { message: msg.into(), code: aragent::EXIT_USAGE }
 	}
 
 	/// Non-zero exit whose explanation was already printed on stdout.
@@ -222,12 +210,8 @@ fn run() -> std::result::Result<(), CliError> {
 			None => std::env::current_dir()?,
 		};
 		let output = cli.prompt.first().map(PathBuf::from);
-		let path = run_export_command(
-			Some(session),
-			output.as_deref(),
-			&base,
-			cli.session_dir.as_deref(),
-		)?;
+		let path =
+			run_export_command(Some(session), output.as_deref(), &base, cli.session_dir.as_deref())?;
 		println!("Exported to: {path}");
 		return Ok(());
 	}
@@ -332,16 +316,7 @@ fn run() -> std::result::Result<(), CliError> {
 			.map_err(CliError::fail)?;
 			return Ok(());
 		},
-		Some(Command::Grep {
-			pattern,
-			path,
-			glob,
-			limit,
-			context,
-			files,
-			count,
-			no_gitignore,
-		}) => {
+		Some(Command::Grep { pattern, path, glob, limit, context, files, count, no_gitignore }) => {
 			let base = match &cli.cwd {
 				Some(cwd) => dirs::absolute(&std::env::current_dir()?, cwd),
 				None => std::env::current_dir()?,
@@ -374,7 +349,11 @@ fn run() -> std::result::Result<(), CliError> {
 			let request = config_cmd::Request {
 				action,
 				key: key.clone(),
-				value: if value.is_empty() { None } else { Some(value.join(" ")) },
+				value: if value.is_empty() {
+					None
+				} else {
+					Some(value.join(" "))
+				},
 				json: *json,
 				cwd: base,
 				overlays: cli.config.clone(),
@@ -394,11 +373,10 @@ fn run() -> std::result::Result<(), CliError> {
 			// `config get`); `resolve_base` owns getWorktreesDir semantics:
 			// `OMP_WORKTREE_DIR` first, then `~` expansion + absolute
 			// normalisation, then the XDG data-root default.
-			let configured =
-				match config_cmd::effective_setting(&cwd, &cli.config, "worktree.base")? {
-					Some(serde_json::Value::String(path)) => Some(PathBuf::from(path)),
-					_ => None,
-				};
+			let configured = match config_cmd::effective_setting(&cwd, &cli.config, "worktree.base")? {
+				Some(serde_json::Value::String(path)) => Some(PathBuf::from(path)),
+				_ => None,
+			};
 			let base = worktree_cmd::resolve_base(configured.as_deref()).map_err(CliError::usage)?;
 			let stdout = io::stdout();
 			let mut out = io::BufWriter::new(stdout.lock());
@@ -428,7 +406,18 @@ fn run() -> std::result::Result<(), CliError> {
 			return Ok(());
 		},
 		Some(Command::Ps {
-			action, name, all, json, plain, dir, global, follow, head, lines, grep, timeout,
+			action,
+			name,
+			all,
+			json,
+			plain,
+			dir,
+			global,
+			follow,
+			head,
+			lines,
+			grep,
+			timeout,
 		}) => {
 			let base = match &cli.cwd {
 				Some(cwd) => dirs::absolute(&std::env::current_dir()?, cwd),
@@ -492,12 +481,7 @@ fn run() -> std::result::Result<(), CliError> {
 			};
 			let stdout = io::stdout();
 			let mut out = io::BufWriter::new(stdout.lock());
-			run_stats_command(
-				session.as_deref(),
-				&base,
-				cli.session_dir.as_deref(),
-				&mut out,
-			)?;
+			run_stats_command(session.as_deref(), &base, cli.session_dir.as_deref(), &mut out)?;
 			return Ok(());
 		},
 		Some(Command::Render { session, output }) => {
@@ -518,12 +502,7 @@ fn run() -> std::result::Result<(), CliError> {
 				Some(cwd) => dirs::absolute(&std::env::current_dir()?, cwd),
 				None => std::env::current_dir()?,
 			};
-			run_cleanse_command(
-				session.as_deref(),
-				*confirm,
-				&base,
-				cli.session_dir.as_deref(),
-			)?;
+			run_cleanse_command(session.as_deref(), *confirm, &base, cli.session_dir.as_deref())?;
 			return Ok(());
 		},
 		Some(Command::Commit { message }) => {
@@ -626,7 +605,8 @@ fn run() -> std::result::Result<(), CliError> {
 		},
 		Some(Command::Setup { component, check, json }) => {
 			let base = base_dir(&cli)?;
-			let opts = local_cmd::SetupOptions { component: component.clone(), check: *check, json: *json };
+			let opts =
+				local_cmd::SetupOptions { component: component.clone(), check: *check, json: *json };
 			let stdout = io::stdout();
 			let stderr = io::stderr();
 			let mut out = io::BufWriter::new(stdout.lock());
@@ -695,9 +675,7 @@ fn run() -> std::result::Result<(), CliError> {
 
 	// Foreign and session flags validation
 	if cli.from_claude && cli.from_codex {
-		return Err(CliError::usage(
-			"--from-claude and --from-codex cannot be used together",
-		));
+		return Err(CliError::usage("--from-claude and --from-codex cannot be used together"));
 	}
 	let foreign_source = if cli.from_claude {
 		Some(foreign_session::ForeignSessionSource::Claude)
@@ -709,9 +687,7 @@ fn run() -> std::result::Result<(), CliError> {
 	if let Some(src) = foreign_source {
 		let src_name = src.to_string().to_ascii_lowercase();
 		if cli.no_session {
-			return Err(CliError::usage(format!(
-				"--from-{src_name} requires session persistence"
-			)));
+			return Err(CliError::usage(format!("--from-{src_name} requires session persistence")));
 		}
 		if cli.continue_session || cli.resume.is_some() || cli.fork.is_some() {
 			return Err(CliError::usage(format!(
@@ -736,7 +712,11 @@ fn run() -> std::result::Result<(), CliError> {
 	// path collapse onto the first copy.
 	for root in &config.add_dirs {
 		for file in prompts::resolve(None, None, root)?.files {
-			if !loaded_prompts.files.iter().any(|existing| existing.path == file.path) {
+			if !loaded_prompts
+				.files
+				.iter()
+				.any(|existing| existing.path == file.path)
+			{
 				loaded_prompts.files.push(file);
 			}
 		}
@@ -766,24 +746,21 @@ fn run() -> std::result::Result<(), CliError> {
 		.clone()
 		.unwrap_or_else(dirs::agent_dir);
 	let _ = internal_urls
-		.register(Arc::new(MemoryUrlHandler::new(
-			memory_agent_dir,
-			config.memory_backend(),
-		)))
+		.register(Arc::new(MemoryUrlHandler::new(memory_agent_dir, config.memory_backend())))
 		.map_err(Error::new)?;
 	let catalog = Arc::new(Catalog::load(&cwd)?);
-	let approvals = Approvals::new(
-		config.approval_mode.unwrap_or_default(),
-		config.allow.iter().cloned(),
-	);
+	let approvals =
+		Approvals::new(config.approval_mode.unwrap_or_default(), config.allow.iter().cloned());
 	let default_model = config.default_model.clone();
 	// TS findInitialModel: an explicit `--model` wins, then the first model in
 	// the `--models` scope for a fresh session. A resumed session keeps its own
 	// model, so the scope does not override it here. An explicitly supplied
 	// scope that matches nothing is a hard error instead of a fallback to the
 	// configured default (a CLI `--models` scope never silently widens).
-	let restoring_session =
-		cli.continue_session || cli.resume.is_some() || cli.fork.is_some() || foreign_source.is_some();
+	let restoring_session = cli.continue_session
+		|| cli.resume.is_some()
+		|| cli.fork.is_some()
+		|| foreign_source.is_some();
 	let (requested_model, scoped_thinking) = match &cli.model {
 		Some(model) => (Some(model.clone()), None),
 		None if !restoring_session => match &config.model_scope {
@@ -814,7 +791,11 @@ fn run() -> std::result::Result<(), CliError> {
 			}
 			parsed
 		})
-		.or_else(|| scoped_thinking.as_deref().and_then(runtime::parse_cli_thinking));
+		.or_else(|| {
+			scoped_thinking
+				.as_deref()
+				.and_then(runtime::parse_cli_thinking)
+		});
 	let session_dir = cli
 		.session_dir
 		.as_ref()
@@ -837,13 +818,9 @@ fn run() -> std::result::Result<(), CliError> {
 	}
 	// Plan-yolo is explicit and fails hard: an unresolved target, missing
 	// credential, or unapprovable tool mode must not silently run without it.
-	let plan_yolo_arm = plan_yolo::resolve_arm(
-		&cli,
-		&config,
-		&catalog,
-		requested_api_key.as_deref(),
-	)
-	.map_err(CliError::fail)?;
+	let plan_yolo_arm =
+		plan_yolo::resolve_arm(&cli, &config, &catalog, requested_api_key.as_deref())
+			.map_err(CliError::fail)?;
 	reject_dual_startup_arms(prewalk_policy.arm.is_some(), plan_yolo_arm.is_some())?;
 
 	// Pre-resolve session target
@@ -919,7 +896,10 @@ fn run() -> std::result::Result<(), CliError> {
 		}
 		chosen_file = imported_store.file().map(Path::to_path_buf);
 	} else if let Some(fork_arg) = &cli.fork {
-		let source_path = if fork_arg.contains('/') || fork_arg.contains('\\') || fork_arg.ends_with(".jsonl") {
+		let source_path = if fork_arg.contains('/')
+			|| fork_arg.contains('\\')
+			|| fork_arg.ends_with(".jsonl")
+		{
 			dirs::absolute(&cwd, Path::new(fork_arg))
 		} else {
 			match session::resolve_resumable_session(fork_arg, &cwd, session_dir.as_deref(), true) {
@@ -928,7 +908,7 @@ fn run() -> std::result::Result<(), CliError> {
 					return Err(CliError::usage(format!(
 						"Session \"{fork_arg}\" not found.\nRun `arag --resume` without an argument to pick from recent sessions, or `arag` to start a new one."
 					)));
-				}
+				},
 			}
 		};
 		let new_file = session::fork_session(&source_path, Some(&cwd), session_dir.as_deref())
@@ -975,7 +955,10 @@ fn run() -> std::result::Result<(), CliError> {
 				return Ok(());
 			}
 			chosen_file = Some(sessions[idx - 1].0.clone());
-		} else if resume_arg.contains('/') || resume_arg.contains('\\') || resume_arg.ends_with(".jsonl") {
+		} else if resume_arg.contains('/')
+			|| resume_arg.contains('\\')
+			|| resume_arg.ends_with(".jsonl")
+		{
 			let path = dirs::absolute(&cwd, Path::new(resume_arg));
 			if !path.exists() {
 				return Err(CliError::usage(format!(
@@ -992,7 +975,7 @@ fn run() -> std::result::Result<(), CliError> {
 					return Err(CliError::usage(format!(
 						"Session \"{resume_arg}\" not found.\nRun `arag --resume` without an argument to pick from recent sessions, or `arag` to start a new one."
 					)));
-				}
+				},
 			}
 		}
 	}
@@ -1052,7 +1035,7 @@ fn run() -> std::result::Result<(), CliError> {
 	if let Some(key) = requested_api_key {
 		// A CLI-supplied key is a real credential and never passes through the
 		// credential store, so register it here for exact redaction.
-		crate::auth::known_secrets::register(&key);
+		aragent::auth::known_secrets::register(&key);
 		session.api_key = Some(key);
 	}
 	session.refresh_root_endpoint();
@@ -1061,11 +1044,14 @@ fn run() -> std::result::Result<(), CliError> {
 	// TS `main.ts` truthiness: any non-empty `PI_NO_TITLE` disables titles,
 	// including `0`. Resolved here (CLI boundary) so the library never reads
 	// process-wide env and tests stay race-free.
-	let no_title = cli.no_title
-		|| std::env::var_os("PI_NO_TITLE").is_some_and(|value| !value.is_empty());
+	let no_title =
+		cli.no_title || std::env::var_os("PI_NO_TITLE").is_some_and(|value| !value.is_empty());
 	let mut open_opts = if let Some(target) = &chosen_file {
 		let dir = target.parent().map(PathBuf::from);
-		let id = target.file_stem().and_then(|s| s.to_str()).map(str::to_string);
+		let id = target
+			.file_stem()
+			.and_then(|s| s.to_str())
+			.map(str::to_string);
 		SessionOptions {
 			enabled: !cli.no_session,
 			cwd: cwd.clone(),
@@ -1188,9 +1174,7 @@ fn run() -> std::result::Result<(), CliError> {
 			eprintln!("warning: {warning}");
 		}
 		if let Some(occupied) = rpc_store.occupied() {
-			return Err(CliError::usage(format!(
-				"cannot open the session store: {occupied}"
-			)));
+			return Err(CliError::usage(format!("cannot open the session store: {occupied}")));
 		}
 		if rpc_store.legacy_read_only() {
 			return Err(CliError::usage(
@@ -1247,8 +1231,7 @@ fn run() -> std::result::Result<(), CliError> {
 			provider: session.provider.clone(),
 			api_key: session.api_key.clone(),
 			thinking: session.thinking,
-			restore_model: cli.model.is_none()
-				&& (restoring_session || explicitly_existing),
+			restore_model: cli.model.is_none() && (restoring_session || explicitly_existing),
 			prewalk: prewalk_policy.arm.clone(),
 			plan_yolo: plan_yolo_arm.clone(),
 			max_time: session.max_time,
@@ -1263,10 +1246,7 @@ fn run() -> std::result::Result<(), CliError> {
 				&& rpc_cache_key.is_some(),
 			prompt_cache_key: rpc_cache_key,
 			service_tier_explicit: cli.service_tier.is_some(),
-			provider_session_id: cli
-				.provider_session_id
-				.clone()
-				.filter(|id| !id.is_empty()),
+			provider_session_id: cli.provider_session_id.clone().filter(|id| !id.is_empty()),
 			store_options: open_opts,
 			// Transfer the preflight writer so RpcSession does not reacquire.
 			preopened_store: Some(rpc_store),
@@ -1280,9 +1260,7 @@ fn run() -> std::result::Result<(), CliError> {
 		eprintln!("warning: {warning}");
 	}
 	if let Some(occupied) = store.occupied() {
-		return Err(CliError::usage(format!(
-			"cannot open the session store: {occupied}"
-		)));
+		return Err(CliError::usage(format!("cannot open the session store: {occupied}")));
 	}
 	if store.legacy_read_only() {
 		return Err(CliError::usage(
@@ -1329,12 +1307,19 @@ fn run() -> std::result::Result<(), CliError> {
 	// draft stays in
 	// the store (peek, not take) so a crash before the next completed turn
 	// keeps it; that turn's persist clears it atomically.
-	session.interrupted_fragment =
-		store.recovered_partial_text().map_err(|err| CliError::fail(err.to_string()))?;
+	session.interrupted_fragment = store
+		.recovered_partial_text()
+		.map_err(|err| CliError::fail(err.to_string()))?;
 	if let Some(fragment) = session.interrupted_fragment.as_deref() {
 		let preview: String = fragment.chars().take(240).collect();
-		let ellipsis = if fragment.chars().count() > 240 { "…" } else { "" };
-		eprintln!("note: recovered an interrupted assistant fragment (not journaled; sent to the model once as interrupted context, no tool calls): {preview}{ellipsis}");
+		let ellipsis = if fragment.chars().count() > 240 {
+			"…"
+		} else {
+			""
+		};
+		eprintln!(
+			"note: recovered an interrupted assistant fragment (not journaled; sent to the model once as interrupted context, no tool calls): {preview}{ellipsis}"
+		);
 	}
 	session.store = store;
 	// One authoritative live selection, resolved once at launch with the TS
@@ -1361,7 +1346,9 @@ fn run() -> std::result::Result<(), CliError> {
 		// TS `setServiceTierFamily`: an explicit launch flag is recorded, so a
 		// later resume restores the re-armed selection.
 		if session.store.enabled()
-			&& let Err(err) = session.store.append_service_tier_change(&live_service_tiers)
+			&& let Err(err) = session
+				.store
+				.append_service_tier_change(&live_service_tiers)
 		{
 			eprintln!("warning: cannot record service tier change: {err}");
 		}
@@ -1453,7 +1440,11 @@ fn run() -> std::result::Result<(), CliError> {
 	let mut prompts_to_run = Vec::new();
 	if has_initial_content {
 		prompts_to_run.push((
-			if context_prefix.is_empty() { None } else { Some(context_prefix) },
+			if context_prefix.is_empty() {
+				None
+			} else {
+				Some(context_prefix)
+			},
 			initial_prompt,
 			processed_cli_files.images,
 		));
@@ -1521,7 +1512,10 @@ fn list_sessions_for_picker(dir: &Path) -> Vec<(PathBuf, Option<String>, String,
 		let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
 			continue;
 		};
-		let id = stem.rfind('_').map_or(stem, |pos| &stem[pos + 1..]).to_string();
+		let id = stem
+			.rfind('_')
+			.map_or(stem, |pos| &stem[pos + 1..])
+			.to_string();
 		if result.iter().any(|(_, _, existing, _)| existing == &id) {
 			continue;
 		}
@@ -1728,8 +1722,7 @@ fn persist_advisor_card<W: Write, E: Write>(
 			content,
 			true,
 			details.clone(),
-		)
-	{
+		) {
 		eprintln!("warning: {err}");
 	}
 	reporter.advisor_card(content, details)
@@ -1866,10 +1859,7 @@ impl Drop for TurnCancelLease {
 /// Scope selector matching a run request, derived from the live store rather
 /// than from `self`: rewind/fork handlers need the current journal identity.
 fn advisor_scope_for(store: &SessionStore) -> (Option<String>, Option<PathBuf>) {
-	(
-		store.enabled().then(|| store.id().to_string()),
-		store.file().map(Path::to_path_buf),
-	)
+	(store.enabled().then(|| store.id().to_string()), store.file().map(Path::to_path_buf))
 }
 
 impl Session<'_> {
@@ -1899,24 +1889,17 @@ impl Session<'_> {
 			{
 				continue;
 			}
-			let candidate_endpoint = runtime::effective_endpoint(
-				&self.catalog,
-				&self.config,
-				provider,
-				id,
-			)
-			.ok();
+			let candidate_endpoint =
+				runtime::effective_endpoint(&self.catalog, &self.config, provider, id).ok();
 			let same_route = self.provider.as_deref() == Some(provider)
 				&& candidate_endpoint.is_some()
 				&& candidate_endpoint.as_deref() == self.root_base_url.as_deref()
-				&& self.api_key.as_deref().is_some_and(|key| !key.trim().is_empty());
+				&& self
+					.api_key
+					.as_deref()
+					.is_some_and(|key| !key.trim().is_empty());
 			if !same_route
-				&& !runtime::provider_has_configured_auth(
-					&self.catalog,
-					&self.config,
-					provider,
-					None,
-				)
+				&& !runtime::provider_has_configured_auth(&self.catalog, &self.config, provider, None)
 			{
 				continue;
 			}
@@ -1928,22 +1911,15 @@ impl Session<'_> {
 			self.provider = Some(provider.to_string());
 			self.model = Some(id.to_string());
 			self.api_key = api_key;
-			if restore_thinking
-				&& let Some(level) = runtime::thinking_suffix(rest)
-			{
+			if restore_thinking && let Some(level) = runtime::thinking_suffix(rest) {
 				self.thinking = Some(level);
 			}
 			// Restoration reconstructs the session's own route; it is not an
 			// explicit model switch. The header cache key was inherited for this
 			// session before this call and must survive unchanged.
 
-			self.root_base_url = runtime::effective_endpoint(
-				&self.catalog,
-				&self.config,
-				provider,
-				id,
-			)
-			.ok();
+			self.root_base_url =
+				runtime::effective_endpoint(&self.catalog, &self.config, provider, id).ok();
 			return Some(candidate);
 		}
 		None
@@ -2023,13 +1999,16 @@ impl Session<'_> {
 		if !self.goal_tool_mounted() {
 			return Vec::new();
 		}
-		let tool: Arc<dyn pi_agent::tool::Tool> =
-			Arc::new(GoalTool::new(Arc::clone(&self.goal)));
+		let tool: Arc<dyn pi_agent::tool::Tool> = Arc::new(GoalTool::new(Arc::clone(&self.goal)));
 		vec![ExtraTool::from(tool)]
 	}
 
 	fn agent_dir(&self) -> PathBuf {
-		self.skill_options.agent_dir.clone().unwrap_or_else(dirs::agent_dir)
+		self
+			.skill_options
+			.agent_dir
+			.clone()
+			.unwrap_or_else(dirs::agent_dir)
 	}
 
 	/// Whether this run mounts each auto-learn tool, mirroring TS `isToolAllowed`
@@ -2049,18 +2028,22 @@ impl Session<'_> {
 	fn autolearn_extra_tools(&self) -> Vec<ExtraTool> {
 		let (manage, learn) = self.autolearn_tool_presence();
 		let mut tools = Vec::new();
-		if manage && let Some(tool) =
-			ManageSkillTool::create_if(true, self.skill_options.clone(), self.skill_snapshot.clone())
-		{
+		if manage
+			&& let Some(tool) = ManageSkillTool::create_if(
+				true,
+				self.skill_options.clone(),
+				self.skill_snapshot.clone(),
+			) {
 			let tool: Arc<dyn pi_agent::tool::Tool> = Arc::new(tool);
 			tools.push(ExtraTool::from(tool));
 		}
-		if learn && let Some(tool) = LocalLearnTool::create_if(
-			true,
-			MemoryBackend::Local,
-			self.skill_options.clone(),
-			self.skill_snapshot.clone(),
-		) {
+		if learn
+			&& let Some(tool) = LocalLearnTool::create_if(
+				true,
+				MemoryBackend::Local,
+				self.skill_options.clone(),
+				self.skill_snapshot.clone(),
+			) {
 			let tool: Arc<dyn pi_agent::tool::Tool> = Arc::new(tool);
 			tools.push(ExtraTool::from(tool));
 		}
@@ -2091,19 +2074,16 @@ impl Session<'_> {
 	fn goal_seed(&self) -> TokenCounters {
 		let usage = self.store.session_usage();
 		TokenCounters {
-			input:       usage.input,
-			output:      usage.output,
-			cache_read:  usage.cache_read,
+			input: usage.input,
+			output: usage.output,
+			cache_read: usage.cache_read,
 			cache_write: usage.cache_write,
 		}
 	}
 
 	/// Hidden per-turn goal context (TS `goal-mode-context`): the active prompt
 	/// plus live persisted todos when the `todo` tool is available.
-	fn goal_mode_context(
-		&self,
-		todo_phases: &[pi_agent::tools::todo::TodoPhase],
-	) -> Option<String> {
+	fn goal_mode_context(&self, todo_phases: &[pi_agent::tools::todo::TodoPhase]) -> Option<String> {
 		let active = self.goal.build_active_prompt()?;
 		let todo = goal::build_goal_todo_context(todo_phases, self.tool_selected("todo"));
 		Some(goal::render_goal_mode_context(&active, todo.as_deref()))
@@ -2169,8 +2149,9 @@ impl Session<'_> {
 		if let Err(err) = self.store.append_mode_change(goal::MODE_NONE, None) {
 			eprintln!("warning: {err}");
 		}
-		if let Err(err) =
-			self.store.append_goal_completed(goal::encode_completed_data(&completed))
+		if let Err(err) = self
+			.store
+			.append_goal_completed(goal::encode_completed_data(&completed))
 		{
 			eprintln!("warning: {err}");
 		}
@@ -2305,10 +2286,8 @@ impl Session<'_> {
 			// capture; the runtime gate also refuses an advisor manager.
 			request.advisor_card_sink = None;
 			// Capability ceiling: no MCP, no extension/eval bridge for capture.
-			request.tool_ceiling = Some(agent::ToolCeiling {
-				exclude_mcp:             true,
-				exclude_extension_tools: true,
-			});
+			request.tool_ceiling =
+				Some(agent::ToolCeiling { exclude_mcp: true, exclude_extension_tools: true });
 			let stream = self.runner.run(&request)?;
 			for event in stream {
 				event?;
@@ -2321,7 +2300,8 @@ impl Session<'_> {
 	}
 
 	fn plan_artifacts(&self) -> Option<PathBuf> {
-		self.store
+		self
+			.store
 			.file()
 			.filter(|_| self.store.enabled())
 			.and_then(session::artifacts_directory_for)
@@ -2336,14 +2316,9 @@ impl Session<'_> {
 		};
 		let Some(_artifacts) = self.plan_artifacts() else {
 			shared.rollback_arm(arming);
-			return Err(Error::new(
-				"plan-yolo requires a persisted session for plan artifacts",
-			));
+			return Err(Error::new("plan-yolo requires a persisted session for plan artifacts"));
 		};
-		let tools = match plan_yolo::plan_tools(
-			self.tools_enabled,
-			self.config.tools.as_deref(),
-		) {
+		let tools = match plan_yolo::plan_tools(self.tools_enabled, self.config.tools.as_deref()) {
 			Ok(tools) => tools,
 			Err(error) => {
 				shared.rollback_arm(arming);
@@ -2431,7 +2406,7 @@ impl Session<'_> {
 		let child_session_root = local_root.as_ref().map(|dir| dir.join("subagents"));
 		let url_scope = pi_agent::tools::internal_urls::UrlScope {
 			session_file: session_file.clone(),
-			local_roots:  local_root
+			local_roots: local_root
 				.map(|dir| std::collections::BTreeMap::from([("local".to_string(), dir)]))
 				.unwrap_or_default(),
 		};
@@ -2625,7 +2600,10 @@ impl Session<'_> {
 						},
 					},
 				};
-				let supports_images = self.catalog.supports_images(&provider, &model_id).unwrap_or(true);
+				let supports_images = self
+					.catalog
+					.supports_images(&provider, &model_id)
+					.unwrap_or(true);
 				if !supports_images {
 					return Err(Error::new(format!(
 						"model '{provider}/{model_id}' does not support image input"
@@ -2641,7 +2619,8 @@ impl Session<'_> {
 		self
 			.goal
 			.begin_turn(hidden_custom_type.is_none().then_some(full_prompt.as_str()), seed);
-		self.goal
+		self
+			.goal
 			.seed_background_dedup(session::durable_background_keys(&self.store));
 
 		let (turn_parts, user_content) = if has_images {
@@ -2780,19 +2759,13 @@ impl Session<'_> {
 		                        provider_fallback: Option<&str>,
 		                        prewalk_state: &mut prewalk::PrewalkState,
 		                        prewalk_switch: &mut Option<prewalk::AppliedSwitch>,
-		                        priority_downgraded: &mut bool| -> Result<()> {
+		                        priority_downgraded: &mut bool|
+		 -> Result<()> {
 			match event {
 				agent::Event::ToolStart { id, tool, .. } => {
 					tools.insert(id.clone(), tool.clone());
 				},
-				agent::Event::TurnEnd {
-					message,
-					tool_results,
-					stop_reason,
-					api,
-					provider,
-					model,
-				} => {
+				agent::Event::TurnEnd { message, tool_results, stop_reason, api, provider, model } => {
 					let now_evt = std::time::SystemTime::now();
 					let evt_iso = output::iso8601(now_evt);
 					let evt_ms = now_evt
@@ -2877,11 +2850,11 @@ impl Session<'_> {
 						canon_stop,
 						evt_ms,
 					);
-					asst_msg.error_message = message.error_message.clone().or_else(|| {
-						(canon_stop == "aborted").then(|| "Interrupted by user".to_string())
-					});
-					asst_msg.attribution =
-						message.attribution.map(|value| value.as_str().to_string());
+					asst_msg.error_message = message
+						.error_message
+						.clone()
+						.or_else(|| (canon_stop == "aborted").then(|| "Interrupted by user".to_string()));
+					asst_msg.attribution = message.attribution.map(|value| value.as_str().to_string());
 					asst_msg.disabled_features = message.disabled_features.clone();
 					if message
 						.disabled_features
@@ -2890,22 +2863,15 @@ impl Session<'_> {
 					{
 						*priority_downgraded = true;
 					}
-					let asst_entry = MessageEntry::new(
-						asst_id.clone(),
-						parent.take(),
-						&evt_iso,
-						asst_msg,
-					);
+					let asst_entry =
+						MessageEntry::new(asst_id.clone(), parent.take(), &evt_iso, asst_msg);
 
 					let mut turn_entries = vec![asst_entry];
 					let mut prev_id = asst_id;
 
 					for tr in tool_results {
 						let res_id = format!("msg-{}", output::session_id());
-						let tool_name = tools
-							.get(&tr.tool_call_id)
-							.cloned()
-							.unwrap_or_default();
+						let tool_name = tools.get(&tr.tool_call_id).cloned().unwrap_or_default();
 						let mut tool_msg = SessionMessage::tool_result(
 							tr.tool_call_id.clone(),
 							tool_name,
@@ -2914,14 +2880,12 @@ impl Session<'_> {
 							evt_ms,
 						);
 						if let Some(details) = &tr.details {
-							tool_msg.extra.insert("details".to_string(), details.clone());
+							tool_msg
+								.extra
+								.insert("details".to_string(), details.clone());
 						}
-						let tool_entry = MessageEntry::new(
-							res_id.clone(),
-							Some(prev_id.clone()),
-							&evt_iso,
-							tool_msg,
-						);
+						let tool_entry =
+							MessageEntry::new(res_id.clone(), Some(prev_id.clone()), &evt_iso, tool_msg);
 						turn_entries.push(tool_entry);
 						prev_id = res_id;
 					}
@@ -3052,9 +3016,7 @@ impl Session<'_> {
 									// The mirror is the uncompacted branch; replay it
 									// wholesale so the current run does not depend on
 									// the checkpoint result surviving compaction.
-									aragent::session_checkpoint::apply_in_memory_rewind(
-										messages, &rewind,
-									);
+									aragent::session_checkpoint::apply_in_memory_rewind(messages, &rewind);
 									if let Some(runner) = agent::runner() {
 										let (id, file) = advisor_scope_for(store);
 										runner.advisor_reset_boundary(
@@ -3068,11 +3030,7 @@ impl Session<'_> {
 								None => {
 									if let Some(runner) = agent::runner() {
 										let (id, file) = advisor_scope_for(store);
-										runner.advisor_reset_boundary(
-											id.as_deref(),
-											file.as_deref(),
-											&[],
-										);
+										runner.advisor_reset_boundary(id.as_deref(), file.as_deref(), &[]);
 									}
 									Some(pi_agent::TurnRewrite::InMemory(rewind))
 								},
@@ -3101,9 +3059,7 @@ impl Session<'_> {
 						message.stop_reason,
 						Some(pi_agent::StopReason::Error | pi_agent::StopReason::Aborted)
 					);
-					if !terminal
-						&& let Some(arm) = prewalk_state.target().cloned()
-					{
+					if !terminal && let Some(arm) = prewalk_state.target().cloned() {
 						let noop = prewalk::would_be_noop(
 							&prewalk_catalog,
 							&arm.target,
@@ -3115,18 +3071,13 @@ impl Session<'_> {
 						// TS `isPrewalkImplementationAction` keys on the
 						// tool/typed tier only; a failed edit/write still counts.
 						let action_tool = tool_results.iter().find_map(|result| {
-							let name =
-								tools.get(&result.tool_call_id).map(String::as_str)?;
-							prewalk::is_implementation_action(
-								name,
-								result.details.as_ref(),
-							)
-							.then_some(name)
+							let name = tools.get(&result.tool_call_id).map(String::as_str)?;
+							prewalk::is_implementation_action(name, result.details.as_ref())
+								.then_some(name)
 						});
 						let todo_succeeded = tool_results.iter().any(|result| {
 							!result.is_error
-								&& tools.get(&result.tool_call_id).map(String::as_str)
-									== Some("todo")
+								&& tools.get(&result.tool_call_id).map(String::as_str) == Some("todo")
 						});
 						let boundary = prewalk::TurnBoundary {
 							has_tool_results: !tool_results.is_empty(),
@@ -3140,8 +3091,7 @@ impl Session<'_> {
 							eprintln!("{notice}");
 						}
 						if action.scrub_plan {
-							decision.scrub_custom_type =
-								Some(prewalk::PREWALK_PLAN_TYPE.to_string());
+							decision.scrub_custom_type = Some(prewalk::PREWALK_PLAN_TYPE.to_string());
 						}
 						let mut guidance = action.guidance;
 						if let Some(target) = action.switch {
@@ -3183,93 +3133,90 @@ impl Session<'_> {
 								);
 								guidance.clear();
 							} else {
-							// Explicit suffix wins; otherwise apply the target's
-							// declared default clamped through the same resolver.
-							let switch_thinking = action.switch_thinking.map(Some).or_else(|| {
-								match runtime::model_default_thinking(
-									&prewalk_catalog,
-									&target.provider,
-									&target.model,
-								) {
-									runtime::DefaultThinking::Unspecified => None,
-									runtime::DefaultThinking::Resolved(level) => Some(level),
-								}
-							});
-							let mut switch_target = target.clone();
-							if switch_target.effort.is_none()
-								&& let Some(Some(runtime::CliThinking::Effort(effort))) =
-									switch_thinking
-							{
-								switch_target.effort = Some(effort.to_string());
-							}
-							let cache_key = if prewalk_cache_inherited {
-								None
-							} else {
-								prewalk_cache_key.clone()
-							};
-							match runtime::build_switch_provider(
-								&prewalk_catalog,
-								session_config,
-								&switch_target,
-								api_key.clone(),
-								// Provider session belongs to the previous route.
-								None,
-								cache_key,
-								&store.service_tier_by_family(),
-							) {
-								Ok(provider) => {
-									// Ephemeral role: resume/fork fall back to the
-									// configured default instead of the fast model.
-									if store.enabled() {
-										match store.append_model_change(
-											&format!("{}/{}", target.provider, target.model),
-											"fallback",
-										) {
-											Ok(id) => *parent = Some(id),
-											Err(err) => eprintln!(
-												"warning: cannot record prewalk model change: {err}"
-											),
-										}
+								// Explicit suffix wins; otherwise apply the target's
+								// declared default clamped through the same resolver.
+								let switch_thinking = action.switch_thinking.map(Some).or_else(|| {
+									match runtime::model_default_thinking(
+										&prewalk_catalog,
+										&target.provider,
+										&target.model,
+									) {
+										runtime::DefaultThinking::Unspecified => None,
+										runtime::DefaultThinking::Resolved(level) => Some(level),
 									}
-									for (custom_type, content) in &action.journal {
+								});
+								let mut switch_target = target.clone();
+								if switch_target.effort.is_none()
+									&& let Some(Some(runtime::CliThinking::Effort(effort))) = switch_thinking
+								{
+									switch_target.effort = Some(effort.to_string());
+								}
+								let cache_key = if prewalk_cache_inherited {
+									None
+								} else {
+									prewalk_cache_key.clone()
+								};
+								match runtime::build_switch_provider(
+									&prewalk_catalog,
+									session_config,
+									&switch_target,
+									api_key.clone(),
+									// Provider session belongs to the previous route.
+									None,
+									cache_key,
+									&store.service_tier_by_family(),
+								) {
+									Ok(provider) => {
+										// Ephemeral role: resume/fork fall back to the
+										// configured default instead of the fast model.
 										if store.enabled() {
-											match store.append_custom_message(
-												custom_type,
-												content,
-												false,
-												serde_json::Value::Null,
+											match store.append_model_change(
+												&format!("{}/{}", target.provider, target.model),
+												"fallback",
 											) {
 												Ok(id) => *parent = Some(id),
-												Err(err) => eprintln!("warning: {err}"),
+												Err(err) => eprintln!(
+													"warning: cannot record prewalk model change: {err}"
+												),
 											}
-										} else if let Some(messages) = in_memory.as_mut() {
-											messages.push(pi_agent::Message::guidance(
-												*custom_type,
-												*content,
-											));
 										}
-									}
-									decision.provider = Some(provider);
-									decision.context_limit = Some(
-										prewalk_catalog
-											.context_window(&target.provider, &target.model)
-											.unwrap_or(runtime::DEFAULT_CONTEXT_LIMIT),
-									);
-									*prewalk_switch = Some(prewalk::AppliedSwitch {
-										target: switch_target,
-										thinking: switch_thinking,
-										api_key,
-									});
-									decision.continue_turn |= action.continue_turn;
-									decision.guidance = guidance;
-								},
-								Err(err) => {
-									// Startup already resolved this target; a setup
-									// failure here must not silently claim a switch.
-									eprintln!("warning: prewalk switch failed — {err}");
-									guidance.clear();
-								},
-							}
+										for (custom_type, content) in &action.journal {
+											if store.enabled() {
+												match store.append_custom_message(
+													custom_type,
+													content,
+													false,
+													serde_json::Value::Null,
+												) {
+													Ok(id) => *parent = Some(id),
+													Err(err) => eprintln!("warning: {err}"),
+												}
+											} else if let Some(messages) = in_memory.as_mut() {
+												messages
+													.push(pi_agent::Message::guidance(*custom_type, *content));
+											}
+										}
+										decision.provider = Some(provider);
+										decision.context_limit = Some(
+											prewalk_catalog
+												.context_window(&target.provider, &target.model)
+												.unwrap_or(runtime::DEFAULT_CONTEXT_LIMIT),
+										);
+										*prewalk_switch = Some(prewalk::AppliedSwitch {
+											target: switch_target,
+											thinking: switch_thinking,
+											api_key,
+										});
+										decision.continue_turn |= action.continue_turn;
+										decision.guidance = guidance;
+									},
+									Err(err) => {
+										// Startup already resolved this target; a setup
+										// failure here must not silently claim a switch.
+										eprintln!("warning: prewalk switch failed — {err}");
+										guidance.clear();
+									},
+								}
 							}
 						} else {
 							for (custom_type, content) in &action.journal {
@@ -3284,10 +3231,7 @@ impl Session<'_> {
 										Err(err) => eprintln!("warning: {err}"),
 									}
 								} else if let Some(messages) = in_memory.as_mut() {
-									messages.push(pi_agent::Message::guidance(
-										*custom_type,
-										*content,
-									));
+									messages.push(pi_agent::Message::guidance(*custom_type, *content));
 								}
 							}
 							decision.continue_turn |= action.continue_turn;
@@ -3302,28 +3246,22 @@ impl Session<'_> {
 					} else if let Some(shared) = plan_yolo_shared.clone()
 						&& shared.has_pending()
 					{
-						let committed = shared.commit_pending(
-							plan_yolo_artifacts.as_deref(),
-							|pending| {
+						let committed =
+							shared.commit_pending(plan_yolo_artifacts.as_deref(), |pending| {
 								let target = pending.target().clone();
-								let switch_thinking =
-									pending.thinking().map(Some).or_else(|| {
-										match runtime::model_default_thinking(
-											&prewalk_catalog,
-											&target.provider,
-											&target.model,
-										) {
-											runtime::DefaultThinking::Unspecified => None,
-											runtime::DefaultThinking::Resolved(level) => {
-												Some(level)
-											},
-										}
-									});
+								let switch_thinking = pending.thinking().map(Some).or_else(|| {
+									match runtime::model_default_thinking(
+										&prewalk_catalog,
+										&target.provider,
+										&target.model,
+									) {
+										runtime::DefaultThinking::Unspecified => None,
+										runtime::DefaultThinking::Resolved(level) => Some(level),
+									}
+								});
 								let mut switch_target = target.clone();
 								if switch_target.effort.is_none()
-									&& let Some(Some(runtime::CliThinking::Effort(
-										effort,
-									))) = switch_thinking
+									&& let Some(Some(runtime::CliThinking::Effort(effort))) = switch_thinking
 								{
 									switch_target.effort = Some(effort.to_string());
 								}
@@ -3337,17 +3275,14 @@ impl Session<'_> {
 								let reuses_root = prewalk_provider.as_deref()
 									== Some(target.provider.as_str())
 									&& target_endpoint.is_some()
-									&& target_endpoint.as_deref()
-										== prewalk_root_base_url.as_deref();
+									&& target_endpoint.as_deref() == prewalk_root_base_url.as_deref();
 								let api_key = if reuses_root {
 									prewalk_api_key.clone()
 								} else {
 									session_config.resolve_api_key(&target.provider)
 								};
 								let stored_auth = reuses_root
-									|| api_key
-										.as_deref()
-										.is_some_and(|key| !key.trim().is_empty())
+									|| api_key.as_deref().is_some_and(|key| !key.trim().is_empty())
 									|| runtime::provider_has_configured_auth(
 										&prewalk_catalog,
 										session_config,
@@ -3375,61 +3310,43 @@ impl Session<'_> {
 									&store.service_tier_by_family(),
 								)?;
 								Ok((provider, switch_target, switch_thinking, api_key))
-							},
-						);
+							});
 						match committed {
-							Ok((
-								commit,
-								(provider, target, switch_thinking, api_key),
-							)) => {
+							Ok((commit, (provider, target, switch_thinking, api_key))) => {
 								if store.enabled() {
 									match store.append_model_change(
-										&format!(
-											"{}/{}",
-											target.provider, target.model
-										),
+										&format!("{}/{}", target.provider, target.model),
 										"fallback",
 									) {
 										Ok(id) => *parent = Some(id),
-										Err(err) => eprintln!(
-											"warning: cannot record plan-yolo model change: {err}"
-										),
+										Err(err) => {
+											eprintln!("warning: cannot record plan-yolo model change: {err}")
+										},
 									}
 								}
 								decision.provider = Some(provider);
 								decision.context_limit = Some(
 									prewalk_catalog
-										.context_window(
-											&target.provider,
-											&target.model,
-										)
+										.context_window(&target.provider, &target.model)
 										.unwrap_or(runtime::DEFAULT_CONTEXT_LIMIT),
 								);
-								decision.guidance.push(
-									pi_agent::Message::guidance(
-										plan_yolo::PLAN_YOLO_HANDOFF_TYPE,
-										commit.handoff,
-									),
-								);
+								decision.guidance.push(pi_agent::Message::guidance(
+									plan_yolo::PLAN_YOLO_HANDOFF_TYPE,
+									commit.handoff,
+								));
 								decision.continue_turn = true;
 								decision.tool_selection = plan_yolo_tools_restore
 									.as_ref()
-									.map(|tools| pi_agent::TurnToolSelection::Hide(
-										tools.hidden_by_plan(),
-									));
+									.map(|tools| pi_agent::TurnToolSelection::Hide(tools.hidden_by_plan()));
 								eprintln!("{}", commit.notice);
-								plan_yolo_switch =
-									Some((target, switch_thinking, api_key));
+								plan_yolo_switch = Some((target, switch_thinking, api_key));
 							},
 							Err(err) => {
 								let message = format!("plan-yolo switch failed — {err}");
 								if store.enabled()
-									&& let Err(append) =
-										store.append_plan_yolo_switch_failure(&message)
+									&& let Err(append) = store.append_plan_yolo_switch_failure(&message)
 								{
-									eprintln!(
-										"warning: cannot record plan-yolo switch failure: {append}"
-									);
+									eprintln!("warning: cannot record plan-yolo switch failure: {append}");
 								}
 								return Err(Error::new(message));
 							},
@@ -3483,8 +3400,7 @@ impl Session<'_> {
 				// persist/render them at this boundary so they cannot be lost
 				// between turns or after the stream drops.
 				while let Ok((content, details)) = self.advisor_cards_rx.try_recv() {
-					if let Err(err) =
-						persist_advisor_card(&mut self.store, reporter, &content, &details)
+					if let Err(err) = persist_advisor_card(&mut self.store, reporter, &content, &details)
 					{
 						reporter_failed = true;
 						return Err(err);
@@ -3493,7 +3409,6 @@ impl Session<'_> {
 				Ok(())
 			},
 		);
-
 
 		if drive_result.is_err() {
 			cancel_token.cancel();
@@ -3516,20 +3431,13 @@ impl Session<'_> {
 						provider_opt.as_deref(),
 						&mut prewalk_state,
 						&mut prewalk_switch,
-					&mut priority_downgraded,
+						&mut priority_downgraded,
 					);
 					if !reporter_failed {
 						let _ = reporter.event(&event);
 					}
 					while let Ok((content, details)) = self.advisor_cards_rx.try_recv() {
-						if persist_advisor_card(
-							&mut self.store,
-							reporter,
-							&content,
-							&details,
-						)
-						.is_err()
-						{
+						if persist_advisor_card(&mut self.store, reporter, &content, &details).is_err() {
 							reporter_failed = true;
 						}
 					}
@@ -3549,7 +3457,10 @@ impl Session<'_> {
 		self.turn_tool_calls = turn_tool_calls;
 		self.turn_started_in_goal = turn_started_in_goal;
 		if priority_downgraded
-			&& self.service_tier_by_family.get("anthropic").map(String::as_str)
+			&& self
+				.service_tier_by_family
+				.get("anthropic")
+				.map(String::as_str)
 				== Some("priority")
 		{
 			// One authoritative update after the turn: the journal entry appended
@@ -3558,8 +3469,9 @@ impl Session<'_> {
 			self.service_tier_by_family.remove("anthropic");
 			self.service_tier_recorded = true;
 			if self.store.enabled()
-				&& let Err(err) =
-					self.store.append_service_tier_change(&self.service_tier_by_family)
+				&& let Err(err) = self
+					.store
+					.append_service_tier_change(&self.service_tier_by_family)
 			{
 				eprintln!("warning: cannot record service tier change: {err}");
 			}
@@ -3609,11 +3521,9 @@ impl Session<'_> {
 				.as_deref()
 				.zip(self.model.as_deref())
 				.and_then(|(provider, model)| {
-					runtime::effective_endpoint(&self.catalog, &self.config, provider, model)
-						.ok()
+					runtime::effective_endpoint(&self.catalog, &self.config, provider, model).ok()
 				});
-			self.config.tools = plan_yolo_tools_restore
-				.and_then(|tools| tools.restore());
+			self.config.tools = plan_yolo_tools_restore.and_then(|tools| tools.restore());
 			self.plan_yolo_tools = None;
 		}
 		// Drain the final goal writes (agent-end flush, interrupt pause) and, if
@@ -3673,7 +3583,8 @@ fn maybe_auto_chdir(cli: &Cli) {
 	let Ok(cwd) = std::env::current_dir() else {
 		return;
 	};
-	let comparable = |path: &Path| std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+	let comparable =
+		|path: &Path| std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
 	if comparable(&cwd) != comparable(&home) {
 		return;
 	}
@@ -3706,10 +3617,7 @@ fn split_model_thinking_suffix(pattern: &str) -> (&str, Option<&str>) {
 /// exactly, then by case-insensitive substring (TS fuzzy selector). The
 /// returned thinking level is the `:level` suffix carried by the winning
 /// pattern (TS scoped-model thinking, `main.ts` initialThinking).
-fn first_scoped_model(
-	patterns: &[String],
-	catalog: &Catalog,
-) -> Option<(String, Option<String>)> {
+fn first_scoped_model(patterns: &[String], catalog: &Catalog) -> Option<(String, Option<String>)> {
 	for pattern in patterns {
 		let raw = pattern.trim();
 		if raw.is_empty() {
@@ -3726,9 +3634,9 @@ fn first_scoped_model(
 				continue;
 			};
 			let matcher = glob.compile_matcher();
-			if let Some(model) = find_in_catalog(catalog, |full, id| {
-				matcher.is_match(full) || matcher.is_match(id)
-			}) {
+			if let Some(model) =
+				find_in_catalog(catalog, |full, id| matcher.is_match(full) || matcher.is_match(id))
+			{
 				return Some((model, suffix));
 			}
 			continue;
@@ -3741,8 +3649,7 @@ fn first_scoped_model(
 		}
 		if stripped == raw {
 			let needle = raw.to_lowercase();
-			if let Some(model) =
-				find_in_catalog(catalog, |_, id| id.to_lowercase().contains(&needle))
+			if let Some(model) = find_in_catalog(catalog, |_, id| id.to_lowercase().contains(&needle))
 			{
 				return Some((model, None));
 			}
@@ -3754,9 +3661,7 @@ fn first_scoped_model(
 			return Some((model, suffix));
 		}
 		let needle = stripped.to_lowercase();
-		if let Some(model) =
-			find_in_catalog(catalog, |_, id| id.to_lowercase().contains(&needle))
-		{
+		if let Some(model) = find_in_catalog(catalog, |_, id| id.to_lowercase().contains(&needle)) {
 			return Some((model, suffix));
 		}
 	}
@@ -3788,13 +3693,29 @@ fn resolve_cwd(cli_cwd: Option<PathBuf>, config_cwd: Option<PathBuf>) -> Result<
 		.map_err(|err| Error::with_source(format!("cwd {} is not accessible", path.display()), err))
 }
 
-
 #[cfg(unix)]
 fn open_file_safe(path: &Path) -> std::io::Result<std::fs::File> {
 	use std::os::unix::fs::OpenOptionsExt;
-	#[cfg(all(unix, not(any(target_os = "macos", target_os = "ios", target_os = "freebsd", target_os = "netbsd", target_os = "openbsd", target_os = "dragonfly"))))]
+	#[cfg(all(
+		unix,
+		not(any(
+			target_os = "macos",
+			target_os = "ios",
+			target_os = "freebsd",
+			target_os = "netbsd",
+			target_os = "openbsd",
+			target_os = "dragonfly"
+		))
+	))]
 	const O_NONBLOCK: i32 = 0o4000;
-	#[cfg(any(target_os = "macos", target_os = "ios", target_os = "freebsd", target_os = "netbsd", target_os = "openbsd", target_os = "dragonfly"))]
+	#[cfg(any(
+		target_os = "macos",
+		target_os = "ios",
+		target_os = "freebsd",
+		target_os = "netbsd",
+		target_os = "openbsd",
+		target_os = "dragonfly"
+	))]
 	const O_NONBLOCK: i32 = 0x0004;
 
 	let mut options = std::fs::OpenOptions::new();
@@ -3828,13 +3749,13 @@ fn poll_stdin(timeout_ms: std::os::raw::c_int) -> std::io::Result<bool> {
 	const READY: std::os::raw::c_short = 0x0001 | 0x0008 | 0x0010 | 0x0020; // POLLIN|POLLERR|POLLHUP|POLLNVAL
 	const EINTR: i32 = 4;
 	unsafe extern "C" {
-		fn poll(fds: *mut PollFd, nfds: usize, timeout_ms: std::os::raw::c_int) -> std::os::raw::c_int;
+		fn poll(
+			fds: *mut PollFd,
+			nfds: usize,
+			timeout_ms: std::os::raw::c_int,
+		) -> std::os::raw::c_int;
 	}
-	let mut pfd = PollFd {
-		fd: 0,
-		events: 0x0001,
-		revents: 0,
-	};
+	let mut pfd = PollFd { fd: 0, events: 0x0001, revents: 0 };
 	loop {
 		let ret = unsafe { poll(&mut pfd, 1, timeout_ms) };
 		if ret == 0 {
@@ -3889,7 +3810,8 @@ fn read_piped_stdin() -> std::io::Result<Option<String>> {
 		return Ok(None);
 	}
 	let bytes = read_stdin_to_eof()?;
-	let text = String::from_utf8(bytes).map_err(|err| std::io::Error::new(std::io::ErrorKind::InvalidData, err))?;
+	let text = String::from_utf8(bytes)
+		.map_err(|err| std::io::Error::new(std::io::ErrorKind::InvalidData, err))?;
 	if text.trim().is_empty() {
 		Ok(None)
 	} else {
@@ -3903,7 +3825,10 @@ struct ProcessedCliFiles {
 	images: Vec<ContentPart>,
 }
 
-fn process_cli_file_args(file_args: &[String], cwd: &Path) -> std::result::Result<ProcessedCliFiles, CliError> {
+fn process_cli_file_args(
+	file_args: &[String],
+	cwd: &Path,
+) -> std::result::Result<ProcessedCliFiles, CliError> {
 	let mut text = String::new();
 	let mut images = Vec::new();
 	for file_arg in file_args {
@@ -3912,10 +3837,7 @@ fn process_cli_file_args(file_args: &[String], cwd: &Path) -> std::result::Resul
 
 		if abs_path.is_dir() {
 			let listing = file_mentions::build_directory_listing(&abs_path).map_err(|err| {
-				CliError::fail(format!(
-					"Error: Could not read directory {}: {err}",
-					abs_path.display()
-				))
+				CliError::fail(format!("Error: Could not read directory {}: {err}", abs_path.display()))
 			})?;
 			text.push_str(&format!(
 				"<file name=\"{}\">\n{}\n</file>\n",
@@ -3928,10 +3850,7 @@ fn process_cli_file_args(file_args: &[String], cwd: &Path) -> std::result::Resul
 		let mut file = match open_file_safe(&abs_path) {
 			Ok(f) => f,
 			Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-				return Err(CliError::fail(format!(
-					"Error: File not found: {}",
-					abs_path.display()
-				)));
+				return Err(CliError::fail(format!("Error: File not found: {}", abs_path.display())));
 			},
 			Err(err) => {
 				return Err(CliError::fail(format!(
@@ -3984,11 +3903,7 @@ fn process_cli_file_args(file_args: &[String], cwd: &Path) -> std::result::Resul
 
 		if let Some(mime) = detected_image_mime {
 			let max_bytes = file_mentions::MAX_AUTO_READ_IMAGE_BYTES;
-			let bytes = match file_mentions::read_bounded(
-				&mut file,
-				initial_buf,
-				max_bytes,
-			) {
+			let bytes = match file_mentions::read_bounded(&mut file, initial_buf, max_bytes) {
 				Ok(b) => b,
 				Err(file_mentions::BoundedReadError::TooLarge { actual_read }) => {
 					let disk_size = file.metadata().map(|m| m.len()).unwrap_or(0);
@@ -4025,11 +3940,7 @@ fn process_cli_file_args(file_args: &[String], cwd: &Path) -> std::result::Resul
 			images.push(ContentPart::image(b64, mime));
 		} else {
 			let max_bytes = file_mentions::MAX_AUTO_READ_TEXT_BYTES;
-			let bytes = match file_mentions::read_bounded(
-				&mut file,
-				initial_buf,
-				max_bytes,
-			) {
+			let bytes = match file_mentions::read_bounded(&mut file, initial_buf, max_bytes) {
 				Ok(b) => b,
 				Err(file_mentions::BoundedReadError::TooLarge { actual_read }) => {
 					let disk_size = file.metadata().map(|m| m.len()).unwrap_or(0);
@@ -4126,44 +4037,44 @@ fn run_export_command(
 			 Exports a session log to standalone HTML without starting a live session.",
 		));
 	};
-	let session_path = if session.contains('/') || session.contains('\\') || session.ends_with(".jsonl")
-	{
-		let path = dirs::absolute(cwd, Path::new(session));
-		if !path.is_file() {
-			// A durable session's path is an identity, not a JSONL file. Accept
-			// it when the SQLite row exists in the same directory.
-			let durable = path
-				.extension()
-				.and_then(|extension| (extension == "jsonl").then_some(()))
-				.and_then(|()| path.parent())
-				.zip(
-					path
-						.file_stem()
-						.and_then(|stem| stem.to_str())
-						.map(str::to_string),
-				)
-				.is_some_and(|(parent, id)| {
-					aragent::durable_session::session_exists(
-						&aragent::durable_session::database_path(parent),
-						&id,
+	let session_path =
+		if session.contains('/') || session.contains('\\') || session.ends_with(".jsonl") {
+			let path = dirs::absolute(cwd, Path::new(session));
+			if !path.is_file() {
+				// A durable session's path is an identity, not a JSONL file. Accept
+				// it when the SQLite row exists in the same directory.
+				let durable = path
+					.extension()
+					.and_then(|extension| (extension == "jsonl").then_some(()))
+					.and_then(|()| path.parent())
+					.zip(
+						path
+							.file_stem()
+							.and_then(|stem| stem.to_str())
+							.map(str::to_string),
 					)
-					.unwrap_or(false)
-				});
-			if !durable {
-				return Err(CliError::fail(format!("File not found: {session}")));
+					.is_some_and(|(parent, id)| {
+						aragent::durable_session::session_exists(
+							&aragent::durable_session::database_path(parent),
+							&id,
+						)
+						.unwrap_or(false)
+					});
+				if !durable {
+					return Err(CliError::fail(format!("File not found: {session}")));
+				}
 			}
-		}
-		path
-	} else {
-		match session::resolve_resumable_session(session, cwd, session_dir, true) {
-			Ok(Some(path)) => path,
-			_ => {
-				return Err(CliError::fail(format!(
-					"Session \"{session}\" not found.\nPass a session JSONL path or id."
-				)));
-			},
-		}
-	};
+			path
+		} else {
+			match session::resolve_resumable_session(session, cwd, session_dir, true) {
+				Ok(Some(path)) => path,
+				_ => {
+					return Err(CliError::fail(format!(
+						"Session \"{session}\" not found.\nPass a session JSONL path or id."
+					)));
+				},
+			}
+		};
 	let dir = session_path.parent().map(PathBuf::from);
 	let id = session_path
 		.file_stem()
@@ -4203,19 +4114,18 @@ fn run_export_command(
 	let html = render_session_html(&store);
 	if let Some(parent) = out_path.parent() {
 		if !parent.as_os_str().is_empty() {
-			std::fs::create_dir_all(parent).map_err(|err| {
-				CliError::fail(format!("cannot create {}: {err}", parent.display()))
-			})?;
+			std::fs::create_dir_all(parent)
+				.map_err(|err| CliError::fail(format!("cannot create {}: {err}", parent.display())))?;
 		}
 	}
-	std::fs::write(&out_path, html).map_err(|err| {
-		CliError::fail(format!("cannot write {}: {err}", out_path.display()))
-	})?;
+	std::fs::write(&out_path, html)
+		.map_err(|err| CliError::fail(format!("cannot write {}: {err}", out_path.display())))?;
 	Ok(out_path.display().to_string())
 }
 
 fn html_escape_text(text: &str) -> String {
-	text.replace('&', "&amp;")
+	text
+		.replace('&', "&amp;")
 		.replace('<', "&lt;")
 		.replace('>', "&gt;")
 		.replace('"', "&quot;")
@@ -4279,16 +4189,12 @@ fn open_headless_session(
 		},
 		None => {
 			if required {
-				return Err(CliError::usage(
-					"session argument is required (path or id)",
-				));
+				return Err(CliError::usage("session argument is required (path or id)"));
 			}
 			match session::continue_recent(cwd, session_dir) {
 				Ok(Some(path)) => path,
 				Ok(None) => {
-					return Err(CliError::fail(
-						"No sessions found.\nPass a session JSONL path or id.",
-					));
+					return Err(CliError::fail("No sessions found.\nPass a session JSONL path or id."));
 				},
 				Err(err) => return Err(CliError::fail(err)),
 			}
@@ -4383,10 +4289,8 @@ fn run_stats_command(
 		.map_err(|err| CliError::fail(err.to_string()))?;
 	writeln!(out, "  assistant    {assistant_messages}")
 		.map_err(|err| CliError::fail(err.to_string()))?;
-	writeln!(out, "  tool calls   {tool_calls}")
-		.map_err(|err| CliError::fail(err.to_string()))?;
-	writeln!(out, "  tool results {tool_results}")
-		.map_err(|err| CliError::fail(err.to_string()))?;
+	writeln!(out, "  tool calls   {tool_calls}").map_err(|err| CliError::fail(err.to_string()))?;
+	writeln!(out, "  tool results {tool_results}").map_err(|err| CliError::fail(err.to_string()))?;
 	writeln!(out, "  total        {}", messages.len())
 		.map_err(|err| CliError::fail(err.to_string()))?;
 	writeln!(out).map_err(|err| CliError::fail(err.to_string()))?;
@@ -4395,8 +4299,7 @@ fn run_stats_command(
 		.map_err(|err| CliError::fail(err.to_string()))?;
 	writeln!(out, "  output       {}", usage.output)
 		.map_err(|err| CliError::fail(err.to_string()))?;
-	writeln!(out, "  reasoning    {reasoning}")
-		.map_err(|err| CliError::fail(err.to_string()))?;
+	writeln!(out, "  reasoning    {reasoning}").map_err(|err| CliError::fail(err.to_string()))?;
 	writeln!(out, "  cache read   {}", usage.cache_read)
 		.map_err(|err| CliError::fail(err.to_string()))?;
 	writeln!(out, "  cache write  {}", usage.cache_write)
@@ -4404,8 +4307,7 @@ fn run_stats_command(
 	writeln!(out, "  total        {}", usage.total_tokens)
 		.map_err(|err| CliError::fail(err.to_string()))?;
 	if cost > 0.0 {
-		writeln!(out, "  cost         ${cost:.4}")
-			.map_err(|err| CliError::fail(err.to_string()))?;
+		writeln!(out, "  cost         ${cost:.4}").map_err(|err| CliError::fail(err.to_string()))?;
 	}
 	out.flush().map_err(|err| CliError::fail(err.to_string()))?;
 	Ok(())
@@ -4419,9 +4321,9 @@ fn format_iso_span(start: &str, end: &str) -> String {
 		let mo: i64 = d.next()?.parse().ok()?;
 		let da: i64 = d.next()?.parse().ok()?;
 		let time = time.trim_end_matches('Z');
-		let (hms, frac) = time
-			.split_once('.')
-			.map_or((time, 0i64), |(h, f)| (h, f.chars().take(3).collect::<String>().parse().unwrap_or(0)));
+		let (hms, frac) = time.split_once('.').map_or((time, 0i64), |(h, f)| {
+			(h, f.chars().take(3).collect::<String>().parse().unwrap_or(0))
+		});
 		let mut t = hms.split(':');
 		let h: i64 = t.next()?.parse().ok()?;
 		let mi: i64 = t.next()?.parse().ok()?;
@@ -4477,9 +4379,8 @@ fn run_render_command(
 					})?;
 				}
 			}
-			std::fs::write(&out_path, text).map_err(|err| {
-				CliError::fail(format!("cannot write {}: {err}", out_path.display()))
-			})?;
+			std::fs::write(&out_path, text)
+				.map_err(|err| CliError::fail(format!("cannot write {}: {err}", out_path.display())))?;
 			println!("Rendered to: {}", out_path.display());
 		},
 		None => {
@@ -4543,9 +4444,8 @@ fn run_cleanse_command(
 		));
 	};
 	let (session_path, _store) = open_headless_session(Some(session), cwd, session_dir, true)?;
-	let raw = std::fs::read_to_string(&session_path).map_err(|err| {
-		CliError::fail(format!("cannot read {}: {err}", session_path.display()))
-	})?;
+	let raw = std::fs::read_to_string(&session_path)
+		.map_err(|err| CliError::fail(format!("cannot read {}: {err}", session_path.display())))?;
 	let mut changed = 0usize;
 	let mut out = String::with_capacity(raw.len());
 	for line in raw.lines() {
@@ -4560,9 +4460,8 @@ fn run_cleanse_command(
 		out.push_str(&redacted);
 		out.push('\n');
 	}
-	std::fs::write(&session_path, out).map_err(|err| {
-		CliError::fail(format!("cannot write {}: {err}", session_path.display()))
-	})?;
+	std::fs::write(&session_path, out)
+		.map_err(|err| CliError::fail(format!("cannot write {}: {err}", session_path.display())))?;
 	println!(
 		"Cleansed {} ({} line{} rewritten)",
 		session_path.display(),
@@ -4573,10 +4472,7 @@ fn run_cleanse_command(
 }
 
 /// Headless `arag commit`: `git add -A` then `git commit` in the cwd.
-fn run_commit_command(
-	message: Option<&str>,
-	cwd: &Path,
-) -> std::result::Result<(), CliError> {
+fn run_commit_command(message: Option<&str>, cwd: &Path) -> std::result::Result<(), CliError> {
 	let msg = message
 		.map(str::trim)
 		.filter(|s| !s.is_empty())
@@ -4589,10 +4485,7 @@ fn run_commit_command(
 		.status()
 		.map_err(|err| CliError::fail(format!("git not available: {err}")))?;
 	if !status.success() {
-		return Err(CliError::fail(format!(
-			"not a git repository: {}",
-			cwd.display()
-		)));
+		return Err(CliError::fail(format!("not a git repository: {}", cwd.display())));
 	}
 	let unmerged = std::process::Command::new("git")
 		.args(["ls-files", "-u"])
@@ -4636,10 +4529,7 @@ fn run_commit_command(
 		.status()
 		.map_err(|err| CliError::fail(format!("git add failed: {err}")))?;
 	if !add.success() {
-		return Err(CliError::fail(format!(
-			"git add -A exited {}",
-			add.code().unwrap_or(-1)
-		)));
+		return Err(CliError::fail(format!("git add -A exited {}", add.code().unwrap_or(-1))));
 	}
 	let commit = std::process::Command::new("git")
 		.args(["commit", "-m", msg])
@@ -4647,10 +4537,7 @@ fn run_commit_command(
 		.status()
 		.map_err(|err| CliError::fail(format!("git commit failed: {err}")))?;
 	if !commit.success() {
-		return Err(CliError::fail(format!(
-			"git commit exited {}",
-			commit.code().unwrap_or(-1)
-		)));
+		return Err(CliError::fail(format!("git commit exited {}", commit.code().unwrap_or(-1))));
 	}
 	println!("Committed: {msg}");
 	Ok(())
@@ -4697,7 +4584,9 @@ mod tests {
 	/// reported as "Nothing to commit, working tree clean." with exit 0.
 	#[test]
 	fn commit_command_surfaces_a_failing_git_probe() {
-		let Some(dir) = temp_git_dir("commit-corrupt-index") else { return };
+		let Some(dir) = temp_git_dir("commit-corrupt-index") else {
+			return;
+		};
 		std::fs::write(dir.join("tracked.txt"), "x").expect("write tracked");
 		let added = std::process::Command::new("git")
 			.args(["add", "-A"])
@@ -4718,7 +4607,9 @@ mod tests {
 
 	#[test]
 	fn commit_command_reports_a_clean_tree_without_committing() {
-		let Some(dir) = temp_git_dir("commit-clean-tree") else { return };
+		let Some(dir) = temp_git_dir("commit-clean-tree") else {
+			return;
+		};
 		if let Err(error) = run_commit_command(Some("unused"), &dir) {
 			panic!("a clean tree is not an error: {}", error.message);
 		}

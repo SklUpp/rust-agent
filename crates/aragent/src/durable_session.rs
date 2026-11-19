@@ -25,14 +25,14 @@ use std::{
 
 use async_trait::async_trait;
 use pi_agent::CompactionReport;
-use rusqlite::{OpenFlags, OptionalExtension as _};
-use tokio::runtime::{Handle, RuntimeFlavor};
 use pi_agent::{
 	ChildDurability, ChildDurabilityFactory, DeliveredWorkerResult, DurableBoundary, DurableError,
 	WorkerCompletionSink, WorkerIdentity,
 	state::{Message, Role, StopReason, ToolCall, ToolResult},
 };
+use rusqlite::{OpenFlags, OptionalExtension as _};
 use serde_json::Value;
+use tokio::runtime::{Handle, RuntimeFlavor};
 use xxhash_rust::xxh64::xxh64;
 
 use crate::{
@@ -42,8 +42,8 @@ use crate::{
 		SessionMessage, Usage, derive_turn_history,
 	},
 	session_store::{
-		NewBranch, NewDelivery, NewIntent, NewMessage, NewSession, SessionRecord, SqliteStore,
-		ExecutionRecord, StoreError, StoreResult, UnresolvedIntent, WorkerCompletion,
+		ExecutionRecord, NewBranch, NewDelivery, NewIntent, NewMessage, NewSession, SessionRecord,
+		SqliteStore, StoreError, StoreResult, UnresolvedIntent, WorkerCompletion,
 	},
 };
 
@@ -52,10 +52,16 @@ use crate::{
 /// [`SessionWriterLease::acquire_in`] with an explicit private root.
 fn default_session_lock_root() -> io::Result<PathBuf> {
 	if let Some(home) = std::env::var_os("HOME").filter(|value| !value.is_empty()) {
-		return Ok(PathBuf::from(home).join(".omp").join("run").join("session-writer"));
+		return Ok(PathBuf::from(home)
+			.join(".omp")
+			.join("run")
+			.join("session-writer"));
 	}
 	if let Some(home) = std::env::var_os("USERPROFILE").filter(|value| !value.is_empty()) {
-		return Ok(PathBuf::from(home).join(".omp").join("run").join("session-writer"));
+		return Ok(PathBuf::from(home)
+			.join(".omp")
+			.join("run")
+			.join("session-writer"));
 	}
 	Err(io::Error::new(
 		io::ErrorKind::NotFound,
@@ -102,11 +108,7 @@ fn ensure_private_lock_dir(dir: &Path) -> io::Result<()> {
 		if metadata.uid() != uid {
 			return Err(io::Error::new(
 				io::ErrorKind::PermissionDenied,
-				format!(
-					"{} is owned by uid {} not the current user",
-					dir.display(),
-					metadata.uid()
-				),
+				format!("{} is owned by uid {} not the current user", dir.display(), metadata.uid()),
 			));
 		}
 		let mut permissions = metadata.permissions();
@@ -122,9 +124,7 @@ fn ensure_private_lock_dir(dir: &Path) -> io::Result<()> {
 /// path-dependent; multi-link names are outside the cooperative contract.
 fn assert_cooperative_db_path(db_path: &Path) -> StoreResult<()> {
 	if db_path.as_os_str().is_empty() {
-		return Err(StoreError::Validation(
-			"session store path must not be empty".to_string(),
-		));
+		return Err(StoreError::Validation("session store path must not be empty".to_string()));
 	}
 	match std::fs::symlink_metadata(db_path) {
 		Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
@@ -166,7 +166,10 @@ fn validate_writer_session_id(session_id: &str) -> StoreResult<()> {
 			"invalid session id `{session_id}` for writer lease"
 		)));
 	}
-	if session_id.bytes().any(|b| b == 0 || b == b'/' || b == b'\\' || b == b'\n' || b == b'\r') {
+	if session_id
+		.bytes()
+		.any(|b| b == 0 || b == b'/' || b == b'\\' || b == b'\n' || b == b'\r')
+	{
 		return Err(StoreError::Validation(format!(
 			"session id `{session_id}` contains path-unsafe bytes; writer lease refused"
 		)));
@@ -225,17 +228,13 @@ impl SessionWriterLease {
 		let lock_path = db_dir.join(session_lock_file_name(session_id));
 		let file = open_session_lock_file(&lock_path).map_err(StoreError::Io)?;
 		match try_lock_exclusive(&file) {
-			Ok(()) => Ok(Self {
-				file,
-				canonical_db,
-				session_id: session_id.to_string(),
-			}),
-			Err(error) if error.kind() == io::ErrorKind::WouldBlock => Err(StoreError::Conflict(
-				format!(
+			Ok(()) => Ok(Self { file, canonical_db, session_id: session_id.to_string() }),
+			Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+				Err(StoreError::Conflict(format!(
 					"session {session_id} in {} is already owned by another writer",
 					canonical_db.display()
-				),
-			)),
+				)))
+			},
 			Err(error) => Err(StoreError::Io(error)),
 		}
 	}
@@ -260,7 +259,9 @@ fn open_session_lock_file(path: &Path) -> io::Result<File> {
 	#[cfg(unix)]
 	{
 		use std::os::unix::fs::OpenOptionsExt;
-		options.mode(0o600).custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
+		options
+			.mode(0o600)
+			.custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
 	}
 	options.open(path)
 }
@@ -540,10 +541,7 @@ pub struct LoadedSession {
 impl DurableSession {
 	/// Open the writer and create a new session plus its root branch in one
 	/// transaction. Acquires the exclusive cooperative writer lease first.
-	pub fn create(
-		db_path: impl Into<PathBuf>,
-		header: SessionHeader,
-	) -> StoreResult<Self> {
+	pub fn create(db_path: impl Into<PathBuf>, header: SessionHeader) -> StoreResult<Self> {
 		let db_path = db_path.into();
 		let session_id = header.id.clone();
 		let lease = SessionWriterLease::acquire(&db_path, &session_id)?;
@@ -561,20 +559,11 @@ impl DurableSession {
 		writer.call(move |store| {
 			// Lineage may name a session in another project's database; the FK
 			// only accepts an id that exists here. The header keeps the original.
-			let parent = parent_session_id.filter(|parent| {
-				store.session(parent).ok().flatten().is_some()
-			});
+			let parent =
+				parent_session_id.filter(|parent| store.session(parent).ok().flatten().is_some());
 			store.create_session(NewSession { parent_session_id: parent, ..session })
 		})?;
-		Ok(empty_session_fields(
-			writer,
-			session_id,
-			branch_id,
-			None,
-			None,
-			None,
-			None,
-		))
+		Ok(empty_session_fields(writer, session_id, branch_id, None, None, None, None))
 	}
 
 	/// Open an existing session or a new one. `None` means the row was absent
@@ -624,11 +613,8 @@ impl DurableSession {
 				if let Some(stored) = parts.header {
 					header = stored;
 				}
-				let seed = seed_entries(
-					&parts.branch_messages,
-					parts.projection.as_ref(),
-					&parts.messages,
-				);
+				let seed =
+					seed_entries(&parts.branch_messages, parts.projection.as_ref(), &parts.messages);
 				Ok((
 					empty_session_fields(
 						writer,
@@ -657,8 +643,7 @@ impl DurableSession {
 				let parent = header.parent_session.clone();
 				let create_branch = branch_id.clone();
 				writer.call(move |store| {
-					let parent = parent
-						.filter(|parent| store.session(parent).ok().flatten().is_some());
+					let parent = parent.filter(|parent| store.session(parent).ok().flatten().is_some());
 					store.create_session(NewSession {
 						id: session_id,
 						parent_session_id: parent,
@@ -667,10 +652,7 @@ impl DurableSession {
 						initial_branch_payload: Value::Null,
 					})
 				})?;
-				Ok((
-					empty_session_fields(writer, id, branch_id, None, child_lease, None, None),
-					None,
-				))
+				Ok((empty_session_fields(writer, id, branch_id, None, child_lease, None, None), None))
 			},
 		}
 	}
@@ -708,7 +690,9 @@ impl DurableSession {
 	pub fn peek_recovered_partial(&self) -> StoreResult<Option<String>> {
 		let session_id = self.session_id.clone();
 		let branch_id = lock(&self.cursor).branch.clone();
-		self.writer.call(move |store| store.stream_draft(&session_id, &branch_id))
+		self
+			.writer
+			.call(move |store| store.stream_draft(&session_id, &branch_id))
 	}
 	/// Load the active branch and its full entry set. Used on resume and after
 	/// an external durable write (the loop's assistant/tool rows).
@@ -732,11 +716,8 @@ impl DurableSession {
 		lock(&self.written_tool_ids).clear();
 		*lock(&self.projection) = parts.projection.clone();
 		if lock(&self.tracked).is_empty() {
-			let seed = seed_entries(
-				&parts.branch_messages,
-				parts.projection.as_ref(),
-				&parts.messages,
-			);
+			let seed =
+				seed_entries(&parts.branch_messages, parts.projection.as_ref(), &parts.messages);
 			*lock(&self.resume_seed) = Some(seed);
 		}
 		Ok(LoadedSession {
@@ -771,9 +752,9 @@ impl DurableSession {
 				let branch_id = format!("{}.branch-{}", session_id, output::session_id());
 				let parent_branch_id = match &parent {
 					Some(point) => {
-						let record = store
-							.message(point)?
-							.ok_or_else(|| StoreError::NotFound(format!("branch point message {point} not found")))?;
+						let record = store.message(point)?.ok_or_else(|| {
+							StoreError::NotFound(format!("branch point message {point} not found"))
+						})?;
 						if record.session_id != session_id {
 							return Err(StoreError::Validation(format!(
 								"branch point message {point} belongs to session {}, not {session_id}",
@@ -856,9 +837,7 @@ impl DurableSession {
 		// replay projection the resumed conversation will contain.
 		let persisted: Vec<&MessageEntry> = crate::session::replayable_message_entries(branch)
 			.into_iter()
-			.filter(|entry| {
-				matches!(entry.message.role.as_str(), "user" | "assistant" | "toolResult")
-			})
+			.filter(|entry| matches!(entry.message.role.as_str(), "user" | "assistant" | "toolResult"))
 			.collect();
 		let mut ids = Vec::with_capacity(messages.len());
 		let mut seen = 0usize;
@@ -945,12 +924,8 @@ impl DurableSession {
 			cursor.branch = parts.branch_id;
 			cursor.leaf = parts.leaf;
 		}
-		let seed = seed_entries(
-			&parts.branch_messages,
-			parts.projection.as_ref(),
-			&parts.messages,
-		)
-		.map_err(|error| DurableError::new(error.to_string()))?;
+		let seed = seed_entries(&parts.branch_messages, parts.projection.as_ref(), &parts.messages)
+			.map_err(|error| DurableError::new(error.to_string()))?;
 		let Some((boundary, matched)) = align_seed(messages, digests, &seed) else {
 			return Err(DurableError::new(if messages.len() < previous {
 				"conversation shrank without a compaction mapping"
@@ -970,7 +945,8 @@ impl DurableSession {
 		operation: impl FnOnce(&mut SqliteStore) -> StoreResult<T> + Send + 'static,
 	) -> StoreResult<T> {
 		let lease = self.child_lease.clone();
-		self.writer
+		self
+			.writer
 			.call_async(move |store| {
 				let result = operation(store);
 				drop(lease);
@@ -979,25 +955,23 @@ impl DurableSession {
 			.await
 	}
 
-	async fn set_projection(&self, projection: Option<StoredProjection>) -> Result<(), DurableError> {
+	async fn set_projection(
+		&self,
+		projection: Option<StoredProjection>,
+	) -> Result<(), DurableError> {
 		let session_id = self.session_id.clone();
 		self
 			.call_async_owned(move |store| {
 				let mut payload = store
 					.session(&session_id)?
-					.ok_or_else(|| {
-						StoreError::NotFound(format!("session {session_id} not found"))
-					})?
+					.ok_or_else(|| StoreError::NotFound(format!("session {session_id} not found")))?
 					.payload;
 				let Some(map) = payload.as_object_mut() else {
 					return Err(StoreError::Corrupt("session payload is not an object".to_string()));
 				};
 				match projection {
 					Some(projection) => {
-						map.insert(
-							"durableProjection".to_string(),
-							serde_json::to_value(projection)?,
-						);
+						map.insert("durableProjection".to_string(), serde_json::to_value(projection)?);
 					},
 					None => {
 						map.remove("durableProjection");
@@ -1012,16 +986,11 @@ impl DurableSession {
 	/// Set or replace the selected projection synchronously.
 	pub fn set_projection_sync(&self, projection: Option<StoredProjection>) -> StoreResult<()> {
 		let session_id = self.session_id.clone();
-		let proj_val = projection
-			.as_ref()
-			.map(serde_json::to_value)
-			.transpose()?;
+		let proj_val = projection.as_ref().map(serde_json::to_value).transpose()?;
 		self.writer.call(move |store| {
 			let mut payload = store
 				.session(&session_id)?
-				.ok_or_else(|| {
-					StoreError::NotFound(format!("session {session_id} not found"))
-				})?
+				.ok_or_else(|| StoreError::NotFound(format!("session {session_id} not found")))?
 				.payload;
 			let Some(map) = payload.as_object_mut() else {
 				return Err(StoreError::Corrupt("session payload is not an object".to_string()));
@@ -1044,11 +1013,8 @@ impl DurableSession {
 		*lock(&self.projection) = reconciled_proj.clone();
 		lock(&self.tracked).clear();
 		lock(&self.tracked_ids).clear();
-		*lock(&self.resume_seed) = Some(seed_entries(
-			&parts.branch_messages,
-			reconciled_proj.as_ref(),
-			&parts.messages,
-		));
+		*lock(&self.resume_seed) =
+			Some(seed_entries(&parts.branch_messages, reconciled_proj.as_ref(), &parts.messages));
 		Ok(())
 	}
 
@@ -1112,14 +1078,18 @@ impl DurableSession {
 	/// effect ran; callers must not replay automatically.
 	pub fn unresolved_intents(&self) -> StoreResult<Vec<UnresolvedIntent>> {
 		let session_id = self.session_id.clone();
-		self.writer.call(move |store| store.unresolved_intents(&session_id))
+		self
+			.writer
+			.call(move |store| store.unresolved_intents(&session_id))
 	}
 
 	/// Executions that have a terminal outcome recorded in SQLite, but no corresponding
 	/// tool-result message on the branch.
 	pub fn executions_needing_recovery(&self) -> StoreResult<Vec<ExecutionRecord>> {
 		let session_id = self.session_id.clone();
-		self.writer.call(move |store| store.executions_needing_recovery(&session_id))
+		self
+			.writer
+			.call(move |store| store.executions_needing_recovery(&session_id))
 	}
 
 	/// Read an execution record by id.
@@ -1186,10 +1156,7 @@ impl DurableSession {
 			Some(session) => session_digest(&session),
 			// System/developer context is runtime-only but still occupies an
 			// index in the compaction report; give it a stable revision too.
-			None => xxh64(
-				format!("{:?}\0{}", message.role, message.content).as_bytes(),
-				0,
-			),
+			None => xxh64(format!("{:?}\0{}", message.role, message.content).as_bytes(), 0),
 		}
 	}
 
@@ -1208,7 +1175,10 @@ impl DurableSession {
 			Role::System | Role::Developer => return None,
 		};
 		let now = SystemTime::now();
-		let timestamp_ms = now.duration_since(UNIX_EPOCH).unwrap_or_default().as_millis() as u64;
+		let timestamp_ms = now
+			.duration_since(UNIX_EPOCH)
+			.unwrap_or_default()
+			.as_millis() as u64;
 		// Image parts are replay-visible content: the resume seed and the live
 		// history must project them identically, or a forked/imported session
 		// can never align its first write with the stored branch.
@@ -1261,14 +1231,13 @@ impl DurableSession {
 					message.provider.clone().unwrap_or_default(),
 					message.model.clone().unwrap_or_default(),
 					message.usage.map(Usage::from),
-					message.stop_reason.map(StopReason::as_str).unwrap_or(if message
-						.tool_calls
-						.is_empty()
-					{
-						"stop"
-					} else {
-						"toolUse"
-					}),
+					message.stop_reason.map(StopReason::as_str).unwrap_or(
+						if message.tool_calls.is_empty() {
+							"stop"
+						} else {
+							"toolUse"
+						},
+					),
 					timestamp_ms,
 				);
 				entry.error_message = message.error_message.clone();
@@ -1277,10 +1246,9 @@ impl DurableSession {
 				// Only the loop stamps this on the terminal assistant; mirror
 				// writes (RPC tail, replays) carry none and never clear.
 				if let Some(attempt) = message.stream_attempt.clone() {
-					entry.extra.insert(
-						"streamAttempt".to_string(),
-						serde_json::Value::String(attempt),
-					);
+					entry
+						.extra
+						.insert("streamAttempt".to_string(), serde_json::Value::String(attempt));
 				}
 				entry
 			},
@@ -1340,11 +1308,7 @@ impl DurableSession {
 				if let Some(details) = details.as_mut().and_then(Value::as_object_mut) {
 					details.remove("images");
 				}
-				(
-					format!("{}\n\n[image payload rejected: {error}]", result.content),
-					true,
-					Vec::new(),
-				)
+				(format!("{}\n\n[image payload rejected: {error}]", result.content), true, Vec::new())
 			},
 		};
 		let message = if parts.is_empty() {
@@ -1398,9 +1362,10 @@ impl DurableBoundary for DurableSession {
 			let mut parent = leaf;
 			for message in &messages[start..] {
 				if message.role == Role::Tool
-					&& message.tool_call_id.as_deref().is_some_and(|id| {
-						written_tools.get(id).is_some_and(|count| *count > 0)
-					})
+					&& message
+						.tool_call_id
+						.as_deref()
+						.is_some_and(|id| written_tools.get(id).is_some_and(|count| *count > 0))
 				{
 					// The outcome write already stored this tool result, in order.
 					// Consume one occurrence: a provider may reuse a tool-call id.
@@ -1408,17 +1373,13 @@ impl DurableBoundary for DurableSession {
 					if let Some(count) = written_tools.get_mut(id) {
 						*count = count.saturating_sub(1);
 					}
-					tail_ids.push(
-						written_tool_ids
-							.get_mut(id)
-							.and_then(|ids| ids.pop_front()),
-					);
+					tail_ids.push(written_tool_ids.get_mut(id).and_then(|ids| ids.pop_front()));
 					continue;
 				}
- 				let Some(entry) = self.to_message_entry(message, parent.clone()) else {
- 					tail_ids.push(None);
- 					continue;
- 				};
+				let Some(entry) = self.to_message_entry(message, parent.clone()) else {
+					tail_ids.push(None);
+					continue;
+				};
 				if message.role == Role::Assistant {
 					*lock(&self.last_assistant_id) = Some(entry.id.clone());
 				}
@@ -1530,8 +1491,7 @@ impl DurableBoundary for DurableSession {
 				continue;
 			}
 			synthetic.push(
-				serde_json::to_value(message)
-					.map_err(|error| DurableError::new(error.to_string()))?,
+				serde_json::to_value(message).map_err(|error| DurableError::new(error.to_string()))?,
 			);
 		}
 		let projection = StoredProjection { kept, synthetic, anchor: None };
@@ -1570,11 +1530,11 @@ impl DurableBoundary for DurableSession {
 			.iter()
 			.map(|message| self.incoming_digest(message))
 			.collect();
- 		*lock(&self.tracked_ids) = ids;
+		*lock(&self.tracked_ids) = ids;
 		*lock(&self.last_assistant_id) = None;
- 		*lock(&self.resume_seed) = None;
- 		*lock(&self.projection) = parts.projection;
- 		Ok(())
+		*lock(&self.resume_seed) = None;
+		*lock(&self.projection) = parts.projection;
+		Ok(())
 	}
 
 	async fn begin_execution(&self, call: &ToolCall) -> Result<String, DurableError> {
@@ -1653,8 +1613,8 @@ impl DurableBoundary for DurableSession {
 				}
 				Ok(())
 			})
-		.await
-		.map_err(|error| DurableError::new(error.to_string()))
+			.await
+			.map_err(|error| DurableError::new(error.to_string()))
 	}
 
 	async fn finish_turn(
@@ -1683,7 +1643,11 @@ impl DurableBoundary for DurableSession {
 		Ok(())
 	}
 
-	async fn persist_partial_assistant(&self, text: &str, attempt: &str) -> Result<(), DurableError> {
+	async fn persist_partial_assistant(
+		&self,
+		text: &str,
+		attempt: &str,
+	) -> Result<(), DurableError> {
 		let session_id = self.session_id.clone();
 		let branch_id = lock(&self.cursor).branch.clone();
 		let text = text.to_string();
@@ -1711,10 +1675,7 @@ impl DurableBoundary for DurableSession {
 	fn child_durability_factory(&self) -> Option<Arc<dyn ChildDurabilityFactory>> {
 		Some(self.durable_child_factory())
 	}
-	async fn mark_deliveries_delivered(
-		&self,
-		delivery_ids: &[String],
-	) -> Result<(), DurableError> {
+	async fn mark_deliveries_delivered(&self, delivery_ids: &[String]) -> Result<(), DurableError> {
 		if delivery_ids.is_empty() {
 			return Ok(());
 		}
@@ -1731,10 +1692,7 @@ impl DurableBoundary for DurableSession {
 			.map_err(|error| DurableError::new(error.to_string()))
 	}
 
-	async fn mark_deliveries_processed(
-		&self,
-		delivery_ids: &[String],
-	) -> Result<(), DurableError> {
+	async fn mark_deliveries_processed(&self, delivery_ids: &[String]) -> Result<(), DurableError> {
 		if delivery_ids.is_empty() {
 			return Ok(());
 		}
@@ -1834,8 +1792,8 @@ impl DurableBoundary for DurableSession {
 				output::iso8601(SystemTime::now()),
 				session_message,
 			);
-			let entry_payload = serde_json::to_value(&message_entry)
-				.map_err(|e| DurableError::new(e.to_string()))?;
+			let entry_payload =
+				serde_json::to_value(&message_entry).map_err(|e| DurableError::new(e.to_string()))?;
 
 			let session_id_clone = session_id.clone();
 			let delivery_id_clone = delivery_id.clone();
@@ -1954,26 +1912,56 @@ impl std::fmt::Debug for StoreChildDurabilityFactory {
 impl StoreChildDurabilityFactory {
 	fn gate(&self, worker_id: &str) -> Arc<Mutex<()>> {
 		let mut gates = lock(&self.gates);
-		Arc::clone(gates.entry(worker_id.to_string()).or_insert_with(|| Arc::new(Mutex::new(()))))
+		Arc::clone(
+			gates
+				.entry(worker_id.to_string())
+				.or_insert_with(|| Arc::new(Mutex::new(()))),
+		)
 	}
 
-	fn open_session(&self, worker_id: &str) -> Result<(DurableSession, WorkerIdentity, Option<LoadedSession>), DurableError> {
-		if worker_id.is_empty() { return Err(DurableError::new("worker id must not be empty")); }
+	fn open_session(
+		&self,
+		worker_id: &str,
+	) -> Result<(DurableSession, WorkerIdentity, Option<LoadedSession>), DurableError> {
+		if worker_id.is_empty() {
+			return Err(DurableError::new("worker id must not be empty"));
+		}
 		let origin_branch_id = lock(&self.cursor).branch.clone();
 		let header = SessionHeader {
-			kind: "session".to_string(), version: 3, id: worker_id.to_string(), timestamp: output::iso8601(SystemTime::now()),
-			cwd: std::env::current_dir().map(|path| path.display().to_string()).unwrap_or_default(), model: None, provider: None,
-			title: None, title_source: None, additional_directories: Vec::new(), parent_session: Some(self.session_id.clone()),
-			previous_session_files: Vec::new(), provider_prompt_cache_key: None,
+			kind: "session".to_string(),
+			version: 3,
+			id: worker_id.to_string(),
+			timestamp: output::iso8601(SystemTime::now()),
+			cwd: std::env::current_dir()
+				.map(|path| path.display().to_string())
+				.unwrap_or_default(),
+			model: None,
+			provider: None,
+			title: None,
+			title_source: None,
+			additional_directories: Vec::new(),
+			parent_session: Some(self.session_id.clone()),
+			previous_session_files: Vec::new(),
+			provider_prompt_cache_key: None,
 		};
-		let writer = Arc::clone(&self.writer); let child_id = worker_id.to_string();
-		let (child, loaded) = run_blocking(move || DurableSession::open_with_writer(writer, &child_id, header)).map_err(|error| DurableError::new(error.to_string()))?;
-		let identity = WorkerIdentity { worker_id: worker_id.to_string(), session_id: self.session_id.clone(), origin_branch_id };
+		let writer = Arc::clone(&self.writer);
+		let child_id = worker_id.to_string();
+		let (child, loaded) =
+			run_blocking(move || DurableSession::open_with_writer(writer, &child_id, header))
+				.map_err(|error| DurableError::new(error.to_string()))?;
+		let identity = WorkerIdentity {
+			worker_id: worker_id.to_string(),
+			session_id: self.session_id.clone(),
+			origin_branch_id,
+		};
 		Ok((child, identity, loaded))
 	}
 
 	fn handle(child: DurableSession, identity: WorkerIdentity) -> ChildDurability {
-		let completion = Arc::new(StoreWorkerCompletion { writer: Arc::clone(&child.writer), identity: identity.clone() });
+		let completion = Arc::new(StoreWorkerCompletion {
+			writer: Arc::clone(&child.writer),
+			identity: identity.clone(),
+		});
 		ChildDurability::new(identity, Arc::new(child) as Arc<dyn DurableBoundary>, completion)
 	}
 }
@@ -1983,19 +1971,31 @@ fn replay_loaded_session(loaded: &LoadedSession) -> StoreResult<Vec<Message>> {
 		return crate::runtime::history_messages_from_entries(&loaded.branch_messages)
 			.map_err(|error| StoreError::Corrupt(error.to_string()));
 	};
-	let by_id: HashMap<&str, &MessageEntry> = loaded.messages.iter().map(|entry| (entry.id.as_str(), entry)).collect();
+	let by_id: HashMap<&str, &MessageEntry> = loaded
+		.messages
+		.iter()
+		.map(|entry| (entry.id.as_str(), entry))
+		.collect();
 	let mut restored = Vec::with_capacity(projection.kept.len() + projection.synthetic.len());
 	for value in &projection.synthetic {
-		restored.push(serde_json::from_value::<Message>(value.clone()).map_err(|error| StoreError::Corrupt(format!("child synthetic message: {error}")))?);
+		restored.push(
+			serde_json::from_value::<Message>(value.clone())
+				.map_err(|error| StoreError::Corrupt(format!("child synthetic message: {error}")))?,
+		);
 	}
 	let mut kept = Vec::with_capacity(projection.kept.len());
 	for kept_id in &projection.kept {
 		let Some(entry) = by_id.get(kept_id.as_str()) else {
-			return Err(StoreError::Corrupt(format!("child compaction projection references missing message {kept_id}")));
+			return Err(StoreError::Corrupt(format!(
+				"child compaction projection references missing message {kept_id}"
+			)));
 		};
 		kept.push((*entry).clone());
 	}
-	restored.extend(crate::runtime::history_messages_from_entries(&kept).map_err(|error| StoreError::Corrupt(error.to_string()))?);
+	restored.extend(
+		crate::runtime::history_messages_from_entries(&kept)
+			.map_err(|error| StoreError::Corrupt(error.to_string()))?,
+	);
 	Ok(restored)
 }
 impl ChildDurabilityFactory for StoreChildDurabilityFactory {
@@ -2006,20 +2006,26 @@ impl ChildDurabilityFactory for StoreChildDurabilityFactory {
 		Ok(Self::handle(child, identity))
 	}
 
-	fn open_child_with_replay(&self, worker_id: &str) -> Result<(ChildDurability, Option<Vec<Message>>), DurableError> {
+	fn open_child_with_replay(
+		&self,
+		worker_id: &str,
+	) -> Result<(ChildDurability, Option<Vec<Message>>), DurableError> {
 		let gate = self.gate(worker_id);
 		let _guard = lock(&gate);
 		let (child, identity, loaded) = self.open_session(worker_id)?;
-		let replay = loaded.as_ref().map(replay_loaded_session).transpose()
+		let replay = loaded
+			.as_ref()
+			.map(replay_loaded_session)
+			.transpose()
 			.map_err(|e| DurableError::new(e.to_string()))?;
 		Ok((Self::handle(child, identity), replay))
 	}
 
-    fn import_legacy_child(
-        &self,
-        worker_id: &str,
-        messages: &[Message],
-    ) -> Result<ChildDurability, DurableError> {
+	fn import_legacy_child(
+		&self,
+		worker_id: &str,
+		messages: &[Message],
+	) -> Result<ChildDurability, DurableError> {
 		let (child, identity, _) = self.open_session(worker_id)?;
 		let id = worker_id.to_string();
 		let existing = writer_call(&self.writer, move |store| {
@@ -2052,36 +2058,42 @@ impl ChildDurabilityFactory for StoreChildDurabilityFactory {
 				return Ok(None);
 			}
 			let snapshot = store.load_session_snapshot(&id)?;
-            let mut branch_messages = Vec::new();
-            for row in &snapshot.branch_messages {
-                let entry: SessionEntry = serde_json::from_value(row.payload.clone())
-                    .map_err(|error| StoreError::Corrupt(error.to_string()))?;
-                if entry.kind == "message" {
-                    branch_messages.push(serde_json::from_value::<MessageEntry>(row.payload.clone())
-                        .map_err(|error| StoreError::Corrupt(error.to_string()))?);
-                }
-            }
-            let Some(projection) = snapshot.projection else {
-                return crate::runtime::history_messages_from_entries(&branch_messages)
-                    .map(Some)
-                    .map_err(|error| StoreError::Corrupt(error.to_string()));
-            };
-            let mut session_messages = Vec::new();
-            for row in &snapshot.session_messages {
-                let entry: SessionEntry = serde_json::from_value(row.payload.clone())
-                    .map_err(|error| StoreError::Corrupt(error.to_string()))?;
-                if entry.kind == "message" {
-                    session_messages.push(serde_json::from_value::<MessageEntry>(row.payload.clone())
-                        .map_err(|error| StoreError::Corrupt(error.to_string()))?);
-                }
-            }
-			let by_id: HashMap<&str, &MessageEntry> =
-				session_messages.iter().map(|entry| (entry.id.as_str(), entry)).collect();
+			let mut branch_messages = Vec::new();
+			for row in &snapshot.branch_messages {
+				let entry: SessionEntry = serde_json::from_value(row.payload.clone())
+					.map_err(|error| StoreError::Corrupt(error.to_string()))?;
+				if entry.kind == "message" {
+					branch_messages.push(
+						serde_json::from_value::<MessageEntry>(row.payload.clone())
+							.map_err(|error| StoreError::Corrupt(error.to_string()))?,
+					);
+				}
+			}
+			let Some(projection) = snapshot.projection else {
+				return crate::runtime::history_messages_from_entries(&branch_messages)
+					.map(Some)
+					.map_err(|error| StoreError::Corrupt(error.to_string()));
+			};
+			let mut session_messages = Vec::new();
+			for row in &snapshot.session_messages {
+				let entry: SessionEntry = serde_json::from_value(row.payload.clone())
+					.map_err(|error| StoreError::Corrupt(error.to_string()))?;
+				if entry.kind == "message" {
+					session_messages.push(
+						serde_json::from_value::<MessageEntry>(row.payload.clone())
+							.map_err(|error| StoreError::Corrupt(error.to_string()))?,
+					);
+				}
+			}
+			let by_id: HashMap<&str, &MessageEntry> = session_messages
+				.iter()
+				.map(|entry| (entry.id.as_str(), entry))
+				.collect();
 			let mut restored = Vec::with_capacity(projection.kept.len() + projection.synthetic.len());
 			for value in &projection.synthetic {
-				restored.push(serde_json::from_value::<Message>(value.clone()).map_err(
-					|error| StoreError::Corrupt(format!("child synthetic message: {error}")),
-				)?);
+				restored.push(serde_json::from_value::<Message>(value.clone()).map_err(|error| {
+					StoreError::Corrupt(format!("child synthetic message: {error}"))
+				})?);
 			}
 			let mut kept = Vec::with_capacity(projection.kept.len());
 			for kept_id in &projection.kept {
@@ -2120,7 +2132,7 @@ impl ChildDurabilityFactory for StoreChildDurabilityFactory {
 				StoreError::Corrupt(format!("target session {branch_session} has no active branch"))
 			})
 		})
-			.map_err(|error| DurableError::new(error.to_string()))?;
+		.map_err(|error| DurableError::new(error.to_string()))?;
 		let delivery_id = format!("peer-{}", output::session_id());
 		let payload = serde_json::json!({
 			"kind": "peer-message",
@@ -2139,12 +2151,11 @@ impl ChildDurabilityFactory for StoreChildDurabilityFactory {
 			.map_err(|error| DurableError::new(error.to_string()))?;
 		Ok(delivery_id)
 	}
-
 }
 
 #[derive(Debug)]
 struct StoreWorkerCompletion {
-	writer:   Arc<DurableWriter>,
+	writer: Arc<DurableWriter>,
 	identity: WorkerIdentity,
 }
 
@@ -2156,9 +2167,7 @@ impl WorkerCompletionSink for StoreWorkerCompletion {
 		delivery: Value,
 	) -> Result<(), DurableError> {
 		if identity != &self.identity {
-			return Err(DurableError::new(
-				"worker identity does not match the opened child scope",
-			));
+			return Err(DurableError::new("worker identity does not match the opened child scope"));
 		}
 		let writer = Arc::clone(&self.writer);
 		let record = WorkerCompletion {
@@ -2220,10 +2229,7 @@ impl DurableSession {
 	}
 }
 
-fn load_parts(
-	store: &mut SqliteStore,
-	session_id: &str,
-) -> StoreResult<LoadedParts> {
+fn load_parts(store: &mut SqliteStore, session_id: &str) -> StoreResult<LoadedParts> {
 	store.recover_unmessaged_outcomes(session_id)?;
 	// Unresolved-intent recovery runs only from open_with_writer after the
 	// exclusive cooperative lease is held. load_parts stays callable for live
@@ -2263,28 +2269,25 @@ fn load_parts(
 		}
 	}
 	derive_turn_history(&branch_messages).map_err(StoreError::Corrupt)?;
-	Ok(LoadedParts {
-		branch_id,
-		leaf,
-		entries,
-		messages,
-		branch_messages,
-		header,
-		projection,
-	})
+	Ok(LoadedParts { branch_id, leaf, entries, messages, branch_messages, header, projection })
 }
 
 fn session_digest(message: &SessionMessage) -> u64 {
 	// Revision identity is the replay-visible content only. Provider metadata
 	// (api/model/usage/attribution/stopReason/disabledFeatures) is not restored
 	// by every resume path, so including it would make a valid replay diverge.
-	let canonical = serde_json::json!({
+	let mut canonical = serde_json::json!({
 		"role": message.role,
 		"content": message.content,
 		"toolCallId": message.tool_call_id,
 		"toolName": message.tool_name,
 		"isError": message.is_error,
 	});
+	// Persistence masks credentials in the stored payload, so the revision
+	// identity must be computed over the masked form too: hashing raw text
+	// here would disagree with the stored row after a branch cut or a
+	// message-keeping compaction and reject a valid resume seed.
+	crate::auth::error::redact_json_strings(&mut canonical);
 	xxh64(&serde_json::to_vec(&canonical).unwrap_or_default(), 0)
 }
 
@@ -2299,13 +2302,11 @@ fn seed_entries(
 	let by_id: HashMap<&str, &MessageEntry> =
 		all.iter().map(|entry| (entry.id.as_str(), entry)).collect();
 	let source: Vec<MessageEntry> = match projection {
-		Some(projection) => {
-			projection
-				.kept
-				.iter()
-				.filter_map(|id| by_id.get(id.as_str()).map(|entry| (*entry).clone()))
-				.collect()
-		},
+		Some(projection) => projection
+			.kept
+			.iter()
+			.filter_map(|id| by_id.get(id.as_str()).map(|entry| (*entry).clone()))
+			.collect(),
 		None => {
 			// Mirror `CheckpointHost::context_messages`: an assistant batch may
 			// have sibling tool results on another branch; they are replayed
@@ -2402,9 +2403,7 @@ fn seed_entries(
 
 	replayable
 		.into_iter()
-		.filter(|entry| {
-			matches!(entry.message.role.as_str(), "user" | "assistant" | "toolResult")
-		})
+		.filter(|entry| matches!(entry.message.role.as_str(), "user" | "assistant" | "toolResult"))
 		.map(|entry| projected_digest(entry).map(|digest| (digest, Some(entry.id.clone()))))
 		.collect()
 }
@@ -2414,7 +2413,6 @@ pub fn validate_replay_seed(branch: &[MessageEntry]) -> StoreResult<()> {
 	seed_entries(branch, None, branch).map(|_| ())
 }
 
-
 #[cfg(test)]
 mod runtime_replay_validation_tests {
 	use super::validate_runtime_replay;
@@ -2422,19 +2420,35 @@ mod runtime_replay_validation_tests {
 
 	#[test]
 	fn synthetic_tool_call_pairs_with_kept_tool_result() {
-		let synthetic = Message::assistant_with_tools("call", vec![ToolCall { id: "c1".into(), name: "tool".into(), arguments: serde_json::json!({}) }]);
+		let synthetic = Message::assistant_with_tools(
+			"call",
+			vec![ToolCall { id: "c1".into(), name: "tool".into(), arguments: serde_json::json!({}) }],
+		);
 		let result = Message::tool_with_status("c1", "tool", "ok", false);
 		assert!(validate_runtime_replay(&[synthetic, result]).is_ok());
 	}
 
 	#[test]
 	fn synthetic_dangling_tool_call_fails_closed() {
-		let synthetic = Message::assistant_with_tools("call", vec![ToolCall { id: "missing".into(), name: "tool".into(), arguments: serde_json::json!({}) }]);
+		let synthetic = Message::assistant_with_tools(
+			"call",
+			vec![ToolCall {
+				id: "missing".into(),
+				name: "tool".into(),
+				arguments: serde_json::json!({}),
+			}],
+		);
 		assert!(validate_runtime_replay(&[synthetic]).is_err());
 	}
 	#[test]
 	fn duplicate_call_ids_require_matching_result_count() {
-		let calls = Message::assistant_with_tools("call", vec![ToolCall { id: "same".into(), name: "tool".into(), arguments: serde_json::json!({}) }, ToolCall { id: "same".into(), name: "tool".into(), arguments: serde_json::json!({}) }]);
+		let calls = Message::assistant_with_tools(
+			"call",
+			vec![
+				ToolCall { id: "same".into(), name: "tool".into(), arguments: serde_json::json!({}) },
+				ToolCall { id: "same".into(), name: "tool".into(), arguments: serde_json::json!({}) },
+			],
+		);
 		let result = || Message::tool_with_status("same", "tool", "ok", false);
 		assert!(validate_runtime_replay(&[calls.clone(), result()]).is_err());
 		assert!(validate_runtime_replay(&[calls, result(), result()]).is_ok());
@@ -2442,8 +2456,17 @@ mod runtime_replay_validation_tests {
 
 	#[test]
 	fn runtime_tool_call_representation_uses_single_canonical_source() {
-		let mut message = Message::assistant_with_tools("call", vec![ToolCall { id: "same".into(), name: "tool".into(), arguments: serde_json::json!({}) }]);
-		message.parts.push(pi_agent::ContentPart::tool_call("same", "tool", serde_json::json!({})));
+		let mut message = Message::assistant_with_tools(
+			"call",
+			vec![ToolCall {
+				id: "same".into(),
+				name: "tool".into(),
+				arguments: serde_json::json!({}),
+			}],
+		);
+		message
+			.parts
+			.push(pi_agent::ContentPart::tool_call("same", "tool", serde_json::json!({})));
 		let result = Message::tool_with_status("same", "tool", "ok", false);
 		assert!(validate_runtime_replay(&[message, result]).is_ok());
 	}
@@ -2454,20 +2477,49 @@ pub fn validate_runtime_replay(messages: &[pi_agent::Message]) -> StoreResult<()
 	for message in messages {
 		match message.role {
 			pi_agent::Role::Assistant => {
-				if !pending.is_empty() { return Err(StoreError::Corrupt(format!("unresolvable dangling tool call(s): {}", pending.keys().cloned().collect::<Vec<_>>().join(", ")))); }
-				if !message.tool_calls.is_empty() { for call in &message.tool_calls { *pending.entry(call.id.clone()).or_default() += 1; } }
-				else { for part in &message.parts { if let pi_agent::ContentPart::ToolCall { id, .. } = part { *pending.entry(id.clone()).or_default() += 1; } } }
+				if !pending.is_empty() {
+					return Err(StoreError::Corrupt(format!(
+						"unresolvable dangling tool call(s): {}",
+						pending.keys().cloned().collect::<Vec<_>>().join(", ")
+					)));
+				}
+				if !message.tool_calls.is_empty() {
+					for call in &message.tool_calls {
+						*pending.entry(call.id.clone()).or_default() += 1;
+					}
+				} else {
+					for part in &message.parts {
+						if let pi_agent::ContentPart::ToolCall { id, .. } = part {
+							*pending.entry(id.clone()).or_default() += 1;
+						}
+					}
+				}
 			},
 			pi_agent::Role::Tool => {
-				let id = message.tool_call_id.as_deref().ok_or_else(|| StoreError::Corrupt("tool result missing toolCallId".into()))?;
-				let Some(count) = pending.get_mut(id) else { return Err(StoreError::Corrupt(format!("tool result has no pending call {id}"))); };
-				*count -= 1; if *count == 0 { pending.remove(id); }
+				let id = message
+					.tool_call_id
+					.as_deref()
+					.ok_or_else(|| StoreError::Corrupt("tool result missing toolCallId".into()))?;
+				let Some(count) = pending.get_mut(id) else {
+					return Err(StoreError::Corrupt(format!("tool result has no pending call {id}")));
+				};
+				*count -= 1;
+				if *count == 0 {
+					pending.remove(id);
+				}
 			},
-			pi_agent::Role::User if !pending.is_empty() => return Err(StoreError::Corrupt("user message interrupts unresolved tool calls".into())),
+			pi_agent::Role::User if !pending.is_empty() => {
+				return Err(StoreError::Corrupt("user message interrupts unresolved tool calls".into()));
+			},
 			_ => {},
 		}
 	}
-	if !pending.is_empty() { return Err(StoreError::Corrupt(format!("unresolvable dangling tool call(s): {}", pending.keys().cloned().collect::<Vec<_>>().join(", ")))); }
+	if !pending.is_empty() {
+		return Err(StoreError::Corrupt(format!(
+			"unresolvable dangling tool call(s): {}",
+			pending.keys().cloned().collect::<Vec<_>>().join(", ")
+		)));
+	}
 	Ok(())
 }
 
@@ -2484,10 +2536,7 @@ fn projected_digest(entry: &MessageEntry) -> StoreResult<u64> {
 			StoreError::Corrupt(format!("cannot project stored revision {}: {error}", entry.id))
 		})?;
 	let message = messages.pop().ok_or_else(|| {
-		StoreError::Corrupt(format!(
-			"stored revision {} has no replayable projection",
-			entry.id
-		))
+		StoreError::Corrupt(format!("stored revision {} has no replayable projection", entry.id))
 	})?;
 	let projected = DurableSession::project_message(&message).ok_or_else(|| {
 		StoreError::Corrupt(format!(
@@ -2536,7 +2585,9 @@ fn root_branch_id(session_id: &str) -> String {
 }
 
 fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
-	mutex.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+	mutex
+		.lock()
+		.unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 /// One stored session as ACP listing/export sees it.
@@ -2598,11 +2649,7 @@ pub fn session_exists(db_path: &Path, session_id: &str) -> StoreResult<bool> {
 		rusqlite::Connection::open_with_flags(db_path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
 	connection.busy_timeout(std::time::Duration::from_millis(5000))?;
 	let exists = connection
-		.query_row(
-			"SELECT 1 FROM sessions WHERE id = ? LIMIT 1",
-			[session_id],
-			|_row| Ok(()),
-		)
+		.query_row("SELECT 1 FROM sessions WHERE id = ? LIMIT 1", [session_id], |_row| Ok(()))
 		.optional()?
 		.is_some();
 	Ok(exists)
@@ -2741,8 +2788,9 @@ mod tests {
 				.expect("message");
 		}
 
-		let error = DurableSession::open(&path, "corrupt", header("corrupt", None))
-			.expect_err("invalid durable projection must fail closed, not fall back to the raw branch");
+		let error = DurableSession::open(&path, "corrupt", header("corrupt", None)).expect_err(
+			"invalid durable projection must fail closed, not fall back to the raw branch",
+		);
 		assert!(matches!(error, StoreError::Corrupt(_)), "unexpected error: {error}");
 
 		let store = SqliteStore::open(&path).expect("store");
@@ -2785,7 +2833,10 @@ mod tests {
 		assert!(matches!(error, StoreError::Corrupt(_)), "unexpected error: {error}");
 
 		let store = SqliteStore::open(&path).expect("store");
-		let session = store.session("malformed").expect("session").expect("exists");
+		let session = store
+			.session("malformed")
+			.expect("session")
+			.expect("exists");
 		assert_eq!(
 			session.payload["durableProjection"]["kept"],
 			serde_json::json!("nope"),
@@ -2822,93 +2873,99 @@ mod tests {
 		);
 		let _ = std::fs::remove_dir_all(dir);
 	}
-    #[tokio::test]
-    async fn child_revive_skips_metadata_rows() {
-        let (dir, path) = temp_db("child-metadata-revive");
-        let root = Arc::new(DurableSession::create(&path, header("root", None)).expect("create root"));
-        let factory = root.durable_child_factory();
-        let child = factory.open_child("mixed-child").expect("open child");
-        child.boundary().persist_messages(&[Message::user("history")]).await.expect("persist history");
-        let mut store = SqliteStore::open(&path).expect("open store");
-        let parent = store
-            .branch_messages("mixed-child.main")
-            .expect("load branch")
-            .last()
-            .expect("history row")
-            .id
-            .clone();
-        store.append_message(NewMessage {
+	#[tokio::test]
+	async fn child_revive_skips_metadata_rows() {
+		let (dir, path) = temp_db("child-metadata-revive");
+		let root =
+			Arc::new(DurableSession::create(&path, header("root", None)).expect("create root"));
+		let factory = root.durable_child_factory();
+		let child = factory.open_child("mixed-child").expect("open child");
+		child
+			.boundary()
+			.persist_messages(&[Message::user("history")])
+			.await
+			.expect("persist history");
+		let mut store = SqliteStore::open(&path).expect("open store");
+		let parent = store
+			.branch_messages("mixed-child.main")
+			.expect("load branch")
+			.last()
+			.expect("history row")
+			.id
+			.clone();
+		store.append_message(NewMessage {
             id: "meta-1".to_string(),
             session_id: "mixed-child".to_string(),
             branch_id: "mixed-child.main".to_string(),
             parent_message_id: Some(parent.clone()),
             payload: serde_json::json!({ "type": "model_change", "id": "meta-1", "parentId": parent, "timestamp": "2026-01-01T00:00:00Z", "model": "fixture" }),
         }).expect("append metadata");
-        drop(store);
-        let revived = factory.load_child_messages("mixed-child").expect("revive").expect("exists");
-        assert_eq!(revived.len(), 1);
-        assert_eq!(revived[0].content, "history");
-        let _ = std::fs::remove_dir_all(dir);
-    }
+		drop(store);
+		let revived = factory
+			.load_child_messages("mixed-child")
+			.expect("revive")
+			.expect("exists");
+		assert_eq!(revived.len(), 1);
+		assert_eq!(revived[0].content, "history");
+		let _ = std::fs::remove_dir_all(dir);
+	}
 
+	#[tokio::test]
+	async fn fresh_child_replay_fails_closed_on_corrupt_projection() {
+		let (dir, path) = temp_db("child-corrupt-projection");
+		let root = Arc::new(
+			DurableSession::create(&path, header("root", None)).expect("create root session"),
+		);
+		let factory = root.durable_child_factory();
+		let child = factory
+			.open_child("corrupt-child")
+			.expect("open child scope");
+		child
+			.boundary()
+			.persist_messages(&[Message::user("durable history")])
+			.await
+			.expect("persist child history");
+		// Keep projection references valid so reconciliation preserves projection;
+		// corrupt synthetic payload must fail during fresh-child replay.
+		let mut store = SqliteStore::open(&path).expect("open fixture store");
+		let message_id = store
+			.branch_messages("corrupt-child.main")
+			.expect("load child branch")
+			.first()
+			.expect("child history row")
+			.id
+			.clone();
+		let mut payload = store
+			.session("corrupt-child")
+			.expect("load child session")
+			.expect("child session exists")
+			.payload;
+		payload["durableProjection"] = serde_json::json!({
+			 "kept": [message_id],
+			 "synthetic": [{"not": "a message"}],
+			 "anchor": null,
+		});
+		store
+			.update_session_payload("corrupt-child", payload)
+			.expect("persist corrupt projection");
+		drop(store);
+		drop(child);
 
-    #[tokio::test]
-    async fn fresh_child_replay_fails_closed_on_corrupt_projection() {
-        let (dir, path) = temp_db("child-corrupt-projection");
-        let root = Arc::new(
-            DurableSession::create(&path, header("root", None)).expect("create root session"),
-        );
-        let factory = root.durable_child_factory();
-        let child = factory
-            .open_child("corrupt-child")
-            .expect("open child scope");
-        child
-            .boundary()
-            .persist_messages(&[Message::user("durable history")])
-            .await
-            .expect("persist child history");
-        // Keep projection references valid so reconciliation preserves projection;
-        // corrupt synthetic payload must fail during fresh-child replay.
-        let mut store = SqliteStore::open(&path).expect("open fixture store");
-        let message_id = store
-            .branch_messages("corrupt-child.main")
-            .expect("load child branch")
-            .first()
-            .expect("child history row")
-            .id
-            .clone();
-        let mut payload = store
-            .session("corrupt-child")
-            .expect("load child session")
-            .expect("child session exists")
-            .payload;
-        payload["durableProjection"] = serde_json::json!({
-            "kept": [message_id],
-            "synthetic": [{"not": "a message"}],
-            "anchor": null,
-        });
-        store
-            .update_session_payload("corrupt-child", payload)
-            .expect("persist corrupt projection");
-        drop(store);
-        drop(child);
-
-        let error = factory
-            .open_child_with_replay("corrupt-child")
-            .expect_err("fresh-child replay must fail on corrupt projection");
-        let message = error.to_string();
-        assert!(
-            message.contains("synthetic") || message.contains("missing field role"),
-            "replay error must identify invalid synthetic projection data: {message}"
-        );
-        let _ = std::fs::remove_dir_all(dir);
-    }
+		let error = factory
+			.open_child_with_replay("corrupt-child")
+			.expect_err("fresh-child replay must fail on corrupt projection");
+		let message = error.to_string();
+		assert!(
+			message.contains("synthetic") || message.contains("missing field role"),
+			"replay error must identify invalid synthetic projection data: {message}"
+		);
+		let _ = std::fs::remove_dir_all(dir);
+	}
 
 	#[tokio::test]
 	async fn corrupt_resume_seed_stays_readable_and_fails_every_write() {
 		let (dir, path) = temp_db("corrupt-seed");
-		let session =
-			DurableSession::create(&path, header("corrupt", None)).expect("create session");
+		let session = DurableSession::create(&path, header("corrupt", None)).expect("create session");
 		let user = MessageEntry::new(
 			"msg-u",
 			None,
