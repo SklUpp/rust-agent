@@ -1448,6 +1448,9 @@ impl SqliteStore {
 		if session.parent_session_id.as_deref() == Some(session.id.as_str()) {
 			return Err(StoreError::Validation("a session cannot be its own parent".to_string()));
 		}
+		let mut session = session;
+		crate::auth::error::redact_json_strings(&mut session.payload);
+		crate::auth::error::redact_json_strings(&mut session.initial_branch_payload);
 		let now = now_ms();
 		let transaction = self.connection.transaction()?;
 		let exists: bool = transaction.query_row(
@@ -1940,6 +1943,10 @@ impl SqliteStore {
 				"generated execution key collided with the provider call id".to_string(),
 			));
 		}
+		// The intent is replayed after a crash, so it passes the same exact-secret
+		// gate as messages: masking happens on the write path only.
+		let mut intent_payload = intent.payload;
+		crate::auth::error::redact_json_strings(&mut intent_payload);
 		let now = now_ms();
 		let transaction = self.connection.transaction()?;
 		let branch_session: Option<String> = transaction
@@ -1973,7 +1980,7 @@ impl SqliteStore {
 				intent.branch_id,
 				intent.provider_call_id,
 				intent.tool_name,
-				encode_json(&intent.payload)?,
+				encode_json(&intent_payload)?,
 				now
 			],
 		)?;
@@ -2773,6 +2780,11 @@ impl SqliteStore {
 		validate_id("delivery id", &completion.delivery_id)?;
 		validate_id("session id", &completion.session_id)?;
 		validate_id("origin branch id", &completion.origin_branch_id)?;
+		// Mask before encoding and before the idempotency comparisons below: a
+		// repeat carries the raw payload while the stored row is masked.
+		let mut completion = completion;
+		crate::auth::error::redact_json_strings(&mut completion.completion);
+		crate::auth::error::redact_json_strings(&mut completion.delivery);
 		let completion_json = encode_json(&completion.completion)?;
 		let delivery_json = encode_json(&completion.delivery)?;
 		let now = now_ms();
@@ -2935,6 +2947,8 @@ impl SqliteStore {
 		validate_id("worker id", &delivery.worker_id)?;
 		validate_id("delivery session id", &delivery.session_id)?;
 		validate_id("delivery origin branch id", &delivery.origin_branch_id)?;
+		let mut delivery = delivery;
+		crate::auth::error::redact_json_strings(&mut delivery.payload);
 		let payload_json = encode_json(&delivery.payload)?;
 		let transaction = self.connection.transaction()?;
 		let origin_session: Option<String> = transaction
@@ -3356,6 +3370,8 @@ impl SqliteStore {
 		validate_id("artifact id", &artifact.artifact_id)?;
 		validate_id("artifact session id", &artifact.session_id)?;
 		validate_id("artifact location", &artifact.location)?;
+		let mut artifact = artifact;
+		crate::auth::error::redact_json_strings(&mut artifact.metadata);
 		let metadata_json = encode_json(&artifact.metadata)?;
 		let now = now_ms();
 		let transaction = self.connection.transaction()?;
@@ -3600,6 +3616,8 @@ impl SqliteStore {
 	/// lineage, or active branch.
 	pub fn update_session_payload(&mut self, session_id: &str, payload: Value) -> StoreResult<()> {
 		validate_id("session id", session_id)?;
+		let mut payload = payload;
+		crate::auth::error::redact_json_strings(&mut payload);
 		let encoded = encode_json(&payload)?;
 		let changed = self.connection.execute(
 			"UPDATE sessions SET payload_json = ?1, updated_at_ms = ?2 WHERE id = ?3",
@@ -4059,7 +4077,9 @@ fn record_outcome_tx(
 	now: i64,
 ) -> StoreResult<bool> {
 	validate_id("execution id", execution_id)?;
-	let encoded = encode_json(outcome)?;
+	let mut redacted_outcome = outcome.clone();
+	crate::auth::error::redact_json_strings(&mut redacted_outcome);
+	let encoded = encode_json(&redacted_outcome)?;
 	let existing: Option<Option<String>> = transaction
 		.query_row(
 			"SELECT outcome_json FROM executions WHERE execution_id = ?1",
@@ -4072,7 +4092,10 @@ fn record_outcome_tx(
 	};
 	if let Some(existing) = existing {
 		let existing = decode_json(&existing)?;
-		if existing == *outcome {
+		// Rows written before the redaction layer hold the raw value; repeating
+		// the original payload must stay idempotent even though new rows store
+		// the masked form.
+		if existing == redacted_outcome || existing == *outcome {
 			return Ok(false);
 		}
 		return Err(StoreError::Conflict(format!(
@@ -10341,6 +10364,122 @@ mod tests {
 		assert!(!text.contains(secret), "stored payload must be masked: {text}");
 		assert!(text.contains("[REDACTED]"));
 		assert!(text.contains("and failed"));
+		let _ = std::fs::remove_dir_all(dir);
+	}
+
+	#[test]
+	fn execution_delivery_artifact_and_header_rows_are_redacted_before_persist() {
+		let secret = "row-registry-secret-71e0a4";
+		crate::auth::known_secrets::register(secret);
+		let (dir, path) = temp_db("row-redaction");
+		let mut store = SqliteStore::open(&path).expect("open store");
+		store
+			.create_session(NewSession {
+				id: "s_rows".to_string(),
+				parent_session_id: None,
+				payload: json!({ "title": format!("first turn {secret}") }),
+				initial_branch_id: "b1".to_string(),
+				initial_branch_payload: json!({}),
+			})
+			.expect("create session");
+		let header = store.session("s_rows").expect("read").expect("present");
+		assert!(
+			!header.payload.to_string().contains(secret),
+			"creation payload masked: {}",
+			header.payload
+		);
+
+		let execution_id = store
+			.record_intent(NewIntent {
+				session_id: "s_rows".to_string(),
+				branch_id: "b1".to_string(),
+				provider_call_id: "call_rows".to_string(),
+				tool_name: "shell".to_string(),
+				payload: json!({ "command": format!("curl -H 'Authorization: Bearer {secret}'") }),
+			})
+			.expect("record intent");
+		let intent = store
+			.execution(&execution_id)
+			.expect("read")
+			.expect("present");
+		assert!(!intent.intent.to_string().contains(secret), "intent masked: {}", intent.intent);
+		store
+			.record_outcome(&execution_id, json!({ "output": format!("token={secret}") }))
+			.expect("record outcome");
+		let outcome = store
+			.outcome(&execution_id)
+			.expect("read")
+			.expect("present");
+		assert!(!outcome.to_string().contains(secret), "outcome masked: {outcome}");
+		// Repeating the raw payload must stay idempotent although the stored row
+		// is masked.
+		store
+			.record_outcome(&execution_id, json!({ "output": format!("token={secret}") }))
+			.expect("repeat outcome");
+
+		store
+			.enqueue_delivery(NewDelivery {
+				delivery_id: "d_rows".to_string(),
+				worker_id: "w_rows".to_string(),
+				session_id: "s_rows".to_string(),
+				origin_branch_id: "b1".to_string(),
+				payload: json!({ "text": format!("mail {secret}") }),
+			})
+			.expect("enqueue delivery");
+		let deliveries = store.pending_deliveries("s_rows").expect("read deliveries");
+		assert!(
+			!deliveries[0].payload.to_string().contains(secret),
+			"delivery masked: {}",
+			deliveries[0].payload
+		);
+
+		store
+			.complete_worker(WorkerCompletion {
+				worker_id: "w_rows2".to_string(),
+				delivery_id: "d_rows2".to_string(),
+				session_id: "s_rows".to_string(),
+				origin_branch_id: "b1".to_string(),
+				completion: json!({ "summary": format!("done {secret}") }),
+				delivery: json!({ "text": format!("worker said {secret}") }),
+			})
+			.expect("complete worker");
+		let completion_json: String = store
+			.connection
+			.query_row(
+				"SELECT completion_json FROM worker_completions WHERE worker_id = 'w_rows2'",
+				[],
+				|row| row.get(0),
+			)
+			.expect("read completion");
+		assert!(!completion_json.contains(secret), "completion masked: {completion_json}");
+
+		store
+			.record_artifact(NewArtifact {
+				artifact_id: "a_rows".to_string(),
+				session_id: "s_rows".to_string(),
+				branch_id: Some("b1".to_string()),
+				execution_id: Some(execution_id),
+				location: "/tmp/row-artifact".to_string(),
+				metadata: json!({ "preview": format!("artifact {secret}") }),
+			})
+			.expect("record artifact");
+		let artifacts = store.artifacts("s_rows").expect("read artifacts");
+		assert!(
+			!artifacts[0].metadata.to_string().contains(secret),
+			"artifact metadata masked: {}",
+			artifacts[0].metadata
+		);
+
+		store
+			.update_session_payload("s_rows", json!({ "title": format!("renamed {secret}") }))
+			.expect("update header");
+		let header = store.session("s_rows").expect("read").expect("present");
+		assert!(
+			!header.payload.to_string().contains(secret),
+			"updated header masked: {}",
+			header.payload
+		);
+		assert!(header.payload.to_string().contains("[REDACTED]"));
 		let _ = std::fs::remove_dir_all(dir);
 	}
 
