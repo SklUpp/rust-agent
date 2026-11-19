@@ -442,6 +442,26 @@ impl McpConnection {
 		Ok(())
 	}
 
+	/// Force a replacement for a failure class that leaves the transport
+	/// "healthy" (404, reset, timeout). Runs under the state barrier so
+	/// concurrent retries do not each handshake, and skips the replacement
+	/// when the installed epoch is no longer the one the failed request used:
+	/// another caller already replaced it.
+	async fn reconnect_until(
+		&self,
+		deadline: Option<Instant>,
+		used_epoch: u64,
+	) -> Result<(), McpError> {
+		let _state = self.lock_state(deadline, "reconnect").await?;
+		if self.closed.load(Ordering::Acquire) {
+			return Err(McpError::Closed);
+		}
+		if self.transport_epoch.load(Ordering::Acquire) == used_epoch && !self.transport_broken() {
+			self.reconnect_locked(deadline).await?;
+		}
+		Ok(())
+	}
+
 	pub async fn reconnect(&self) -> Result<(), McpError> {
 		let _guard = self.state_barrier.lock().await;
 		self.reconnect_locked(None).await
@@ -476,6 +496,7 @@ impl McpConnection {
 				},
 				None => None,
 			};
+			let used_epoch = self.transport_epoch.load(Ordering::Acquire);
 			let call_res = self
 				.request_value("tools/list", Some(params.clone()), deadline)
 				.await;
@@ -493,7 +514,7 @@ impl McpConnection {
 					if !self.transport_broken() {
 						// The reconnect is part of what the caller asked for, so
 						// it shares the request deadline.
-						self.reconnect_locked(deadline).await?;
+						self.reconnect_until(deadline, used_epoch).await?;
 					}
 					self
 						.request_value("tools/list", Some(params), deadline)
