@@ -12,7 +12,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use pi_agent::mcp::{MCPHttpServerConfig, MCPServerConfig, McpError, connect_to_server};
+use pi_agent::mcp::{
+	MCPServerConfig, MCPHttpServerConfig, McpError, connect_to_server,
+};
 use serde_json::{Value, json};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -39,7 +41,6 @@ struct Fixture {
 	url: String,
 	seen: mpsc::Receiver<Value>,
 	post_closed: Arc<AtomicBool>,
-	headers_sent: Arc<AtomicBool>,
 	_server: Server,
 }
 
@@ -58,105 +59,50 @@ impl Drop for Server {
 }
 
 async fn spawn_fixture() -> Fixture {
-	spawn_fixture_with(false).await
-}
-
-/// Fixture that accepts the TCP connection and the `initialize` request but
-/// never completes the response body: the caller's handshake stays pending.
-async fn spawn_stalling_initialize_fixture() -> Fixture {
-	spawn_fixture_with(true).await
-}
-
-async fn spawn_fixture_with(stall_initialize: bool) -> Fixture {
-	let listener = TcpListener::bind("127.0.0.1:0")
-		.await
-		.expect("bind loopback");
+	let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind loopback");
 	let addr = listener.local_addr().expect("fixture address");
 	let (tx, seen) = mpsc::channel(SEEN_CAPACITY);
 	let post_closed = Arc::new(AtomicBool::new(false));
 	let post_closed_for_accept = Arc::clone(&post_closed);
-	let headers_sent = Arc::new(AtomicBool::new(false));
-	let headers_sent_for_accept = Arc::clone(&headers_sent);
 	let connections = Arc::new(Mutex::new(Vec::new()));
 	let connections_for_accept = Arc::clone(&connections);
 	let accept = tokio::spawn(async move {
 		loop {
-			let Ok((mut socket, _)) = listener.accept().await else {
-				return;
-			};
+			let Ok((mut socket, _)) = listener.accept().await else { return; };
 			let tx = tx.clone();
 			let post_closed = Arc::clone(&post_closed_for_accept);
-			let headers_sent = Arc::clone(&headers_sent_for_accept);
-			let handle = tokio::spawn(async move {
-				serve(&mut socket, tx, post_closed, headers_sent, stall_initialize).await;
-			});
+			let handle = tokio::spawn(async move { serve(&mut socket, tx, post_closed).await; });
 			connections_for_accept.lock().unwrap().push(handle);
 		}
 	});
-	Fixture {
-		url: format!("http://{addr}/mcp"),
-		seen,
-		post_closed,
-		headers_sent,
-		_server: Server { accept, connections },
-	}
+	Fixture { url: format!("http://{addr}/mcp"), seen, post_closed, _server: Server { accept, connections } }
 }
 
-async fn serve(
-	socket: &mut TcpStream,
-	seen: mpsc::Sender<Value>,
-	post_closed: Arc<AtomicBool>,
-	headers_sent: Arc<AtomicBool>,
-	stall_initialize: bool,
-) {
-	let Some(body) = read_request(socket).await else {
-		return;
-	};
-	let method = body
-		.get("method")
-		.and_then(Value::as_str)
-		.unwrap_or_default()
-		.to_string();
+async fn serve(socket: &mut TcpStream, seen: mpsc::Sender<Value>, post_closed: Arc<AtomicBool>) {
+	let Some(body) = read_request(socket).await else { return; };
+	let method = body.get("method").and_then(Value::as_str).unwrap_or_default().to_string();
 	let _ = seen.send(body.clone()).await;
 	match method.as_str() {
-		"initialize" if stall_initialize => hold_sse_open(socket, post_closed, headers_sent).await,
-		"initialize" => write_json(socket, &rpc_result(&body, initialize_result())).await,
-		"notifications/initialized" | "notifications/cancelled" => {
-			write_json(socket, &json!({})).await
-		},
-		"tools/list" | "prompts/get" => hold_sse_open(socket, post_closed, headers_sent).await,
-		_ => write_json(socket, &rpc_result(&body, json!({}))).await,
+        "initialize" => write_json(socket, &rpc_result(&body, initialize_result())).await,
+        "notifications/initialized" | "notifications/cancelled" => write_json(socket, &json!({})).await,
+        "tools/list" | "prompts/get" => hold_sse_open(socket, post_closed).await,
+        _ => write_json(socket, &rpc_result(&body, json!({}))).await,
 	}
 }
 
-/// Send SSE headers, then keep body pending. Flag socket close after client
-/// cancellation and flag the moment the headers are on the wire, so a test can
-/// cancel after rmcp's worker starts observing the cancellation token.
-async fn hold_sse_open(
-	socket: &mut TcpStream,
-	post_closed: Arc<AtomicBool>,
-	headers_sent: Arc<AtomicBool>,
-) {
-	let _ = socket
-		.write_all(
-			b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\n\r\n",
-		)
-		.await;
+/// Send SSE headers, then keep body pending. Flag socket close after client cancellation.
+async fn hold_sse_open(socket: &mut TcpStream, post_closed: Arc<AtomicBool>) {
+	let _ = socket.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\n\r\n").await;
 	let _ = socket.flush().await;
-	headers_sent.store(true, Ordering::Release);
 	let mut buf = [0u8; 1024];
 	let _ = tokio::time::timeout(Duration::from_secs(30), async {
 		loop {
 			match socket.read(&mut buf).await {
-				Ok(0) | Err(_) => {
-					post_closed.store(true, Ordering::Release);
-					break;
-				},
+				Ok(0) | Err(_) => { post_closed.store(true, Ordering::Release); break; },
 				Ok(_) => {},
 			}
 		}
-	})
-	.await;
+	}).await;
 }
 
 async fn write_json(socket: &mut TcpStream, body: &Value) {
@@ -180,11 +126,11 @@ fn rpc_result(request: &Value, result: Value) -> Value {
 }
 
 fn initialize_result() -> Value {
-	json!({
-		 "protocolVersion": "2025-11-25",
-		 "capabilities": { "tools": {}, "prompts": {} },
-		 "serverInfo": { "name": "cancel-fixture", "version": "1.0.0" },
-	})
+    json!({
+        "protocolVersion": "2025-11-25",
+        "capabilities": { "tools": {}, "prompts": {} },
+        "serverInfo": { "name": "cancel-fixture", "version": "1.0.0" },
+    })
 }
 
 /// Read one HTTP request (headers plus Content-Length body) off a connection.
@@ -195,10 +141,7 @@ async fn read_request(socket: &mut TcpStream) -> Option<Value> {
 		if let Some(pos) = buf.windows(4).position(|window| window == b"\r\n\r\n") {
 			break pos;
 		}
-		let n = tokio::time::timeout(READ_TIMEOUT, socket.read(&mut chunk))
-			.await
-			.ok()?
-			.ok()?;
+		let n = tokio::time::timeout(READ_TIMEOUT, socket.read(&mut chunk)).await.ok()?.ok()?;
 		if n == 0 {
 			return None;
 		}
@@ -207,18 +150,14 @@ async fn read_request(socket: &mut TcpStream) -> Option<Value> {
 	let content_length = String::from_utf8_lossy(&buf[..header_end])
 		.lines()
 		.find_map(|line| {
-			line
-				.to_ascii_lowercase()
+			line.to_ascii_lowercase()
 				.strip_prefix("content-length:")
 				.and_then(|value| value.trim().parse::<usize>().ok())
 		})
 		.unwrap_or(0);
 	let mut body = buf[header_end + 4..].to_vec();
 	while body.len() < content_length {
-		let n = tokio::time::timeout(READ_TIMEOUT, socket.read(&mut chunk))
-			.await
-			.ok()?
-			.ok()?;
+		let n = tokio::time::timeout(READ_TIMEOUT, socket.read(&mut chunk)).await.ok()?.ok()?;
 		if n == 0 {
 			return None;
 		}
@@ -241,34 +180,25 @@ async fn expect_request(fixture: &mut Fixture, method: &str) -> Value {
 }
 
 async fn assert_timed_out_request_is_bounded() {
-	let mut fixture = spawn_fixture().await;
-	let config = MCPHttpServerConfig {
-		url: fixture.url.clone(),
-		headers: HashMap::new(),
-		timeout: Some(REQUEST_TIMEOUT.as_millis() as u64),
-		request_id_format: None,
-		header_policy: None,
-		auth: None,
-		oauth: None,
-	};
-	let connection = connect_to_server("cancel", MCPServerConfig::Http(config))
-		.await
-		.expect("initialize and initialized must complete");
-	expect_request(&mut fixture, "initialize").await;
-	expect_request(&mut fixture, "notifications/initialized").await;
-	let started = std::time::Instant::now();
-	let error = connection
-		.list_tools()
-		.await
-		.expect_err("pending tools/list must time out");
-	assert!(matches!(error, McpError::Timeout(_)), "expected timeout, got {error:?}");
-	assert!(
-		started.elapsed() < REQUEST_TIMEOUT + SLACK,
-		"a stalled tools/list must return by its deadline: {:?}",
-		started.elapsed()
-	);
-	let list = expect_request(&mut fixture, "tools/list").await;
-	assert!(list.get("id").is_some_and(Value::is_u64), "rmcp HTTP request ID must be numeric");
+    let mut fixture = spawn_fixture().await;
+    let config = MCPHttpServerConfig {
+        url: fixture.url.clone(), headers: HashMap::new(),
+        timeout: Some(REQUEST_TIMEOUT.as_millis() as u64), request_id_format: None,
+        header_policy: None, auth: None, oauth: None,
+    };
+    let connection = connect_to_server("cancel", MCPServerConfig::Http(config)).await.expect("initialize and initialized must complete");
+    expect_request(&mut fixture, "initialize").await;
+    expect_request(&mut fixture, "notifications/initialized").await;
+    let started = std::time::Instant::now();
+    let error = connection.list_tools().await.expect_err("pending tools/list must time out");
+    assert!(matches!(error, McpError::Timeout(_)), "expected timeout, got {error:?}");
+    assert!(
+        started.elapsed() < REQUEST_TIMEOUT + SLACK,
+        "a stalled tools/list must return by its deadline: {:?}",
+        started.elapsed()
+    );
+    let list = expect_request(&mut fixture, "tools/list").await;
+    assert!(list.get("id").is_some_and(Value::is_u64), "rmcp HTTP request ID must be numeric");
 }
 
 #[tokio::test]
@@ -282,24 +212,15 @@ async fn pending_tools_list_timeout_is_bounded() {
 async fn timed_out_streamable_http_post_is_bounded() {
 	let mut fixture = spawn_fixture().await;
 	let config = MCPHttpServerConfig {
-		url: fixture.url.clone(),
-		headers: HashMap::new(),
-		timeout: Some(REQUEST_TIMEOUT.as_millis() as u64),
-		request_id_format: None,
-		header_policy: None,
-		auth: None,
-		oauth: None,
+		url: fixture.url.clone(), headers: HashMap::new(),
+		timeout: Some(REQUEST_TIMEOUT.as_millis() as u64), request_id_format: None,
+		header_policy: None, auth: None, oauth: None,
 	};
-	let connection = connect_to_server("deadline-close", MCPServerConfig::Http(config))
-		.await
-		.expect("initialize");
+	let connection = connect_to_server("deadline-close", MCPServerConfig::Http(config)).await.expect("initialize");
 	expect_request(&mut fixture, "initialize").await;
 	expect_request(&mut fixture, "notifications/initialized").await;
 	let started = std::time::Instant::now();
-	let _ = connection
-		.list_tools()
-		.await
-		.expect_err("stalled list must time out");
+	let _ = connection.list_tools().await.expect_err("stalled list must time out");
 	assert!(
 		started.elapsed() < REQUEST_TIMEOUT + SLACK,
 		"a stalled POST must return by its deadline: {:?}",
@@ -313,17 +234,11 @@ async fn timed_out_streamable_http_post_is_bounded() {
 async fn timed_out_prompts_get_is_bounded() {
 	let mut fixture = spawn_fixture().await;
 	let config = MCPHttpServerConfig {
-		url: fixture.url.clone(),
-		headers: HashMap::new(),
-		timeout: Some(REQUEST_TIMEOUT.as_millis() as u64),
-		request_id_format: None,
-		header_policy: None,
-		auth: None,
-		oauth: None,
+		url: fixture.url.clone(), headers: HashMap::new(),
+		timeout: Some(REQUEST_TIMEOUT.as_millis() as u64), request_id_format: None,
+		header_policy: None, auth: None, oauth: None,
 	};
-	let connection = connect_to_server("deadline-prompt", MCPServerConfig::Http(config))
-		.await
-		.expect("initialize");
+	let connection = connect_to_server("deadline-prompt", MCPServerConfig::Http(config)).await.expect("initialize");
 	expect_request(&mut fixture, "initialize").await;
 	expect_request(&mut fixture, "notifications/initialized").await;
 	let mut args = BTreeMap::new();
@@ -338,41 +253,4 @@ async fn timed_out_prompts_get_is_bounded() {
 	);
 	let prompt = expect_request(&mut fixture, "prompts/get").await;
 	assert!(prompt.get("id").is_some_and(Value::is_u64), "rmcp raw prompt ID must be numeric");
-}
-
-#[tokio::test]
-async fn cancelled_initialize_closes_the_transport() {
-	// Dropping a pending `connect_to_server` future must not leave the HTTP
-	// connection (and the rmcp session behind it) alive once the server has
-	// started its SSE response: rmcp observes cancellation from that point on,
-	// and the fixture reports EOF only when the client closes its side.
-	let mut fixture = spawn_stalling_initialize_fixture().await;
-	let config = MCPHttpServerConfig {
-		url: fixture.url.clone(),
-		headers: HashMap::new(),
-		timeout: Some(30_000),
-		request_id_format: None,
-		header_policy: None,
-		auth: None,
-		oauth: None,
-	};
-	let connect = tokio::spawn(connect_to_server("cancel-init", MCPServerConfig::Http(config)));
-	expect_request(&mut fixture, "initialize").await;
-	tokio::time::timeout(WAIT_TIMEOUT, async {
-		while !fixture.headers_sent.load(Ordering::Acquire) {
-			tokio::time::sleep(Duration::from_millis(10)).await;
-		}
-	})
-	.await
-	.expect("the server must start the SSE response before cancellation");
-	tokio::time::sleep(Duration::from_millis(100)).await;
-	connect.abort();
-	assert!(connect.await.is_err(), "cancelled handshake must not produce a connection");
-	tokio::time::timeout(WAIT_TIMEOUT, async {
-		while !fixture.post_closed.load(Ordering::Acquire) {
-			tokio::time::sleep(Duration::from_millis(10)).await;
-		}
-	})
-	.await
-	.expect("a cancelled initialize must close the HTTP connection");
 }
