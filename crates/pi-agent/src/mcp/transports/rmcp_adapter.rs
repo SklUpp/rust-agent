@@ -437,19 +437,37 @@ fn http_status(error: &rmcp::transport::DynamicTransportError) -> Option<u16> {
 }
 
 fn map_initialize_error(error: rmcp::service::ClientInitializeError) -> McpError {
+	use rmcp::service::ClientInitializeError as InitError;
 	match error {
-		rmcp::service::ClientInitializeError::JsonRpcError(error) => McpError::JsonRpc {
+		InitError::JsonRpcError(error) => McpError::JsonRpc {
 			code: i64::from(error.code.0),
 			message: error.message.into_owned(),
 			data: error.data,
 		},
-		// `error` is the transport's own failure (for the streamable HTTP
-		// client, e.g. "Transport channel closed"); it is the only diagnostic
-		// that tells a broken stream from a rejected handshake, so it is kept.
-		rmcp::service::ClientInitializeError::TransportError { context, error } => {
-			McpError::Protocol(format!("MCP initialization failed: {context}: {error}"))
+		// rmcp embeds the request URL and a body preview in the transport
+		// message. Only a categorical form may leave this module: callers
+		// render `Display`, and a URL can carry credentials in its query.
+		InitError::TransportError { error, .. } => McpError::Protocol(match http_status(&error) {
+			Some(status) => format!("MCP initialization failed: HTTP {status}"),
+			None => {
+				"MCP initialization failed: transport closed before the handshake completed".to_string()
+			},
+		}),
+		InitError::ConnectionClosed(_) => {
+			McpError::Protocol("MCP initialization failed: connection closed".to_string())
 		},
-		other => McpError::Protocol(format!("MCP initialization failed: {other}")),
+		InitError::NoCompatibleProtocolVersion { client_supported, server_supported } => {
+			McpError::Protocol(format!(
+				"MCP initialization failed: no compatible protocol version (client: \
+				 {client_supported:?}, server: {server_supported:?})"
+			))
+		},
+		InitError::NoPreferredProtocolVersion => {
+			McpError::Protocol("MCP initialization failed: no preferred protocol version".to_string())
+		},
+		_ => {
+			McpError::Protocol("MCP initialization failed: unexpected handshake response".to_string())
+		},
 	}
 }
 
@@ -495,5 +513,44 @@ mod tests {
 	fn http_status_is_none_for_a_broken_stream() {
 		let error = transport_error(StreamableHttpError::TransportChannelClosed);
 		assert_eq!(http_status(&error), None);
+	}
+
+	#[derive(Debug)]
+	struct LeakyTransportError;
+
+	impl std::fmt::Display for LeakyTransportError {
+		fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+			f.write_str("failed to GET https://example.test/mcp?token=init-leak-secret")
+		}
+	}
+
+	impl std::error::Error for LeakyTransportError {}
+
+	#[test]
+	fn initialize_transport_error_does_not_echo_the_transport_text() {
+		// rmcp's transport text carries the request URL and a body preview.
+		// Both must stay inside the adapter: `Display` reaches logs and the UI.
+		let error = rmcp::service::ClientInitializeError::TransportError {
+			error: DynamicTransportError::from_parts(
+				"test",
+				std::any::TypeId::of::<()>(),
+				Box::new(LeakyTransportError),
+			),
+			context: "connect".into(),
+		};
+		let mapped = map_initialize_error(error).to_string();
+		assert!(!mapped.contains("init-leak-secret"), "transport text leaked: {mapped}");
+		assert!(!mapped.contains("example.test"), "URL leaked: {mapped}");
+		assert!(mapped.contains("transport closed"), "{mapped}");
+	}
+
+	#[test]
+	fn initialize_http_status_is_reported_without_the_body() {
+		let error = rmcp::service::ClientInitializeError::TransportError {
+			error: transport_error(StreamableHttpError::HttpStatus(HttpStatusError::new(503, None))),
+			context: "connect".into(),
+		};
+		let mapped = map_initialize_error(error).to_string();
+		assert!(mapped.contains("HTTP 503"), "{mapped}");
 	}
 }
