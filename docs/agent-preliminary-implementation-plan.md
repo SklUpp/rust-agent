@@ -12,7 +12,7 @@
 
 Дальнейший порядок:
 
-1. **MCP Streamable HTTP lifecycle** — отдельно: довести reconnect/close, cancel и deadline, независимое ревью, затем CI. Stdio-результаты HTTP не подтверждают.
+1. ~~**MCP Streamable HTTP lifecycle**~~ — закрыто `3ef4a36`…`7f90830`: единый teardown, epoch-протокол, категорийные сообщения, HTTP-статус из ошибки; независимое ревью, CI `44388709069` зелёный с HTTP-фикстурами. Остаток: живой smoke против внешнего MCP-сервера.
 2. **S4 durable `task`** — admission и crash recovery до снятия fail-closed; затем producer generation и FIFO writer barrier для cached revive.
 3. **S5 SQLITE_BUSY** — граница до statements и cancellation-aware контракт; повтор вокруг неоднозначного commit запрещён.
 4. **S3 процессы** — доказать TERM→KILL группе и межпроцессный lease; shell не является sandbox под тем же UID.
@@ -140,7 +140,7 @@
 - Gate: Cedar (G-auth) — optional engine; fallback hand-coded rules сохраняет ту же поверхность allow/deny + host-owned ask/trust/ceilings. Разделение полномочий: tool description hash / env-токены — не sandbox и не authority (D92: concerns разделены, env token не идентичность).
 
 ### S7. MCP (параллелимо после S2)
-**Статус 2026-11-18: partial.** Stdio на `rmcp 3.9.0` проверен; Streamable HTTP в рабочем дереве не завершён, в коммиты не входит и готовым не считается.
+**Статус 2026-11-19: done для согласованного контракта.** Stdio и Streamable HTTP на `rmcp 3.9.0` закоммичены и покрыты тестами (`mcp.rs`, `mcp_boundaries.rs`, `mcp_http_cancel.rs`, `mcp_redirect_contract.rs`); legacy SSE остаётся за конфигом `sse`. Не доказано: внешний MCP-сервер вживую, re-init после ротации session ID (по контракту не принимается), legacy stdio-транспорт не подключён.
 - Файлы: `mcp/` adapter модуль поверх rmcp; registry naming (`mcp/naming.rs`); trust-check до stdio spawn.
 - Acceptance: spawn без trust — отказ до запуска; имена привязаны к server identity (collision не вызывает чужой сервер); бинарные resources с типами/MIME (не «всё в base64-text»); sampling/elicitation — через policy/budgets; cancel ≠ отмена remote effect (unknown outcome записывается); capability matrix выбранной версии задокументирована (D54 «полный» = выбранный matrix, не «всё сразу»).
 
