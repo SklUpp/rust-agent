@@ -436,6 +436,24 @@ fn http_status(error: &rmcp::transport::DynamicTransportError) -> Option<u16> {
 	None
 }
 
+fn initialize_transport_detail(error: &rmcp::transport::DynamicTransportError) -> String {
+	use rmcp::transport::streamable_http_client::StreamableHttpError;
+	if let Some(status) = http_status(error) {
+		return format!("HTTP {status}");
+	}
+	match error
+		.error
+		.downcast_ref::<StreamableHttpError<rmcp_http::Error>>()
+	{
+		Some(StreamableHttpError::TransportChannelClosed) => "Transport channel closed".to_string(),
+		Some(StreamableHttpError::UnexpectedEndOfStream) => "unexpected end of stream".to_string(),
+		Some(StreamableHttpError::ServerDoesNotSupportSse) => {
+			"server does not support SSE".to_string()
+		},
+		_ => "transport failure".to_string(),
+	}
+}
+
 fn map_initialize_error(error: rmcp::service::ClientInitializeError) -> McpError {
 	use rmcp::service::ClientInitializeError as InitError;
 	match error {
@@ -444,15 +462,13 @@ fn map_initialize_error(error: rmcp::service::ClientInitializeError) -> McpError
 			message: error.message.into_owned(),
 			data: error.data,
 		},
-		// rmcp embeds the request URL and a body preview in the transport
-		// message. Only a categorical form may leave this module: callers
-		// render `Display`, and a URL can carry credentials in its query.
-		InitError::TransportError { error, .. } => McpError::Protocol(match http_status(&error) {
-			Some(status) => format!("MCP initialization failed: HTTP {status}"),
-			None => {
-				"MCP initialization failed: transport closed before the handshake completed".to_string()
-			},
-		}),
+		// `context` is rmcp-authored and names the failed step. The nested
+		// error's `Display` can carry the request URL and a body preview, so
+		// only fixed rmcp variants or a numeric status are quoted.
+		InitError::TransportError { error, context } => McpError::Protocol(format!(
+			"MCP initialization failed: {context}: {}",
+			initialize_transport_detail(&error)
+		)),
 		InitError::ConnectionClosed(_) => {
 			McpError::Protocol("MCP initialization failed: connection closed".to_string())
 		},
@@ -541,7 +557,8 @@ mod tests {
 		let mapped = map_initialize_error(error).to_string();
 		assert!(!mapped.contains("init-leak-secret"), "transport text leaked: {mapped}");
 		assert!(!mapped.contains("example.test"), "URL leaked: {mapped}");
-		assert!(mapped.contains("transport closed"), "{mapped}");
+		assert!(mapped.contains("connect"), "rmcp step context is safe and useful: {mapped}");
+		assert!(mapped.contains("transport failure"), "{mapped}");
 	}
 
 	#[test]
