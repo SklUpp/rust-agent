@@ -1,10 +1,10 @@
 # Состояние проекта и задачи
 
-Обновлено 2026-11-19. Состояние после MCP-миграции, точного redaction, закрытия версии/таймаутов и R0.1–R0.3. Дальнейший порядок работ — `docs/agent-preliminary-implementation-plan.md`, раздел «Актуальный план» (R0–R12) с примечаниями.
+Обновлено 2026-11-20. Состояние после MCP-миграции, точного redaction, закрытия версии/таймаутов, R0.1–R0.3 и среза durable admission (R1). Дальнейший порядок работ — `docs/agent-preliminary-implementation-plan.md`, раздел «Актуальный план» (R0–R12) с примечаниями.
 
 ## Проект
 
-`aragent` — самостоятельный coding-first AI runtime на Rust, бинарник `arag`, целевые платформы Linux и Termux/Bionic. Репозиторий `/data/data/com.termux/files/home/rust-agent`, ветка `feat/standalone-runtime`, HEAD `790eff6` (схема БД v6, `task_admissions`). Версия пакета `0.1.0` со схемой в `README.md` (`## Versioning`); версия схемы БД версионируется отдельно. Донор `/data/data/com.termux/files/home/omp-work` — только чтение. План: `docs/agent-preliminary-implementation-plan.md`; решения: `docs/agent-architecture-decisions.md`; MCP: `docs/agent-provider-mcp-contract-proposal.md`.
+`aragent` — самостоятельный coding-first AI runtime на Rust, бинарник `arag`, целевые платформы Linux и Termux/Bionic. Репозиторий `/data/data/com.termux/files/home/rust-agent`, ветка `feat/standalone-runtime`, HEAD `790eff6` (схема БД v6, `task_admissions`). Версия пакета `0.1.0` со схемой в `README.md` (`## Versioning`); версия схемы БД версионируется отдельно. Донор `/data/data/com.termux/files/home/omp-work` — только чтение. Комплект документации: `docs/README.md`; план: `docs/agent-preliminary-implementation-plan.md`; решения: `docs/agent-architecture-decisions.md`; MCP: `docs/agent-provider-mcp-contract-proposal.md`.
 
 ## Проверено
 

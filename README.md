@@ -15,7 +15,7 @@ CLI tool roundtrip passed on Termux.
   (`feat/rust-agent-termux-bionic`), HEAD
   `3008cfd0ca88bb0e28323561a165f39efa7159e1` (SklUpp/omp-rust-termux fork).
 - Upstream original: can1357/oh-my-pi
-  `035e4f95c314f9aff2f5a779fa335422680f8e36` (see `docs/`).
+  `035e4f95c314f9aff2f5a779fa335422680f8e36` (see `docs/README.md` for the document set).
 - Extracted from the donor working tree at that commit, not from a Git
   worktree. The donor is read-only reference material and is not linked to this
   repository.
