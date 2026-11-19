@@ -1,10 +1,10 @@
 # Состояние проекта и задачи
 
-Обновлено 2026-11-19. Состояние после MCP-миграции, точного redaction и закрытия версии/таймаутов. Дальнейший порядок работ — `docs/agent-preliminary-implementation-plan.md`, раздел «Актуальный план» (R0–R10) с примечаниями.
+Обновлено 2026-11-19. Состояние после MCP-миграции, точного redaction, закрытия версии/таймаутов и R0.1–R0.3. Дальнейший порядок работ — `docs/agent-preliminary-implementation-plan.md`, раздел «Актуальный план» (R0–R12) с примечаниями.
 
 ## Проект
 
-`aragent` — самостоятельный coding-first AI runtime на Rust, бинарник `arag`, целевые платформы Linux и Termux/Bionic. Репозиторий `/data/data/com.termux/files/home/rust-agent`, ветка `feat/standalone-runtime`, HEAD `e272f2c`. Версия пакета `0.1.0` со схемой в `README.md` (`## Versioning`); версия схемы БД версионируется отдельно. Донор `/data/data/com.termux/files/home/omp-work` — только чтение. План: `docs/agent-preliminary-implementation-plan.md`; решения: `docs/agent-architecture-decisions.md`; MCP: `docs/agent-provider-mcp-contract-proposal.md`.
+`aragent` — самостоятельный coding-first AI runtime на Rust, бинарник `arag`, целевые платформы Linux и Termux/Bionic. Репозиторий `/data/data/com.termux/files/home/rust-agent`, ветка `feat/standalone-runtime`, HEAD `e2680d8`. Версия пакета `0.1.0` со схемой в `README.md` (`## Versioning`); версия схемы БД версионируется отдельно. Донор `/data/data/com.termux/files/home/omp-work` — только чтение. План: `docs/agent-preliminary-implementation-plan.md`; решения: `docs/agent-architecture-decisions.md`; MCP: `docs/agent-provider-mcp-contract-proposal.md`.
 
 ## Проверено
 
@@ -17,9 +17,9 @@
 
 ## Ближайшие работы
 
-Полный порядок с критериями и проверками — в `docs/agent-preliminary-implementation-plan.md` («Актуальный план», R0–R10). Кратко:
+Полный порядок с критериями и проверками — в `docs/agent-preliminary-implementation-plan.md` («Актуальный план», R0–R12). Кратко:
 
-1. **R0** — хвосты: redaction остальных writer'ов (`executions`, `deliveries`, заголовок сессии, артефакты), close-on-drop при отмене SSE-хендшейка, санитайзинг `map_initialize_error`, живой smoke внешнего MCP-сервера.
+1. **R0** — из четырёх пунктов закрыты R0.1 (redaction `executions.intent_json/outcome_json`, `deliveries`, `worker_completions`, `sessions.payload_json` включая заголовок, метаданные артефактов; идемпотентность повторов сохраняется для строк до redaction), R0.2 (тест `cancelled_initialize_closes_the_transport`: отмена после начала SSE-ответа закрывает HTTP-соединение; отмена до заголовков ограничена поведением rmcp — токен проверяется только после заголовков) и R0.3 (`map_initialize_error` оставляет категорию и шаг rmcp, но не URL/тело; статус извлекается из `HttpStatus` и reqwest-ошибки). Остался R0.4 — живой smoke внешнего MCP-сервера: подготовлен стенд `$PREFIX/tmp/arag-mcp-live` с `context7-mcp` (ручной handshake `initialize`/`tools/list` проходит).
 2. **R1** — S4 durable `task`: admission до эффекта, crash recovery, cached revive (producer generation, FIFO barrier).
 3. **R2** — S5 `SQLITE_BUSY`: граница до statements, cancellation-aware контракт, без повтора вокруг неоднозначного commit.
 4. **R3** — S3 процессы: TERM→KILL группе, lease, восстановление `cwd`.

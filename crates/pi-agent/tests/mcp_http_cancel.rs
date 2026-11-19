@@ -39,6 +39,7 @@ struct Fixture {
 	url: String,
 	seen: mpsc::Receiver<Value>,
 	post_closed: Arc<AtomicBool>,
+	headers_sent: Arc<AtomicBool>,
 	_server: Server,
 }
 
@@ -74,6 +75,8 @@ async fn spawn_fixture_with(stall_initialize: bool) -> Fixture {
 	let (tx, seen) = mpsc::channel(SEEN_CAPACITY);
 	let post_closed = Arc::new(AtomicBool::new(false));
 	let post_closed_for_accept = Arc::clone(&post_closed);
+	let headers_sent = Arc::new(AtomicBool::new(false));
+	let headers_sent_for_accept = Arc::clone(&headers_sent);
 	let connections = Arc::new(Mutex::new(Vec::new()));
 	let connections_for_accept = Arc::clone(&connections);
 	let accept = tokio::spawn(async move {
@@ -83,8 +86,9 @@ async fn spawn_fixture_with(stall_initialize: bool) -> Fixture {
 			};
 			let tx = tx.clone();
 			let post_closed = Arc::clone(&post_closed_for_accept);
+			let headers_sent = Arc::clone(&headers_sent_for_accept);
 			let handle = tokio::spawn(async move {
-				serve(&mut socket, tx, post_closed, stall_initialize).await;
+				serve(&mut socket, tx, post_closed, headers_sent, stall_initialize).await;
 			});
 			connections_for_accept.lock().unwrap().push(handle);
 		}
@@ -93,6 +97,7 @@ async fn spawn_fixture_with(stall_initialize: bool) -> Fixture {
 		url: format!("http://{addr}/mcp"),
 		seen,
 		post_closed,
+		headers_sent,
 		_server: Server { accept, connections },
 	}
 }
@@ -101,6 +106,7 @@ async fn serve(
 	socket: &mut TcpStream,
 	seen: mpsc::Sender<Value>,
 	post_closed: Arc<AtomicBool>,
+	headers_sent: Arc<AtomicBool>,
 	stall_initialize: bool,
 ) {
 	let Some(body) = read_request(socket).await else {
@@ -113,24 +119,31 @@ async fn serve(
 		.to_string();
 	let _ = seen.send(body.clone()).await;
 	match method.as_str() {
-		"initialize" if stall_initialize => hold_sse_open(socket, post_closed).await,
+		"initialize" if stall_initialize => hold_sse_open(socket, post_closed, headers_sent).await,
 		"initialize" => write_json(socket, &rpc_result(&body, initialize_result())).await,
 		"notifications/initialized" | "notifications/cancelled" => {
 			write_json(socket, &json!({})).await
 		},
-		"tools/list" | "prompts/get" => hold_sse_open(socket, post_closed).await,
+		"tools/list" | "prompts/get" => hold_sse_open(socket, post_closed, headers_sent).await,
 		_ => write_json(socket, &rpc_result(&body, json!({}))).await,
 	}
 }
 
-/// Send SSE headers, then keep body pending. Flag socket close after client cancellation.
-async fn hold_sse_open(socket: &mut TcpStream, post_closed: Arc<AtomicBool>) {
+/// Send SSE headers, then keep body pending. Flag socket close after client
+/// cancellation and flag the moment the headers are on the wire, so a test can
+/// cancel after rmcp's worker starts observing the cancellation token.
+async fn hold_sse_open(
+	socket: &mut TcpStream,
+	post_closed: Arc<AtomicBool>,
+	headers_sent: Arc<AtomicBool>,
+) {
 	let _ = socket
 		.write_all(
 			b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\n\r\n",
 		)
 		.await;
 	let _ = socket.flush().await;
+	headers_sent.store(true, Ordering::Release);
 	let mut buf = [0u8; 1024];
 	let _ = tokio::time::timeout(Duration::from_secs(30), async {
 		loop {
@@ -330,8 +343,9 @@ async fn timed_out_prompts_get_is_bounded() {
 #[tokio::test]
 async fn cancelled_initialize_closes_the_transport() {
 	// Dropping a pending `connect_to_server` future must not leave the HTTP
-	// connection (and the rmcp session behind it) alive: the fixture reports
-	// EOF only when the client closes its side.
+	// connection (and the rmcp session behind it) alive once the server has
+	// started its SSE response: rmcp observes cancellation from that point on,
+	// and the fixture reports EOF only when the client closes its side.
 	let mut fixture = spawn_stalling_initialize_fixture().await;
 	let config = MCPHttpServerConfig {
 		url: fixture.url.clone(),
@@ -344,6 +358,14 @@ async fn cancelled_initialize_closes_the_transport() {
 	};
 	let connect = tokio::spawn(connect_to_server("cancel-init", MCPServerConfig::Http(config)));
 	expect_request(&mut fixture, "initialize").await;
+	tokio::time::timeout(WAIT_TIMEOUT, async {
+		while !fixture.headers_sent.load(Ordering::Acquire) {
+			tokio::time::sleep(Duration::from_millis(10)).await;
+		}
+	})
+	.await
+	.expect("the server must start the SSE response before cancellation");
+	tokio::time::sleep(Duration::from_millis(100)).await;
 	connect.abort();
 	assert!(connect.await.is_err(), "cancelled handshake must not produce a connection");
 	tokio::time::timeout(WAIT_TIMEOUT, async {
