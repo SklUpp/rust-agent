@@ -141,7 +141,9 @@ fn is_format_char(ch: char) -> bool {
 /// substring a later one would otherwise match.
 #[must_use]
 pub fn redact_secrets(text: &str) -> String {
-	let mut out = text.to_string();
+	// Exact known values first: the shape list below cannot see an opaque
+	// credential, and a lesson is replayed to the model on later turns.
+	let mut out = crate::auth::known_secrets::redact(text).into_owned();
 	out = redact_with(&out, |s, i| {
 		prefixed_run(s, i, &["sk", "pk", "rk", "tok", "key", "secret", "token", "password"], 12, is_ident)
 	});
