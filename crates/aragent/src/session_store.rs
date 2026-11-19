@@ -45,7 +45,7 @@ use serde_json::{Value, json};
 
 use crate::durable_session::StoredProjection;
 /// Current schema version. Bump only with a new branch in [`SqliteStore::initialize`].
-pub const SCHEMA_VERSION: i64 = 5;
+pub const SCHEMA_VERSION: i64 = 6;
 const SCHEMA_VERSION_DDL: &str = "
 	CREATE TABLE IF NOT EXISTS schema_version (
 		id INTEGER PRIMARY KEY CHECK (id = 1),
@@ -182,6 +182,14 @@ const SCHEMA_V5_MIGRATION_DDL: &str = "
 	);
 	CREATE UNIQUE INDEX IF NOT EXISTS task_admissions_worker_idx ON task_admissions(worker_id, producer_generation);
 	CREATE INDEX IF NOT EXISTS task_admissions_open_idx ON task_admissions(parent_session_id, state);
+";
+
+/// v5 shipped a single-column `UNIQUE(worker_id)` index, which permanently
+/// blocked reusing `task-N` in a later producer generation. Rebuild the index
+/// under the same name; generation epochs keep live spawns single-flight.
+const SCHEMA_V6_MIGRATION_DDL: &str = "
+	DROP INDEX IF EXISTS task_admissions_worker_idx;
+	CREATE UNIQUE INDEX task_admissions_worker_idx ON task_admissions(worker_id, producer_generation);
 ";
 
 /// Immutable fork-only classification of a copied tool-result message. Not an
@@ -1444,6 +1452,7 @@ impl SqliteStore {
 				transaction.execute_batch(SCHEMA_V3_MIGRATION_DDL)?;
 				transaction.execute_batch(SCHEMA_V4_MIGRATION_DDL)?;
 				transaction.execute_batch(SCHEMA_V5_MIGRATION_DDL)?;
+				transaction.execute_batch(SCHEMA_V6_MIGRATION_DDL)?;
 				transaction.execute(
 					"INSERT INTO schema_version (id, version) VALUES (1, ?1)",
 					params![SCHEMA_VERSION],
@@ -1454,6 +1463,7 @@ impl SqliteStore {
 				transaction.execute_batch(SCHEMA_V3_MIGRATION_DDL)?;
 				transaction.execute_batch(SCHEMA_V4_MIGRATION_DDL)?;
 				transaction.execute_batch(SCHEMA_V5_MIGRATION_DDL)?;
+				transaction.execute_batch(SCHEMA_V6_MIGRATION_DDL)?;
 				transaction.execute(
 					"UPDATE schema_version SET version = ?1 WHERE id = 1",
 					params![SCHEMA_VERSION],
@@ -1463,6 +1473,7 @@ impl SqliteStore {
 				transaction.execute_batch(SCHEMA_V3_MIGRATION_DDL)?;
 				transaction.execute_batch(SCHEMA_V4_MIGRATION_DDL)?;
 				transaction.execute_batch(SCHEMA_V5_MIGRATION_DDL)?;
+				transaction.execute_batch(SCHEMA_V6_MIGRATION_DDL)?;
 				transaction.execute(
 					"UPDATE schema_version SET version = ?1 WHERE id = 1",
 					params![SCHEMA_VERSION],
@@ -1471,6 +1482,7 @@ impl SqliteStore {
 			Some(3) => {
 				transaction.execute_batch(SCHEMA_V4_MIGRATION_DDL)?;
 				transaction.execute_batch(SCHEMA_V5_MIGRATION_DDL)?;
+				transaction.execute_batch(SCHEMA_V6_MIGRATION_DDL)?;
 				transaction.execute(
 					"UPDATE schema_version SET version = ?1 WHERE id = 1",
 					params![SCHEMA_VERSION],
@@ -1478,6 +1490,14 @@ impl SqliteStore {
 			},
 			Some(4) => {
 				transaction.execute_batch(SCHEMA_V5_MIGRATION_DDL)?;
+				transaction.execute_batch(SCHEMA_V6_MIGRATION_DDL)?;
+				transaction.execute(
+					"UPDATE schema_version SET version = ?1 WHERE id = 1",
+					params![SCHEMA_VERSION],
+				)?;
+			},
+			Some(5) => {
+				transaction.execute_batch(SCHEMA_V6_MIGRATION_DDL)?;
 				transaction.execute(
 					"UPDATE schema_version SET version = ?1 WHERE id = 1",
 					params![SCHEMA_VERSION],
@@ -10923,7 +10943,7 @@ mod tests {
 			.expect("downgrade to v4");
 		drop(connection);
 
-		let mut store = SqliteStore::open(&path).expect("migrate to v5");
+		let mut store = SqliteStore::open(&path).expect("migrate to the current schema");
 		let version: i64 = store
 			.connection
 			.query_row("SELECT version FROM schema_version WHERE id = 1", [], |row| row.get(0))
@@ -10947,6 +10967,56 @@ mod tests {
 				.state,
 			"admitted"
 		);
+		let _ = std::fs::remove_dir_all(dir);
+	}
+
+	#[test]
+	fn schema_v5_index_upgrade_allows_worker_reuse_in_a_new_generation() {
+		let (dir, path) = temp_db("v5-admission-index");
+		let mut store = SqliteStore::open(&path).expect("open store");
+		store
+			.create_session(NewSession {
+				id: "s_idx".to_string(),
+				parent_session_id: None,
+				payload: json!({}),
+				initial_branch_id: "b1".to_string(),
+				initial_branch_payload: json!({}),
+			})
+			.expect("session");
+		drop(store);
+		// Simulate the v5 index shipped before generation-aware identity.
+		let connection = rusqlite::Connection::open(&path).expect("raw");
+		connection
+			.execute_batch(
+				"DROP INDEX task_admissions_worker_idx; \
+				 CREATE UNIQUE INDEX task_admissions_worker_idx ON task_admissions(worker_id); \
+				 UPDATE schema_version SET version = 5;",
+			)
+			.expect("downgrade to v5");
+		drop(connection);
+
+		let mut store = SqliteStore::open(&path).expect("migrate to v6");
+		for (task_id, generation) in [("t_gen1", 1), ("t_gen2", 2)] {
+			store
+				.admit_task(NewTaskAdmission {
+					task_id: task_id.to_string(),
+					parent_session_id: "s_idx".to_string(),
+					parent_branch_id: "b1".to_string(),
+					worker_id: "w_reuse".to_string(),
+					producer_generation: generation,
+					spec: json!({}),
+				})
+				.expect("same worker in a new generation");
+		}
+		let index_sql: String = store
+			.connection
+			.query_row(
+				"SELECT sql FROM sqlite_master WHERE type = 'index' AND name = 'task_admissions_worker_idx'",
+				[],
+				|row| row.get(0),
+			)
+			.expect("index present");
+		assert!(index_sql.contains("producer_generation"));
 		let _ = std::fs::remove_dir_all(dir);
 	}
 

@@ -2887,6 +2887,9 @@ mod tests {
 		}
 
 		let child = factory.open_child(worker_id).expect("open child scope");
+		// Supervisor calls this once ownership is taken; opening the scope
+		// alone never advances the admission.
+		factory.start_child(worker_id).expect("start child");
 		{
 			let store = SqliteStore::open(&path).expect("reopen store");
 			let row = store
@@ -2899,7 +2902,8 @@ mod tests {
 		drop(factory);
 		drop(root);
 
-		let root = DurableSession::open(&path, "root", header("root", None)).expect("reopen root");
+		let (root, _loaded) =
+			DurableSession::open(&path, "root", header("root", None)).expect("reopen root");
 		assert!(root.producer_generation > generation, "recovery must advance the epoch");
 		let store = SqliteStore::open(&path).expect("reopen store");
 		let row = store

@@ -1417,16 +1417,20 @@ impl Supervisor {
                 child.identity().worker_id
             ));
         }
-        let _barrier = self.admission_barrier.lock().unwrap();
-        if self.admission_shutdown.load(Ordering::Acquire) {
-            return Err(format!("child {id} durable admission cancelled during open"));
-        }
-        if let Some(existing) = self.state.lock().unwrap().durable_children.get(id).cloned() {
-            if existing.identity().worker_id == worker_id {
-                return Ok(Some((existing, false, None)));
+        {
+            let _barrier = self.admission_barrier.lock().unwrap();
+            if self.admission_shutdown.load(Ordering::Acquire) {
+                return Err(format!("child {id} durable admission cancelled during open"));
             }
+            if let Some(existing) = self.state.lock().unwrap().durable_children.get(id).cloned() {
+                if existing.identity().worker_id == worker_id {
+                    return Ok(Some((existing, false, None)));
+                }
+            }
+            self.state.lock().unwrap().durable_children.insert(id.to_string(), child.clone());
         }
-        self.state.lock().unwrap().durable_children.insert(id.to_string(), child.clone());
+        // The lease keeps shutdown waiting, so this write may run after the
+        // barrier is released without racing admission close.
         if let Err(error) = factory.start_child(worker_id) {
             self.state.lock().unwrap().durable_children.remove(id);
             return Err(format!("child {id} admission start: {error}"));
@@ -1443,6 +1447,14 @@ impl Supervisor {
 		completion: serde_json::Value,
 		delivery: serde_json::Value,
 	) -> Result<(), String> {
+		// The completion is the single source of the child's outcome. Never
+		// record a failed or aborted settlement as `completed`: the admission
+		// row is terminal and a later correction cannot overwrite it.
+		let admission_state = match completion.get("status").and_then(serde_json::Value::as_str) {
+			Some("completed") => "completed",
+			Some("aborted") => "abandoned",
+			_ => "failed",
+		};
 		let child = self
 			.state
 			.lock()
@@ -1461,7 +1473,7 @@ impl Supervisor {
 					.unwrap()
 					.completed_children
 					.insert(id.to_string());
-				self.finish_child_admission(id, "completed");
+				self.finish_child_admission(id, admission_state);
 				Ok(())
 			},
 			None => Ok(()),
