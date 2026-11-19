@@ -2781,7 +2781,10 @@ impl SqliteStore {
 		validate_id("session id", &completion.session_id)?;
 		validate_id("origin branch id", &completion.origin_branch_id)?;
 		// Mask before encoding and before the idempotency comparisons below: a
-		// repeat carries the raw payload while the stored row is masked.
+		// repeat carries the raw payload while the stored row is masked. Keep
+		// the raw form so a repeat of a pre-redaction row stays idempotent too.
+		let raw_completion = completion.completion.clone();
+		let raw_delivery = completion.delivery.clone();
 		let mut completion = completion;
 		crate::auth::error::redact_json_strings(&mut completion.completion);
 		crate::auth::error::redact_json_strings(&mut completion.delivery);
@@ -2823,10 +2826,11 @@ impl SqliteStore {
 		if let Some((session_id, origin_branch_id, delivery_id, stored_completion)) =
 			existing_completion
 		{
+			let stored_completion = decode_json(&stored_completion)?;
 			if session_id != completion.session_id
 				|| origin_branch_id != completion.origin_branch_id
 				|| delivery_id != completion.delivery_id
-				|| decode_json(&stored_completion)? != completion.completion
+				|| (stored_completion != completion.completion && stored_completion != raw_completion)
 			{
 				return Err(StoreError::Conflict(format!(
 					"worker {} already completed with different data",
@@ -2853,10 +2857,11 @@ impl SqliteStore {
 					completion.worker_id, completion.delivery_id
 				)));
 			};
+			let stored_delivery_json = decode_json(&stored_delivery_json)?;
 			if delivery_worker_id != completion.worker_id
 				|| delivery_session_id != completion.session_id
 				|| delivery_origin_branch_id != completion.origin_branch_id
-				|| decode_json(&stored_delivery_json)? != completion.delivery
+				|| (stored_delivery_json != completion.delivery && stored_delivery_json != raw_delivery)
 			{
 				return Err(StoreError::Conflict(format!(
 					"delivery {} already exists with different data",
@@ -2876,10 +2881,11 @@ impl SqliteStore {
 			)
 			.optional()?;
 		if let Some((worker_id, session_id, origin_branch_id, stored_delivery)) = existing_delivery {
+			let stored_delivery = decode_json(&stored_delivery)?;
 			if worker_id != completion.worker_id
 				|| session_id != completion.session_id
 				|| origin_branch_id != completion.origin_branch_id
-				|| decode_json(&stored_delivery)? != completion.delivery
+				|| (stored_delivery != completion.delivery && stored_delivery != raw_delivery)
 			{
 				return Err(StoreError::Conflict(format!(
 					"delivery {} already exists with different data",
@@ -2948,6 +2954,7 @@ impl SqliteStore {
 		validate_id("delivery session id", &delivery.session_id)?;
 		validate_id("delivery origin branch id", &delivery.origin_branch_id)?;
 		let mut delivery = delivery;
+		let raw_payload = delivery.payload.clone();
 		crate::auth::error::redact_json_strings(&mut delivery.payload);
 		let payload_json = encode_json(&delivery.payload)?;
 		let transaction = self.connection.transaction()?;
@@ -2981,10 +2988,11 @@ impl SqliteStore {
 			)
 			.optional()?;
 		if let Some((worker_id, session_id, origin_branch_id, stored)) = existing {
+			let stored = decode_json(&stored)?;
 			if worker_id != delivery.worker_id
 				|| session_id != delivery.session_id
 				|| origin_branch_id != delivery.origin_branch_id
-				|| decode_json(&stored)? != delivery.payload
+				|| (stored != delivery.payload && stored != raw_payload)
 			{
 				return Err(StoreError::Conflict(format!(
 					"delivery {} already exists with different data",
@@ -3371,6 +3379,7 @@ impl SqliteStore {
 		validate_id("artifact session id", &artifact.session_id)?;
 		validate_id("artifact location", &artifact.location)?;
 		let mut artifact = artifact;
+		let raw_metadata = artifact.metadata.clone();
 		crate::auth::error::redact_json_strings(&mut artifact.metadata);
 		let metadata_json = encode_json(&artifact.metadata)?;
 		let now = now_ms();
@@ -3435,11 +3444,12 @@ impl SqliteStore {
 			)
 			.optional()?;
 		if let Some((session_id, branch_id, execution_id, location, stored_metadata)) = existing {
+			let stored_metadata = decode_json(&stored_metadata)?;
 			if session_id != artifact.session_id
 				|| branch_id != artifact.branch_id
 				|| execution_id != artifact.execution_id
 				|| location != artifact.location
-				|| decode_json(&stored_metadata)? != artifact.metadata
+				|| (stored_metadata != artifact.metadata && stored_metadata != raw_metadata)
 			{
 				return Err(StoreError::Conflict(format!(
 					"artifact {} already exists with different metadata",
@@ -10432,16 +10442,28 @@ mod tests {
 			"delivery masked: {}",
 			deliveries[0].payload
 		);
-
+		// The same raw payload must stay idempotent against the masked row.
 		store
-			.complete_worker(WorkerCompletion {
-				worker_id: "w_rows2".to_string(),
-				delivery_id: "d_rows2".to_string(),
+			.enqueue_delivery(NewDelivery {
+				delivery_id: "d_rows".to_string(),
+				worker_id: "w_rows".to_string(),
 				session_id: "s_rows".to_string(),
 				origin_branch_id: "b1".to_string(),
-				completion: json!({ "summary": format!("done {secret}") }),
-				delivery: json!({ "text": format!("worker said {secret}") }),
+				payload: json!({ "text": format!("mail {secret}") }),
 			})
+			.expect("repeat delivery");
+		assert_eq!(store.pending_deliveries("s_rows").expect("read").len(), 1);
+
+		let completion = || WorkerCompletion {
+			worker_id: "w_rows2".to_string(),
+			delivery_id: "d_rows2".to_string(),
+			session_id: "s_rows".to_string(),
+			origin_branch_id: "b1".to_string(),
+			completion: json!({ "summary": format!("done {secret}") }),
+			delivery: json!({ "text": format!("worker said {secret}") }),
+		};
+		store
+			.complete_worker(completion())
 			.expect("complete worker");
 		let completion_json: String = store
 			.connection
@@ -10452,23 +10474,26 @@ mod tests {
 			)
 			.expect("read completion");
 		assert!(!completion_json.contains(secret), "completion masked: {completion_json}");
-
 		store
-			.record_artifact(NewArtifact {
-				artifact_id: "a_rows".to_string(),
-				session_id: "s_rows".to_string(),
-				branch_id: Some("b1".to_string()),
-				execution_id: Some(execution_id),
-				location: "/tmp/row-artifact".to_string(),
-				metadata: json!({ "preview": format!("artifact {secret}") }),
-			})
-			.expect("record artifact");
+			.complete_worker(completion())
+			.expect("repeat completion");
+
+		let artifact = || NewArtifact {
+			artifact_id: "a_rows".to_string(),
+			session_id: "s_rows".to_string(),
+			branch_id: Some("b1".to_string()),
+			execution_id: Some(execution_id.clone()),
+			location: "/tmp/row-artifact".to_string(),
+			metadata: json!({ "preview": format!("artifact {secret}") }),
+		};
+		store.record_artifact(artifact()).expect("record artifact");
 		let artifacts = store.artifacts("s_rows").expect("read artifacts");
 		assert!(
 			!artifacts[0].metadata.to_string().contains(secret),
 			"artifact metadata masked: {}",
 			artifacts[0].metadata
 		);
+		store.record_artifact(artifact()).expect("repeat artifact");
 
 		store
 			.update_session_payload("s_rows", json!({ "title": format!("renamed {secret}") }))
