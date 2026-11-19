@@ -1434,6 +1434,15 @@ impl Supervisor {
         Ok(Some((child, true, replay)))
     }
 
+	fn admission_state_for_completion(completion: &serde_json::Value) -> &'static str {
+		match completion.get("status").and_then(serde_json::Value::as_str) {
+			Some("completed") => "completed",
+			Some("failed") => "failed",
+			Some("aborted") | Some("cancelled") => "abandoned",
+			_ => "failed",
+		}
+	}
+
 	/// Commit a worker completion and its parent notification. No-op when this
 	/// scope has no durable child (explicit ephemeral), never a silent fallback
 	/// for a configured one.
@@ -1446,12 +1455,7 @@ impl Supervisor {
 		// The completion is the single source of the child's outcome. Never
 		// record a failed or aborted settlement as `completed`: the admission
 		// row is terminal and a later correction cannot overwrite it.
-		let admission_state = match completion.get("status").and_then(serde_json::Value::as_str) {
-			Some("completed") => "completed",
-			Some("failed") => "failed",
-			Some("aborted") | Some("cancelled") => "abandoned",
-			_ => "failed",
-		};
+		let admission_state = Self::admission_state_for_completion(&completion);
 		let child = self
 			.state
 			.lock()
@@ -3248,6 +3252,23 @@ mod process_wiring_tests {
 		tool::{Tool, ToolError},
 		tools::{PendingAction, process::ProcessManager, registry::ToolRegistry},
 	};
+
+	#[test]
+	fn admission_state_matches_the_child_outcome() {
+		for (status, expected) in [
+			("completed", "completed"),
+			("failed", "failed"),
+			("aborted", "abandoned"),
+			("cancelled", "abandoned"),
+		] {
+			let completion = serde_json::json!({ "status": status });
+			assert_eq!(Supervisor::admission_state_for_completion(&completion), expected);
+		}
+		assert_eq!(
+			Supervisor::admission_state_for_completion(&serde_json::json!({})),
+			"failed"
+		);
+	}
 
 	struct Stage(std::path::PathBuf);
 
