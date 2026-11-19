@@ -491,7 +491,9 @@ impl McpConnection {
 					// reconnect or the retry would resend on the same broken
 					// session.
 					if !self.transport_broken() {
-						self.reconnect().await?;
+						// The reconnect is part of what the caller asked for, so
+						// it shares the request deadline.
+						self.reconnect_locked(deadline).await?;
 					}
 					self
 						.request_value("tools/list", Some(params), deadline)

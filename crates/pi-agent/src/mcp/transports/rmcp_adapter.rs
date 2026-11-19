@@ -376,9 +376,15 @@ fn map_service_error(error: rmcp::ServiceError, mutating: bool) -> McpError {
 		// the request URL (and with it any credential in the path or query), so
 		// it must not reach a tool result or a log line.
 		rmcp::ServiceError::TransportSend(error) => match http_status(&error) {
-			// The server answered with an error status: a definite HTTP
-			// failure, not an unverifiable stream break. rmcp keeps the status
-			// and no body, so surfacing it carries no secret material.
+			// A gateway 502/503 can arrive after the tool already ran, so a
+			// mutating call keeps the unverified wording: `Http` renders as a
+			// definite failure and would invite a replay.
+			Some(status) if mutating && matches!(status, 502 | 503) => McpError::UnknownOutcome(
+				"RMCP tools/call delivery is unverified: upstream answered with a transient error"
+					.to_string(),
+			),
+			// The server answered with a definite error status; rmcp keeps the
+			// status and no body, so surfacing it carries no secret material.
 			Some(status) => McpError::Http { status, message: "RMCP transport failure".to_string() },
 			None if mutating => {
 				McpError::UnknownOutcome("RMCP tools/call delivery is unverified".to_string())
@@ -414,7 +420,7 @@ fn http_status(error: &rmcp::transport::DynamicTransportError) -> Option<u16> {
 			return Some(status.status);
 		}
 		if let Some(StreamableHttpError::HttpStatus(status)) =
-			err.downcast_ref::<StreamableHttpError<reqwest::Error>>()
+			err.downcast_ref::<StreamableHttpError<rmcp_http::Error>>()
 		{
 			return Some(status.status);
 		}
@@ -453,7 +459,7 @@ mod tests {
 	use rmcp::transport::DynamicTransportError;
 	use rmcp::transport::streamable_http_client::{HttpStatusError, StreamableHttpError};
 
-	fn transport_error(inner: StreamableHttpError<reqwest::Error>) -> DynamicTransportError {
+	fn transport_error(inner: StreamableHttpError<rmcp_http::Error>) -> DynamicTransportError {
 		DynamicTransportError::from_parts("test", std::any::TypeId::of::<()>(), Box::new(inner))
 	}
 
@@ -461,6 +467,28 @@ mod tests {
 	fn http_status_reads_the_status_variant_of_a_transport_failure() {
 		let error = transport_error(StreamableHttpError::HttpStatus(HttpStatusError::new(500, None)));
 		assert_eq!(http_status(&error), Some(500));
+	}
+
+	#[test]
+	fn mutating_transient_http_status_stays_unverified() {
+		// A 502/503 can arrive after the tool ran; reporting a definite HTTP
+		// failure would invite the model to replay a non-idempotent call.
+		let error = transport_error(StreamableHttpError::HttpStatus(HttpStatusError::new(503, None)));
+		assert!(matches!(
+			map_service_error(rmcp::ServiceError::TransportSend(error), true),
+			McpError::UnknownOutcome(_)
+		));
+		let error = transport_error(StreamableHttpError::HttpStatus(HttpStatusError::new(500, None)));
+		assert!(matches!(
+			map_service_error(rmcp::ServiceError::TransportSend(error), true),
+			McpError::Http { status: 500, .. }
+		));
+		// A safe call never claims an unknown outcome.
+		let error = transport_error(StreamableHttpError::HttpStatus(HttpStatusError::new(503, None)));
+		assert!(matches!(
+			map_service_error(rmcp::ServiceError::TransportSend(error), false),
+			McpError::Http { status: 503, .. }
+		));
 	}
 
 	#[test]
