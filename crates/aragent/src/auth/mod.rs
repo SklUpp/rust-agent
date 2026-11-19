@@ -486,6 +486,10 @@ impl AuthBackend {
 				return Err(AuthError::config(provider, "stored credential is not an OAuth grant"));
 			},
 		};
+		// `materialize` may have refreshed the grant: record the token this call
+		// actually uses, so an echo in progress text is masked too.
+		known_secrets::register(&credentials.access);
+		known_secrets::register(&credentials.refresh);
 		let http = HttpClient::new();
 		let callbacks: Arc<dyn LoginCallbacks> = Arc::new(NoCallbacks);
 		Ok(runtime.block_on(async {
