@@ -10836,6 +10836,54 @@ mod tests {
 	}
 
 	#[test]
+	fn schema_v4_upgrades_and_accepts_task_admissions() {
+		let (dir, path) = temp_db("v4-to-v5");
+		let mut store = SqliteStore::open(&path).expect("store");
+		store
+			.create_session(NewSession {
+				id: "s_up".to_string(),
+				parent_session_id: None,
+				payload: json!({}),
+				initial_branch_id: "b1".to_string(),
+				initial_branch_payload: json!({}),
+			})
+			.expect("session");
+		drop(store);
+		// Simulate a database written by the previous release.
+		let connection = rusqlite::Connection::open(&path).expect("raw");
+		connection
+			.execute_batch("DROP TABLE task_admissions; UPDATE schema_version SET version = 4;")
+			.expect("downgrade to v4");
+		drop(connection);
+
+		let mut store = SqliteStore::open(&path).expect("migrate to v5");
+		let version: i64 = store
+			.connection
+			.query_row("SELECT version FROM schema_version WHERE id = 1", [], |row| row.get(0))
+			.expect("version");
+		assert_eq!(version, SCHEMA_VERSION);
+		store
+			.admit_task(NewTaskAdmission {
+				task_id: "t_up".to_string(),
+				parent_session_id: "s_up".to_string(),
+				parent_branch_id: "b1".to_string(),
+				worker_id: "w_up".to_string(),
+				producer_generation: 1,
+				spec: json!({}),
+			})
+			.expect("admission after migration");
+		assert_eq!(
+			store
+				.task_admission("t_up")
+				.expect("read")
+				.expect("present")
+				.state,
+			"admitted"
+		);
+		let _ = std::fs::remove_dir_all(dir);
+	}
+
+	#[test]
 	fn stream_draft_delivery_window_keeps_newest_tail_char_exact() {
 		// Exactly at the window: delivered whole and unmarked.
 		let at_window = json!({ "priors": [{ "text": "x".repeat(STREAM_DRAFT_DELIVERY_CHARS) }] });
