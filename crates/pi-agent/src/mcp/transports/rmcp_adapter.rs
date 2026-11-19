@@ -403,6 +403,16 @@ fn map_service_error(error: rmcp::ServiceError, mutating: bool) -> McpError {
 	}
 }
 
+/// Reads `HTTP <code> ...` without keeping the trailing text; used only for
+/// rmcp-authored status messages and the redirect response text.
+fn parse_http_status_prefix(text: &str) -> Option<u16> {
+	text
+		.strip_prefix("HTTP ")
+		.and_then(|rest| rest.get(..3))
+		.filter(|code| code.bytes().all(|byte| byte.is_ascii_digit()))
+		.and_then(|code| code.parse().ok())
+}
+
 /// HTTP status carried by an rmcp transport failure, when the server answered
 /// with an error response instead of the stream breaking. rmcp keeps the status
 /// and discards the body, so surfacing it cannot leak a response body secret.
@@ -438,16 +448,16 @@ fn http_status(error: &rmcp::transport::DynamicTransportError) -> Option<u16> {
 		{
 			return Some(status.as_u16());
 		}
-		// The status variant is the only failure whose message starts with the
-		// status. Require exactly three digits after the prefix and discard the
-		// rest: `UnexpectedServerResponse` may append arbitrary server text.
-		if let Some(code) = err
-			.to_string()
-			.strip_prefix("HTTP ")
-			.and_then(|rest| rest.get(..3))
-			.filter(|code| code.bytes().all(|byte| byte.is_ascii_digit()))
+		if let Some(StreamableHttpError::UnexpectedServerResponse(text)) =
+			err.downcast_ref::<StreamableHttpError<rmcp_http::Error>>()
+			&& let Some(status) = parse_http_status_prefix(text.as_ref())
 		{
-			return code.parse().ok();
+			return Some(status);
+		}
+		// Keep the fallback for a status variant whose message starts with the
+		// status. Only the three digits are read; the rest never leaves here.
+		if let Some(code) = parse_http_status_prefix(&err.to_string()) {
+			return Some(code);
 		}
 		current = err.source();
 	}
