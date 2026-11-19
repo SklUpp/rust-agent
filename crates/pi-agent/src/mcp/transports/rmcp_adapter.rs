@@ -424,10 +424,28 @@ fn http_status(error: &rmcp::transport::DynamicTransportError) -> Option<u16> {
 		{
 			return Some(status.status);
 		}
+		// `error_for_status` keeps the status on the reqwest error even for a
+		// status rmcp does not classify (for example a refused 302 redirect).
+		// Downcast rather than parse text: the message also carries a URL.
+		if let Some(StreamableHttpError::Client(error)) =
+			err.downcast_ref::<StreamableHttpError<rmcp_http::Error>>()
+			&& let Some(status) = error.status()
+		{
+			return Some(status.as_u16());
+		}
+		if let Some(error) = err.downcast_ref::<rmcp_http::Error>()
+			&& let Some(status) = error.status()
+		{
+			return Some(status.as_u16());
+		}
+		// The status variant is the only failure whose message starts with the
+		// status. Require exactly three digits after the prefix and discard the
+		// rest: `UnexpectedServerResponse` may append arbitrary server text.
 		if let Some(code) = err
 			.to_string()
 			.strip_prefix("HTTP ")
-			.filter(|tail| tail.len() == 3 && tail.bytes().all(|byte| byte.is_ascii_digit()))
+			.and_then(|rest| rest.get(..3))
+			.filter(|code| code.bytes().all(|byte| byte.is_ascii_digit()))
 		{
 			return code.parse().ok();
 		}
@@ -529,6 +547,17 @@ mod tests {
 	fn http_status_is_none_for_a_broken_stream() {
 		let error = transport_error(StreamableHttpError::TransportChannelClosed);
 		assert_eq!(http_status(&error), None);
+	}
+
+	#[test]
+	fn http_status_accepts_a_prefixed_status_with_trailing_text() {
+		let error =
+			transport_error(StreamableHttpError::UnexpectedServerResponse("HTTP 302 Found".into()));
+		assert_eq!(http_status(&error), Some(302));
+		let error = transport_error(StreamableHttpError::UnexpectedServerResponse(
+			"HTTP 302 https://example.test/?token=leak".into(),
+		));
+		assert_eq!(http_status(&error), Some(302));
 	}
 
 	#[derive(Debug)]
