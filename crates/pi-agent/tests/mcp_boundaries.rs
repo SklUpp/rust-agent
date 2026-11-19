@@ -13,7 +13,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use pi_agent::mcp::{
-	MCPServerConfig, MCPHttpServerConfig, MCPStdioServerConfig, McpError, connect_to_server,
+	MCPHttpServerConfig, MCPServerConfig, MCPStdioServerConfig, McpError, connect_to_server,
 };
 use serde_json::{Value, json};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -33,11 +33,7 @@ struct Reply {
 
 impl Reply {
 	fn json(body: String) -> Self {
-		Self {
-			status: 200,
-			headers: vec![("Content-Type", "application/json".to_string())],
-			body,
-		}
+		Self { status: 200, headers: vec![("Content-Type", "application/json".to_string())], body }
 	}
 
 	fn with_header(mut self, name: &'static str, value: &str) -> Self {
@@ -88,7 +84,8 @@ async fn read_seen(socket: &mut tokio::net::TcpStream) -> Option<Seen> {
 	let content_length = headers
 		.lines()
 		.find_map(|line| {
-			line.to_ascii_lowercase()
+			line
+				.to_ascii_lowercase()
 				.strip_prefix("content-length:")
 				.map(|value| value.trim().parse::<usize>().unwrap_or(0))
 		})
@@ -108,9 +105,7 @@ async fn read_seen(socket: &mut tokio::net::TcpStream) -> Option<Seen> {
 	Some(Seen { headers, body: serde_json::from_slice(&body).unwrap_or(Value::Null) })
 }
 
-async fn spawn_mock(
-	handler: impl Fn(usize, &Seen) -> Reply + Send + Sync + 'static,
-) -> MockServer {
+async fn spawn_mock(handler: impl Fn(usize, &Seen) -> Reply + Send + Sync + 'static) -> MockServer {
 	let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
 	let addr = listener.local_addr().expect("addr");
 	let seen = Arc::new(Mutex::new(Vec::new()));
@@ -189,7 +184,10 @@ async fn tools_list_follows_cursor_pages_in_order() {
 			.with_header("mcp-session-id", "sess-1"),
 		Some("notifications/initialized") => Reply::json("{}".to_string()),
 		Some("tools/list") => {
-			let cursor = seen.body.get("params").and_then(|params| params.get("cursor"));
+			let cursor = seen
+				.body
+				.get("params")
+				.and_then(|params| params.get("cursor"));
 			if cursor.is_none() {
 				Reply::json(rpc_result(
 					&seen.body,
@@ -222,12 +220,15 @@ async fn tools_list_follows_cursor_pages_in_order() {
 		.filter(|seen| seen.body.get("method").and_then(Value::as_str) == Some("tools/list"))
 		.collect();
 	assert_eq!(list_calls.len(), 2, "one request per cursor page");
-assert!(list_calls[0].body["params"].get("cursor").is_none());
-assert!(list_calls[0].body["params"]["_meta"]["progressToken"].is_number());
-assert_eq!(list_calls[1].body["params"]["cursor"], "page-2");
+	assert!(list_calls[0].body["params"].get("cursor").is_none());
+	assert!(list_calls[0].body["params"]["_meta"]["progressToken"].is_number());
+	assert_eq!(list_calls[1].body["params"]["cursor"], "page-2");
 
 	connection.close().await.expect("close");
-	connection.close().await.expect("close is idempotent for HTTP");
+	connection
+		.close()
+		.await
+		.expect("close is idempotent for HTTP");
 }
 
 #[tokio::test]
@@ -235,19 +236,26 @@ async fn tools_list_rejects_repeated_cursor() {
 	let server = spawn_mock(|_, seen| match seen.body.get("method").and_then(Value::as_str) {
 		Some("initialize") => Reply::json(rpc_result(&seen.body, initialize_result())),
 		Some("notifications/initialized") => Reply::json("{}".to_string()),
-		Some("tools/list") => Reply::json(rpc_result(
-			&seen.body,
-			json!({ "tools": [], "nextCursor": "same" }),
-		)),
+		Some("tools/list") => {
+			Reply::json(rpc_result(&seen.body, json!({ "tools": [], "nextCursor": "same" })))
+		},
 		_ => Reply::json(rpc_result(&seen.body, json!({}))),
 	})
 	.await;
-	let connection = connect_to_server("repeated-cursor", MCPServerConfig::Http(http_config(&server.url)))
+	let connection =
+		connect_to_server("repeated-cursor", MCPServerConfig::Http(http_config(&server.url)))
+			.await
+			.expect("connect");
+	let error = connection
+		.list_tools()
 		.await
-		.expect("connect");
-	let error = connection.list_tools().await.expect_err("repeated cursor must fail");
+		.expect_err("repeated cursor must fail");
 	assert!(matches!(error, McpError::Protocol(message) if message.contains("repeated cursor")));
-	let calls = server.seen.lock().unwrap().iter()
+	let calls = server
+		.seen
+		.lock()
+		.unwrap()
+		.iter()
 		.filter(|seen| seen.body.get("method").and_then(Value::as_str) == Some("tools/list"))
 		.count();
 	assert_eq!(calls, 2, "stop when cursor repeats");
@@ -259,22 +267,39 @@ async fn tools_list_rejects_page_limit_without_truncating() {
 		Some("initialize") => Reply::json(rpc_result(&seen.body, initialize_result())),
 		Some("notifications/initialized") => Reply::json("{}".to_string()),
 		Some("tools/list") => {
-			let cursor = seen.body.get("params").and_then(|params| params.get("cursor"));
-			let page = cursor.and_then(Value::as_str).and_then(|value| value.strip_prefix("page-"))
-				.and_then(|value| value.parse::<usize>().ok()).unwrap_or(1);
-			Reply::json(rpc_result(&seen.body, json!({
-				"tools": [], "nextCursor": format!("page-{}", page + 1),
-			})))
+			let cursor = seen
+				.body
+				.get("params")
+				.and_then(|params| params.get("cursor"));
+			let page = cursor
+				.and_then(Value::as_str)
+				.and_then(|value| value.strip_prefix("page-"))
+				.and_then(|value| value.parse::<usize>().ok())
+				.unwrap_or(1);
+			Reply::json(rpc_result(
+				&seen.body,
+				json!({
+					"tools": [], "nextCursor": format!("page-{}", page + 1),
+				}),
+			))
 		},
 		_ => Reply::json(rpc_result(&seen.body, json!({}))),
 	})
 	.await;
-	let connection = connect_to_server("page-limit", MCPServerConfig::Http(http_config(&server.url)))
+	let connection =
+		connect_to_server("page-limit", MCPServerConfig::Http(http_config(&server.url)))
+			.await
+			.expect("connect");
+	let error = connection
+		.list_tools()
 		.await
-		.expect("connect");
-	let error = connection.list_tools().await.expect_err("page limit must fail");
+		.expect_err("page limit must fail");
 	assert!(matches!(error, McpError::Protocol(message) if message.contains("pagination bounds")));
-	let calls = server.seen.lock().unwrap().iter()
+	let calls = server
+		.seen
+		.lock()
+		.unwrap()
+		.iter()
 		.filter(|seen| seen.body.get("method").and_then(Value::as_str) == Some("tools/list"))
 		.count();
 	assert_eq!(calls, 64, "must stop at page limit without returning partial list");
@@ -292,10 +317,14 @@ async fn tools_list_rejects_entry_limit_without_truncating() {
 		_ => Reply::json(rpc_result(&seen.body, json!({}))),
 	})
 	.await;
-	let connection = connect_to_server("entry-limit", MCPServerConfig::Http(http_config(&server.url)))
+	let connection =
+		connect_to_server("entry-limit", MCPServerConfig::Http(http_config(&server.url)))
+			.await
+			.expect("connect");
+	let error = connection
+		.list_tools()
 		.await
-		.expect("connect");
-	let error = connection.list_tools().await.expect_err("entry limit must fail");
+		.expect_err("entry limit must fail");
 	assert!(matches!(error, McpError::Protocol(message) if message.contains("pagination bounds")));
 }
 
@@ -324,12 +353,18 @@ async fn configured_headers_lose_to_generated_and_session_headers_follow() {
 	let init_headers = requests[0].headers.to_ascii_lowercase();
 	assert!(init_headers.contains("authorization: bearer tok"), "{init_headers}");
 	assert!(init_headers.contains("x-api-key: k-1"), "{init_headers}");
-assert!(init_headers.contains("content-type: application/json"), "SDK must generate JSON content type: {init_headers}");
-assert!(!init_headers.contains("text/plain"), "configured content type must be rejected: {init_headers}");
-assert!(
-	!init_headers.contains("mcp-protocol-version: spoofed"),
-	"configured protocol version must not override SDK negotiation: {init_headers}"
-);
+	assert!(
+		init_headers.contains("content-type: application/json"),
+		"SDK must generate JSON content type: {init_headers}"
+	);
+	assert!(
+		!init_headers.contains("text/plain"),
+		"configured content type must be rejected: {init_headers}"
+	);
+	assert!(
+		!init_headers.contains("mcp-protocol-version: spoofed"),
+		"configured protocol version must not override SDK negotiation: {init_headers}"
+	);
 
 	let notify_headers = requests[1].headers.to_ascii_lowercase();
 	assert!(
@@ -392,11 +427,20 @@ async fn http_redirect_is_refused_before_second_origin_contact() {
 		status: 302,
 		headers: vec![("Location", target.url.clone())],
 		body: String::new(),
-	}).await;
+	})
+	.await;
 	let config = http_config(&redirector.url);
-	let err = connect_to_server("locked", MCPServerConfig::Http(config)).await.expect_err("Policy::none must refuse all redirects");
-assert!(matches!(&err, McpError::Protocol(message) if message.contains("HTTP 302")), "expected rmcp Protocol redirect refusal, got {err:?}");
-	assert!(target_hits.lock().unwrap().is_empty(), "refused redirect must never reach target origin");
+	let err = connect_to_server("locked", MCPServerConfig::Http(config))
+		.await
+		.expect_err("Policy::none must refuse all redirects");
+	assert!(
+		matches!(&err, McpError::Protocol(message) if message.contains("HTTP 302")),
+		"expected rmcp Protocol redirect refusal, got {err:?}"
+	);
+	assert!(
+		target_hits.lock().unwrap().is_empty(),
+		"refused redirect must never reach target origin"
+	);
 }
 
 #[tokio::test]
@@ -455,33 +499,34 @@ for line in sys.stdin:
 	let pending = tokio::spawn(async move { caller.call_tool("wait_forever", json!({})).await });
 	let start = tokio::time::Instant::now();
 	while !marker.exists() {
-		assert!(
-			start.elapsed() < Duration::from_secs(3),
-			"server never observed tools/call"
-		);
+		assert!(start.elapsed() < Duration::from_secs(3), "server never observed tools/call");
 		tokio::time::sleep(Duration::from_millis(10)).await;
 	}
 
-    connection.close().await.expect("close");
-    let result = tokio::time::timeout(Duration::from_secs(2), pending)
-        .await
-        .expect("pending request must settle on close")
-        .expect("task");
-    match result {
-        Err(McpError::UnknownOutcome(message)) => assert!(message.contains("unverified") || message.contains("unknown"), "{message}"),
-        other => panic!("pending mutating call must report unknown outcome, got {other:?}"),
-    }
+	connection.close().await.expect("close");
+	let result = tokio::time::timeout(Duration::from_secs(2), pending)
+		.await
+		.expect("pending request must settle on close")
+		.expect("task");
+	match result {
+		Err(McpError::UnknownOutcome(message)) => {
+			assert!(message.contains("unverified") || message.contains("unknown"), "{message}")
+		},
+		other => panic!("pending mutating call must report unknown outcome, got {other:?}"),
+	}
 
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
-    let mut alive = true;
-    while alive && tokio::time::Instant::now() < deadline {
-        alive = std::process::Command::new("kill")
-            .args(["-0", &pid.to_string()])
-            .status()
-            .is_ok_and(|status| status.success());
-        if alive { tokio::time::sleep(Duration::from_millis(20)).await; }
-    }
-    assert!(!alive, "close must terminate the stdio child");
+	let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+	let mut alive = true;
+	while alive && tokio::time::Instant::now() < deadline {
+		alive = std::process::Command::new("kill")
+			.args(["-0", &pid.to_string()])
+			.status()
+			.is_ok_and(|status| status.success());
+		if alive {
+			tokio::time::sleep(Duration::from_millis(20)).await;
+		}
+	}
+	assert!(!alive, "close must terminate the stdio child");
 
 	let _ = std::fs::remove_file(&script);
 	let _ = std::fs::remove_file(&pid_file);
@@ -516,10 +561,8 @@ impl pi_agent::mcp::McpTransport for FailingTransport {
 		Err(match self.failure {
 			Failure::Transport => McpError::Transport("mock transport broke".to_string()),
 			Failure::Closed => McpError::Closed,
-			Failure::JsonRpc => McpError::JsonRpc {
-				code: -32000,
-				message: "rejected".to_string(),
-				data: None,
+			Failure::JsonRpc => {
+				McpError::JsonRpc { code: -32000, message: "rejected".to_string(), data: None }
 			},
 		})
 	}
@@ -540,8 +583,9 @@ fn fake_connection(failure: Failure, config: MCPServerConfig) -> Arc<pi_agent::m
 	Arc::new(pi_agent::mcp::McpConnection {
 		name: "fake".to_string(),
 		config,
-		transport: Arc::new(tokio::sync::RwLock::new(Arc::new(FailingTransport { failure })
-			as Arc<dyn pi_agent::mcp::McpTransport>)),
+		transport: Arc::new(tokio::sync::RwLock::new(
+			Arc::new(FailingTransport { failure }) as Arc<dyn pi_agent::mcp::McpTransport>
+		)),
 		server_info: pi_agent::mcp::MCPServerInfo { name: "fake".to_string(), version: None },
 		capabilities: pi_agent::mcp::MCPServerCapabilities::default(),
 		instructions: None,
@@ -579,10 +623,17 @@ async fn definite_errors_never_condemn_the_transport() {
 
 	// A JSON-RPC error response means the server answered: the transport is
 	// healthy, so neither this call nor the next may trigger a handshake.
-	let connection = fake_connection(Failure::JsonRpc, MCPServerConfig::Http(http_config(&server.url)));
-	let error = connection.call_tool("tool", json!({})).await.expect_err("fake always fails");
+	let connection =
+		fake_connection(Failure::JsonRpc, MCPServerConfig::Http(http_config(&server.url)));
+	let error = connection
+		.call_tool("tool", json!({}))
+		.await
+		.expect_err("fake always fails");
 	assert!(matches!(error, McpError::JsonRpc { .. }), "{error:?}");
-	connection.call_tool("tool", json!({})).await.expect_err("fake always fails");
+	connection
+		.call_tool("tool", json!({}))
+		.await
+		.expect_err("fake always fails");
 	assert_eq!(
 		method_count(&server, "initialize"),
 		0,
@@ -599,14 +650,21 @@ async fn closed_transport_is_replaced_on_the_next_call() {
 	})
 	.await;
 
-	let connection = fake_connection(Failure::Closed, MCPServerConfig::Http(http_config(&server.url)));
+	let connection =
+		fake_connection(Failure::Closed, MCPServerConfig::Http(http_config(&server.url)));
 	// Definite: the request never left the client, so it is reported as `Closed`
 	// rather than as an unknown outcome.
-	let error = connection.call_tool("tool", json!({})).await.expect_err("fake fails");
+	let error = connection
+		.call_tool("tool", json!({}))
+		.await
+		.expect_err("fake fails");
 	assert!(matches!(error, McpError::Closed), "{error:?}");
 
 	// A transport that reports `Closed` is gone, so the next call replaces it.
-	connection.call_tool("tool", json!({})).await.expect("reconnected call succeeds");
+	connection
+		.call_tool("tool", json!({}))
+		.await
+		.expect("reconnected call succeeds");
 	assert_eq!(method_count(&server, "initialize"), 1, "closed transport is replaced once");
 }
 
@@ -619,14 +677,21 @@ async fn unverified_delivery_retires_only_its_own_epoch() {
 	})
 	.await;
 
-	let connection = fake_connection(Failure::Transport, MCPServerConfig::Http(http_config(&server.url)));
+	let connection =
+		fake_connection(Failure::Transport, MCPServerConfig::Http(http_config(&server.url)));
 
 	// An unverified delivery blames the transport that produced it.
-	let error = connection.call_tool("tool", json!({})).await.expect_err("fake fails");
+	let error = connection
+		.call_tool("tool", json!({}))
+		.await
+		.expect_err("fake fails");
 	assert!(matches!(error, McpError::Transport(_)), "{error:?}");
 
 	// The next call reconnects (one handshake) and the replacement serves it.
-	connection.call_tool("tool", json!({})).await.expect("reconnected call succeeds");
+	connection
+		.call_tool("tool", json!({}))
+		.await
+		.expect("reconnected call succeeds");
 	assert_eq!(method_count(&server, "initialize"), 1, "exactly one reconnect");
 	assert_eq!(
 		connection.transport_epoch.load(Ordering::SeqCst),
@@ -637,14 +702,55 @@ async fn unverified_delivery_retires_only_its_own_epoch() {
 	// A late failure from the retired transport must not mark the healthy one:
 	// record it against epoch 1, then prove no further handshake happens.
 	connection.failed_epoch.fetch_max(1, Ordering::AcqRel);
-	connection.call_tool("tool", json!({})).await.expect("healthy transport keeps serving");
+	connection
+		.call_tool("tool", json!({}))
+		.await
+		.expect("healthy transport keeps serving");
 	assert_eq!(method_count(&server, "initialize"), 1, "stale epoch must be ignored");
 
 	// A failure on the installed epoch is genuine and must survive: it is the
 	// epoch reconnect has actually observed, so the next call reconnects again.
 	connection.failed_epoch.fetch_max(2, Ordering::AcqRel);
-	connection.call_tool("tool", json!({})).await.expect("second reconnect succeeds");
+	connection
+		.call_tool("tool", json!({}))
+		.await
+		.expect("second reconnect succeeds");
 	assert_eq!(method_count(&server, "initialize"), 2, "current-epoch failure is honoured");
+}
+
+#[tokio::test]
+async fn transient_gateway_status_on_a_mutating_call_is_unverified() {
+	// 502/503 can arrive after the tool already ran. Reporting a definite HTTP
+	// failure would invite the model to replay a non-idempotent call, so the
+	// error has to keep the unverified wording and must not be retried.
+	let calls = Arc::new(AtomicUsize::new(0));
+	let seen_calls = Arc::clone(&calls);
+	let server = spawn_mock(move |_, seen| match seen.body.get("method").and_then(Value::as_str) {
+		Some("initialize") => Reply::json(rpc_result(&seen.body, initialize_result())),
+		Some("tools/call") => {
+			seen_calls.fetch_add(1, Ordering::SeqCst);
+			Reply { status: 503, headers: Vec::new(), body: "unavailable".to_string() }
+		},
+		_ => Reply::json(rpc_result(&seen.body, json!({}))),
+	})
+	.await;
+	let connection =
+		connect_to_server("mutating-503", MCPServerConfig::Http(http_config(&server.url)))
+			.await
+			.expect("connect");
+
+	let error = connection
+		.call_tool("tool", json!({}))
+		.await
+		.expect_err("503 fails the call");
+	match error {
+		McpError::UnknownOutcome(message) => {
+			assert!(message.contains("unverified"), "wording keeps the replay warning: {message}");
+		},
+		other => panic!("mutating 503 must be UnknownOutcome, got {other:?}"),
+	}
+	assert_eq!(calls.load(Ordering::SeqCst), 1, "an unverified call is never replayed");
+	connection.close().await.expect("close");
 }
 
 #[tokio::test]
@@ -671,7 +777,10 @@ async fn concurrent_calls_share_one_reconnect() {
 	assert!(connection.call_tool("tool", json!({})).await.is_err(), "first call breaks");
 
 	// Both callers observe the broken epoch; exactly one of them may rebuild it.
-	let (left, right) = tokio::join!(connection.call_tool("tool", json!({})), connection.call_tool("tool", json!({})));
+	let (left, right) = tokio::join!(
+		connection.call_tool("tool", json!({})),
+		connection.call_tool("tool", json!({}))
+	);
 	left.expect("left call succeeds after reconnect");
 	right.expect("right call succeeds on the reconnected transport");
 
@@ -705,7 +814,10 @@ async fn close_wins_over_concurrent_reconnect() {
 	closed.expect("close completes");
 
 	// Post-close requests are definite: nothing reached a transport.
-	let error = connection.call_tool("tool", json!({})).await.expect_err("closed session");
+	let error = connection
+		.call_tool("tool", json!({}))
+		.await
+		.expect_err("closed session");
 	assert!(matches!(error, McpError::Closed), "{error:?}");
 	connection.close().await.expect("close is idempotent");
 }
