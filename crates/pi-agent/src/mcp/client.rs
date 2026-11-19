@@ -358,8 +358,26 @@ impl McpConnection {
 		params: Option<Value>,
 		deadline: Option<Instant>,
 	) -> Result<Value, McpError> {
-		let (transport, epoch) = self.acquire_transport(deadline).await?;
-		match transport
+		self
+			.request_value_measured(method, params, deadline)
+			.await
+			.0
+	}
+
+	/// `request_value` plus the epoch the attempt actually used: a retry must
+	/// judge the failure against the transport that produced it, not against a
+	/// snapshot taken before a concurrent caller replaced that transport.
+	async fn request_value_measured(
+		&self,
+		method: &str,
+		params: Option<Value>,
+		deadline: Option<Instant>,
+	) -> (Result<Value, McpError>, u64) {
+		let (transport, epoch) = match self.acquire_transport(deadline).await {
+			Ok(pair) => pair,
+			Err(error) => return (Err(error), self.transport_epoch.load(Ordering::Acquire)),
+		};
+		let result = match transport
 			.request(method, params, Self::remaining(deadline))
 			.await
 		{
@@ -372,7 +390,8 @@ impl McpConnection {
 				}
 				Err(error)
 			},
-		}
+		};
+		(result, epoch)
 	}
 
 	async fn reconnect_locked(&self, deadline: Option<Instant>) -> Result<(), McpError> {
@@ -496,9 +515,8 @@ impl McpConnection {
 				},
 				None => None,
 			};
-			let used_epoch = self.transport_epoch.load(Ordering::Acquire);
-			let call_res = self
-				.request_value("tools/list", Some(params.clone()), deadline)
+			let (call_res, used_epoch) = self
+				.request_value_measured("tools/list", Some(params.clone()), deadline)
 				.await;
 
 			let res_val = match call_res {
