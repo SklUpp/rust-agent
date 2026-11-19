@@ -1335,10 +1335,39 @@ impl Supervisor {
 		self.child_durability.lock().unwrap().clone()
 	}
 
+	/// Durable admission before a child scope exists. A configured factory must
+	/// accept it or the spawn is refused; without a factory this is a no-op.
+	pub fn admit_child_durable(
+		&self,
+		worker_id: &str,
+		spec: &serde_json::Value,
+	) -> Result<(), String> {
+		let Some(factory) = self.child_durability_factory() else {
+			return Ok(());
+		};
+		factory
+			.admit_child(worker_id, spec)
+			.map_err(|error| format!("child admission for {worker_id}: {error}"))
+	}
+
+	/// Close an admission on a terminal child transition. Unknown ids and
+	/// already-terminal rows are ignored by the store factory.
+	fn finish_child_admission(&self, id: &str, state: &str) {
+		let Some(worker_id) = self.capture_result_key(id) else {
+			return;
+		};
+		let Some(factory) = self.child_durability_factory() else {
+			return;
+		};
+		if let Err(error) = factory.finish_child(&worker_id, state) {
+			eprintln!("warning: child {id} admission {state} failed: {error}");
+		}
+	}
+
 	/// Open the durable scope for one worker before its first turn. `worker_id`
 	/// is the spawn-time result key; a configured factory never falls back to an
 	/// ephemeral child if that key is missing.
-    pub fn open_child_durable(
+	pub fn open_child_durable(
         &self,
         id: &str,
         worker_id: Option<&str>,
@@ -1398,6 +1427,10 @@ impl Supervisor {
             }
         }
         self.state.lock().unwrap().durable_children.insert(id.to_string(), child.clone());
+        if let Err(error) = factory.start_child(worker_id) {
+            self.state.lock().unwrap().durable_children.remove(id);
+            return Err(format!("child {id} admission start: {error}"));
+        }
         Ok(Some((child, true, replay)))
     }
 
@@ -1428,6 +1461,7 @@ impl Supervisor {
 					.unwrap()
 					.completed_children
 					.insert(id.to_string());
+				self.finish_child_admission(id, "completed");
 				Ok(())
 			},
 			None => Ok(()),
@@ -2903,6 +2937,7 @@ impl Supervisor {
 
 	pub fn mark_failed(&self, id: &str, duration_ms: u64, error: &str) {
 		self.settle_child(id, duration_ms, None, Some(error), None);
+		self.finish_child_admission(id, "failed");
 	}
 
 	/// Fail a job after it already reported usage. Turns that ran before the
@@ -2915,10 +2950,15 @@ impl Supervisor {
 		usage: Option<TokenUsage>,
 	) {
 		self.settle_child(id, duration_ms, None, Some(error), usage);
+		self.finish_child_admission(id, "failed");
 	}
 
 	pub fn mark_aborted(&self, id: &str, reason: &str) -> bool {
-		self.abort_child(id, reason, None)
+		let changed = self.abort_child(id, reason, None);
+		if changed {
+			self.finish_child_admission(id, "abandoned");
+		}
+		changed
 	}
 
 	/// Abort a job whose completed turns already reported usage. The counters
@@ -2930,7 +2970,11 @@ impl Supervisor {
 		reason: &str,
 		usage: Option<TokenUsage>,
 	) -> bool {
-		self.abort_child(id, reason, usage)
+		let changed = self.abort_child(id, reason, usage);
+		if changed {
+			self.finish_child_admission(id, "abandoned");
+		}
+		changed
 	}
 
 	fn abort_child(&self, id: &str, reason: &str, usage: Option<TokenUsage>) -> bool {

@@ -506,6 +506,36 @@ impl TaskTool {
 		// carries its own accounting key from here on, so no consumer has to look
 		// the record up later (a settled record may already be pruned).
 		let spawn_result_key = self.supervisor.capture_result_key(&child_id);
+		if let Some(worker_id) = spawn_result_key.as_deref() {
+			let admission_spec = serde_json::json!({
+				"task": &item.task,
+				"agent": &agent_name,
+				"agentSource": &agent_source,
+				"background": false,
+			});
+			if let Err(message) = self
+				.supervisor
+				.admit_child_durable(worker_id, &admission_spec)
+			{
+				reservation.disarm();
+				self.supervisor
+					.mark_failed(&child_id, start.elapsed().as_millis() as u64, &message);
+				self.supervisor.unregister_active_child(&child_id);
+				self.supervisor.release_outstanding(&child_id);
+				return single_failure(
+					index,
+					child_id,
+					child_name,
+					agent_name,
+					agent_source,
+					item.task,
+					message,
+					start.elapsed().as_millis() as u64,
+					None,
+					None,
+				);
+			}
+		}
 		let child_durability = match self
 			.supervisor
 			.open_child_durable(&child_id, spawn_result_key.as_deref())
@@ -1498,6 +1528,24 @@ impl TaskTool {
 		// Captured while the record is unreserved-but-immutable: a late usage
 		// fill must prove it addresses this exact record, never a later one.
 		let spawn_result_key = self.supervisor.capture_result_key(&child_id);
+		if let Some(worker_id) = spawn_result_key.as_deref() {
+			let admission_spec = serde_json::json!({
+				"task": &item.task,
+				"agent": &agent_name,
+				"agentSource": &agent_source,
+				"background": true,
+			});
+			if let Err(message) = self
+				.supervisor
+				.admit_child_durable(worker_id, &admission_spec)
+			{
+				self.supervisor
+					.mark_aborted(&child_id, "durable admission refused");
+				self.supervisor.unregister_active_child(&child_id);
+				self.supervisor.release_outstanding(&child_id);
+				return Err(format!("{child_name}: {message}"));
+			}
+		}
 		let child_durable = match self
 			.supervisor
 			.open_child_durable(&child_id, spawn_result_key.as_deref())

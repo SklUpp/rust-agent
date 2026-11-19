@@ -180,7 +180,7 @@ const SCHEMA_V5_MIGRATION_DDL: &str = "
 		created_at_ms INTEGER NOT NULL,
 		updated_at_ms INTEGER NOT NULL
 	);
-	CREATE UNIQUE INDEX IF NOT EXISTS task_admissions_worker_idx ON task_admissions(worker_id);
+	CREATE UNIQUE INDEX IF NOT EXISTS task_admissions_worker_idx ON task_admissions(worker_id, producer_generation);
 	CREATE INDEX IF NOT EXISTS task_admissions_open_idx ON task_admissions(parent_session_id, state);
 ";
 
@@ -3183,6 +3183,34 @@ impl SqliteStore {
 			});
 		}
 		Ok(admissions)
+	}
+
+	/// Next producer generation for a session: one above every generation this
+	/// table has ever stored. Reopening a session therefore never reuses an
+	/// earlier epoch, and a session with no admissions starts at 1.
+	pub fn next_producer_generation(&self, session_id: &str) -> StoreResult<u64> {
+		validate_id("parent session id", session_id)?;
+		let max: Option<i64> = self.connection.query_row(
+			"SELECT MAX(producer_generation) FROM task_admissions WHERE parent_session_id = ?1",
+			params![session_id],
+			|row| row.get(0),
+		)?;
+		Ok(u64::try_from(max.unwrap_or(0))
+			.unwrap_or(0)
+			.saturating_add(1))
+	}
+
+	/// Recovery for a session whose writer ownership was just acquired: any
+	/// admission still `admitted` or `started` belonged to a producer that no
+	/// longer owns the session, so its outcome is unknown and it is closed as
+	/// `abandoned` — never replayed. Returns how many rows changed.
+	pub fn abandon_open_task_admissions(&mut self, session_id: &str) -> StoreResult<usize> {
+		validate_id("parent session id", session_id)?;
+		Ok(self.connection.execute(
+			"UPDATE task_admissions SET state = 'abandoned', updated_at_ms = ?2 \
+			 WHERE parent_session_id = ?1 AND state IN ('admitted', 'started')",
+			params![session_id, now_ms()],
+		)?)
 	}
 
 	/// Insert a pending delivery that has no worker completion (peer mail).
@@ -10787,14 +10815,15 @@ mod tests {
 			1
 		);
 
-		// The same task id and the same worker id are single-flight.
+		// The same task id and the same worker id at the same generation are
+		// single-flight; a later producer generation may reuse the worker name.
 		assert!(store.admit_task(admission).is_err());
 		let duplicate_worker = NewTaskAdmission {
 			task_id: "t_other".to_string(),
 			parent_session_id: "s_adm".to_string(),
 			parent_branch_id: "b1".to_string(),
 			worker_id: "w_adm".to_string(),
-			producer_generation: 8,
+			producer_generation: 7,
 			spec: json!({}),
 		};
 		assert!(store.admit_task(duplicate_worker).is_err());
@@ -10822,6 +10851,44 @@ mod tests {
 		);
 		assert!(store.finish_task_admission("t_one", "failed").is_err());
 		assert!(store.finish_task_admission("t_one", "bogus").is_err());
+
+		// Recovery epochs never reuse a stored generation.
+		let next = store.next_producer_generation("s_adm").expect("generation");
+		assert_eq!(next, 8);
+		store
+			.admit_task(NewTaskAdmission {
+				task_id: "t_lost".to_string(),
+				parent_session_id: "s_adm".to_string(),
+				parent_branch_id: "b1".to_string(),
+				worker_id: "w_lost".to_string(),
+				producer_generation: next,
+				spec: json!({ "prompt": "started before the crash" }),
+			})
+			.expect("admit lost task");
+		store
+			.mark_task_admission_started("t_lost")
+			.expect("start lost task");
+		assert_eq!(
+			store
+				.abandon_open_task_admissions("s_adm")
+				.expect("recovery"),
+			1
+		);
+		assert_eq!(
+			store
+				.abandon_open_task_admissions("s_adm")
+				.expect("idempotent recovery"),
+			0
+		);
+		assert_eq!(
+			store
+				.task_admission("t_lost")
+				.expect("read")
+				.expect("present")
+				.state,
+			"abandoned"
+		);
+		assert_eq!(store.next_producer_generation("s_adm").expect("generation"), 9);
 
 		// Durable across reopen: the admission is not in-memory state.
 		drop(store);

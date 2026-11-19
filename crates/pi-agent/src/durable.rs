@@ -264,6 +264,26 @@ pub trait ChildDurabilityFactory: Send + Sync + std::fmt::Debug {
 	fn open_child(&self, _worker_id: &str) -> Result<ChildDurability, DurableError> {
 		Err(DurableError::new("durable child scope is not implemented"))
 	}
+
+	/// Record that a child is about to be created. Must be durable before the
+	/// host starts any effect; a failure aborts the spawn. The default keeps
+	/// stores that predate task admissions working.
+	fn admit_child(&self, _worker_id: &str, _spec: &Value) -> Result<(), DurableError> {
+		Ok(())
+	}
+
+	/// Record that the child's effect was requested. Called once, after the
+	/// durable scope is open and before the first provider request.
+	fn start_child(&self, _worker_id: &str) -> Result<(), DurableError> {
+		Ok(())
+	}
+
+	/// Close an admitted child with a terminal state. Called on settlement and
+	/// on every early-abort path; repeating a terminal state is not an error,
+	/// and an unknown admission is ignored.
+	fn finish_child(&self, _worker_id: &str, _state: &str) -> Result<(), DurableError> {
+		Ok(())
+	}
     fn open_child_with_replay(&self, worker_id: &str) -> Result<(ChildDurability, Option<Vec<Message>>), DurableError> {
         let child = self.open_child(worker_id)?;
         let replay = self.load_child_messages_fresh(worker_id, &child)?;

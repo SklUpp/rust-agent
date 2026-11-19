@@ -42,8 +42,8 @@ use crate::{
 		SessionMessage, Usage, derive_turn_history,
 	},
 	session_store::{
-		ExecutionRecord, NewBranch, NewDelivery, NewIntent, NewMessage, NewSession, SessionRecord,
-		SqliteStore, StoreError, StoreResult, UnresolvedIntent, WorkerCompletion,
+		ExecutionRecord, NewBranch, NewDelivery, NewIntent, NewMessage, NewSession, NewTaskAdmission,
+		SessionRecord, SqliteStore, StoreError, StoreResult, UnresolvedIntent, WorkerCompletion,
 	},
 };
 
@@ -466,6 +466,8 @@ pub struct DurableSession {
 	/// Last persisted assistant message id on the active branch, updated by
 	/// `persist_messages` and amended on terminal abort by `finish_turn`.
 	last_assistant_id: Arc<Mutex<Option<String>>>,
+	/// Durable recovery epoch handed to every task admission this handle makes.
+	producer_generation: u64,
 	/// Per-child exclusivity when this handle is a worker session. Root sessions
 	/// leave this `None`; root exclusivity lives inside [`DurableWriter`].
 	/// Shared as Arc so every queued writer job retains ownership until the
@@ -480,6 +482,7 @@ fn empty_session_fields(
 	session_id: String,
 	branch: String,
 	leaf: Option<String>,
+	producer_generation: u64,
 	child_lease: Option<Arc<SessionWriterLease>>,
 	projection: Option<StoredProjection>,
 	resume_seed: Option<StoreResult<Vec<(u64, Option<String>)>>>,
@@ -495,6 +498,7 @@ fn empty_session_fields(
 		projection: Arc::new(Mutex::new(projection)),
 		resume_seed: Arc::new(Mutex::new(resume_seed)),
 		last_assistant_id: Arc::new(Mutex::new(None)),
+		producer_generation,
 		child_lease,
 	}
 }
@@ -563,7 +567,11 @@ impl DurableSession {
 				parent_session_id.filter(|parent| store.session(parent).ok().flatten().is_some());
 			store.create_session(NewSession { parent_session_id: parent, ..session })
 		})?;
-		Ok(empty_session_fields(writer, session_id, branch_id, None, None, None, None))
+		let generation = {
+			let id = session_id.clone();
+			writer.call(move |store| store.next_producer_generation(&id))?
+		};
+		Ok(empty_session_fields(writer, session_id, branch_id, None, generation, None, None, None))
 	}
 
 	/// Open an existing session or a new one. `None` means the row was absent
@@ -598,14 +606,20 @@ impl DurableSession {
 			let id = id.clone();
 			writer.call(move |store| store.session(&id))?
 		};
+		let generation = {
+			let id = id.clone();
+			writer.call(move |store| store.next_producer_generation(&id))?
+		};
 		match existing {
 			Some(_) => {
 				// Exclusive ownership is proven: recover trailing unresolved
-				// intents once, then load. Failure is fatal to writer open.
+				// intents and close child admissions orphaned by the previous
+				// owner before loading. Failure is fatal to writer open.
 				let parts = {
 					let id = id.clone();
 					writer.call(move |store| {
 						store.recover_unresolved_intents(&id)?;
+						store.abandon_open_task_admissions(&id)?;
 						load_parts(store, &id)
 					})?
 				};
@@ -621,6 +635,7 @@ impl DurableSession {
 						id,
 						parts.branch_id.clone(),
 						parts.leaf.clone(),
+						generation,
 						child_lease,
 						parts.projection.clone(),
 						Some(seed),
@@ -652,7 +667,19 @@ impl DurableSession {
 						initial_branch_payload: Value::Null,
 					})
 				})?;
-				Ok((empty_session_fields(writer, id, branch_id, None, child_lease, None, None), None))
+				Ok((
+					empty_session_fields(
+						writer,
+						id,
+						branch_id,
+						None,
+						generation,
+						child_lease,
+						None,
+						None,
+					),
+					None,
+				))
 			},
 		}
 	}
@@ -1897,6 +1924,7 @@ struct StoreChildDurabilityFactory {
 	writer: Arc<DurableWriter>,
 	session_id: String,
 	cursor: Arc<Mutex<Cursor>>,
+	producer_generation: u64,
 	gates: Arc<Mutex<HashMap<String, Arc<Mutex<()>>>>>,
 }
 
@@ -1964,6 +1992,50 @@ impl StoreChildDurabilityFactory {
 		});
 		ChildDurability::new(identity, Arc::new(child) as Arc<dyn DurableBoundary>, completion)
 	}
+
+	/// Admission rows are keyed by worker *and* producer generation, so a
+	/// restarted session reusing the `task-N` name never collides with the
+	/// previous generation's terminal row.
+	fn admission_id(&self, worker_id: &str) -> String {
+		format!("{worker_id}@{}", self.producer_generation)
+	}
+
+	fn admit_task(&self, worker_id: &str, spec: &Value) -> Result<(), DurableError> {
+		let task_id = self.admission_id(worker_id);
+		let session_id = self.session_id.clone();
+		let branch_id = lock(&self.cursor).branch.clone();
+		let worker_id = worker_id.to_string();
+		let producer_generation = self.producer_generation;
+		let spec = spec.clone();
+		writer_call(&self.writer, move |store| {
+			store.admit_task(NewTaskAdmission {
+				task_id,
+				parent_session_id: session_id,
+				parent_branch_id: branch_id,
+				worker_id,
+				producer_generation,
+				spec,
+			})
+		})
+		.map_err(|error| DurableError::new(error.to_string()))
+	}
+
+	fn start_task(&self, worker_id: &str) -> Result<(), DurableError> {
+		let task_id = self.admission_id(worker_id);
+		match writer_call(&self.writer, move |store| store.mark_task_admission_started(&task_id)) {
+			Ok(()) | Err(StoreError::Conflict(_)) | Err(StoreError::NotFound(_)) => Ok(()),
+			Err(error) => Err(DurableError::new(error.to_string())),
+		}
+	}
+
+	fn finish_task(&self, worker_id: &str, state: &str) -> Result<(), DurableError> {
+		let task_id = self.admission_id(worker_id);
+		let state = state.to_string();
+		match writer_call(&self.writer, move |store| store.finish_task_admission(&task_id, &state)) {
+			Ok(()) | Err(StoreError::Conflict(_)) | Err(StoreError::NotFound(_)) => Ok(()),
+			Err(error) => Err(DurableError::new(error.to_string())),
+		}
+	}
 }
 
 fn replay_loaded_session(loaded: &LoadedSession) -> StoreResult<Vec<Message>> {
@@ -2019,6 +2091,18 @@ impl ChildDurabilityFactory for StoreChildDurabilityFactory {
 			.transpose()
 			.map_err(|e| DurableError::new(e.to_string()))?;
 		Ok((Self::handle(child, identity), replay))
+	}
+
+	fn admit_child(&self, worker_id: &str, spec: &Value) -> Result<(), DurableError> {
+		self.admit_task(worker_id, spec)
+	}
+
+	fn start_child(&self, worker_id: &str) -> Result<(), DurableError> {
+		self.start_task(worker_id)
+	}
+
+	fn finish_child(&self, worker_id: &str, state: &str) -> Result<(), DurableError> {
+		self.finish_task(worker_id, state)
 	}
 
 	fn import_legacy_child(
@@ -2224,6 +2308,7 @@ impl DurableSession {
 			writer: Arc::clone(&self.writer),
 			session_id: self.session_id.clone(),
 			cursor: Arc::clone(&self.cursor),
+			producer_generation: self.producer_generation,
 			gates: Arc::new(Mutex::new(HashMap::new())),
 		})
 	}
@@ -2775,6 +2860,55 @@ mod tests {
 			"completion must use the branch captured at spawn"
 		);
 		drop(store);
+		let _ = std::fs::remove_dir_all(dir);
+	}
+
+	#[test]
+	fn child_admission_is_durable_and_abandoned_on_reopen() {
+		let (dir, path) = temp_db("admission");
+		let root = Arc::new(
+			DurableSession::create(&path, header("root", None)).expect("create root session"),
+		);
+		let generation = root.producer_generation;
+		let factory = root.durable_child_factory();
+		let worker_id = "ns:task-9";
+		factory
+			.admit_child(worker_id, &serde_json::json!({"task": "write the report"}))
+			.expect("admit child");
+		let task_id = format!("{worker_id}@{generation}");
+		{
+			let store = SqliteStore::open(&path).expect("reopen store");
+			let row = store
+				.task_admission(&task_id)
+				.expect("read")
+				.expect("present");
+			assert_eq!(row.state, "admitted");
+			assert_eq!(row.producer_generation, generation);
+		}
+
+		let child = factory.open_child(worker_id).expect("open child scope");
+		{
+			let store = SqliteStore::open(&path).expect("reopen store");
+			let row = store
+				.task_admission(&task_id)
+				.expect("read")
+				.expect("present");
+			assert_eq!(row.state, "started");
+		}
+		drop(child);
+		drop(factory);
+		drop(root);
+
+		let root = DurableSession::open(&path, "root", header("root", None)).expect("reopen root");
+		assert!(root.producer_generation > generation, "recovery must advance the epoch");
+		let store = SqliteStore::open(&path).expect("reopen store");
+		let row = store
+			.task_admission(&task_id)
+			.expect("read")
+			.expect("present");
+		assert_eq!(row.state, "abandoned");
+		drop(store);
+		drop(root);
 		let _ = std::fs::remove_dir_all(dir);
 	}
 
