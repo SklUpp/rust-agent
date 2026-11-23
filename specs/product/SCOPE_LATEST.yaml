@@ -1,0 +1,250 @@
+core_value: "Autonomous coding-first Rust runtime for Linux and Termux/Android Bionic arm64, executing single-binary CLI/TUI/headless agent workflows with SQLite durable state, crash resilience, and secure modular reuse."
+
+summary: >
+  Defines the authoritative product scope for aragent based on the approved
+  preliminary implementation plan (R0–R12), architecture decisions (D01–D96),
+  and modular reuse blueprint. The scope bounds the core runtime capabilities,
+  durable state machine, execution isolation, language analysis, memory,
+  subagent delivery, and diagnostics while strictly excluding unapproved package
+  installations, unapproved pushes, unapproved releases, and viral/incompatible
+  third-party licenses.
+
+work_order_and_dependencies:
+  ordering_rules:
+    - "R0 MUST precede R1: durable task admission relies on absence of unredacted dirty writers in same transactions (docs/agent-preliminary-implementation-plan.md:45)."
+    - "R1 through R3 MUST execute sequentially: durable task relies on non-conflicting writers, and SQLITE_BUSY relies on absence of blind retries around commit (docs/agent-preliminary-implementation-plan.md:52)."
+    - "R7 (parallel writers & merge) MUST NOT start before R2: without the SQLITE_BUSY statement boundary, concurrent commits cannot be proven (docs/agent-preliminary-implementation-plan.md:46)."
+    - "R4 through R8 MAY execute in parallel only AFTER R3 is completed, provided worktrees and files are disjoint (docs/agent-preliminary-implementation-plan.md:52)."
+    - "R9 and R10 MUST NOT start until R1 through R3 are proven on a live device (docs/agent-preliminary-implementation-plan.md:52)."
+    - "Versioning and releases: prerelease chain (-dev, -alpha, -beta) and CI builds distinguish builds during ongoing implementation; MAJOR version remains 0 until R7 closes, and stable 0.2.0 release is not declared before R7 completion (docs/agent-preliminary-implementation-plan.md:36,65; docs/agent-architecture-decisions.md:495)."
+
+in_scope:
+  - id: R0
+    name: "Transport & Redaction Hardening (R0.1–R0.4)"
+    summary: >
+      Redact known secrets across all SQLite writes (executions.intent_json/outcome_json,
+      deliveries.payload_json, worker_completions, sessions.payload_json with auto-title,
+      and artifact metadata). Close leak on SSE handshake cancellation so a timeout during
+      initialize leaves no live SSE task and no socket, without breaking long SSE streams.
+      Strip URL and body (<=256 bytes) from McpError::Protocol Display implementations so
+      secrets do not appear in to_string(). Provide live Termux external MCP server
+      (filesystem) smoke verification.
+    dependencies: []
+    epic: "epic-00-transport-redaction"
+
+  - id: R1
+    name: "Durable Task Admission & Crash Recovery (S4)"
+    summary: >
+      Task admission persisted in SQLite v6 before effect, survivor generation
+      recovery, FIFO writer barrier, and cached revive logic preventing duplicate
+      or lost child tasks across process kills (kill -9 between accept and persist
+      does not lose or duplicate task; resume plays back exactly once).
+    dependencies: ["R0"]
+    epic: "epic-01-durable-task-admission"
+
+  - id: R2
+    name: "SQLite Concurrency & SQLITE_BUSY Boundary (S5)"
+    summary: >
+      Configured busy_timeout, boundary before statements, cancellation-aware
+      contracts without blind retries on ambiguous commit outcomes, and fail-closed
+      reporting to user. Under competing writer processes and DDL, no commit is retried
+      blindly.
+    dependencies: ["R1"]
+    epic: "epic-02-sqlite-concurrency"
+
+  - id: R3
+    name: "Process Engine, Lease & Bash Protection (S3)"
+    summary: >
+      Android-safe process lifecycle in pi-shell without pidfd SIGSYS, cross-process
+      flock lease coordinator, crash handler, Termux wake-lock integration, cwd
+      restoration, prefix_rule/host_executable policy gate without starlark,
+      built-in destructive command rules on brush-parser AST, seccomp-BPF network
+      kill-switch on Linux and Android, and Linux-only landlock/bwrap isolation.
+    dependencies: ["R2"]
+    epic: "epic-03-process-bash-protection"
+
+  - id: R4
+    name: "Semantic Code Matrix & Navigation (S8)"
+    summary: >
+      utok tokenizer extraction with feature gating (utok-all-families), Aider
+      RepoMap port over pi-ast split across core-grammars (12) and full-grammars (+44),
+      and lazy LSP with idle kill and graceful text/AST degradation (LSP is optional,
+      disabled by default, requires explicit owner enablement). Full semantic operations
+      (rename, refactor, resolve) across language/backend coverage matrix; requirements
+      are strictly preserved and not reduced to tags or syntax heuristics.
+    dependencies: ["R3"]
+    epic: "epic-04-semantic-code-matrix"
+
+  - id: R5
+    name: "Memory Extraction, Experience Consolidation & Skills Lifecycle (S9)"
+    summary: >
+      Port mnemopi from bun:sqlite to rusqlite FTS5 with global, project, and
+      session scopes, vectors.rs extraction without N-API, and optional hybrid
+      recall via 9Router /v1/embeddings without local ONNX. Complete experience-to-skills
+      pipeline (background experience extraction, consolidation, reusable skill generation,
+      validation, usage, and retirement/review). By default, candidates for memory and skills
+      are presented to user for confirmation (separate TUI window or prompt after turn in CLI).
+      Additionally provides a configurable automatic mode for candidates, with option to assign
+      an evaluation model; automatic evaluation is distinct from and does not constitute user consent,
+      preserving provenance, inspection, and deletion.
+    dependencies: ["R3"]
+    epic: "epic-05-memory-consolidation"
+
+  - id: R6
+    name: "Session Export, Import & Inspector (S10)"
+    summary: >
+      Full session export and import preserving SQLite schema fidelity and lossless
+      round-trip data transfer without credentials (credentials MUST NOT be exported
+      under any circumstance). Context inspector and diagnostics with credentials and
+      secrets masked.
+    dependencies: ["R3"]
+    epic: "epic-06-session-export-import"
+
+  - id: R7
+    name: "Subagent Isolation & Parallel Worktree Merge (S11)"
+    summary: >
+      Subagent isolated workspaces via pure-Rust pi-vcs git integration (without
+      jj-lib), diffy 3-way merge, explicit size cap on non-git Rcopy, and
+      [PENDING_APPLY] marker over conflict:// virtual URLs. Enforces conflict-without-file-writes
+      (conflict writes zero files to target), successful [AUTO-APPLIED] state, xxh3
+      verification of merged content, and preservation of dirty/uncommitted workspace changes.
+    dependencies: ["R2", "R3"]
+    epic: "epic-07-parallel-worktree-merge"
+
+  - id: R8
+    name: "Subprocess Hooks & Packaging Contracts (S12)"
+    summary: >
+      Neutral subprocess JSON hooks over stdin/stdout triggered at turn, tool,
+      and delivery seams with mandatory re-approval on modified arguments;
+      Cargo feature profiles; and packaging contract ensuring artifacts of four platforms
+      build successfully in CI platform matrix. Zero embedded JS/script runtimes.
+    dependencies: ["R3"]
+    epic: "epic-08-subprocess-hooks-packaging"
+
+  - id: R9
+    name: "Path Migration & Dual-Read Storage"
+    summary: >
+      Safe migration from ~/.omp to ~/.aragent with non-destructive dual-read
+      compatibility, writing strictly to the new path, accompanied by full
+      license and NOTICE audits. Old directory remains unmodified.
+    dependencies: ["R1", "R2", "R3"]
+    epic: "epic-09-storage-path-migration"
+
+  - id: R10
+    name: "Manual User Retry & Intervention Controls"
+    summary: >
+      User-controlled /retry and Alt+R keybinding to re-attempt interrupted turns
+      or commands; warnings on unconfirmed tool outcomes requiring explicit manual
+      confirmation without blind automated retries. Warning remains in next turn context.
+    dependencies: ["R1", "R2", "R3"]
+    epic: "epic-10-manual-user-retry"
+
+  - id: R11
+    name: "Diagnostics & Safe Fix Engine (arag doctor)"
+    summary: >
+      Standard diagnostic tool reading state by default across db (integrity_check,
+      foreign_key_check, schema version vs binary, orphaned records), sessions (unfinished
+      executions, stream_drafts, empty branches, broken fork_provenance), redaction
+      (secret counts per table), artifacts (orphaned files and metadata, size/TTL candidates),
+      config (layer parsing and merge, unknown/obsolete keys, invalid timeouts and limits),
+      locks (stale flock/lease/PID files without active process), permissions (0700 dirs,
+      0600 secret files, accessibility of DB and artifact root), and env (model endpoint and key
+      presence without network request). Output is human-readable by section and structured
+      --json for CI; exit codes are 0 (clean), 1 (findings present), 2 (I/O or argument error).
+      Diagnostic reports never contain secret values, paths with tokens, or response bodies.
+      Optional --fix flag is strictly limited to safe non-destructive repairs (WAL checkpoint
+      truncate, stale lock removal, chmod to expected permissions, rebuilding artifact links)
+      and does not delete user data or repair semantic conflicts. Separate explicit opt-in
+      subcommands handle data modification: artifact deletion requires --prune-artifacts --yes;
+      rewriting history under redaction requires --redact-legacy mandating database backup,
+      dry-run by default, and user confirmation.
+    dependencies: []
+    epic: "epic-11-diagnostics-doctor"
+
+  - id: SEC-TUI
+    name: "Tool Credential Boundary & Termux TUI Reflow"
+    summary: >
+      Host-side credential injection pattern (nearai/ironclaw) over known_secrets.rs
+      and env allowlist: bash receives zero keys in env; HTTP, MCP, and web tools inject
+      auth headers strictly at host boundary with endpoint allowlist. Termux TUI
+      ANSI rendering with inline-viewport resize and reflow ported from codex-tui,
+      handling on-screen keyboard appearance/dismissal without ratatui.
+    dependencies: []
+    epic: "epic-13-credential-boundary-tui"
+
+  - id: R12
+    name: "Release Qualification & Artifact Verification"
+    summary: >
+      Release 0.2.0 qualification pathway through pre-release tags (-dev, -alpha,
+      -beta), reproducible CI artifact builds, arag.sha256 checksums, and strict
+      versioning conformity where MAJOR remains 0 until R7 closes. Pre-release builds
+      are permitted during active development without waiting for every epic, but final
+      0.2.0 release qualification requires closing the entire approved R0–R12 scope.
+    dependencies: []
+    epic: "epic-12-release-qualification"
+
+out_of_scope:
+  - item: "Unapproved Git Pushes and Automated Releases"
+    reason: >
+      Hard constraint. Push, tagging, publishing, and creating PRs require explicit
+      user approval; zero autonomous releases.
+  - item: "Unapproved Package and System Installations"
+    reason: >
+      Hard constraint. Never install, uninstall, or upgrade packages, plugins, or
+      system packages without explicit approval.
+  - item: "Destructive Command Guard (dcg) and OpenAI/Anthropic Rider Code"
+    reason: >
+      License incompatibility. Non-OSI viral restriction with automatic termination
+      and indemnification clauses incompatible with coding agents.
+  - item: "GPL/AGPL Components (Warp, omp-headroom, Zed GPL portions)"
+    reason: >
+      Incompatible license boundaries for aragent core binary.
+  - item: "Native Runtime Starlark/Rhai/rquickjs Script Engines"
+    reason: >
+      Excessive binary overhead and maintenance burden; neutral subprocess JSON
+      hooks fulfill all extension needs.
+  - item: "Local ONNX / fastembed Neural Inference on Device"
+    reason: >
+      High memory and binary footprint on Termux/Android; remote 9Router embeddings
+      and SQLite FTS5 fulfill memory retrieval.
+  - item: "Multi-Tenant Server Architecture"
+    reason: >
+      Single-user runtime design per architecture decision D02.
+  - item: "Android Native GUI Application"
+    reason: >
+      Future goal out of current CLI/TUI/headless scope per D02.
+  - item: "Automatic Replay of Unconfirmed Tool Effects"
+    reason: >
+      Safety invariant (D33, D34). Ambiguous tool outcomes require manual user confirmation.
+  - item: "Massive Automatic History Backfill under Redaction"
+    reason: >
+      Irreversible data transformation; ordinary --fix does not touch history;
+      available only via explicit opt-in --redact-legacy with backup and dry-run.
+  - item: "Credential Export in Session Data"
+    reason: >
+      Security invariant (docs/agent-preliminary-implementation-plan.md:230; D27).
+      Session export/import must never include credentials or secret tokens.
+
+constraints:
+  - "Target OS: Linux (glibc/musl) and Android Termux (Bionic arm64)."
+  - "Workspace: Donor repository at ~/omp-work is strictly read-only."
+  - "Process Safety: No pidfd on Android (avoids SIGSYS); Landlock and bwrap strictly on Linux."
+  - "Network: seccomp-BPF network kill-switch allowed on both Android and Linux."
+  - "Persistence: SQLite single-writer task, WAL mode, synchronous=NORMAL, fail-closed on persistence failure."
+  - "Policy: Deny precedes ask/allow; unknown tool outcome never retried automatically; intent persisted before effect."
+  - "Build & Dependencies: Workspace migration to unified reqwest 0.13 + rustls ring provider (eliminates aws-lc-sys and cmake); feature gates for heavy grammars and providers."
+  - "Execution: No tests, builds, linters, or formatters executed by subagents; verification reserved for parent."
+  - "Versioning: MAJOR version remains 0 until R7 closes; pre-release suffixes (-dev, -alpha, -beta) and commit SHA used until then."
+  - "Dependencies & Sequencing: R0 before R1; R1-R3 sequential; R7 strictly after R2; R4-R8 after R3; R9-R10 only after live-device proof of R1-R3."
+
+success_criteria:
+  - "Every item from R0 through R12 plus SEC-TUI mapped to a concrete bounded epic."
+  - "Work ordering and prerequisite gates explicitly defined in work_order_and_dependencies without invented scheduling constraints."
+  - "Zero unapproved network releases, pushes, or package installations allowed."
+  - "All architectural invariants (intent before effect, deny over ask/allow, single SQLite writer, fail-closed persistence, credentials excluded from export) preserved."
+  - "Exclusions documented with explicit license, architectural, or technical justifications."
+
+references:
+  - "docs/agent-preliminary-implementation-plan.md"
+  - "docs/agent-architecture-decisions.md"
+  - "docs/modular-reuse-blueprint.md"
