@@ -374,19 +374,20 @@ fn redact_bearer_tokens(text: &str) -> String {
 /// ordinary JSON keys (`"code"`, `"key"`) or identifiers (`skip_serializing_if`).
 /// Credentials this process resolved are masked first, by exact value: shape
 /// heuristics cannot see an opaque token, and that layer has no off switch.
-pub(crate) fn redact_free_text(text: &str) -> String {
+pub fn redact_free_text(text: &str) -> String {
 	let known = crate::auth::known_secrets::redact(text);
 	let after_queries = redact_url_queries(&known);
 	let after_jwt = redact_strict_jwts(&after_queries);
 	redact_boundary_tokens(&after_jwt)
 }
 
-/// Mask every string value inside a stored JSON payload.
+/// Mask every string value and dynamic JSON key inside an arbitrary JSON payload.
 ///
-/// Message payloads are what the UI renders and what the model replays, so a
-/// credential echoed by a tool result or a provider error must be masked
-/// before the row is written, not only in the stream draft.
-pub(crate) fn redact_json_strings(value: &mut serde_json::Value) {
+/// Unconditional generic traversal over JSON values. Does NOT inspect keys
+/// (such as `"type"`, `"id"`, or `"role"`) to select privileged schemas,
+/// preventing untrusted input (e.g. tool arguments, tool results, execution
+/// intents, worker deliveries) from spoofing structural schemas.
+pub fn redact_json_strings(value: &mut serde_json::Value) {
 	match value {
 		serde_json::Value::String(text) => {
 			let redacted = redact_free_text(text);
@@ -394,12 +395,442 @@ pub(crate) fn redact_json_strings(value: &mut serde_json::Value) {
 				*text = redacted;
 			}
 		},
-		serde_json::Value::Array(items) => items.iter_mut().for_each(redact_json_strings),
-		serde_json::Value::Object(map) => map.values_mut().for_each(redact_json_strings),
+		serde_json::Value::Array(items) => {
+			items.iter_mut().for_each(redact_json_strings);
+		},
+		serde_json::Value::Object(map) => {
+			redact_dynamic_object(map);
+		},
 		_ => {},
 	}
 }
 
+// ponytail: collision disambiguation uses explicit `[REDACTED_COLLISION:{counter}]` so unredacted keys are never mutated
+pub(crate) fn insert_dynamic_entries_two_phase(
+	target: &mut serde_json::Map<String, serde_json::Value>,
+	entries: Vec<(String, serde_json::Value)>,
+) {
+	let mut unredacted = Vec::new();
+	let mut modified = Vec::new();
+	for (key, mut val) in entries {
+		redact_json_strings(&mut val);
+		let redacted_key = redact_free_text(&key);
+		if redacted_key == key {
+			unredacted.push((key, val));
+		} else {
+			modified.push((redacted_key, val));
+		}
+	}
+	// Phase 1: Insert all unredacted keys first. Literal keys that never had secrets
+	// (including literal [REDACTED] or [REDACTED_COLLISION:N]) are never displaced or overwritten.
+	for (key, val) in unredacted {
+		target.insert(key, val);
+	}
+	// Phase 2: Insert modified keys. If a redacted key collides with an existing key,
+	// assign an explicit documented collision marker [REDACTED_COLLISION:N] without data loss.
+	for (redacted_key, val) in modified {
+		let mut final_key = redacted_key;
+		let mut counter = 1usize;
+		while target.contains_key(&final_key) {
+			final_key = format!("[REDACTED_COLLISION:{counter}]");
+			counter += 1;
+		}
+		target.insert(final_key, val);
+	}
+}
+
+pub(crate) fn redact_dynamic_object(map: &mut serde_json::Map<String, serde_json::Value>) {
+	let old_entries: Vec<(String, serde_json::Value)> = std::mem::take(map).into_iter().collect();
+	insert_dynamic_entries_two_phase(map, old_entries);
+}
+
+/// Redact a session header payload, preserving structural `id`, `parentSession`, and
+/// projection kept/anchor references while masking metadata and synthetic messages.
+pub fn redact_session_payload(payload: &mut serde_json::Value) {
+	if let Some(map) = payload.as_object_mut() {
+		redact_session_payload_map(map);
+	} else {
+		redact_json_strings(payload);
+	}
+}
+
+fn redact_session_payload_map(map: &mut serde_json::Map<String, serde_json::Value>) {
+	let old_entries: Vec<(String, serde_json::Value)> = std::mem::take(map).into_iter().collect();
+	let mut dynamic_entries = Vec::new();
+	for (key, mut val) in old_entries {
+		match key.as_str() {
+			"id" | "parentSession" | "type" | "version" | "timestamp" => {
+				map.insert(key, val);
+			},
+			"durableProjection" => {
+				redact_stored_projection_value(&mut val);
+				map.insert(key, val);
+			},
+			"title" | "cwd" | "model" | "provider" | "titleSource"
+			| "providerPromptCacheKey" => {
+				redact_json_strings(&mut val);
+				map.insert(key, val);
+			},
+			"additionalDirectories" | "previousSessionFiles" => {
+				redact_json_strings(&mut val);
+				map.insert(key, val);
+			},
+			_ => {
+				dynamic_entries.push((key, val));
+			},
+		}
+	}
+	insert_dynamic_entries_two_phase(map, dynamic_entries);
+}
+
+/// Redact stored projection, preserving `kept` message IDs and `anchor` while
+/// masking native synthetic compaction messages.
+pub fn redact_stored_projection_value(proj_val: &mut serde_json::Value) {
+	let Some(map) = proj_val.as_object_mut() else {
+		return;
+	};
+	if let Some(synthetic) = map.get_mut("synthetic").and_then(serde_json::Value::as_array_mut) {
+		for msg in synthetic {
+			redact_synthetic_message_value(msg);
+		}
+	}
+	let old_entries: Vec<(String, serde_json::Value)> = std::mem::take(map).into_iter().collect();
+	let mut dynamic_entries = Vec::new();
+	for (key, val) in old_entries {
+		match key.as_str() {
+			"kept" | "anchor" | "firstKeptEntryId" | "synthetic" => {
+				map.insert(key, val);
+			},
+			_ => {
+				dynamic_entries.push((key, val));
+			},
+		}
+	}
+	insert_dynamic_entries_two_phase(map, dynamic_entries);
+}
+
+/// Redact a synthetic projection message (native `pi_agent::Message` or wrapped `MessageEntry`).
+pub fn redact_synthetic_message_value(value: &mut serde_json::Value) {
+	let Some(map) = value.as_object_mut() else {
+		redact_json_strings(value);
+		return;
+	};
+	if map.get("type").and_then(serde_json::Value::as_str) == Some("message")
+		&& map.contains_key("message")
+	{
+		redact_message_payload_map(map);
+		return;
+	}
+
+	if let Some(serde_json::Value::String(content)) = map.get_mut("content") {
+		let redacted = redact_free_text(content);
+		if redacted != *content {
+			*content = redacted;
+		}
+	}
+	if let Some(parts) = map.get_mut("parts").and_then(serde_json::Value::as_array_mut) {
+		for part in parts {
+			redact_content_part_value(part);
+		}
+	}
+	for key in ["tool_calls", "toolCalls"] {
+		if let Some(calls) = map.get_mut(key).and_then(serde_json::Value::as_array_mut) {
+			for call in calls {
+				if let Some(call_map) = call.as_object_mut() {
+					if let Some(args) = call_map.get_mut("arguments") {
+						redact_json_strings(args);
+					}
+					let old_call: Vec<(String, serde_json::Value)> =
+						std::mem::take(call_map).into_iter().collect();
+					let mut dynamic_call = Vec::new();
+					for (k, v) in old_call {
+						match k.as_str() {
+							"id" | "name" | "arguments" => {
+								call_map.insert(k, v);
+							},
+							_ => {
+								dynamic_call.push((k, v));
+							},
+						}
+					}
+					insert_dynamic_entries_two_phase(call_map, dynamic_call);
+				} else {
+					redact_json_strings(call);
+				}
+			}
+		}
+	}
+	for key in ["errorMessage", "error_message"] {
+		if let Some(serde_json::Value::String(err)) = map.get_mut(key) {
+			let redacted = redact_free_text(err);
+			if redacted != *err {
+				*err = redacted;
+			}
+		}
+	}
+	for key in ["name", "api", "provider", "model", "customType", "custom_type", "attribution"] {
+		if let Some(serde_json::Value::String(s)) = map.get_mut(key) {
+			let redacted = redact_free_text(s);
+			if redacted != *s {
+				*s = redacted;
+			}
+		}
+	}
+	for key in ["disabledFeatures", "disabled_features"] {
+		if let Some(features) = map.get_mut(key).and_then(serde_json::Value::as_array_mut) {
+			for f in features {
+				if let serde_json::Value::String(s) = f {
+					let redacted = redact_free_text(s);
+					if redacted != *s {
+						*s = redacted;
+					}
+				}
+			}
+		}
+	}
+	let old_entries: Vec<(String, serde_json::Value)> = std::mem::take(map).into_iter().collect();
+	let mut dynamic_entries = Vec::new();
+	for (key, val) in old_entries {
+		match key.as_str() {
+			"role" | "tool_call_id" | "toolCallId" | "is_error" | "isError" | "usage"
+			| "stopReason" | "stop_reason" | "streamAttempt" | "stream_attempt"
+			| "content" | "parts" | "tool_calls" | "toolCalls" | "errorMessage"
+			| "error_message" | "name" | "api" | "provider" | "model" | "customType"
+			| "custom_type" | "attribution" | "disabledFeatures" | "disabled_features" => {
+				map.insert(key, val);
+			},
+			_ => {
+				dynamic_entries.push((key, val));
+			},
+		}
+	}
+	insert_dynamic_entries_two_phase(map, dynamic_entries);
+}
+
+/// Redact a message entry payload, preserving structural `id` and `parentId` while
+/// masking message contents, tool arguments, and dynamic details.
+pub fn redact_message_payload(payload: &mut serde_json::Value) {
+	let Some(map) = payload.as_object_mut() else {
+		redact_json_strings(payload);
+		return;
+	};
+	if map.contains_key("message") {
+		redact_message_payload_map(map);
+	} else if map.contains_key("role") {
+		redact_session_message_map(map);
+	} else {
+		redact_message_payload_map(map);
+	}
+}
+
+fn redact_message_payload_map(map: &mut serde_json::Map<String, serde_json::Value>) {
+	if let Some(msg_val) = map.get_mut("message") {
+		redact_session_message_value(msg_val);
+	}
+	let old_entries: Vec<(String, serde_json::Value)> = std::mem::take(map).into_iter().collect();
+	let mut dynamic_entries = Vec::new();
+	for (key, val) in old_entries {
+		match key.as_str() {
+			"id" | "parentId" | "type" | "timestamp" | "message" => {
+				map.insert(key, val);
+			},
+			_ => {
+				dynamic_entries.push((key, val));
+			},
+		}
+	}
+	insert_dynamic_entries_two_phase(map, dynamic_entries);
+}
+
+/// Redact an inner session message, preserving `toolCallId` and tool-call `id` while
+/// masking tool arguments (including user fields named `id`), prose, extras, and details.
+pub fn redact_session_message_value(message: &mut serde_json::Value) {
+	if let Some(map) = message.as_object_mut() {
+		redact_session_message_map(map);
+	} else {
+		redact_json_strings(message);
+	}
+}
+
+fn redact_session_message_map(map: &mut serde_json::Map<String, serde_json::Value>) {
+	if let Some(content) = map.get_mut("content") {
+		match content {
+			serde_json::Value::String(text) => {
+				let redacted = redact_free_text(text);
+				if redacted != *text {
+					*text = redacted;
+				}
+			},
+			serde_json::Value::Array(parts) => {
+				for part in parts {
+					redact_content_part_value(part);
+				}
+			},
+			_ => {
+				redact_json_strings(content);
+			},
+		}
+	}
+	if let Some(serde_json::Value::String(err)) = map.get_mut("errorMessage") {
+		let redacted = redact_free_text(err);
+		if redacted != *err {
+			*err = redacted;
+		}
+	}
+	for key in ["api", "provider", "model", "attribution"] {
+		if let Some(serde_json::Value::String(s)) = map.get_mut(key) {
+			let redacted = redact_free_text(s);
+			if redacted != *s {
+				*s = redacted;
+			}
+		}
+	}
+	if let Some(features) = map.get_mut("disabledFeatures").and_then(serde_json::Value::as_array_mut) {
+		for f in features {
+			if let serde_json::Value::String(s) = f {
+				let redacted = redact_free_text(s);
+				if redacted != *s {
+					*s = redacted;
+				}
+			}
+		}
+	}
+	let old_entries: Vec<(String, serde_json::Value)> = std::mem::take(map).into_iter().collect();
+	let mut dynamic_entries = Vec::new();
+	for (key, val) in old_entries {
+		match key.as_str() {
+			"toolCallId" | "toolName" | "role" | "isError" | "timestamp" | "usage"
+			| "stopReason" | "content" | "errorMessage" | "api" | "provider" | "model"
+			| "attribution" | "disabledFeatures" => {
+				map.insert(key, val);
+			},
+			_ => {
+				// Passthrough fields on SessionMessage (details, providerPayload, etc.)
+				dynamic_entries.push((key, val));
+			},
+		}
+	}
+	insert_dynamic_entries_two_phase(map, dynamic_entries);
+}
+
+fn redact_content_part_value(part: &mut serde_json::Value) {
+	let Some(part_map) = part.as_object_mut() else {
+		redact_json_strings(part);
+		return;
+	};
+	let kind = part_map.get("type").and_then(serde_json::Value::as_str);
+	match kind {
+		Some("toolCall") => {
+			if let Some(args) = part_map.get_mut("arguments") {
+				redact_json_strings(args);
+			}
+			let old_part: Vec<(String, serde_json::Value)> =
+				std::mem::take(part_map).into_iter().collect();
+			let mut dynamic_entries = Vec::new();
+			for (k, v) in old_part {
+				match k.as_str() {
+					"id" | "name" | "type" | "arguments" => {
+						part_map.insert(k, v);
+					},
+					_ => {
+						dynamic_entries.push((k, v));
+					},
+				}
+			}
+			insert_dynamic_entries_two_phase(part_map, dynamic_entries);
+		},
+		Some("text") => {
+			if let Some(serde_json::Value::String(text)) = part_map.get_mut("text") {
+				let redacted = redact_free_text(text);
+				if redacted != *text {
+					*text = redacted;
+				}
+			}
+			let old_part: Vec<(String, serde_json::Value)> =
+				std::mem::take(part_map).into_iter().collect();
+			let mut dynamic_entries = Vec::new();
+			for (k, v) in old_part {
+				match k.as_str() {
+					"type" | "text" => {
+						part_map.insert(k, v);
+					},
+					_ => {
+						dynamic_entries.push((k, v));
+					},
+				}
+			}
+			insert_dynamic_entries_two_phase(part_map, dynamic_entries);
+		},
+		Some("thinking") => {
+			let mut text_changed = false;
+			if let Some(serde_json::Value::String(text)) = part_map.get_mut("thinking") {
+				let redacted = redact_free_text(text);
+				if redacted != *text {
+					*text = redacted;
+					text_changed = true;
+				}
+			}
+			let old_part: Vec<(String, serde_json::Value)> =
+				std::mem::take(part_map).into_iter().collect();
+			let mut dynamic_entries = Vec::new();
+			for (k, v) in old_part {
+				match k.as_str() {
+					"thinkingSignature" => {
+						// Reasoning signature proves the exact original thinking text.
+						// If text changed by redaction, signature is invalid.
+						// Dropping the signature prevents replay of an invalid signature
+						// and safely demotes the thinking block to unsigned replay.
+						if !text_changed {
+							part_map.insert(k, v);
+						}
+					},
+					"type" | "thinking" => {
+						part_map.insert(k, v);
+					},
+					_ => {
+						dynamic_entries.push((k, v));
+					},
+				}
+			}
+			insert_dynamic_entries_two_phase(part_map, dynamic_entries);
+		},
+		Some("image") => {
+			let old_part: Vec<(String, serde_json::Value)> =
+				std::mem::take(part_map).into_iter().collect();
+			let mut dynamic_entries = Vec::new();
+			for (k, v) in old_part {
+				match k.as_str() {
+					"type" | "data" | "mimeType" | "mime_type" => {
+						part_map.insert(k, v);
+					},
+					_ => {
+						dynamic_entries.push((k, v));
+					},
+				}
+			}
+			insert_dynamic_entries_two_phase(part_map, dynamic_entries);
+		},
+		Some("redactedThinking") => {
+			let old_part: Vec<(String, serde_json::Value)> =
+				std::mem::take(part_map).into_iter().collect();
+			let mut dynamic_entries = Vec::new();
+			for (k, v) in old_part {
+				match k.as_str() {
+					"type" | "data" => {
+						part_map.insert(k, v);
+					},
+					_ => {
+						dynamic_entries.push((k, v));
+					},
+				}
+			}
+			insert_dynamic_entries_two_phase(part_map, dynamic_entries);
+		},
+		_ => {
+			redact_json_strings(part);
+		},
+	}
+}
 fn redact_strict_jwts(text: &str) -> String {
 	let bytes = text.as_bytes();
 	let is_jwt_char = |b: u8| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_');
@@ -748,5 +1179,345 @@ mod tests {
 		] {
 			assert_eq!(redact_free_text(text), text, "unchanged: {text}");
 		}
+	}
+
+	#[test]
+	fn redact_json_strings_handles_dynamic_keys_and_disambiguates_collisions() {
+		let mut obj = serde_json::json!({
+			"sk-ant-api03-secret1-123456789012": "value1",
+			"sk-ant-api03-secret2-123456789012": "value2",
+			"[REDACTED]": "literal_unredacted_val",
+			"normal_key": "normal_val"
+		});
+		redact_json_strings(&mut obj);
+		let map = obj.as_object().expect("object");
+		assert!(map.get("normal_key") == Some(&serde_json::json!("normal_val")));
+		assert!(
+			map.get("[REDACTED]") == Some(&serde_json::json!("literal_unredacted_val")),
+			"literal unredacted key preserved"
+		);
+		assert!(map.contains_key("[REDACTED_COLLISION:1]"), "first collision marker present");
+		assert!(map.contains_key("[REDACTED_COLLISION:2]"), "second collision marker present");
+		let v1 = map.get("[REDACTED_COLLISION:1]").unwrap();
+		let v2 = map.get("[REDACTED_COLLISION:2]").unwrap();
+		assert!(v1 == "value1" || v1 == "value2");
+		assert!(v2 == "value1" || v2 == "value2");
+		assert!(v1 != v2);
+	}
+
+	#[test]
+	fn redact_json_strings_redacts_user_field_named_id() {
+		let secret = "sk-ant-api03-user-id-secret-12345";
+		let mut obj = serde_json::json!({
+			"id": secret,
+			"nested": {
+				"id": secret,
+				"other": "hello"
+			}
+		});
+		redact_json_strings(&mut obj);
+		assert!(obj["id"] == "[REDACTED]", "id must be masked");
+		assert!(obj["nested"]["id"] == "[REDACTED]", "nested id must be masked");
+		assert!(obj["nested"]["other"] == "hello");
+		let dump = obj.to_string();
+		assert!(!dump.contains(secret), "secret must not appear in cleartext");
+	}
+
+	#[test]
+	fn redact_message_payload_preserves_structural_ids_and_tool_call_ids() {
+		let secret = "sk-ant-api03-tool-arg-secret-1234";
+		let mut msg = serde_json::json!({
+			"type": "message",
+			"id": "msg-struct-id-123",
+			"parentId": "msg-parent-id-000",
+			"timestamp": "2026-01-01T00:00:00Z",
+			"message": {
+				"role": "assistant",
+				"content": [
+					{
+						"type": "toolCall",
+						"id": "call-struct-id-999",
+						"name": "calc",
+						"arguments": {
+							"id": secret,
+							"expr": format!("eval {secret}")
+						}
+					},
+					{
+						"type": "text",
+						"text": format!("thought about {secret}")
+					}
+				],
+				"details": {
+					"id": secret
+				}
+			}
+		});
+		redact_message_payload(&mut msg);
+		assert!(msg["id"] == "msg-struct-id-123", "structural id must be preserved");
+		assert!(msg["parentId"] == "msg-parent-id-000", "structural parentId must be preserved");
+		let parts = msg["message"]["content"].as_array().expect("parts");
+		assert!(parts[0]["id"] == "call-struct-id-999", "tool call id preserved");
+		assert!(parts[0]["name"] == "calc");
+		assert!(parts[0]["arguments"]["id"] == "[REDACTED]", "tool argument id masked");
+		assert!(parts[0]["arguments"]["expr"] == "eval [REDACTED]", "tool argument expr masked");
+		assert!(parts[1]["text"] == "thought about [REDACTED]", "text part masked");
+		assert!(msg["message"]["details"]["id"] == "[REDACTED]", "details id masked");
+		let dump = msg.to_string();
+		assert!(!dump.contains(secret), "secret must not appear in cleartext");
+	}
+
+	#[test]
+	fn redact_session_payload_preserves_structural_ids_and_projection_kept() {
+		let secret = "sk-ant-api03-proj-synth-secret-12";
+		let mut sess = serde_json::json!({
+			"type": "session",
+			"version": 3,
+			"id": "s-struct-id-456",
+			"parentSession": "s-parent-id-789",
+			"timestamp": "2026-01-01T00:00:00Z",
+			"cwd": "/tmp",
+			"title": format!("session title with {secret}"),
+			"durableProjection": {
+				"kept": ["msg-kept-1", "msg-kept-2"],
+				"anchor": "msg-kept-2",
+				"synthetic": [
+					{
+						"type": "message",
+						"id": "synth-msg-1",
+						"parentId": "msg-kept-2",
+						"message": {
+							"role": "user",
+							"content": format!("synthetic summary {secret}")
+						}
+					}
+				]
+			}
+		});
+		redact_session_payload(&mut sess);
+		assert!(sess["id"] == "s-struct-id-456", "session id preserved");
+		assert!(sess["parentSession"] == "s-parent-id-789", "parentSession preserved");
+		assert!(sess["title"] == "session title with [REDACTED]", "title masked");
+		let proj = &sess["durableProjection"];
+		assert!(proj["kept"] == serde_json::json!(["msg-kept-1", "msg-kept-2"]));
+		assert!(proj["anchor"] == "msg-kept-2");
+		assert!(proj["synthetic"][0]["id"] == "synth-msg-1");
+		assert!(
+			proj["synthetic"][0]["message"]["content"] == "synthetic summary [REDACTED]"
+		);
+		let dump = sess.to_string();
+		assert!(!dump.contains(secret), "secret must not appear in cleartext");
+	}
+
+	#[test]
+	fn generic_redact_json_strings_does_not_spoof_schemas() {
+		let secret = "sk-ant-api03-spoofed-schema-secret-1234";
+		let mut spoofed_session = serde_json::json!({
+			"type": "session",
+			"id": secret,
+			"parentSession": secret
+		});
+		redact_json_strings(&mut spoofed_session);
+		let s_id = spoofed_session["id"].as_str().unwrap_or_default();
+		assert!(s_id == "[REDACTED]", "generic redaction must mask id even if type is session");
+		let s_parent = spoofed_session["parentSession"].as_str().unwrap_or_default();
+		assert!(s_parent == "[REDACTED]");
+		assert!(!spoofed_session.to_string().contains(secret));
+
+		let mut spoofed_msg = serde_json::json!({
+			"type": "message",
+			"id": secret,
+			"parentId": secret,
+			"message": {
+				"role": "assistant",
+				"toolCallId": secret
+			}
+		});
+		redact_json_strings(&mut spoofed_msg);
+		let m_id = spoofed_msg["id"].as_str().unwrap_or_default();
+		assert!(m_id == "[REDACTED]", "generic redaction must mask id even if type is message");
+		let m_parent = spoofed_msg["parentId"].as_str().unwrap_or_default();
+		assert!(m_parent == "[REDACTED]");
+		let m_call = spoofed_msg["message"]["toolCallId"].as_str().unwrap_or_default();
+		assert!(m_call == "[REDACTED]");
+		assert!(!spoofed_msg.to_string().contains(secret));
+	}
+
+	#[test]
+	fn content_parts_redact_extras_while_preserving_signatures_and_image_bytes() {
+		let secret = "sk-ant-api03-content-part-secret-5678";
+		let sig = "opaque-cryptographic-provider-signature-abc123";
+		let b64 = "aW1hZ2UtYnl0ZXMtcGF5bG9hZA==";
+
+		let mut text_part = serde_json::json!({
+			"type": "text",
+			"text": format!("thought {secret}"),
+			"customExtra": format!("extra-val-{secret}")
+		});
+		redact_content_part_value(&mut text_part);
+		assert!(text_part["text"] == "thought [REDACTED]");
+		assert!(text_part["customExtra"] == "extra-val-[REDACTED]");
+		assert!(!text_part.to_string().contains(secret));
+
+		// When thinking text contains a secret, redaction modifies the text, so the
+		// cryptographic signature is invalid and MUST be removed.
+		let mut modified_thinking = serde_json::json!({
+			"type": "thinking",
+			"thinking": format!("deep reasoning {secret}"),
+			"thinkingSignature": sig,
+			"extraField": secret
+		});
+		redact_content_part_value(&mut modified_thinking);
+		assert!(modified_thinking["thinking"] == "deep reasoning [REDACTED]");
+		assert!(
+			modified_thinking.get("thinkingSignature").is_none(),
+			"invalidated signature must be removed when text modified"
+		);
+		assert!(modified_thinking["extraField"] == "[REDACTED]");
+		assert!(!modified_thinking.to_string().contains(secret));
+
+		// When thinking text does NOT contain a secret, text is unchanged and signature is preserved.
+		let mut unredacted_thinking = serde_json::json!({
+			"type": "thinking",
+			"thinking": "clean reasoning without any secret",
+			"thinkingSignature": sig,
+			"extraField": secret
+		});
+		redact_content_part_value(&mut unredacted_thinking);
+		assert!(unredacted_thinking["thinking"] == "clean reasoning without any secret");
+		assert!(
+			unredacted_thinking["thinkingSignature"] == sig,
+			"signature preserved when thinking text is unchanged"
+		);
+		assert!(unredacted_thinking["extraField"] == "[REDACTED]");
+		assert!(!unredacted_thinking.to_string().contains(secret));
+
+		let mut image_part = serde_json::json!({
+			"type": "image",
+			"data": b64,
+			"mimeType": "image/png",
+			"extraMeta": secret
+		});
+		redact_content_part_value(&mut image_part);
+		assert!(image_part["data"] == b64, "image data preserved");
+		assert!(image_part["mimeType"] == "image/png");
+		assert!(image_part["extraMeta"] == "[REDACTED]");
+		assert!(!image_part.to_string().contains(secret));
+	}
+
+	#[test]
+	fn stored_projection_preserves_native_synthetic_tool_ids_and_masks_args() {
+		let secret = "sk-ant-api03-synth-native-secret-9999";
+		let call_id = "call-synthetic-id-123";
+		let mut proj = serde_json::json!({
+			"kept": ["m1", "m2"],
+			"anchor": "m2",
+			"synthetic": [
+				{
+					"role": "assistant",
+					"content": format!("synthetic summary {secret}"),
+					"tool_calls": [
+						{
+							"id": call_id,
+							"name": "bash",
+							"arguments": {
+								"id": format!("user-id-{secret}"),
+								"cmd": format!("run {secret}")
+							}
+						}
+					],
+					"tool_call_id": call_id
+				}
+			]
+		});
+		redact_stored_projection_value(&mut proj);
+		assert!(proj["kept"] == serde_json::json!(["m1", "m2"]));
+		assert!(proj["anchor"] == "m2");
+		let synth = &proj["synthetic"][0];
+		assert!(synth["content"] == "synthetic summary [REDACTED]");
+		assert!(synth["tool_call_id"] == call_id, "tool_call_id preserved");
+		assert!(synth["tool_calls"][0]["id"] == call_id, "tool_call id preserved");
+		assert!(synth["tool_calls"][0]["name"] == "bash");
+		assert!(synth["tool_calls"][0]["arguments"]["id"] == "user-id-[REDACTED]");
+		assert!(synth["tool_calls"][0]["arguments"]["cmd"] == "run [REDACTED]");
+		assert!(!proj.to_string().contains(secret));
+	}
+	#[test]
+	fn content_part_text_extras_two_phase_preserves_literals_and_counts() {
+		let secret = "sk-ant-api03-extra-secret-key-12345";
+		// Order matters: secret key first, followed by literal [REDACTED], then literal [REDACTED_COLLISION:1]
+		let mut text_part = serde_json::json!({
+			"type": "text",
+			"text": "plain text",
+			format!("sk-ant-api03-{secret}"): "secret-key-val",
+			"[REDACTED]": "literal-redacted-val",
+			"[REDACTED_COLLISION:1]": "literal-collision-val",
+			"normal_extra": "normal-val"
+		});
+		redact_content_part_value(&mut text_part);
+		let map = text_part.as_object().expect("object");
+		// 1. Entry count MUST be exactly preserved: 6 entries in, 6 entries out!
+		assert!(map.len() == 6, "entry count must be preserved without loss");
+		// 2. Structural fields preserved
+		assert!(map.get("type") == Some(&serde_json::json!("text")));
+		assert!(map.get("text") == Some(&serde_json::json!("plain text")));
+		// 3. Unredacted normal extra preserved
+		assert!(map.get("normal_extra") == Some(&serde_json::json!("normal-val")));
+		// 4. Literal unredacted keys MUST NOT be overwritten by the secret key!
+		assert!(
+			map.get("[REDACTED]") == Some(&serde_json::json!("literal-redacted-val")),
+			"literal [REDACTED] key must preserve its own value and not be overwritten"
+		);
+		assert!(
+			map.get("[REDACTED_COLLISION:1]") == Some(&serde_json::json!("literal-collision-val")),
+			"literal collision marker must preserve its own value"
+		);
+		// 5. The secret-bearing key collides with both [REDACTED] and [REDACTED_COLLISION:1],
+		// so it must receive [REDACTED_COLLISION:2] without losing data!
+		assert!(
+			map.get("[REDACTED_COLLISION:2]") == Some(&serde_json::json!("secret-key-val")),
+			"secret key value must be preserved under the next available collision marker"
+		);
+		assert!(!text_part.to_string().contains(secret), "secret must not appear in cleartext");
+
+		// 6. Repeated redaction MUST be idempotent and stable
+		let mut second_pass = text_part.clone();
+		redact_content_part_value(&mut second_pass);
+		assert!(second_pass == text_part, "repeated redaction must be idempotent and stable");
+	}
+
+	#[test]
+	fn session_message_extras_two_phase_preserves_literals_and_repeated_redaction() {
+		let secret = "sk-ant-api03-msg-extra-secret-99999";
+		let mut msg = serde_json::json!({
+			"role": "assistant",
+			"content": "message text",
+			format!("sk-prefix-{secret}"): "secret-val-1",
+			format!("sk-another-{secret}"): "secret-val-2",
+			"[REDACTED]": "literal-val",
+			"details": {
+				"detail_key": "detail_val"
+			}
+		});
+		redact_session_message_value(&mut msg);
+		let map = msg.as_object().expect("object");
+		// 6 entries in, 6 entries out!
+		assert!(map.len() == 6, "entry count must be preserved in message extras");
+		assert!(map.get("role") == Some(&serde_json::json!("assistant")));
+		assert!(map.get("content") == Some(&serde_json::json!("message text")));
+		assert!(map.get("[REDACTED]") == Some(&serde_json::json!("literal-val")));
+		assert!(map.contains_key("[REDACTED_COLLISION:1]"));
+		assert!(map.contains_key("[REDACTED_COLLISION:2]"));
+		let v1 = map.get("[REDACTED_COLLISION:1]").unwrap();
+		let v2 = map.get("[REDACTED_COLLISION:2]").unwrap();
+		assert!(v1 == "secret-val-1" || v1 == "secret-val-2");
+		assert!(v2 == "secret-val-1" || v2 == "secret-val-2");
+		assert!(v1 != v2);
+		assert!(!msg.to_string().contains(secret), "secret must not appear in cleartext");
+
+		// Repeated redaction stability
+		let mut second = msg.clone();
+		redact_session_message_value(&mut second);
+		assert!(second == msg, "message redaction must be idempotent");
 	}
 }

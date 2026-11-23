@@ -636,13 +636,16 @@ impl SqliteStore {
 			.connection
 			.transaction_with_behavior(TransactionBehavior::Immediate)?;
 		let mut payload = fork.session.payload.clone();
+		crate::auth::error::redact_session_payload(&mut payload);
 		let header: crate::session::SessionHeader = serde_json::from_value(payload.clone())
 			.map_err(|e| StoreError::Corrupt(format!("invalid fork session header: {e}")))?;
 		if header.id != fork.session.id || header.parent_session != fork.session.parent_session_id {
 			return Err(StoreError::Validation("fork header identity or parent mismatch".into()));
 		}
 		if let Some(projection) = &fork.projection {
-			payload["durableProjection"] = serde_json::to_value(projection)?;
+			let mut proj_val = serde_json::to_value(projection)?;
+			crate::auth::error::redact_stored_projection_value(&mut proj_val);
+			payload["durableProjection"] = proj_val;
 		} else if let Some(object) = payload.as_object_mut() {
 			object.remove("durableProjection");
 		}
@@ -689,7 +692,9 @@ impl SqliteStore {
 						"fork branch parent fields must be supplied together".into(),
 					));
 				}
-				tx.execute("INSERT INTO branches (id,session_id,parent_branch_id,parent_message_id,leaf_message_id,payload_json,created_at_ms) VALUES (?1,?2,?3,?4,NULL,?5,?6)", params![branch.id, fork.session.id, branch.parent_branch_id, branch.parent_message_id, encode_json(&branch.payload)?, now])?;
+				let mut branch_payload = branch.payload.clone();
+				crate::auth::error::redact_json_strings(&mut branch_payload);
+				tx.execute("INSERT INTO branches (id,session_id,parent_branch_id,parent_message_id,leaf_message_id,payload_json,created_at_ms) VALUES (?1,?2,?3,?4,NULL,?5,?6)", params![branch.id, fork.session.id, branch.parent_branch_id, branch.parent_message_id, encode_json(&branch_payload)?, now])?;
 				inserted.insert(branch.id);
 			}
 			if next.len() == before {
@@ -749,9 +754,11 @@ impl SqliteStore {
 			if !parent_exists {
 				return Err(StoreError::Validation("fork message parent missing".into()));
 			}
-			if message.payload.get("type").and_then(Value::as_str) == Some("message") {
+			let mut msg_payload = message.payload.clone();
+			crate::auth::error::redact_message_payload(&mut msg_payload);
+			if msg_payload.get("type").and_then(Value::as_str) == Some("message") {
 				let entry: crate::session::MessageEntry =
-					serde_json::from_value(message.payload.clone())
+					serde_json::from_value(msg_payload.clone())
 						.map_err(|e| StoreError::Corrupt(format!("invalid fork message payload: {e}")))?;
 				entry.validate_compat().map_err(StoreError::Validation)?;
 				if entry.id != message.id || entry.parent_id != message.parent_message_id {
@@ -759,13 +766,13 @@ impl SqliteStore {
 						"fork message identity does not match payload".into(),
 					));
 				}
-			} else if let Some(payload_id) = message.payload.get("id").and_then(Value::as_str) {
+			} else if let Some(payload_id) = msg_payload.get("id").and_then(Value::as_str) {
 				if payload_id != message.id {
 					return Err(StoreError::Validation(
 						"fork entry identity does not match payload".into(),
 					));
 				}
-				if let Some(payload_parent) = message.payload.get("parentId") {
+				if let Some(payload_parent) = msg_payload.get("parentId") {
 					if payload_parent.as_str() != message.parent_message_id.as_deref() {
 						return Err(StoreError::Validation(
 							"fork entry parent does not match payload".into(),
@@ -773,7 +780,7 @@ impl SqliteStore {
 					}
 				}
 			}
-			tx.execute("INSERT INTO messages (id,session_id,branch_id,parent_message_id,payload_json,created_at_ms) VALUES (?1,?2,?3,?4,?5,?6)", params![message.id, message.session_id, message.branch_id, message.parent_message_id, encode_json(&message.payload)?, now])?;
+			tx.execute("INSERT INTO messages (id,session_id,branch_id,parent_message_id,payload_json,created_at_ms) VALUES (?1,?2,?3,?4,?5,?6)", params![message.id, message.session_id, message.branch_id, message.parent_message_id, encode_json(&msg_payload)?, now])?;
 			tx.execute(
 				"UPDATE branches SET leaf_message_id = ?1 WHERE id = ?2",
 				params![message.id, message.branch_id],
@@ -1528,7 +1535,7 @@ impl SqliteStore {
 			return Err(StoreError::Validation("a session cannot be its own parent".to_string()));
 		}
 		let mut session = session;
-		crate::auth::error::redact_json_strings(&mut session.payload);
+		crate::auth::error::redact_session_payload(&mut session.payload);
 		crate::auth::error::redact_json_strings(&mut session.initial_branch_payload);
 		let now = now_ms();
 		let transaction = self.connection.transaction()?;
@@ -1903,7 +1910,9 @@ impl SqliteStore {
 		let Some(map) = session_payload.as_object_mut() else {
 			return Err(StoreError::Corrupt("session payload is not an object".to_string()));
 		};
-		map.insert("durableProjection".to_string(), serde_json::to_value(&projection)?);
+		let mut proj_val = serde_json::to_value(&projection)?;
+		crate::auth::error::redact_stored_projection_value(&mut proj_val);
+		map.insert("durableProjection".to_string(), proj_val);
 		let updated_payload_json = encode_json(&session_payload)?;
 		transaction.execute(
 			"UPDATE sessions SET payload_json = ?1, updated_at_ms = ?2 WHERE id = ?3",
@@ -3915,7 +3924,7 @@ impl SqliteStore {
 	pub fn update_session_payload(&mut self, session_id: &str, payload: Value) -> StoreResult<()> {
 		validate_id("session id", session_id)?;
 		let mut payload = payload;
-		crate::auth::error::redact_json_strings(&mut payload);
+		crate::auth::error::redact_session_payload(&mut payload);
 		let encoded = encode_json(&payload)?;
 		let changed = self.connection.execute(
 			"UPDATE sessions SET payload_json = ?1, updated_at_ms = ?2 WHERE id = ?3",
@@ -4245,7 +4254,7 @@ impl SqliteStore {
 			}
 		}
 
-		crate::auth::error::redact_json_strings(&mut payload);
+		crate::auth::error::redact_message_payload(&mut payload);
 		let encoded = encode_json(&payload)?;
 		transaction.execute(
 			"UPDATE messages SET payload_json = ?1 WHERE id = ?2",
@@ -4313,7 +4322,7 @@ fn append_message_tx(
 	// what the model replays, so a credential in tool output or a provider error
 	// must not be persisted in the clear.
 	let mut payload = message.payload.clone();
-	crate::auth::error::redact_json_strings(&mut payload);
+	crate::auth::error::redact_message_payload(&mut payload);
 	transaction.execute(
 		"INSERT INTO messages (id, session_id, branch_id, parent_message_id, payload_json, created_at_ms) \
 		 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
@@ -11042,5 +11051,338 @@ mod tests {
 			tail.chars().all(|c| c == 'y'),
 			"undelivered head must be cut, delivered tail must not be re-sent"
 		);
+	}
+	#[test]
+	fn fork_and_compaction_redaction_preserves_relational_identity_and_masks_user_id_and_dynamic_keys() {
+		let secret = "sk-fork-compact-secret-9876543210";
+		crate::auth::known_secrets::register(secret);
+		let (dir, path) = temp_db("fork-compact-redact");
+		let mut store = SqliteStore::open(&path).expect("open store");
+
+		// 1. Create source session with secret in title and user field named "id"
+		store
+			.create_session(NewSession {
+				id: "s_src".to_string(),
+				parent_session_id: None,
+				payload: json!({
+					"type": "session",
+					"version": 3,
+					"id": "s_src",
+					"timestamp": "2026-01-01T00:00:00Z",
+					"cwd": "/tmp",
+					"title": format!("src title with {secret}")
+				}),
+				initial_branch_id: "b_src".to_string(),
+				initial_branch_payload: json!({}),
+			})
+			.expect("create session");
+
+		// 2. Append assistant tool-call message and tool-result message with timestamps
+		let src_msg1_id = "m_src_asst_1";
+		let call_id = "call_test_1";
+		let msg1_payload = json!({
+			"type": "message",
+			"id": src_msg1_id,
+			"timestamp": "2026-01-01T00:00:01Z",
+			"message": {
+				"role": "assistant",
+				"timestamp": 1000,
+				"content": [
+					{
+						"type": "toolCall",
+						"id": call_id,
+						"name": "exec_cmd",
+						"arguments": {
+							"id": format!("user-field-id-{secret}"),
+							format!("sk-dynamic-key-{secret}"): "dynamic_val"
+						}
+					}
+				]
+			}
+		});
+		store
+			.append_message(NewMessage {
+				id: src_msg1_id.to_string(),
+				session_id: "s_src".to_string(),
+				branch_id: "b_src".to_string(),
+				parent_message_id: None,
+				payload: msg1_payload,
+			})
+			.expect("append msg1");
+
+		let src_msg2_id = "m_src_res_1";
+		let msg2_payload = json!({
+			"type": "message",
+			"id": src_msg2_id,
+			"parentId": src_msg1_id,
+			"timestamp": "2026-01-01T00:00:02Z",
+			"message": {
+				"role": "toolResult",
+				"toolCallId": call_id,
+				"toolName": "exec_cmd",
+				"isError": false,
+				"timestamp": 2000,
+				"content": [
+					{
+						"type": "text",
+						"text": format!("result text containing {secret}")
+					}
+				],
+				"details": {
+					"id": format!("detail-id-{secret}")
+				}
+			}
+		});
+		store
+			.append_message(NewMessage {
+				id: src_msg2_id.to_string(),
+				session_id: "s_src".to_string(),
+				branch_id: "b_src".to_string(),
+				parent_message_id: Some(src_msg1_id.to_string()),
+				payload: msg2_payload,
+			})
+			.expect("append msg2");
+
+		// 3. Compact session
+		let src_compact_id = "m_src_comp_1";
+		let compact_payload = json!({
+			"type": "message",
+			"id": src_compact_id,
+			"parentId": src_msg2_id,
+			"timestamp": "2026-01-01T00:00:03Z",
+			"message": {
+				"role": "system",
+				"timestamp": 3000,
+				"content": format!("compaction notice with {secret}")
+			}
+		});
+		let projection = StoredProjection {
+			kept: vec![src_msg1_id.to_string(), src_msg2_id.to_string()],
+			synthetic: vec![
+				json!({
+					"role": "system",
+					"content": format!("synthetic summary {secret}")
+				})
+			],
+			anchor: Some(src_compact_id.to_string()),
+		};
+		store
+			.compact_session(
+				NewMessage {
+					id: src_compact_id.to_string(),
+					session_id: "s_src".to_string(),
+					branch_id: "b_src".to_string(),
+					parent_message_id: Some(src_msg2_id.to_string()),
+					payload: compact_payload,
+				},
+				projection,
+			)
+			.expect("compact session");
+
+		// Verify compacted session payload
+		let src_session = store.session("s_src").expect("read").expect("exists");
+		let proj_val = &src_session.payload["durableProjection"];
+		assert_eq!(proj_val["kept"], json!([src_msg1_id, src_msg2_id]));
+		assert_eq!(proj_val["anchor"], json!(src_compact_id));
+		assert!(
+			proj_val["synthetic"][0]["content"] == "synthetic summary [REDACTED]",
+			"synthetic notice content must be masked"
+		);
+
+		// 4. Create fork atomic from the compacted source with distinct IDs
+		let fork_msg1_id = "m_fork_asst_1";
+		let fork_msg2_id = "m_fork_res_1";
+		let fork_compact_id = "m_fork_comp_1";
+
+		let fork_write = ForkWrite {
+			session: NewSession {
+				id: "s_fork".to_string(),
+				parent_session_id: Some("s_src".to_string()),
+				payload: json!({
+					"type": "session",
+					"version": 3,
+					"id": "s_fork",
+					"parentSession": "s_src",
+					"timestamp": "2026-01-01T00:00:04Z",
+					"cwd": "/tmp",
+					"title": format!("fork title with {secret}")
+				}),
+				initial_branch_id: "b_fork".to_string(),
+				initial_branch_payload: json!({}),
+			},
+			branches: vec![
+				NewBranch {
+					id: "b_fork".to_string(),
+					session_id: "s_fork".to_string(),
+					parent_branch_id: None,
+					parent_message_id: None,
+					payload: json!({}),
+				}
+			],
+			active_branch_id: "b_fork".to_string(),
+			active_leaf_message_id: Some(fork_compact_id.to_string()),
+			messages: vec![
+				NewMessage {
+					id: fork_msg1_id.to_string(),
+					session_id: "s_fork".to_string(),
+					branch_id: "b_fork".to_string(),
+					parent_message_id: None,
+					payload: json!({
+						"type": "message",
+						"id": fork_msg1_id,
+						"timestamp": "2026-01-01T00:00:01Z",
+						"message": {
+							"role": "assistant",
+							"timestamp": 1000,
+							"content": [
+								{
+									"type": "toolCall",
+									"id": call_id,
+									"name": "exec_cmd",
+									"arguments": {
+										"id": format!("user-field-id-{secret}"),
+										format!("sk-dynamic-key-{secret}"): "dynamic_val"
+									}
+								}
+							]
+						}
+					}),
+				},
+				NewMessage {
+					id: fork_msg2_id.to_string(),
+					session_id: "s_fork".to_string(),
+					branch_id: "b_fork".to_string(),
+					parent_message_id: Some(fork_msg1_id.to_string()),
+					payload: json!({
+						"type": "message",
+						"id": fork_msg2_id,
+						"parentId": fork_msg1_id,
+						"timestamp": "2026-01-01T00:00:02Z",
+						"message": {
+							"role": "toolResult",
+							"toolCallId": call_id,
+							"toolName": "exec_cmd",
+							"isError": false,
+							"timestamp": 2000,
+							"content": [
+								{
+									"type": "text",
+									"text": format!("result text containing {secret}")
+								}
+							],
+							"details": {
+								"id": format!("detail-id-{secret}")
+							}
+						}
+					}),
+				},
+				NewMessage {
+					id: fork_compact_id.to_string(),
+					session_id: "s_fork".to_string(),
+					branch_id: "b_fork".to_string(),
+					parent_message_id: Some(fork_msg2_id.to_string()),
+					payload: json!({
+						"type": "message",
+						"id": fork_compact_id,
+						"parentId": fork_msg2_id,
+						"timestamp": "2026-01-01T00:00:03Z",
+						"message": {
+							"role": "system",
+							"timestamp": 3000,
+							"content": format!("compaction notice with {secret}")
+						}
+					}),
+				}
+			],
+			projection: Some(StoredProjection {
+				kept: vec![fork_msg1_id.to_string(), fork_msg2_id.to_string()],
+				synthetic: vec![
+					json!({
+						"role": "system",
+						"content": format!("fork synthetic summary {secret}")
+					})
+				],
+				anchor: Some(fork_compact_id.to_string()),
+			}),
+		};
+
+		store.create_fork_atomic(fork_write).expect("create fork atomic");
+
+		// Verify fork session in store
+		let fork_session = store.session("s_fork").expect("read fork").expect("fork exists");
+		assert_eq!(fork_session.id, "s_fork");
+		assert_eq!(fork_session.parent_session_id.as_deref(), Some("s_src"));
+		assert_eq!(fork_session.payload["id"], "s_fork");
+		assert_eq!(fork_session.payload["parentSession"], "s_src");
+		assert!(
+			fork_session.payload["title"] == "fork title with [REDACTED]",
+			"fork title must be masked"
+		);
+
+		let fork_proj = &fork_session.payload["durableProjection"];
+		assert_eq!(fork_proj["kept"], json!([fork_msg1_id, fork_msg2_id]));
+		assert_eq!(fork_proj["anchor"], json!(fork_compact_id));
+		assert!(
+			fork_proj["synthetic"][0]["content"] == "fork synthetic summary [REDACTED]",
+			"fork synthetic summary must be masked"
+		);
+
+		// Verify messages in fork session
+		let fork_msgs = store.session_messages("s_fork").expect("read fork messages");
+		assert_eq!(fork_msgs.len(), 3);
+		let asst_msg = &fork_msgs[0];
+		assert_eq!(asst_msg.id, fork_msg1_id);
+		assert_eq!(asst_msg.payload["id"], fork_msg1_id);
+		assert_eq!(asst_msg.payload["message"]["content"][0]["id"], call_id);
+		assert!(
+			asst_msg.payload["message"]["content"][0]["arguments"]["id"]
+				== "user-field-id-[REDACTED]",
+			"tool argument user id must be masked"
+		);
+		assert!(
+			asst_msg.payload["message"]["content"][0]["arguments"]
+				.as_object()
+				.unwrap()
+				.contains_key("sk-dynamic-key-[REDACTED]")
+		);
+
+		let res_msg = &fork_msgs[1];
+		assert_eq!(res_msg.id, fork_msg2_id);
+		assert_eq!(res_msg.parent_message_id.as_deref(), Some(fork_msg1_id));
+		assert_eq!(res_msg.payload["id"], fork_msg2_id);
+		assert_eq!(res_msg.payload["parentId"], fork_msg1_id);
+		assert_eq!(res_msg.payload["message"]["toolCallId"], call_id);
+		assert!(
+			res_msg.payload["message"]["details"]["id"] == "detail-id-[REDACTED]",
+			"detail id must be masked"
+		);
+		assert!(
+			res_msg.payload["message"]["content"][0]["text"]
+				== "result text containing [REDACTED]",
+			"tool result text must be masked"
+		);
+
+		// Check full database serialization: secret must NEVER appear in cleartext
+		let dump: String = store
+			.connection
+			.query_row(
+				"SELECT group_concat(payload_json, ' ') FROM messages WHERE session_id = 's_fork'",
+				[],
+				|row| row.get(0),
+			)
+			.expect("query dump");
+		assert!(!dump.contains(secret), "secret must not appear in cleartext in messages");
+
+		let sess_dump: String = store
+			.connection
+			.query_row(
+				"SELECT group_concat(payload_json, ' ') FROM sessions WHERE id IN ('s_src', 's_fork')",
+				[],
+				|row| row.get(0),
+			)
+			.expect("query sess dump");
+		assert!(!sess_dump.contains(secret), "secret must not appear in cleartext in sessions");
+
+		let _ = std::fs::remove_dir_all(dir);
 	}
 }

@@ -3801,3 +3801,145 @@ async fn interrupted_stream_draft_recovers_once_then_clears_on_complete() {
 	assert!(assistant_rows[0].message.tool_name.is_none(), "no partial tool calls persisted");
 	std::fs::remove_dir_all(dir).ok();
 }
+
+#[tokio::test]
+async fn durable_session_resume_after_compaction_preserves_projection_and_masks_user_id_secret() {
+	let secret = "sk-ant-api03-durable-resume-secret-1234567890";
+	aragent::auth::known_secrets::register(secret);
+	let dir = temp_dir("durable-redact-resume");
+	let db = dir.join("sessions.db");
+
+	let mut sess_header = header("s-redact-resume", &dir);
+	sess_header.title = Some(format!("session with {secret}"));
+
+	let session = DurableSession::create(db.clone(), sess_header.clone()).expect("create session");
+
+	// 1. Initial turns before compaction
+	let original = vec![
+		Message::user(format!("turn 1 query with {secret}")),
+		Message::assistant("turn 1 reply"),
+	];
+	session.persist_messages(&original).await.expect("persist original");
+
+	// 2. Compaction: notice + assistant turn 1
+	let notice = Message::system(format!(
+		"{}1 earlier turn(s) were pruned {secret}]",
+		pi_agent::compaction::COMPACTION_NOTICE_PREFIX
+	));
+	let compacted = vec![notice.clone(), Message::assistant("turn 1 reply")];
+	let report = pi_agent::CompactionReport { old_len: 2, kept_from: 1, kept_at: 1 };
+	session.compacted(&compacted, &report).await.expect("compacted");
+	session.persist_messages(&compacted).await.expect("persist compacted");
+
+	// 3. New turn after compaction: assistant tool call + tool result
+	// The toolCall arguments have a user field named "id" and a dynamic key with secret
+	let call_id = "call-durable-comp-1";
+	let call = ToolCall {
+		id: call_id.to_string(),
+		name: "query_tool".to_string(),
+		arguments: json!({
+			"id": format!("user-arg-id-{secret}"),
+			format!("sk-dynamic-arg-{secret}"): "arg-val"
+		}),
+	};
+	let asst_tool = Message::assistant_with_tools("calling tool", vec![call.clone()]);
+	let tool_res = Message::tool_with_status_and_parts(
+		call_id,
+		"query_tool",
+		format!("tool output {secret}"),
+		vec![ContentPart::text(format!("tool output {secret}"))],
+		false,
+	);
+
+	let conversation = vec![
+		notice.clone(),
+		Message::assistant("turn 1 reply"),
+		asst_tool.clone(),
+		tool_res.clone(),
+	];
+	session.persist_messages(&conversation).await.expect("persist conversation");
+	drop(session);
+
+	// 4. Reopen the session: loads stored session, verifies durableProjection and message IDs
+	let (reopened, loaded) =
+		DurableSession::open(db.clone(), "s-redact-resume", sess_header).expect("reopen");
+	let loaded = loaded.expect("loaded session present");
+
+	// Verify projection kept and anchor
+	let projection = loaded.projection.expect("durableProjection present");
+	assert_eq!(projection.kept.len(), 3);
+	assert!(projection.anchor.is_none(), "compaction projection anchor is None");
+
+	// Verify loaded messages maintain relational identities and tool call pairing
+	let tool_call_msg = loaded
+		.branch_messages
+		.iter()
+		.find(|m| {
+			m.message.role == "assistant"
+				&& m.message.content.parts().iter().any(|p| p.kind == "toolCall")
+		})
+		.expect("tool call assistant message present");
+	let tool_call_parts = tool_call_msg.message.content.parts();
+	let tool_call_part = tool_call_parts
+		.iter()
+		.find(|p| p.kind == "toolCall")
+		.expect("tool call part present");
+	assert!(
+		tool_call_part.extra.get("id").and_then(Value::as_str) == Some(call_id),
+		"tool call id must match"
+	);
+	assert!(
+		tool_call_part
+			.extra
+			.get("arguments")
+			.and_then(|a| a.get("id"))
+			.and_then(Value::as_str)
+			== Some("user-arg-id-[REDACTED]"),
+		"tool argument id must be masked"
+	);
+
+	let tool_res_msg = loaded
+		.branch_messages
+		.iter()
+		.find(|m| m.message.role == "toolResult")
+		.expect("tool result message present");
+	assert!(
+		tool_res_msg.message.tool_call_id.as_deref() == Some(call_id),
+		"tool call id must match"
+	);
+	assert!(
+		tool_res_msg.message.content.text() == "tool output [REDACTED]",
+		"tool result content must be masked"
+	);
+
+	// 5. Write boundary: persist next turn on reopened session
+	let continuation = vec![
+		notice,
+		Message::assistant("turn 1 reply"),
+		asst_tool,
+		tool_res,
+		Message::assistant("final answer continuation"),
+	];
+	reopened
+		.persist_messages(&continuation)
+		.await
+		.expect("persist messages on reopened session must succeed without seed mismatch");
+
+	// 6. Direct SQL check: secret must never appear in cleartext anywhere in the database
+	let conn = rusqlite::Connection::open(&db).expect("open raw sqlite");
+	let sess_json: String = conn
+		.query_row("SELECT payload_json FROM sessions WHERE id = 's-redact-resume'", [], |r| r.get(0))
+		.expect("query session row");
+	assert!(!sess_json.contains(secret), "secret must not appear in cleartext in session row");
+
+	let msg_count: i64 = conn
+		.query_row(
+			"SELECT COUNT(*) FROM messages WHERE session_id = 's-redact-resume' AND payload_json LIKE ?1",
+			[format!("%{secret}%")],
+			|r| r.get(0),
+		)
+		.expect("query matching rows");
+	assert_eq!(msg_count, 0, "secret must not appear in any message row in the database");
+
+	let _ = std::fs::remove_dir_all(dir);
+}

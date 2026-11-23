@@ -2372,7 +2372,7 @@ fn session_digest(message: &SessionMessage) -> u64 {
 	// identity must be computed over the masked form too: hashing raw text
 	// here would disagree with the stored row after a branch cut or a
 	// message-keeping compaction and reject a valid resume seed.
-	crate::auth::error::redact_json_strings(&mut canonical);
+	crate::auth::error::redact_session_message_value(&mut canonical);
 	xxh64(&serde_json::to_vec(&canonical).unwrap_or_default(), 0)
 }
 
