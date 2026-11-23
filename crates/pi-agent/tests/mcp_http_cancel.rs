@@ -13,7 +13,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use pi_agent::mcp::{
-	MCPServerConfig, MCPHttpServerConfig, McpError, connect_to_server,
+	MCPServerConfig, MCPHttpServerConfig, MCPSseServerConfig, McpError, connect_to_server,
 };
 use serde_json::{Value, json};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -253,4 +253,285 @@ async fn timed_out_prompts_get_is_bounded() {
 	);
 	let prompt = expect_request(&mut fixture, "prompts/get").await;
 	assert!(prompt.get("id").is_some_and(Value::is_u64), "rmcp raw prompt ID must be numeric");
+}
+async fn spawn_delayed_init_fixture() -> Fixture {
+	let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind loopback");
+	let addr = listener.local_addr().expect("fixture address");
+	let (tx, seen) = mpsc::channel(SEEN_CAPACITY);
+	let post_closed = Arc::new(AtomicBool::new(false));
+	let post_closed_for_accept = Arc::clone(&post_closed);
+	let attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+	let attempts_for_accept = Arc::clone(&attempts);
+	let connections = Arc::new(Mutex::new(Vec::new()));
+	let connections_for_accept = Arc::clone(&connections);
+	let accept = tokio::spawn(async move {
+		loop {
+			let Ok((mut socket, _)) = listener.accept().await else { return; };
+			let tx = tx.clone();
+			let post_closed = Arc::clone(&post_closed_for_accept);
+			let attempts = Arc::clone(&attempts_for_accept);
+			let handle = tokio::spawn(async move {
+				let Some(body) = read_request(&mut socket).await else { return; };
+				let method = body.get("method").and_then(Value::as_str).unwrap_or_default().to_string();
+				let _ = tx.send(body.clone()).await;
+				if method == "initialize" && attempts.fetch_add(1, Ordering::AcqRel) == 0 {
+					hold_sse_open(&mut socket, post_closed).await;
+				} else if method == "initialize" {
+					write_json(&mut socket, &rpc_result(&body, initialize_result())).await;
+				} else if method == "tools/list" {
+					write_json(&mut socket, &rpc_result(&body, json!({"tools": [{"name": "retry_tool", "description": "retry", "inputSchema": {"type": "object"}}]}))).await;
+				} else {
+					write_json(&mut socket, &rpc_result(&body, json!({}))).await;
+				}
+			});
+			connections_for_accept.lock().unwrap().push(handle);
+		}
+	});
+	Fixture { url: format!("http://{addr}/mcp"), seen, post_closed, _server: Server { accept, connections } }
+}
+
+async fn spawn_long_sse_fixture() -> Fixture {
+	let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind loopback");
+	let addr = listener.local_addr().expect("fixture address");
+	let (tx, seen) = mpsc::channel(SEEN_CAPACITY);
+	let post_closed = Arc::new(AtomicBool::new(false));
+	let connections = Arc::new(Mutex::new(Vec::new()));
+	let connections_for_accept = Arc::clone(&connections);
+	let accept = tokio::spawn(async move {
+		loop {
+			let Ok((mut socket, _)) = listener.accept().await else { return; };
+			let tx = tx.clone();
+			let handle = tokio::spawn(async move {
+				let Some(body) = read_request(&mut socket).await else { return; };
+				let method = body.get("method").and_then(Value::as_str).unwrap_or_default().to_string();
+				let _ = tx.send(body.clone()).await;
+				match method.as_str() {
+					"initialize" => write_json(&mut socket, &rpc_result(&body, initialize_result())).await,
+					"notifications/initialized" | "notifications/cancelled" => write_json(&mut socket, &json!({})).await,
+					"tools/list" => {
+						let _ = socket.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\n\r\n").await;
+						let _ = socket.flush().await;
+						let progress = json!({"jsonrpc":"2.0","method":"notifications/progress","params":{"progressToken":"test","progress":1}});
+						let _ = socket.write_all(format!("event: message\r\ndata: {progress}\r\n\r\n").as_bytes()).await;
+						tokio::time::sleep(Duration::from_millis(1500)).await;
+						let result = json!({"tools": [
+							{"name": "preserved_tool", "description": "idle-safe", "inputSchema": {"type": "object"}},
+							{"name": "second_tool", "description": "idle-safe", "inputSchema": {"type": "object"}}
+						]});
+						let event = format!("event: message\r\ndata: {}\r\n\r\n", rpc_result(&body, result));
+						let _ = socket.write_all(event.as_bytes()).await;
+						let _ = socket.flush().await;
+					},
+					_ => write_json(&mut socket, &rpc_result(&body, json!({}))).await,
+				}
+			});
+			connections_for_accept.lock().unwrap().push(handle);
+		}
+	});
+	Fixture { url: format!("http://{addr}/mcp"), seen, post_closed, _server: Server { accept, connections } }
+}
+
+async fn spawn_legacy_sse_fixture() -> Fixture {
+	let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind loopback");
+	let addr = listener.local_addr().expect("fixture address");
+	let (tx, seen) = mpsc::channel(SEEN_CAPACITY);
+	let post_closed = Arc::new(AtomicBool::new(false));
+	let sse_socket: Arc<tokio::sync::Mutex<Option<TcpStream>>> = Arc::new(tokio::sync::Mutex::new(None));
+	let connections = Arc::new(Mutex::new(Vec::new()));
+	let connections_for_accept = Arc::clone(&connections);
+	let sse_socket_for_accept = Arc::clone(&sse_socket);
+	let accept = tokio::spawn(async move {
+		loop {
+			let Ok((mut socket, _)) = listener.accept().await else { return; };
+			let tx = tx.clone();
+			let sse_socket = Arc::clone(&sse_socket_for_accept);
+			let handle = tokio::spawn(async move {
+				let mut head_buf = [0u8; 1];
+				let n = socket.peek(&mut head_buf).await.unwrap_or(0);
+				if n == 1 && head_buf[0] == b'G' {
+					let endpoint = format!("http://{addr}/post");
+					let response = format!(
+						"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\n\r\n\
+						event: endpoint\r\ndata: {endpoint}\r\n\r\n"
+					);
+					let mut guard = sse_socket.lock().await;
+					let _ = socket.write_all(response.as_bytes()).await;
+					let _ = socket.flush().await;
+					*guard = Some(socket);
+				} else if n == 1 && head_buf[0] == b'P' {
+					let Some(body) = read_request(&mut socket).await else { return; };
+					let method = body.get("method").and_then(Value::as_str).unwrap_or_default().to_string();
+					let _ = tx.send(body.clone()).await;
+					let _ = socket.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").await;
+					let _ = socket.flush().await;
+					match method.as_str() {
+						"initialize" => {
+							let event = format!(
+								"event: message\r\ndata: {}\r\n\r\n",
+								rpc_result(&body, initialize_result())
+							);
+							if let Some(sse) = &mut *sse_socket.lock().await {
+								let _ = sse.write_all(event.as_bytes()).await;
+								let _ = sse.flush().await;
+							}
+						},
+						"tools/list" => {
+							if let Some(sse) = &mut *sse_socket.lock().await {
+								let progress = json!({"jsonrpc":"2.0","method":"notifications/progress","params":{"progressToken":"test","progress":1}});
+								let _ = sse.write_all(format!("event: message\r\ndata: {progress}\r\n\r\n").as_bytes()).await;
+							}
+							tokio::time::sleep(Duration::from_millis(1500)).await;
+							let result = json!({
+								"tools": [{
+									"name": "legacy_tool",
+									"description": "legacy sse tool",
+									"inputSchema": { "type": "object" }
+								}]
+							});
+							let event = format!(
+								"event: message\r\ndata: {}\r\n\r\n",
+								rpc_result(&body, result)
+							);
+							if let Some(sse) = &mut *sse_socket.lock().await {
+								let _ = sse.write_all(event.as_bytes()).await;
+								let _ = sse.flush().await;
+							}
+						},
+						_ => {},
+					}
+				}
+			});
+			connections_for_accept.lock().unwrap().push(handle);
+		}
+	});
+	Fixture { url: format!("http://{addr}/sse"), seen, post_closed, _server: Server { accept, connections } }
+}
+
+#[tokio::test]
+async fn initialize_timeout_releases_socket_within_five_seconds() {
+	let mut fixture = spawn_delayed_init_fixture().await;
+	let config = MCPHttpServerConfig {
+		url: fixture.url.clone(),
+		headers: HashMap::new(),
+		timeout: Some(REQUEST_TIMEOUT.as_millis() as u64),
+		request_id_format: None,
+		header_policy: None,
+		auth: None,
+		oauth: None,
+	};
+	let started = std::time::Instant::now();
+	let result = connect_to_server("delay-init", MCPServerConfig::Http(config)).await;
+	assert!(matches!(result, Err(McpError::Timeout(_))), "expected initialize timeout");
+	assert!(started.elapsed() < REQUEST_TIMEOUT + SLACK, "initialize timeout must be bounded: {:?}", started.elapsed());
+	let init_req = expect_request(&mut fixture, "initialize").await;
+	assert!(init_req.get("id").is_some());
+
+	let deadline = std::time::Instant::now() + Duration::from_secs(5);
+	while !fixture.post_closed.load(Ordering::Acquire) && std::time::Instant::now() < deadline {
+		tokio::time::sleep(Duration::from_millis(50)).await;
+	}
+	assert!(fixture.post_closed.load(Ordering::Acquire), "cancelled initialize must close socket within 5 seconds");
+}
+
+#[tokio::test]
+async fn dropped_initialize_future_releases_socket_within_five_seconds() {
+	let mut fixture = spawn_delayed_init_fixture().await;
+	let config = MCPHttpServerConfig {
+		url: fixture.url.clone(), headers: HashMap::new(), timeout: Some(30_000),
+		request_id_format: None, header_policy: None, auth: None, oauth: None,
+	};
+	let task = tokio::spawn(async move {
+		connect_to_server("drop-init", MCPServerConfig::Http(config)).await
+	});
+	expect_request(&mut fixture, "initialize").await;
+	task.abort();
+	let _ = task.await;
+
+	let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+	while !fixture.post_closed.load(Ordering::Acquire) && tokio::time::Instant::now() < deadline {
+		tokio::time::sleep(Duration::from_millis(50)).await;
+	}
+	assert!(fixture.post_closed.load(Ordering::Acquire), "dropped initialize must close its socket");
+}
+
+#[tokio::test]
+async fn repeated_initialize_succeeds_after_cancelled_handshake() {
+	let mut fixture = spawn_delayed_init_fixture().await;
+	let config = MCPHttpServerConfig {
+		url: fixture.url.clone(),
+		headers: HashMap::new(),
+		timeout: Some(REQUEST_TIMEOUT.as_millis() as u64),
+		request_id_format: None,
+		header_policy: None,
+		auth: None,
+		oauth: None,
+	};
+	let result = connect_to_server("retry", MCPServerConfig::Http(config)).await;
+	assert!(matches!(result, Err(McpError::Timeout(_))));
+	let _ = expect_request(&mut fixture, "initialize").await;
+	let deadline = std::time::Instant::now() + Duration::from_secs(5);
+	while !fixture.post_closed.load(Ordering::Acquire) && std::time::Instant::now() < deadline {
+		tokio::time::sleep(Duration::from_millis(50)).await;
+	}
+	assert!(fixture.post_closed.load(Ordering::Acquire));
+	let config = MCPHttpServerConfig {
+		url: fixture.url.clone(),
+		headers: HashMap::new(),
+		timeout: Some(Duration::from_secs(5).as_millis() as u64),
+		request_id_format: None,
+		header_policy: None,
+		auth: None,
+		oauth: None,
+	};
+	let connection = connect_to_server("retry", MCPServerConfig::Http(config)).await.expect("same server reinitialize must succeed");
+	expect_request(&mut fixture, "initialize").await;
+	expect_request(&mut fixture, "notifications/initialized").await;
+	let tools = connection.list_tools().await.expect("same-server tools/list must succeed");
+	assert_eq!(tools.len(), 1);
+	assert_eq!(tools[0].name, "retry_tool");
+}
+
+#[tokio::test]
+async fn rmcp_long_sse_stream_survives_idle_intervals_beyond_handshake_timeout() {
+	let mut fixture = spawn_long_sse_fixture().await;
+	let config = MCPHttpServerConfig {
+		url: fixture.url.clone(),
+		headers: HashMap::new(),
+		timeout: Some(REQUEST_TIMEOUT.as_millis() as u64),
+		request_id_format: None,
+		header_policy: None,
+		auth: None,
+		oauth: None,
+	};
+	let connection = connect_to_server("rmcp-sse", MCPServerConfig::Http(config)).await.expect("initialize must succeed");
+	expect_request(&mut fixture, "initialize").await;
+	expect_request(&mut fixture, "notifications/initialized").await;
+	let started = std::time::Instant::now();
+	let transport = connection.transport.read().await.clone();
+	let result = transport.request("tools/list", Some(json!({})), Some(Duration::from_secs(5))).await.expect("stream survives idle interval");
+	assert!(started.elapsed() >= Duration::from_millis(1200));
+	assert_eq!(result["tools"][0]["name"], "preserved_tool");
+	assert_eq!(result["tools"][1]["name"], "second_tool");
+}
+
+#[tokio::test]
+async fn legacy_sse_stream_survives_idle_intervals_beyond_handshake_timeout() {
+	let mut fixture = spawn_legacy_sse_fixture().await;
+	let config = MCPSseServerConfig {
+		url: fixture.url.clone(),
+		headers: HashMap::new(),
+		timeout: Some(REQUEST_TIMEOUT.as_millis() as u64),
+		request_id_format: None,
+		header_policy: None,
+		auth: None,
+		oauth: None,
+	};
+	let connection = connect_to_server("legacy-sse", MCPServerConfig::Sse(config)).await.expect("legacy sse initialize must succeed");
+	expect_request(&mut fixture, "initialize").await;
+	expect_request(&mut fixture, "notifications/initialized").await;
+	let started = std::time::Instant::now();
+	let transport = connection.transport.read().await.clone();
+	let result = transport.request("tools/list", Some(json!({})), Some(Duration::from_secs(5))).await.expect("legacy stream survives idle interval");
+	assert!(started.elapsed() >= Duration::from_millis(1200));
+	assert_eq!(result["tools"][0]["name"], "legacy_tool");
 }

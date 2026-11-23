@@ -195,10 +195,10 @@ impl HttpClient {
 	/// Same TLS backend as the model transport (rustls, no OpenSSL on bionic).
 	#[must_use]
 	pub fn new() -> Self {
-		let inner = reqwest::Client::builder()
+		let inner = pi_agent::http_client_builder()
 			.user_agent(concat!("aragent/", env!("CARGO_PKG_VERSION")))
 			.build()
-			.unwrap_or_default();
+			.expect("failed to construct auth HTTP client with preconfigured TLS");
 		Self { inner }
 	}
 
@@ -350,5 +350,11 @@ mod tests {
 		assert_eq!(error.status, Some(400));
 		assert!(error.message.contains("invalid_grant"));
 		assert!(!error.message.contains("secretvalue"));
+	}
+
+	#[test]
+	fn http_client_constructs_with_configured_tls() {
+		let client = HttpClient::new();
+		drop(client);
 	}
 }

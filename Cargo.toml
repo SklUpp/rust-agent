@@ -22,6 +22,7 @@ repository = "https://github.com/can1357/oh-my-pi"
 
 [patch.crates-io]
 brush-core = { path = "crates/vendor/brush-core" }
+rmcp = { path = "crates/vendor/rmcp" }
 
 [profile.release]
 opt-level = 3
@@ -234,7 +235,11 @@ pi-walker = { path = "crates/pi-walker" }
 portable-pty = "0.9"
 rayon = "1.12"
 regex = "1"
-reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "gzip", "rustls-tls"] }
+reqwest = { version = "0.13", default-features = false, features = ["json", "stream", "gzip", "rustls-no-provider", "form"] }
+# reqwest 0.13's `rustls` feature is aws-lc-rs (aws-lc-sys + cmake, breaks
+# local bionic builds). `rustls-no-provider` + ring here keeps exactly one
+# provider compiled; rustls auto-installs it, main.rs pins it explicitly.
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "logging", "tls12"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = { version = "1.0", features = ["preserve_order"] }
 similar = "3.1.0"
@@ -300,6 +305,7 @@ tree-sitter-vue = { version = "0.1.0", package = "tree-sitter-vue-next" }
 tree-sitter-xml = "0.7"
 tree-sitter-yaml = "0.7"
 tree-sitter-zig = "1.1"
+webpki-roots = "1.0.11"
 windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Media_Audio", "Win32_Media_Multimedia", "Win32_Security", "Win32_Storage_FileSystem", "Win32_Storage_ProjectedFileSystem", "Win32_System_Com", "Win32_System_LibraryLoader", "Win32_System_IO", "Win32_System_Ioctl", "Win32_System_Threading"] }
 winreg = "0.56"
 xutf = "1.4"

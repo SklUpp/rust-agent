@@ -70,7 +70,7 @@ impl OpenAiCompatibleProvider {
 				parsed.scheme()
 			)));
 		}
-		let http = reqwest::Client::builder()
+		let http = crate::tls::http_client_builder()
 			.connect_timeout(CONNECT_TIMEOUT)
 			.build()
 			.map_err(network_error)?;

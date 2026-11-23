@@ -127,6 +127,9 @@ impl From<std::io::Error> for CliError {
 }
 
 fn main() -> std::process::ExitCode {
+	// reqwest is compiled with `rustls-no-provider`; pin ring as the process
+	// provider before any HTTP client is built.
+	pi_agent::ensure_crypto_provider();
 	match run() {
 		Ok(()) => std::process::ExitCode::from(aragent::EXIT_SUCCESS),
 		Err(error) => {

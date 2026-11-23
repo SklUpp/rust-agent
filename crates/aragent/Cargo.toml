@@ -36,6 +36,7 @@ pi-ast = { path = "../pi-ast" }
 pi-grep-pattern = { path = "../pi-grep-pattern" }
 pi-walker.workspace = true
 reqwest = { workspace = true }
+rustls = { workspace = true }
 serde.workspace = true
 serde_json.workspace = true
 # Pinned: the lock already resolves sha2 0.10.9 and 0.11.0; auth parity uses 0.10.

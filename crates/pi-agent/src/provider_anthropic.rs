@@ -436,7 +436,7 @@ impl AnthropicMessagesProvider {
 				parsed.scheme()
 			)));
 		}
-		let http = reqwest::Client::builder()
+		let http = crate::tls::http_client_builder()
 			.connect_timeout(CONNECT_TIMEOUT)
 			// Never replay credentials across an unintended redirect.
 			.redirect(reqwest::redirect::Policy::none())

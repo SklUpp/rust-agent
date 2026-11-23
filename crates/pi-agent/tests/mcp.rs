@@ -1678,6 +1678,120 @@ async fn rmcp_resource_transport_error_does_not_leak_secret_url() {
 }
 
 #[tokio::test]
+async fn rmcp_initialize_transport_error_does_not_leak_query_or_body() {
+    let query_secret = "SECRET_URL_QUERY_TOKEN_8a4f";
+    let body_secret = "SECRET_RESPONSE_BODY_PREVIEW_9b2c";
+
+    // 1. Response body exclusion: server responds with HTTP 400 containing body_secret.
+    // In rmcp (streamable_http_client.rs:376), non-5xx, non-429 error produces
+    // UnexpectedServerResponse("HTTP 400: <body up to 256 bytes>").
+    {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let mut server_task = tokio::spawn(async move {
+            if let Ok((mut socket, _)) = listener.accept().await {
+                let Some((_headers, _body)) = read_http_json_request(&mut socket).await else { return };
+                let payload = format!("bad request: {body_secret}");
+                let head = format!(
+                    "HTTP/1.1 400 Bad Request\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    payload.len()
+                );
+                let _ = socket.write_all(head.as_bytes()).await;
+                let _ = socket.write_all(payload.as_bytes()).await;
+            }
+        });
+
+        let config = MCPServerConfig::Http(MCPHttpServerConfig {
+            url: format!("http://{addr}/mcp"),
+            headers: HashMap::new(),
+            timeout: Some(2_000),
+            request_id_format: None,
+            header_policy: None,
+            auth: None,
+            oauth: None,
+        });
+
+        let error = connect_to_server("init-body-leak-test", config)
+            .await
+            .expect_err("initialize against HTTP 400 must fail");
+        if tokio::time::timeout(std::time::Duration::from_millis(500), &mut server_task)
+            .await
+            .is_err()
+        {
+            server_task.abort();
+        }
+        match &error {
+            McpError::Protocol(message) => {
+                assert!(message.contains("HTTP 400"), "expected status HTTP 400");
+                assert!(
+                    message.contains("send initialize request"),
+                    "expected step 'send initialize request'"
+                );
+            }
+            _ => panic!("expected McpError::Protocol for initialize failure"),
+        }
+
+        let err_msg = error.to_string();
+        assert!(!err_msg.contains(body_secret), "body secret leaked into Display");
+    }
+
+    // 2. URL query parameter exclusion: server accepts connection and closes it without response.
+    // Keeps port bound to avoid race condition with other local processes.
+    // reqwest attaches request URL to error ("error sending request for url (...)").
+    // rmcp wraps it in StreamableHttpError::Client. Adapter must strip raw error.
+    {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let mut server_task = tokio::spawn(async move {
+            if let Ok((mut socket, _)) = listener.accept().await {
+                let mut buf = [0u8; 1024];
+                let _ = socket.read(&mut buf).await;
+                drop(socket);
+            }
+        });
+
+        let config = MCPServerConfig::Http(MCPHttpServerConfig {
+            url: format!("http://{addr}/mcp?token={query_secret}"),
+            headers: HashMap::new(),
+            timeout: Some(2_000),
+            request_id_format: None,
+            header_policy: None,
+            auth: None,
+            oauth: None,
+        });
+
+        let error = connect_to_server("init-query-leak-test", config)
+            .await
+            .expect_err("initialize against dropped connection must fail");
+        if tokio::time::timeout(std::time::Duration::from_millis(500), &mut server_task)
+            .await
+            .is_err()
+        {
+            server_task.abort();
+        }
+        match &error {
+            McpError::Protocol(message) => {
+                assert!(
+                    message.contains("send initialize request"),
+                    "expected step 'send initialize request'"
+                );
+                assert!(
+                    message.contains("transport failure"),
+                    "expected category 'transport failure'"
+                );
+            }
+            _ => panic!("expected McpError::Protocol for initialize failure"),
+        }
+
+        let err_msg = error.to_string();
+        assert!(!err_msg.contains(query_secret), "query secret leaked into Display");
+        assert!(!err_msg.contains("token="), "token parameter name leaked into Display");
+    }
+}
+
+#[tokio::test]
 async fn test_legacy_sse_server_reply_with_auth_and_numeric_id() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();

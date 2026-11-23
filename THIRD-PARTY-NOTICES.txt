@@ -19,6 +19,14 @@ TRACKED VENDORED CODE AND ASSET NOTICES
 =======================================
 
 -------------------------------------------------------------------------------
+crates/vendor/rmcp/LICENSE
+
+This directory contains rmcp 3.9.0 from the Model Context Protocol Rust SDK
+(https://github.com/modelcontextprotocol/rust-sdk), licensed under Apache-2.0.
+Local modifications make HTTP initialization cancellation-aware. The complete
+license is retained in crates/vendor/rmcp/LICENSE.
+
+-------------------------------------------------------------------------------
 crates/vendor/brush-core/LICENSE
 
 This directory contains a vendored, locally-patched copy of brush-core from the

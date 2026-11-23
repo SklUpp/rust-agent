@@ -760,7 +760,7 @@ impl OllamaProvider {
 		let raw_base_url: String = base_url.into();
 		let base_url = normalize_base_url(&raw_base_url);
 		validate_base_url(&base_url)?;
-		let http = reqwest::Client::builder()
+		let http = crate::tls::http_client_builder()
 			.connect_timeout(CONNECT_TIMEOUT)
 			// Safety boundary: a redirect could forward `Authorization` and
 			// configured credential headers to another origin. Never follow
@@ -4227,7 +4227,7 @@ mod tests {
 		]);
 		message.content = "look".to_string();
 		let provider = OllamaProvider::with_client(
-			reqwest::Client::new(),
+			crate::tls::http_client_builder().build().expect("client"),
 			"http://localhost:11434",
 			"",
 			"m",
@@ -4323,7 +4323,7 @@ mod tests {
 	#[test]
 	fn reasoning_effort_maps_through_the_cloud_effort_map() {
 		let provider = OllamaProvider::with_client(
-			reqwest::Client::new(),
+			crate::tls::http_client_builder().build().expect("client"),
 			"http://localhost:11434",
 			"",
 			"m",

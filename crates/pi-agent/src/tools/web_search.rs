@@ -153,10 +153,10 @@ impl WebSearchTool {
 			// Endpoint is fixed by host config; a redirect could both break the
 			// JSON parse (external bangs) and carry `Authorization` to another
 			// origin, so redirects are surfaced as errors instead of followed.
-			client: reqwest::Client::builder()
+			client: crate::tls::http_client_builder()
 				.redirect(reqwest::redirect::Policy::none())
 				.build()
-				.unwrap_or_default(),
+				.expect("failed to construct web search HTTP client with preconfigured TLS"),
 			timeout: REQUEST_TIMEOUT,
 		}
 	}

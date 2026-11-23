@@ -80,10 +80,11 @@ pub struct LegacySseTransport {
 
 impl LegacySseTransport {
     pub fn new(config: &MCPSseServerConfig) -> Self {
-        let client = reqwest::Client::builder()
+        let client = crate::tls::http_client_builder()
+            .pool_max_idle_per_host(0)
             .redirect(reqwest::redirect::Policy::none())
             .build()
-            .unwrap_or_default();
+            .expect("failed to construct legacy SSE HTTP client with preconfigured TLS");
 
         let timeout_ms = resolve_mcp_timeout_ms(config.timeout);
 
@@ -167,15 +168,18 @@ impl LegacySseTransport {
             }
             req_builder = req_builder.headers(header_map);
 
-            if let Some(dur) = hop_timeout {
-                req_builder = req_builder.timeout(dur);
+            let send = req_builder.send();
+            let resp = match hop_timeout {
+                Some(dur) => tokio::time::timeout(dur, send)
+                    .await
+                    .map_err(|_| McpError::Timeout(format!("Legacy SSE GET timed out: {dur:?}")))?,
+                None => send.await,
             }
-
-            let resp = req_builder.send().await.map_err(|e| {
+            .map_err(|e| {
                 if e.is_timeout() {
-                    McpError::Timeout(format!("Legacy SSE GET timed out: {}", e))
+                    McpError::Timeout(format!("Legacy SSE GET timed out: {e}"))
                 } else {
-                    McpError::Transport(format!("Legacy SSE GET failed: {}", e))
+                    McpError::Transport(format!("Legacy SSE GET failed: {e}"))
                 }
             })?;
 
