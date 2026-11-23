@@ -1,0 +1,49 @@
+id: e01s02
+story: e01s02
+story_id: e01s02
+title: "SSE Handshake Cancellation Socket Guard (R0.2)"
+spec: e01s02-sse-cancellation-guard.md
+status: failing
+bcps: 5
+verify: "cargo test --locked -p pi-agent --test mcp_http_cancel"
+tasks:
+  - id: 1
+    description: "Add regression test in mcp_http_cancel asserting socket closure within 5s and background task termination"
+    verify: "cargo test --locked -p pi-agent --test mcp_http_cancel"
+    risk: P0
+    status: failing
+    allure:
+      severity: critical
+      categories:
+        - "Transport"
+        - "MCP"
+  - id: 2
+    description: "Add regression test in mcp_http_cancel asserting repeated initialize succeeds after cancelled handshake"
+    verify: "cargo test --locked -p pi-agent --test mcp_http_cancel"
+    risk: P0
+    status: failing
+    allure:
+      severity: critical
+      categories:
+        - "Transport"
+        - "MCP"
+  - id: 3
+    description: "Add test in mcp_http_cancel asserting long SSE streams survive idle intervals without premature timeout"
+    verify: "cargo test --locked -p pi-agent --test mcp_http_cancel"
+    risk: P0
+    status: failing
+    allure:
+      severity: critical
+      categories:
+        - "Transport"
+        - "MCP"
+  - id: 4
+    description: "Implement transport cancellation guard in client.rs aborting uninitialized transport on drop within 5s"
+    verify: "cargo test --locked -p pi-agent --test mcp_http_cancel"
+    risk: P0
+    status: failing
+    allure:
+      severity: critical
+      categories:
+        - "Transport"
+        - "MCP"

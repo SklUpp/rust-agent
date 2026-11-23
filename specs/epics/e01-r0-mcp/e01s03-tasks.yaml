@@ -1,0 +1,31 @@
+id: e01s03
+story: e01s03
+story_id: e01s03
+title: "Strip Sensitive rmcp Text from McpError Display (R0.3)"
+spec: e01s03-mcperror-display.md
+status: failing
+historical_status: completed
+provenance: "docs/agent-preliminary-implementation-plan.md:38"
+bcps: 2
+verify: "cargo test --locked -p pi-agent --lib initialize_http_status_excludes_secret_response_body"
+tasks:
+  - id: 1
+    description: "Verify map_initialize_error preserves rmcp step and category without URL query or body preview in existing unit test"
+    verify: "cargo test --locked -p pi-agent --lib initialize_transport_error_does_not_echo_the_transport_text"
+    risk: P1
+    status: failing
+    allure:
+      severity: high
+      categories:
+        - "Security"
+        - "MCP"
+  - id: 2
+    description: "Add concrete regression test initialize_http_status_excludes_secret_response_body supplying a secret-bearing response body (HttpStatusError with non-empty secret body string) asserting map_initialize_error excludes body text from Display output (task specifies adding missing test; existing test only checked None body)"
+    verify: "cargo test --locked -p pi-agent --lib initialize_http_status_excludes_secret_response_body"
+    risk: P1
+    status: failing
+    allure:
+      severity: high
+      categories:
+        - "Security"
+        - "MCP"

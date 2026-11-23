@@ -1,0 +1,41 @@
+id: e01s01
+story: e01s01
+story_id: e01s01
+title: "Transport Redaction Completion (R0.1)"
+spec: e01s01-transport-redaction.md
+status: failing
+historical_status: completed
+provenance: "docs/agent-preliminary-implementation-plan.md:38 (implemented in commit 3d4adf1)"
+bcps: 3
+verify: "cargo test --locked -p aragent"
+tasks:
+  - id: 1
+    description: "Apply redact_json_strings to executions.intent_json and outcome_json"
+    verify: "cargo test --locked -p aragent"
+    risk: P1
+    status: failing
+    allure:
+      severity: high
+      categories:
+        - "Redaction"
+        - "Security Review"
+  - id: 2
+    description: "Apply redact_json_strings to deliveries.payload_json and worker_completions"
+    verify: "cargo test --locked -p aragent"
+    risk: P1
+    status: failing
+    allure:
+      severity: high
+      categories:
+        - "Redaction"
+        - "Security Review"
+  - id: 3
+    description: "Apply redact_json_strings to sessions.payload_json auto-title and artifact metadata"
+    verify: "cargo test --locked -p aragent"
+    risk: P1
+    status: failing
+    allure:
+      severity: high
+      categories:
+        - "Redaction"
+        - "Security Review"

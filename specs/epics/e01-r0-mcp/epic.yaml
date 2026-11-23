@@ -1,0 +1,40 @@
+id: e01
+title: "Transport & Redaction Hardening (R0)"
+scope_ref: R0
+wsjf: 5.67
+total_bcps: 13
+status: in_progress
+active_story: e01s02
+stories:
+  - id: e01s01
+    title: "Transport Redaction Completion (R0.1)"
+    bcps: 3
+    status: done
+    historical_status: completed
+    provenance: "docs/agent-preliminary-implementation-plan.md:38"
+    spec: e01s01-transport-redaction.md
+    tasks: e01s01-tasks.yaml
+    verify: "cargo test --locked -p aragent"
+  - id: e01s02
+    title: "SSE Handshake Cancellation Socket Guard (R0.2)"
+    bcps: 5
+    status: failing
+    spec: e01s02-sse-cancellation-guard.md
+    tasks: e01s02-tasks.yaml
+    verify: "cargo test --locked -p pi-agent --test mcp_http_cancel"
+  - id: e01s03
+    title: "Strip Sensitive rmcp Text from McpError Display (R0.3)"
+    bcps: 2
+    status: done
+    historical_status: completed
+    provenance: "docs/agent-preliminary-implementation-plan.md:38"
+    spec: e01s03-mcperror-display.md
+    tasks: e01s03-tasks.yaml
+    verify: "cargo test --locked -p pi-agent --lib initialize_http_status_excludes_secret_response_body"
+  - id: e01s04
+    title: "Live External MCP Server Smoke on Termux (R0.4)"
+    bcps: 3
+    status: failing
+    spec: e01s04-external-mcp-smoke.md
+    tasks: e01s04-tasks.yaml
+    verify: "cargo test --locked -p aragent --test mcp_filesystem_smoke"

@@ -1,0 +1,31 @@
+id: e01s04
+story: e01s04
+story_id: e01s04
+title: "Live External MCP Server Smoke on Termux (R0.4)"
+spec: e01s04-external-mcp-smoke.md
+status: failing
+bcps: 3
+verify: "cargo test --locked -p aragent --test mcp_filesystem_smoke"
+tasks:
+  - id: 1
+    description: "Verify transport reconnect logic after server disconnect in existing mcp_boundaries suite"
+    verify: "cargo test --locked -p pi-agent --test mcp_boundaries"
+    risk: P1
+    status: failing
+    allure:
+      severity: high
+      categories:
+        - "Integration"
+        - "MCP"
+        - "Reconnect"
+  - id: 2
+    description: "Create executable device smoke test in crates/aragent/tests/mcp_filesystem_smoke.rs covering external filesystem MCP server initialize, tools/list, tools/call, kill -9 reconnect, and close without zombies (task specifies creation of new test target; does not exist yet)"
+    verify: "cargo test --locked -p aragent --test mcp_filesystem_smoke"
+    risk: P1
+    status: failing
+    allure:
+      severity: high
+      categories:
+        - "LiveSmoke"
+        - "Termux"
+        - "MCP"
