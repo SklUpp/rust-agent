@@ -580,22 +580,16 @@ impl pi_agent::mcp::McpTransport for FailingTransport {
 /// point at a live mock server, because a reconnect builds a real transport
 /// from it.
 fn fake_connection(failure: Failure, config: MCPServerConfig) -> Arc<pi_agent::mcp::McpConnection> {
-	Arc::new(pi_agent::mcp::McpConnection {
-		name: "fake".to_string(),
+	Arc::new(pi_agent::mcp::McpConnection::new_for_test(
+		"fake".to_string(),
 		config,
-		transport: Arc::new(tokio::sync::RwLock::new(
+		Arc::new(tokio::sync::RwLock::new(
 			Arc::new(FailingTransport { failure }) as Arc<dyn pi_agent::mcp::McpTransport>
 		)),
-		server_info: pi_agent::mcp::MCPServerInfo { name: "fake".to_string(), version: None },
-		capabilities: pi_agent::mcp::MCPServerCapabilities::default(),
-		instructions: None,
-		closed: std::sync::atomic::AtomicBool::new(false),
-		transport_epoch: std::sync::atomic::AtomicU64::new(1),
-		failed_epoch: std::sync::atomic::AtomicU64::new(0),
-		close_completed: std::sync::atomic::AtomicBool::new(false),
-		close_barrier: Arc::new(tokio::sync::Mutex::new(())),
-		state_barrier: Arc::new(tokio::sync::Mutex::new(())),
-	})
+		pi_agent::mcp::MCPServerInfo { name: "fake".to_string(), version: None },
+		pi_agent::mcp::MCPServerCapabilities::default(),
+		None,
+	))
 }
 
 fn method_count(server: &MockServer, method: &str) -> usize {

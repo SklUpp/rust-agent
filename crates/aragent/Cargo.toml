@@ -47,6 +47,11 @@ tokio-util.workspace = true
 # Same crate and version the native lock names its abstract socket with.
 xxhash-rust.workspace = true
 
+[features]
+default = []
+test-support = ["pi-agent/test-support"]
+
 [dev-dependencies]
 clap.workspace = true
+futures.workspace = true
 tokio = { workspace = true, features = ["full"] }

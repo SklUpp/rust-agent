@@ -15,4 +15,8 @@ pub use client::{
 	connect_to_server, get_active_session, is_retriable_connection_error, list_active_sessions,
 	register_active_session, unregister_active_session, McpConnection,
 };
-pub use transports::McpTransport;
+
+#[cfg(feature = "test-support")]
+pub use rmcp::transport::child_process::{ChildKillController, ReapError};
+#[cfg(feature = "test-support")]
+pub use transports::rmcp_adapter::ChildKillHook;

@@ -5438,9 +5438,9 @@ mod tests_mcp_lifecycle {
 
 	fn connection(name: &str) -> (Arc<McpConnection>, Arc<AtomicBool>) {
 		let closed = Arc::new(AtomicBool::new(false));
-		let connection = Arc::new(McpConnection {
-			name: name.to_string(),
-			config: MCPServerConfig::Stdio(MCPStdioServerConfig {
+		let connection = Arc::new(McpConnection::new_for_test(
+			name.to_string(),
+			MCPServerConfig::Stdio(MCPStdioServerConfig {
 				command: "true".to_string(),
 				args: Vec::new(),
 				env: HashMap::new(),
@@ -5448,23 +5448,17 @@ mod tests_mcp_lifecycle {
 				timeout: None,
 				request_id_format: None,
 			}),
-			transport: Arc::new(tokio::sync::RwLock::new(
+			Arc::new(tokio::sync::RwLock::new(
 				Arc::new(FlagTransport { closed: Arc::clone(&closed) })
 					as Arc<dyn pi_agent::mcp::McpTransport>,
 			)),
-			server_info: pi_agent::mcp::MCPServerInfo {
+			pi_agent::mcp::MCPServerInfo {
 				name: name.to_string(),
 				version: None,
 			},
-			capabilities: pi_agent::mcp::MCPServerCapabilities::default(),
-			closed: std::sync::atomic::AtomicBool::new(false),
-			transport_epoch: std::sync::atomic::AtomicU64::new(1),
-			failed_epoch: std::sync::atomic::AtomicU64::new(0),
-			close_completed: std::sync::atomic::AtomicBool::new(false),
-			close_barrier: std::sync::Arc::new(tokio::sync::Mutex::new(())),
-			state_barrier: std::sync::Arc::new(tokio::sync::Mutex::new(())),
-			instructions: None,
-		});
+			pi_agent::mcp::MCPServerCapabilities::default(),
+			None,
+		));
 		(connection, closed)
 	}
 

@@ -1110,9 +1110,9 @@ mod tests {
 			"empty registry error: {empty}"
 		);
 
-		let connection = Arc::new(McpConnection {
-			name: "demo".to_string(),
-			config: MCPServerConfig::Stdio(MCPStdioServerConfig {
+		let connection = Arc::new(McpConnection::new_for_test(
+			"demo".to_string(),
+			MCPServerConfig::Stdio(MCPStdioServerConfig {
 				command: "true".to_string(),
 				args: Vec::new(),
 				env: Default::default(),
@@ -1120,23 +1120,17 @@ mod tests {
 				timeout: None,
 				request_id_format: None,
 			}),
-			transport: Arc::new(RwLock::new(Arc::new(FakeTransport) as Arc<dyn McpTransport>)),
-			server_info: MCPServerInfo {
+			Arc::new(RwLock::new(Arc::new(FakeTransport) as Arc<dyn McpTransport>)),
+			MCPServerInfo {
 				name: "demo".to_string(),
 				version: Some("1.0.0".to_string()),
 			},
-			capabilities: MCPServerCapabilities {
+			MCPServerCapabilities {
 				resources: Some(json!({})),
 				..Default::default()
 			},
-			closed: std::sync::atomic::AtomicBool::new(false),
-			transport_epoch: std::sync::atomic::AtomicU64::new(1),
-			failed_epoch: std::sync::atomic::AtomicU64::new(0),
-			close_completed: std::sync::atomic::AtomicBool::new(false),
-			close_barrier: std::sync::Arc::new(tokio::sync::Mutex::new(())),
-			state_barrier: std::sync::Arc::new(tokio::sync::Mutex::new(())),
-			instructions: None,
-		});
+			None,
+		));
 		register_active_session(Arc::clone(&connection));
 
 		let listed = runtime

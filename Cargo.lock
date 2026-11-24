@@ -118,6 +118,7 @@ dependencies = [
  "base64 0.22.1",
  "clap",
  "flate2",
+ "futures",
  "globset",
  "grep-searcher",
  "libc",

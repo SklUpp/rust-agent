@@ -54,6 +54,8 @@ jobs:
         run: cargo check --locked -p pi-agent -p aragent
       - name: Test agent core and CLI
         run: cargo test --locked -p pi-agent -p aragent
+      - name: Check MCP smoke test support
+        run: cargo test --locked -p aragent --features test-support --test mcp_filesystem_smoke
       - name: Test persistent shell session and env allowlist
         run: cargo test --locked -p pi-shell --test persistent_session --test session_env_allowlist
       - name: Build CLI for the smoke run

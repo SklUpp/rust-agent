@@ -279,9 +279,9 @@ mod tests {
 		error: Option<(i64, &'static str)>,
 	) -> (McpConnection, Arc<FakeTransport>) {
 		let transport = Arc::new(FakeTransport { error, requested: Mutex::new(Vec::new()) });
-		let connection = McpConnection {
-			name: "demo".to_string(),
-			config: MCPServerConfig::Stdio(MCPStdioServerConfig {
+		let connection = McpConnection::new_for_test(
+			"demo".to_string(),
+			MCPServerConfig::Stdio(MCPStdioServerConfig {
 				command: "true".to_string(),
 				args: Vec::new(),
 				env: Default::default(),
@@ -289,20 +289,14 @@ mod tests {
 				timeout: None,
 				request_id_format: None,
 			}),
-			transport: Arc::new(RwLock::new(Arc::clone(&transport) as Arc<dyn McpTransport>)),
-			server_info: MCPServerInfo { name: "demo".to_string(), version: None },
-			capabilities: MCPServerCapabilities {
+			Arc::new(RwLock::new(Arc::clone(&transport) as Arc<dyn McpTransport>)),
+			MCPServerInfo { name: "demo".to_string(), version: None },
+			MCPServerCapabilities {
 				prompts: prompts.then_some(MCPPromptsCapability { list_changed: false }),
 				..Default::default()
 			},
-			closed: std::sync::atomic::AtomicBool::new(false),
-			transport_epoch: std::sync::atomic::AtomicU64::new(1),
-			failed_epoch: std::sync::atomic::AtomicU64::new(0),
-			close_completed: std::sync::atomic::AtomicBool::new(false),
-			close_barrier: std::sync::Arc::new(tokio::sync::Mutex::new(())),
-			state_barrier: std::sync::Arc::new(tokio::sync::Mutex::new(())),
-			instructions: None,
-		};
+			None,
+		);
 		(connection, transport)
 	}
 

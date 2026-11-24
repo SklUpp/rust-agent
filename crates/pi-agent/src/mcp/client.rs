@@ -121,6 +121,8 @@ pub struct McpConnection {
 	pub close_completed: AtomicBool,
 	pub close_barrier: Arc<AsyncMutex<()>>,
 	pub state_barrier: Arc<AsyncMutex<()>>,
+	#[cfg(feature = "test-support")]
+	pub test_hook: Option<crate::mcp::transports::rmcp_adapter::ChildKillHook>,
 }
 impl std::fmt::Debug for McpConnection {
 	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -136,10 +138,15 @@ impl std::fmt::Debug for McpConnection {
 
 async fn create_and_init_transport(
 	config: &MCPServerConfig,
+	#[cfg(feature = "test-support")]
+	kill_hook: Option<&crate::mcp::transports::rmcp_adapter::ChildKillHook>,
 ) -> Result<(Arc<dyn McpTransport>, MCPInitializeResult), McpError> {
 	let (transport, rmcp_init_result): (Arc<dyn McpTransport>, Option<MCPInitializeResult>) =
 		match config {
 			MCPServerConfig::Stdio(stdio) => {
+				#[cfg(feature = "test-support")]
+				let service = crate::mcp::transports::rmcp_adapter::RmcpService::connect_stdio_with_kill_hook(stdio, kill_hook.cloned()).await?;
+				#[cfg(not(feature = "test-support"))]
 				let service = RmcpService::connect_stdio(stdio).await?;
 				published_rmcp(service).await?
 			},
@@ -221,10 +228,48 @@ pub async fn connect_to_server(
 	name: &str,
 	config: MCPServerConfig,
 ) -> Result<McpConnection, McpError> {
+	#[cfg(feature = "test-support")]
+	{
+		connect_to_server_internal(name, config, None).await
+	}
+	#[cfg(not(feature = "test-support"))]
+	{
+		connect_to_server_internal(name, config).await
+	}
+}
+
+#[cfg(feature = "test-support")]
+pub async fn connect_to_stdio_server_with_kill_seam(
+	name: &str,
+	config: crate::mcp::types::MCPStdioServerConfig,
+	external_hook: Option<crate::mcp::transports::rmcp_adapter::ChildKillHook>,
+) -> Result<(McpConnection, tokio::sync::mpsc::UnboundedReceiver<rmcp::transport::child_process::ChildKillController>), McpError> {
+	let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+	let hook: crate::mcp::transports::rmcp_adapter::ChildKillHook = match external_hook {
+		Some(ext) => std::sync::Arc::new(move |ctrl| {
+			let _ = tx.send(ctrl.clone());
+			ext(ctrl);
+		}),
+		None => std::sync::Arc::new(move |ctrl| {
+			let _ = tx.send(ctrl);
+		}),
+	};
+	let conn = connect_to_server_internal(name, MCPServerConfig::Stdio(config), Some(hook)).await?;
+	Ok((conn, rx))
+}
+async fn connect_to_server_internal(
+	name: &str,
+	config: MCPServerConfig,
+	#[cfg(feature = "test-support")]
+	test_hook: Option<crate::mcp::transports::rmcp_adapter::ChildKillHook>,
+) -> Result<McpConnection, McpError> {
 	if let Err(errors) = validate_server_config(name, &config) {
 		return Err(McpError::Config(errors.join("; ")));
 	}
 
+	#[cfg(feature = "test-support")]
+	let (transport, init_result) = create_and_init_transport(&config, test_hook.as_ref()).await?;
+	#[cfg(not(feature = "test-support"))]
 	let (transport, init_result) = create_and_init_transport(&config).await?;
 
 	Ok(McpConnection {
@@ -240,6 +285,8 @@ pub async fn connect_to_server(
 		close_completed: AtomicBool::new(false),
 		close_barrier: Arc::new(AsyncMutex::new(())),
 		state_barrier: Arc::new(AsyncMutex::new(())),
+		#[cfg(feature = "test-support")]
+		test_hook,
 	})
 }
 
@@ -257,6 +304,33 @@ fn is_method_not_found_error(error: &McpError) -> bool {
 }
 
 impl McpConnection {
+	#[doc(hidden)]
+	pub fn new_for_test(
+		name: String,
+		config: MCPServerConfig,
+		transport: Arc<RwLock<Arc<dyn McpTransport>>>,
+		server_info: MCPServerInfo,
+		capabilities: MCPServerCapabilities,
+		instructions: Option<String>,
+	) -> Self {
+		Self {
+			name,
+			config,
+			transport,
+			server_info,
+			capabilities,
+			instructions,
+			closed: AtomicBool::new(false),
+			transport_epoch: AtomicU64::new(1),
+			failed_epoch: AtomicU64::new(0),
+			close_completed: AtomicBool::new(false),
+			close_barrier: Arc::new(AsyncMutex::new(())),
+			state_barrier: Arc::new(AsyncMutex::new(())),
+			#[cfg(feature = "test-support")]
+			test_hook: None,
+		}
+	}
+
 	fn request_timeout(&self) -> Option<Duration> {
 		let timeout_ms = resolve_mcp_timeout_ms(self.config.timeout());
 		(timeout_ms > 0).then(|| Duration::from_millis(timeout_ms))
@@ -398,6 +472,9 @@ impl McpConnection {
 		if self.closed.load(Ordering::Acquire) {
 			return Err(McpError::Closed);
 		}
+		#[cfg(feature = "test-support")]
+		let handshake = create_and_init_transport(&self.config, self.test_hook.as_ref());
+		#[cfg(not(feature = "test-support"))]
 		let handshake = create_and_init_transport(&self.config);
 		let (new_transport, _) = match deadline {
 			Some(at) => tokio::time::timeout_at(tokio::time::Instant::from_std(at), handshake)

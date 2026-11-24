@@ -25,6 +25,8 @@ use crate::mcp::{
 	transports::{McpTransport, root_uri},
 	types::{MCPHttpServerConfig, MCPStdioServerConfig},
 };
+#[cfg(feature = "test-support")]
+pub type ChildKillHook = Arc<dyn Fn(rmcp::transport::child_process::ChildKillController) + Send + Sync>;
 
 pub(crate) struct RmcpService {
 	service: tokio::sync::Mutex<Option<rmcp::service::RunningService<rmcp::RoleClient, Handler>>>,
@@ -85,6 +87,31 @@ impl RmcpService {
 	}
 
 	pub(crate) async fn connect_stdio(config: &MCPStdioServerConfig) -> Result<Self, McpError> {
+		#[cfg(feature = "test-support")]
+		{
+			Self::connect_stdio_with_kill_hook(config, None).await
+		}
+		#[cfg(not(feature = "test-support"))]
+		{
+			Self::connect_stdio_impl(config, None).await
+		}
+	}
+
+	#[cfg(feature = "test-support")]
+	pub(crate) async fn connect_stdio_with_kill_hook(
+		config: &MCPStdioServerConfig,
+		kill_hook: Option<ChildKillHook>,
+	) -> Result<Self, McpError> {
+		Self::connect_stdio_impl(config, kill_hook).await
+	}
+
+	async fn connect_stdio_impl(
+		config: &MCPStdioServerConfig,
+		#[cfg(feature = "test-support")]
+		kill_hook: Option<ChildKillHook>,
+		#[cfg(not(feature = "test-support"))]
+		_kill_hook: Option<()>,
+	) -> Result<Self, McpError> {
 		use rmcp::transport::child_process::TokioChildProcess;
 		use rmcp::{ClientLifecycleMode, ClientServiceExt};
 
@@ -95,8 +122,13 @@ impl RmcpService {
 			command.current_dir(cwd);
 		}
 		super::stdio::apply_isolated_env(&mut command, &config.env);
-		let (transport, _) = TokioChildProcess::builder(command)
-			.stderr(std::process::Stdio::null())
+		let mut builder = TokioChildProcess::builder(command)
+			.stderr(std::process::Stdio::null());
+		#[cfg(feature = "test-support")]
+		if let Some(hook) = kill_hook {
+			builder = builder.on_kill_controller(move |ctrl| hook(ctrl));
+		}
+		let (transport, _) = builder
 			.spawn()
 			.map_err(|error| {
 				McpError::Transport(format!(

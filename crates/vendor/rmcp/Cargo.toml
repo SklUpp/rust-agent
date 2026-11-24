@@ -63,6 +63,7 @@ rustdoc-args = [
 ]
 
 [features]
+test-support = []
 __reqwest = ["dep:reqwest"]
 auth = [
     "dep:async-trait",

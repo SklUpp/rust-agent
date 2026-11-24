@@ -34,6 +34,10 @@ similar = { workspace = true }
 # Same package/version as `aragent`; `hooks` enables the read-only authorizer.
 rusqlite = { version = "0.33.0", features = ["bundled", "hooks"] }
 
+[features]
+default = []
+test-support = ["rmcp/test-support"]
+
 [dev-dependencies]
 tokio = { workspace = true, features = ["full"] }
 futures = { workspace = true }
