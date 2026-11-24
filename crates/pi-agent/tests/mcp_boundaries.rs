@@ -551,7 +551,7 @@ enum Failure {
 }
 
 #[async_trait::async_trait]
-impl pi_agent::mcp::McpTransport for FailingTransport {
+impl pi_agent::mcp::transports::McpTransport for FailingTransport {
 	async fn request(
 		&self,
 		_method: &str,
@@ -584,7 +584,7 @@ fn fake_connection(failure: Failure, config: MCPServerConfig) -> Arc<pi_agent::m
 		"fake".to_string(),
 		config,
 		Arc::new(tokio::sync::RwLock::new(
-			Arc::new(FailingTransport { failure }) as Arc<dyn pi_agent::mcp::McpTransport>
+			Arc::new(FailingTransport { failure }) as Arc<dyn pi_agent::mcp::transports::McpTransport>
 		)),
 		pi_agent::mcp::MCPServerInfo { name: "fake".to_string(), version: None },
 		pi_agent::mcp::MCPServerCapabilities::default(),

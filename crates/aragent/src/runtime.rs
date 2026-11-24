@@ -5406,7 +5406,7 @@ mod tests_mcp_lifecycle {
 	}
 
 	#[async_trait::async_trait]
-	impl pi_agent::mcp::McpTransport for FlagTransport {
+	impl pi_agent::mcp::transports::McpTransport for FlagTransport {
 		async fn request(
 			&self,
 			_method: &str,
@@ -5450,7 +5450,7 @@ mod tests_mcp_lifecycle {
 			}),
 			Arc::new(tokio::sync::RwLock::new(
 				Arc::new(FlagTransport { closed: Arc::clone(&closed) })
-					as Arc<dyn pi_agent::mcp::McpTransport>,
+					as Arc<dyn pi_agent::mcp::transports::McpTransport>,
 			)),
 			pi_agent::mcp::MCPServerInfo {
 				name: name.to_string(),
