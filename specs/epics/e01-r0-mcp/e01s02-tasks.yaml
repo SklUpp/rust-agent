@@ -38,7 +38,7 @@ tasks:
         - "Transport"
         - "MCP"
   - id: 4
-    description: "Implement transport cancellation guard in client.rs aborting uninitialized transport on drop within 5s"
+    description: "Implement transport cancellation guard (HandshakeDropGuard, CancellableSseStream, CancellableHttpClient) in rmcp_adapter.rs aborting uninitialized transport on drop within 5s"
     verify: "cargo test --locked -p pi-agent --test mcp_http_cancel"
     risk: P0
     status: done

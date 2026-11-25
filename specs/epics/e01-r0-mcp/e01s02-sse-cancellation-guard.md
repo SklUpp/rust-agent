@@ -4,7 +4,7 @@
 - Story ID: `e01s02`
 - Title: SSE Handshake Cancellation Socket Guard (R0.2)
 - Epic: `e01-r0-mcp`
-- Status: failing
+- Status: done (implemented in 1fdae76, CI run 45293757271 success)
 - BCPs: 5
 - Risk: P0
 - Context: domain / networking / mcp-transport
