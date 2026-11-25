@@ -4,7 +4,7 @@ scope_ref: R0
 wsjf: 5.67
 total_bcps: 13
 status: in_progress
-active_story: e01s02
+active_story: e01s04
 stories:
   - id: e01s01
     title: "Transport Redaction Completion (R0.1)"
@@ -18,7 +18,9 @@ stories:
   - id: e01s02
     title: "SSE Handshake Cancellation Socket Guard (R0.2)"
     bcps: 5
-    status: failing
+    status: done
+    historical_status: completed
+    provenance: "1fdae76"
     spec: e01s02-sse-cancellation-guard.md
     tasks: e01s02-tasks.yaml
     verify: "cargo test --locked -p pi-agent --test mcp_http_cancel"
@@ -35,6 +37,7 @@ stories:
     title: "Live External MCP Server Smoke on Termux (R0.4)"
     bcps: 3
     status: failing
+    provenance: "cf1e673"
     spec: e01s04-external-mcp-smoke.md
     tasks: e01s04-tasks.yaml
     verify: "cargo test --locked -p aragent --test mcp_filesystem_smoke"

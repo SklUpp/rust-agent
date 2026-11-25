@@ -11,7 +11,7 @@ tasks:
     description: "Verify transport reconnect logic after server disconnect in existing mcp_boundaries suite"
     verify: "cargo test --locked -p pi-agent --test mcp_boundaries"
     risk: P1
-    status: failing
+    status: done
     allure:
       severity: high
       categories:
@@ -19,8 +19,19 @@ tasks:
         - "MCP"
         - "Reconnect"
   - id: 2
-    description: "Create executable device smoke test in crates/aragent/tests/mcp_filesystem_smoke.rs covering external filesystem MCP server initialize, tools/list, tools/call, kill -9 reconnect, and close without zombies (task specifies creation of new test target; does not exist yet)"
+    description: "Created executable device smoke test in crates/aragent/tests/mcp_filesystem_smoke.rs (cf1e673) covering external filesystem MCP server initialize, tools/list, tools/call, kill -9 reconnect, and close without zombies; gated behind ARAGENT_LIVE_FILESYSTEM_SMOKE env var"
     verify: "cargo test --locked -p aragent --test mcp_filesystem_smoke"
+    risk: P1
+    status: done
+    allure:
+      severity: high
+      categories:
+        - "LiveSmoke"
+        - "Termux"
+        - "MCP"
+  - id: 3
+    description: "Run the gated live smoke on the Termux device (ARAGENT_LIVE_FILESYSTEM_SMOKE=1) against an external filesystem MCP server; live run not yet executed"
+    verify: "ARAGENT_LIVE_FILESYSTEM_SMOKE=1 cargo test --locked -p aragent --test mcp_filesystem_smoke"
     risk: P1
     status: failing
     allure:

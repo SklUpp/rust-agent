@@ -4,7 +4,7 @@
 - Story ID: `e01s04`
 - Title: Live External MCP Server Smoke on Termux (R0.4)
 - Epic: `e01-r0-mcp`
-- Status: failing (partial per `docs/agent-preliminary-implementation-plan.md:38`: context7 smoke executed on Termux; live filesystem MCP server smoke and live reconnect after `kill -9` remain pending)
+- Status: failing (test written in `cf1e673` as `crates/aragent/tests/mcp_filesystem_smoke.rs`, gated behind `ARAGENT_LIVE_FILESYSTEM_SMOKE`; the live Termux run has not been executed yet. Per `docs/agent-preliminary-implementation-plan.md:38`: context7 smoke executed on Termux; live filesystem MCP server smoke and live reconnect after `kill -9` remain pending)
 - BCPs: 3
 - Risk: P1
 - Context: domain / integration / mcp-external
@@ -19,11 +19,11 @@ Guarantees reliable external MCP server operation (specifically the filesystem s
 Runtime execution supervisor, MCP manager, external tool caller subagents.
 
 ## 5. Scope & Boundary Conditions
-- In scope: Implement an executable device smoke test in `crates/aragent/tests/mcp_filesystem_smoke.rs` (to be created as part of this implementation task; currently does not exist) exercising an external filesystem MCP server on Termux/Linux with `initialize`, `tools/list`, `tools/call`, automatic reconnect after an abrupt `kill -9` of the server process, and clean `close()` ensuring zero zombie processes. Automated transport reconnect logic is covered by existing `crates/pi-agent/tests/mcp_boundaries.rs`.
+- In scope: An executable device smoke test in `crates/aragent/tests/mcp_filesystem_smoke.rs` (written in `cf1e673`, gated behind `ARAGENT_LIVE_FILESYSTEM_SMOKE`) exercising an external filesystem MCP server on Termux/Linux with `initialize`, `tools/list`, `tools/call`, automatic reconnect after an abrupt `kill -9` of the server process, and clean `close()` ensuring zero zombie processes. The gated live run on device has not been executed yet. Automated transport reconnect logic is covered by existing `crates/pi-agent/tests/mcp_boundaries.rs`.
 - Out of scope: Sequential dependency on R0.1–R0.3 (R0.1–R0.4 execute in parallel per `docs/agent-preliminary-implementation-plan.md:52`). Arbitrary shutdown duration limits (clean exit without zombie processes is required, with no arbitrary time ceiling).
 
 ## 6. Technical Architecture & Component Impact
-- `crates/aragent/tests/mcp_filesystem_smoke.rs`: Implementation task specifies creation of this new executable integration test target for live external filesystem MCP server lifecycle on Termux/Linux (does not exist yet).
+- `crates/aragent/tests/mcp_filesystem_smoke.rs`: New executable integration test target for live external filesystem MCP server lifecycle on Termux/Linux (written in `cf1e673`, gated behind `ARAGENT_LIVE_FILESYSTEM_SMOKE`; live run pending).
 - `crates/pi-agent/tests/mcp_boundaries.rs`: Existing automated reconnect verification suite.
 - `crates/pi-agent/src/mcp/client.rs`: Connection lifecycle, broken transport detection, and reconnect backoff.
 
@@ -80,7 +80,7 @@ Compatible with standard Model Context Protocol stdio transport specifications.
 
 ## 18. Implementation Steps
 1. Verify automated reconnect logic after server disconnect in existing tests → verify: cargo test --locked -p pi-agent --test mcp_boundaries
-2. Create real executable device smoke test in `crates/aragent/tests/mcp_filesystem_smoke.rs` covering external filesystem MCP server initialize, tools/list, tools/call, kill -9 reconnect, and close without zombies (task specifies creation of new test target; does not exist yet) → verify: cargo test --locked -p aragent --test mcp_filesystem_smoke
+2. Created real executable device smoke test in `crates/aragent/tests/mcp_filesystem_smoke.rs` (`cf1e673`) covering external filesystem MCP server initialize, tools/list, tools/call, kill -9 reconnect, and close without zombies; live Termux run not yet executed → verify: cargo test --locked -p aragent --test mcp_filesystem_smoke
 
 ## 19. Verification Script (Step-by-Step)
 1. Run existing transport reconnect regression test: `cargo test --locked -p pi-agent --test mcp_boundaries`
@@ -88,5 +88,5 @@ Compatible with standard Model Context Protocol stdio transport specifications.
 3. Confirm server recovers after `kill -9` and `close()` leaves zero zombie processes.
 
 ## 20. Out of Scope & Risks
-- Target test creation: `crates/aragent/tests/mcp_filesystem_smoke.rs` does not exist yet and is explicitly created in implementation step 2; until implemented, its verify command truthfully fails.
+- Test exists but is not exercised by default: `crates/aragent/tests/mcp_filesystem_smoke.rs` (cf1e673) is gated behind `ARAGENT_LIVE_FILESYSTEM_SMOKE`, so CI skips it; the live Termux run remains pending and its verify command reflects that.
 - Network dependency: Live external MCP smoke is executed on target device and is not an obligatory CI gate; CI gate relies on local fixtures (`docs/agent-preliminary-implementation-plan.md:62`).
