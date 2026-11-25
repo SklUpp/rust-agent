@@ -1200,8 +1200,18 @@ impl SubagentLifecycleManager {
 		// the revived session's request queue (a turn of its own): an aside would
 		// be absorbed as context by the winner's turn and, when that turn ends
 		// without another step, never reach the provider.
-		let coalesced = gate.try_lock().is_err();
-		let _gate = gate.lock().unwrap_or_else(|poison| poison.into_inner());
+		// Hold the guard `try_lock` won: releasing it and re-entering `lock` would
+		// let two senders both observe a free gate and both take the steering
+		// branch. Only `WouldBlock` means a real coalesced peer; a poisoned gate
+		// is not contention (the blocking `lock` below recovers it).
+		let (coalesced, _gate) = match gate.try_lock() {
+			Ok(guard) => (false, guard),
+			Err(std::sync::TryLockError::WouldBlock) => (
+				true,
+				gate.lock().unwrap_or_else(|poison| poison.into_inner()),
+			),
+			Err(std::sync::TryLockError::Poisoned(poison)) => (false, poison.into_inner()),
+		};
 		let mut state = lock(&self.state);
 		if state.tombstones.contains(id) {
 			return Err(format!(
