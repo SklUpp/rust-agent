@@ -7,7 +7,7 @@ release:
 
 work_order_and_dependencies:
   ordering_rules:
-    - "R0.1–R0.4 are parallel tails of the 0.1.x line; R0.1 and R0.3 are closed, R0.2 and R0.4 are pending (docs/agent-preliminary-implementation-plan.md:38,52)."
+    - "R0.1–R0.4 are parallel tails of the 0.1.x line; R0.1, R0.2 and R0.3 are closed, R0.4 has a gated smoke test written (cf1e673) whose live Termux run is still pending (docs/agent-preliminary-implementation-plan.md:38,52)."
     - "R0 MUST precede R1: durable task admission relies on absence of unredacted dirty writers in same transactions (docs/agent-preliminary-implementation-plan.md:45)."
     - "R1 through R3 MUST execute sequentially: durable task relies on non-conflicting writers, and SQLITE_BUSY relies on absence of blind retries around commit (docs/agent-preliminary-implementation-plan.md:52)."
     - "R7 (parallel writers & merge) MUST NOT start before R2: without the SQLITE_BUSY statement boundary, concurrent commits cannot be proven (docs/agent-preliminary-implementation-plan.md:46)."
@@ -23,7 +23,7 @@ epics:
     capsule_dir: epics/e01-r0-mcp
     file: epics/e01-r0-mcp/epic.yaml
     status: in_progress
-    note: "WSJF includes +2 security boost for secret redaction and socket descriptor leaks. R0.1-R0.4 are parallel tails; R0.1 and R0.3 closed, R0.2 and R0.4 pending."
+    note: "WSJF includes +2 security boost for secret redaction and socket descriptor leaks. R0.1-R0.4 are parallel tails; R0.1, R0.2, R0.3 closed, R0.4 test-written with live Termux run pending."
   - id: e02
     title: "Durable Task Admission & Crash Recovery (R1 / S4)"
     scope_ref: R1
