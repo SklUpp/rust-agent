@@ -1168,9 +1168,9 @@ impl SubagentLifecycleManager {
 	/// lock, and the actor claim runs under the supervisor's lock with the
 	/// generation captured when the revive reserved the record. A per-id gate
 	/// makes the revive single-flight (TS coalesces): a second send waits for the
-	/// winner, then delivers into the published session as `woken`/`injected`
-	/// instead of starting a second actor or dropping its own text. A cancel
-	/// racing the revive wins — no actor is published after it.
+	/// winner, then queues into the published session's request queue as `woken`
+	/// so it gets a turn of its own instead of being absorbed as an aside. A
+	/// cancel racing the revive wins — no actor is published after it.
 	///
 	/// Refused with an error, never receipted: a tombstoned id (hard kill, or an
 	/// explicit [`Self::cancel_live`]), a session whose lifecycle token was
@@ -1195,6 +1195,12 @@ impl SubagentLifecycleManager {
 		// then finds the live slot the winner published, instead of starting a
 		// concurrent revive or failing with a message the peer never received.
 		let gate = self.revive_gate(id);
+		// A gate already held means another send is reviving or adopting this id,
+		// so this send is a coalesced peer of that transition. Its text must join
+		// the revived session's request queue (a turn of its own): an aside would
+		// be absorbed as context by the winner's turn and, when that turn ends
+		// without another step, never reach the provider.
+		let coalesced = gate.try_lock().is_err();
 		let _gate = gate.lock().unwrap_or_else(|poison| poison.into_inner());
 		let mut state = lock(&self.state);
 		if state.tombstones.contains(id) {
@@ -1220,7 +1226,9 @@ impl SubagentLifecycleManager {
 			// The status read and the queue write happen under this same lock: a
 			// concurrent actor idle-transition cannot route the same message into
 			// both queues, and a message accepted while `idle` is never dropped.
-			let delivery = if idle {
+			// A coalesced send takes the request queue even while the winner's
+			// turn runs: it is answered by its own turn, not kept as context.
+			let delivery = if idle || coalesced {
 				match inbound.try_send(text.clone()) {
 					Ok(()) => Some(DeliveryOutcome::Woken),
 					Err(mpsc::error::TrySendError::Full(_)) => {
