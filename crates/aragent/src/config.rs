@@ -9,6 +9,7 @@ use std::{
 	path::{Component, Path, PathBuf},
 };
 
+use pi_agent::hooks::HookConfig;
 use pi_agent::mcp::{
 	MCPHttpServerConfig, MCPServerConfig, MCPSseServerConfig, MCPStdioServerConfig, RequestIdFormat,
 	validate_server_config,
@@ -1079,6 +1080,8 @@ pub struct Config {
 	pub eval_config: EvalConfig,
 	/// `bash.*` approval patterns and the dedicated-tool interceptor.
 	pub bash: BashConfig,
+	/// Trusted subprocess hooks from `config.yml` and Claude/Codex settings.
+	pub hooks: HookConfig,
 	/// `searxng.*`: the web-search endpoint and its credentials.
 	pub searxng: SearxngConfig,
 	/// `task.isolation.mode`; `None` means unset (defaults to `none`).
@@ -1147,6 +1150,68 @@ impl Config {
 	#[must_use]
 	pub fn bash_policy(&self) -> pi_agent::shell_policy::BashPolicy {
 		self.bash.policy()
+	}
+
+	/// Build the subprocess hook engine for this configuration. `None` when no
+	/// trusted hook is configured, so callers can skip every hook boundary.
+	#[must_use]
+	pub fn hook_engine(
+		&self,
+		session_id: impl Into<String>,
+		cwd: &Path,
+	) -> Option<std::sync::Arc<pi_agent::hooks::HookEngine>> {
+		if self.hooks.is_empty() {
+			return None;
+		}
+		Some(std::sync::Arc::new(pi_agent::hooks::HookEngine::new(
+			self.hooks.clone(),
+			session_id,
+			cwd,
+		)))
+	}
+
+	/// Load trusted hook files for `cwd`. Home settings are operator-owned and
+	/// only rejected when the file is a symlink/hardlink alias; project files
+	/// are loaded only with an explicit workspace-trust decision.
+	pub(crate) fn discover_hooks(
+		cwd: &Path,
+		home: Option<&Path>,
+		trust_project: bool,
+	) -> HookConfig {
+		// A home settings file inside the project root (for example `cwd` is
+		// `$HOME`, or the project wraps the home directory) is repository
+		// content, not operator config, and is not trusted.
+		let project_roots = vec![absolute_canonical(cwd)];
+		let mut config = HookConfig::default();
+		let mut load = |path: PathBuf, roots: &[PathBuf]| {
+			if !path.is_file() || implicit_config_is_untrusted(&path, roots) {
+				return;
+			}
+			match HookConfig::from_file(&path) {
+				Ok(parsed) => config.merge(parsed),
+				Err(error) => eprintln!("warning: skipping hook settings: {error}"),
+			}
+		};
+		if let Some(home) = home {
+			for relative in [".claude/settings.json", ".claude/settings.local.json", ".codex/hooks.json"] {
+				load(home.join(relative), &project_roots);
+			}
+		}
+		for relative in [".claude/settings.json", ".claude/settings.local.json", ".codex/hooks.json"] {
+			let path = cwd.join(relative);
+			if !path.is_file() {
+				continue;
+			}
+			if !trust_project {
+				eprintln!(
+					"warning: ignoring project hook file {}: workspace is not trusted",
+					path.display()
+				);
+				continue;
+			}
+			load(path, &[]);
+		}
+		config
 	}
 
 	/// Effective memory backend. An explicit `memory.backend` wins; otherwise
@@ -1229,6 +1294,7 @@ impl Config {
 		self.stream_partial.merge(overlay.stream_partial);
 		self.eval_config.merge(overlay.eval_config);
 		self.bash.merge(overlay.bash);
+		self.hooks.merge(overlay.hooks);
 		// `searxng.*` merges per leaf so an explicit host overlay can add
 		// credentials to a globally configured endpoint (and vice versa).
 		// Project layers never reach here with `searxng` set: see
@@ -1428,6 +1494,12 @@ impl Config {
 			config.merge(overlay);
 		}
 		Self::apply_project_layers(&mut config, &cwd)?;
+		// User home hook settings are trusted operator configuration. Project
+		// `.claude`/`.codex` files are repository-controlled and stay disabled:
+		// there is no workspace-trust prompt in this runtime, so enabling them
+		// would let a checkout register arbitrary subprocesses.
+		let discovered = Self::discover_hooks(&cwd, dirs::home_dir().as_deref(), false);
+		config.hooks.merge(discovered);
 		for path in env_overlays.iter().chain(overlays) {
 			let resolved = resolve_layer_path(&cwd, path);
 			let mut overlay = Self::load_file(&resolved)?;
@@ -1517,6 +1589,16 @@ impl Config {
 		}
 		// Untrusted implicit files can never supply launch-time provenance.
 		overlay.explicit_allow.clear();
+		// A hook is an arbitrary subprocess: only an operator layer may
+		// register one.
+		if !overlay.hooks.is_empty() {
+			eprintln!(
+				"warning: ignoring hooks from untrusted config {}: hook commands require a trusted \
+				 layer",
+				path.display()
+			);
+			overlay.hooks = HookConfig::default();
+		}
 		// `bash.patterns` allow rules auto-approve a shell line, so an
 		// untrusted layer may only contribute deny/prompt (tightening) rules.
 		if let Some(patterns) = overlay.bash.patterns.as_mut() {
@@ -1789,6 +1871,11 @@ impl Config {
 }
 
 fn apply_nested_settings(config: &mut Config, value: &Value, path: &Path) -> Result<()> {
+	// Shared by `config.yml` and project `settings.json`; the trust filter
+	// removes project-defined hooks before they are merged.
+	if let Some(hooks) = value.get("hooks") {
+		config.hooks = parse_hooks(hooks, path)?;
+	}
 	if let Some(tier) = value.get("tier").and_then(Value::as_map) {
 		for (family, item) in tier {
 			if family == "advisor" {
@@ -2831,6 +2918,32 @@ pub fn base_path() -> Option<PathBuf> {
 		.iter()
 		.map(|name| dir.join(name))
 		.find(|path| path.is_file())
+}
+
+fn parse_hooks(value: &Value, path: &Path) -> Result<HookConfig> {
+	HookConfig::from_json(&value_to_json(value))
+		.map_err(|error| invalid(path, "hooks", &error.to_string()))
+}
+
+/// Convert the YAML subset to JSON so one hook parser serves both file forms.
+fn value_to_json(value: &Value) -> serde_json::Value {
+	match value {
+		Value::Null => serde_json::Value::Null,
+		Value::Bool(value) => serde_json::Value::Bool(*value),
+		Value::Int(value) => serde_json::Value::from(*value),
+		Value::Float(value) => serde_json::Number::from_f64(*value)
+			.map_or(serde_json::Value::Null, serde_json::Value::Number),
+		Value::Str(value) => serde_json::Value::String(value.clone()),
+		Value::List(items) => {
+			serde_json::Value::Array(items.iter().map(value_to_json).collect())
+		},
+		Value::Map(pairs) => serde_json::Value::Object(
+			pairs
+				.iter()
+				.map(|(key, value)| (key.clone(), value_to_json(value)))
+				.collect(),
+		),
+	}
 }
 
 fn parse_providers(value: &Value, path: &Path) -> Result<BTreeMap<String, ProviderConfig>> {
@@ -4673,5 +4786,118 @@ mod tests {
 		assert!(parse_config("task:\n  isolation:\n    merge: squash\n").is_err());
 		assert!(parse_config("task:\n  isolation:\n    commits: magic\n").is_err());
 		assert!(parse_config("task:\n  isolation:\n    apply: sometimes\n").is_err());
+	}
+
+	struct TempDir(PathBuf);
+
+	impl TempDir {
+		fn new(label: &str) -> Self {
+			let nanos = std::time::SystemTime::now()
+				.duration_since(std::time::UNIX_EPOCH)
+				.expect("clock")
+				.as_nanos();
+			let path = std::env::temp_dir().join(format!(
+				"omp-config-{label}-{}-{nanos}",
+				std::process::id()
+			));
+			fs::create_dir_all(&path).expect("create temp dir");
+			Self(path)
+		}
+	}
+
+	impl Drop for TempDir {
+		fn drop(&mut self) {
+			let _ = fs::remove_dir_all(&self.0);
+		}
+	}
+
+	#[test]
+	fn hooks_parse_from_config_and_project_files_require_trust() {
+		let config = parse_config("hooks:\n  Stop:\n    - command: printf stop\n")
+			.expect("config hooks");
+		assert_eq!(config.hooks.rules().len(), 1);
+		assert_eq!(
+			config.hooks.rules()[0].event,
+			pi_agent::hooks::HookEvent::Stop
+		);
+
+		let temp = TempDir::new("hooks");
+		let project = temp.0.join("project");
+		let home = temp.0.join("home");
+		fs::create_dir_all(project.join(".claude")).expect("project .claude");
+		fs::create_dir_all(home.join(".claude")).expect("home .claude");
+		fs::create_dir_all(home.join(".codex")).expect("home .codex");
+		fs::write(
+			project.join(".claude/settings.json"),
+			r#"{"hooks":{"PreToolUse":[{"matcher":"Bash","hooks":[{"type":"command","command":"printf project"}]}]}}"#,
+		)
+		.expect("project hook");
+		fs::write(
+			home.join(".claude/settings.json"),
+			r#"{"hooks":{"Stop":[{"command":"printf home"}]}}"#,
+		)
+		.expect("home hook");
+		fs::write(
+			home.join(".codex/hooks.json"),
+			r#"{"SessionStart":[{"command":"printf codex"}]}"#,
+		)
+		.expect("codex hook");
+
+		// Repository-controlled hook files are ignored without an explicit
+		// workspace-trust decision, even when a project settings file exists.
+		let untrusted = Config::discover_hooks(&project, Some(&home), false);
+		assert_eq!(untrusted.rules().len(), 2);
+		assert_eq!(
+			untrusted.rules()[0].event,
+			pi_agent::hooks::HookEvent::Stop
+		);
+		assert_eq!(
+			untrusted.rules()[1].event,
+			pi_agent::hooks::HookEvent::SessionStart
+		);
+
+		let trusted = Config::discover_hooks(&project, Some(&home), true);
+		assert_eq!(trusted.rules().len(), 3);
+		assert_eq!(
+			trusted.rules()[0].event,
+			pi_agent::hooks::HookEvent::Stop,
+			"home settings load before project settings"
+		);
+		assert_eq!(
+			trusted.rules()[1].event,
+			pi_agent::hooks::HookEvent::SessionStart
+		);
+		assert_eq!(
+			trusted.rules()[2].event,
+			pi_agent::hooks::HookEvent::PreToolUse
+		);
+
+		let mut overlay =
+			parse_config("hooks:\n  Stop:\n    - command: printf x\n").expect("overlay");
+		Config::drop_untrusted_permissions(
+			&mut overlay,
+			&Config::default(),
+			Path::new("project.yml"),
+		);
+		assert!(overlay.hooks.is_empty());
+	}
+
+	#[test]
+	fn home_hooks_inside_the_project_root_are_not_trusted() {
+		let temp = TempDir::new("hooks-home-project");
+		let home = temp.0.join("repo");
+		fs::create_dir_all(home.join(".claude")).expect("home .claude");
+		fs::write(
+			home.join(".claude/settings.json"),
+			r#"{"hooks":{"Stop":[{"command":"printf repo-controlled"}]}}"#,
+		)
+		.expect("home hook");
+
+		// `cwd == $HOME == repository`: the settings file is repository content.
+		let discovered = Config::discover_hooks(&home, Some(&home), false);
+		assert!(
+			discovered.rules().is_empty(),
+			"home hooks inside the project root must stay disabled"
+		);
 	}
 }

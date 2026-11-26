@@ -7,8 +7,9 @@ use crate::durable::{
 	DURABILITY_ADMISSION_FAILURE_CODE, DURABILITY_FAILURE_CODE, DURABILITY_UNKNOWN_OUTCOME_CODE,
 	DurableBoundary, DurableError,
 };
+use crate::hooks::HookEngine;
 use crate::tool::ToolError;
-use crate::state::{AgentContext, ToolApprover, ToolCall, ToolResult};
+use crate::state::{AgentContext, ApprovalHint, ToolApprover, ToolCall, ToolResult};
 /// Scheduler partitions a tool batch into concurrent non-exclusive runs and
 /// sequential exclusive ones, preserving call order in the results.
 pub struct ToolScheduler {
@@ -20,6 +21,8 @@ pub struct ToolScheduler {
 	/// Host durability boundary: admission writes an intent before the effect
 	/// and an outcome after it. `None` means the host has no durable session.
 	durable: Option<Arc<dyn DurableBoundary>>,
+	/// Trusted subprocess hooks for `PreToolUse`/`PostToolUse`.
+	hooks: Option<Arc<HookEngine>>,
 }
 
 impl ToolScheduler {
@@ -29,6 +32,7 @@ impl ToolScheduler {
 			approver: None,
 			hidden: std::sync::Mutex::new(Vec::new()),
 			durable: None,
+			hooks: None,
 		}
 	}
 
@@ -38,6 +42,7 @@ impl ToolScheduler {
 			approver: Some(approver),
 			hidden: std::sync::Mutex::new(Vec::new()),
 			durable: None,
+			hooks: None,
 		}
 	}
 
@@ -49,6 +54,11 @@ impl ToolScheduler {
 	/// when the session owner supplies a store.
 	pub fn set_durable(&mut self, durable: Option<Arc<dyn DurableBoundary>>) {
 		self.durable = durable;
+	}
+
+	/// Install or clear the trusted subprocess hook engine.
+	pub fn set_hooks(&mut self, hooks: Option<Arc<HookEngine>>) {
+		self.hooks = hooks;
 	}
 
 	/// Hide internal tool names before the next provider request.
@@ -137,14 +147,55 @@ impl ToolScheduler {
 			};
 		};
 
+		// `PreToolUse` runs before approval and execution: it may deny the call
+		// or rewrite its input. `PermissionRequest` (inside the approver) owns
+		// the allow decision, so a hook cannot bypass the bash policy here.
+		let mut effective_call = call.clone();
+		let mut hook_context = Vec::new();
+		let mut approval_hint = ApprovalHint::default();
+		if let Some(hooks) = &self.hooks {
+			let decision = hooks.pre_tool_use(&call.name, &call.arguments).await;
+			hook_context.extend(decision.additional_context);
+			hook_context.extend(decision.system_messages);
+			approval_hint.force_ask = decision.forced_ask;
+			if let Some(reason) = decision.denied {
+				return ToolResult {
+					tool_call_id: call.id.clone(),
+					content: format!("Tool execution denied: {reason}"),
+					is_error: true,
+					terminate: false,
+					details: None,
+				};
+			}
+			if let Some(updated) = decision.updated_input {
+				effective_call.arguments = updated;
+			}
+		}
+
 		let approver = self.approver.as_ref().or(ctx.approver.as_ref());
+		if approval_hint.force_ask
+			&& approver.is_none_or(|approver| !approver.supports_approval_hints())
+		{
+			let content = if approver.is_some() {
+				"Approval required by PreToolUse hook, but this approver cannot force a prompt"
+			} else {
+				"Approval required by PreToolUse hook, but no approver is available"
+			};
+			return ToolResult {
+				tool_call_id: call.id.clone(),
+				content: content.to_string(),
+				is_error: true,
+				terminate: false,
+				details: None,
+			};
+		}
 		if let Some(approver) = approver {
 			// A pending prompt must not outlive the turn: dropping this future
 			// aborts the approver's blocking read, and no approved-but-cancelled
 			// call reaches `execute`.
 			let decision = tokio::select! {
 				biased;
-				decision = approver.approve(&call.name, &call.arguments) => decision,
+				decision = approver.approve_with_hint(&effective_call.name, &effective_call.arguments, approval_hint) => decision,
 				_ = ctx.cancellation_token.cancelled() => Err("approval cancelled".to_string()),
 			};
 			if let Err(denial) = decision {
@@ -197,7 +248,7 @@ impl ToolScheduler {
 		}
 
 		let execution_id = match &self.durable {
-			Some(durable) => match durable.begin_execution(call).await {
+			Some(durable) => match durable.begin_execution(&effective_call).await {
 				Ok(id) => Some(id),
 				Err(error) => {
 					// Admission failed: the effect must not start. An unknown write
@@ -225,7 +276,7 @@ impl ToolScheduler {
 				details: None,
 			};
 			if let (Some(durable), Some(execution_id)) = (&self.durable, execution_id.as_deref())
-				&& let Err(error) = durable.finish_execution(execution_id, call, &aborted).await
+				&& let Err(error) = durable.finish_execution(execution_id, &effective_call, &aborted).await
 			{
 				return durable_failure_result(
 					&call.id,
@@ -236,13 +287,31 @@ impl ToolScheduler {
 			return aborted;
 		}
 
-		let result = match tool.execute_with_call_id(&call.id, &call.arguments, ctx).await {
+		let result = match tool.execute_with_call_id(&effective_call.id, &effective_call.arguments, ctx).await {
 			Ok(result) => result,
-			Err(err) => tool_error_result(&call.id, err),
+			Err(err) => tool_error_result(&effective_call.id, err),
 		};
-		let result = ToolResult { tool_call_id: call.id.clone(), ..result };
+		let mut result = ToolResult { tool_call_id: call.id.clone(), ..result };
+		if let Some(hooks) = &self.hooks {
+			let post = hooks
+				.post_tool_use(
+					&effective_call.name,
+					&effective_call.arguments,
+					&result.content,
+					result.is_error,
+				)
+				.await;
+			if let Some(reason) = post.blocked {
+				append_hook_text(&mut result, "Hook feedback", &reason);
+			}
+			hook_context.extend(post.additional_context);
+			hook_context.extend(post.system_messages);
+		}
+		for text in hook_context {
+			append_hook_text(&mut result, "Hook context", &text);
+		}
 		if let (Some(durable), Some(execution_id)) = (&self.durable, execution_id.as_deref())
-			&& let Err(error) = durable.finish_execution(execution_id, call, &result).await
+			&& let Err(error) = durable.finish_execution(execution_id, &effective_call, &result).await
 		{
 			// The effect may already have run. The intent stays unresolved; the
 			// loop terminates without another model request and never retries.
@@ -258,6 +327,16 @@ impl ToolScheduler {
 	async fn run_concurrent(&self, calls: &[&ToolCall], ctx: &AgentContext) -> Vec<ToolResult> {
 		join_all(calls.iter().map(|call| self.run_single(call, ctx))).await
 	}
+}
+
+fn append_hook_text(result: &mut ToolResult, label: &str, text: &str) {
+	if text.trim().is_empty() {
+		return;
+	}
+	result.content.push_str("\n\n");
+	result.content.push_str(label);
+	result.content.push_str(": ");
+	result.content.push_str(text.trim());
 }
 
 fn tool_error_result(tool_call_id: &str, err: ToolError) -> ToolResult {

@@ -838,6 +838,9 @@ pub struct AgentLoop {
 	continuation: bool,
 	/// Optional C4 assistant-response gate; `None` for every non-advisor caller.
 	assistant_guard: Option<Arc<dyn AssistantGuard>>,
+	/// Trusted subprocess hooks. `Stop` runs here; the scheduler owns the tool
+	/// events for the same engine.
+	hooks: Option<Arc<crate::hooks::HookEngine>>,
 	/// Host hook invoked with the live conversation at every turn boundary and,
 	/// after a prune, with the index mapping it applied. Owners journal there,
 	/// so a compaction can only drop turns that are already on disk.
@@ -886,6 +889,7 @@ impl AgentLoop {
 			shell: Some(Arc::new(AgentShell::new())),
 			continuation: false,
 			assistant_guard: None,
+			hooks: None,
 			turn_observer: None,
 			stream_boot_nanos: std::time::SystemTime::now()
 				.duration_since(std::time::UNIX_EPOCH)
@@ -918,6 +922,7 @@ impl AgentLoop {
 			shell: Some(Arc::new(AgentShell::new())),
 			continuation: false,
 			assistant_guard: None,
+			hooks: None,
 			turn_observer: None,
 			stream_boot_nanos: std::time::SystemTime::now()
 				.duration_since(std::time::UNIX_EPOCH)
@@ -931,6 +936,15 @@ impl AgentLoop {
 	#[must_use]
 	pub fn with_assistant_guard(mut self, guard: Option<Arc<dyn AssistantGuard>>) -> Self {
 		self.assistant_guard = guard;
+		self
+	}
+
+	/// Install the shared subprocess hook engine for this run. Tool events are
+	/// forwarded to the scheduler; `Stop` is handled by the loop itself.
+	#[must_use]
+	pub fn with_hooks(mut self, hooks: Option<Arc<crate::hooks::HookEngine>>) -> Self {
+		self.scheduler.set_hooks(hooks.clone());
+		self.hooks = hooks;
 		self
 	}
 
@@ -1347,6 +1361,10 @@ impl AgentLoop {
 			.map(|duration| duration.as_millis() as i64)
 			.unwrap_or_default();
 
+		// A `Stop` hook that already forced one continuation must not loop on
+		// the follow-up request; Claude Code reports the same state as
+		// `stop_hook_active`.
+		let mut stop_hook_active = false;
 		while state.total_turns < self.config.max_turns {
 			if let Some(rx) = steering_rx.as_deref_mut() {
 				let steering = Steering::drain(rx);
@@ -1925,6 +1943,19 @@ impl AgentLoop {
 			}
 
 			if assistant.tool_calls.is_empty() {
+				// The model tried to stop, but a hook requires another turn. The
+				// blocked assistant message is still a finished turn: it goes
+				// through the normal `TurnAck` handshake below, then the feedback
+				// message continues the dialog.
+				let mut stop_feedback = None;
+				if !stop_hook_active
+					&& !cancellation_token.is_cancelled()
+					&& let Some(hooks) = &self.hooks
+					&& let Some(reason) = hooks.stop(false).await.blocked
+				{
+					stop_hook_active = true;
+					stop_feedback = Some(reason);
+				}
 				// Register the ack before publishing `TurnEnd` (the consumer takes
 				// it there), and count the injections this block journals next so
 				// the boundary is final when the host sees it.
@@ -1950,6 +1981,10 @@ impl AgentLoop {
 				}
 				self.persist_conversation(&state.messages).await?;
 				let decision = self.await_turn_ack(ack_rx, &cancellation_token).await;
+				// A turn-end rewrite replaces the live conversation; inject the
+				// Stop feedback after it so the continuation actually sees it.
+				let stop_feedback =
+					stop_feedback.filter(|_| !cancellation_token.is_cancelled());
 				let TurnAckDecision {
 					rewrite,
 					warning,
@@ -1978,12 +2013,21 @@ impl AgentLoop {
 				) {
 					self.resync_conversation(&state.messages).await?;
 				}
+				let stop_blocked = stop_feedback.is_some();
+				if let Some(reason) = stop_feedback {
+					let feedback = format!("Stop hook feedback: {reason}");
+					// Host mirrors append `UserSteer` parts to their non-durable
+					// history, so the injected feedback survives the next turn.
+					announce_user_steer(&events, &[ContentPart::text(feedback.clone())]).await;
+					state.messages.push(Message::user(feedback));
+					self.persist_conversation(&state.messages).await?;
+				}
 				turn_results.push(TurnResult {
 					message: assistant,
 					tool_results: Vec::new(),
-					is_completed: !continue_turn,
+					is_completed: !continue_turn && !stop_blocked,
 				});
-				if continue_turn && !cancellation_token.is_cancelled() {
+				if (continue_turn || stop_blocked) && !cancellation_token.is_cancelled() {
 					continue;
 				}
 				return Ok(turn_results);

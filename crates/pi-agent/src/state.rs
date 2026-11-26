@@ -1423,10 +1423,36 @@ pub trait AcpClientBridge: Send + Sync {
 	) -> Result<serde_json::Value, AcpClientError>;
 }
 
+/// Per-call approval constraint produced before the tool runs.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ApprovalHint {
+	/// A `PreToolUse` hook demanded an operator prompt; auto-approval (yolo,
+	/// `--allow`, read-tier) must not satisfy this call.
+	pub force_ask: bool,
+}
+
 /// Tool approval gate checked prior to executing side-effecting operations.
 #[async_trait]
 pub trait ToolApprover: Send + Sync {
 	async fn approve(&self, name: &str, args: &serde_json::Value) -> Result<(), String>;
+
+	/// Approval with a per-call hint. The default keeps existing approvers
+	/// working; gates that can force a prompt override it.
+	async fn approve_with_hint(
+		&self,
+		name: &str,
+		args: &serde_json::Value,
+		_hint: ApprovalHint,
+	) -> Result<(), String> {
+		self.approve(name, args).await
+	}
+
+	/// Whether [`Self::approve_with_hint`] honors `force_ask`. Approvers that
+	/// leave this `false` are denied forced-ask calls instead of silently
+	/// auto-approving them.
+	fn supports_approval_hints(&self) -> bool {
+		false
+	}
 
 	/// Interactive frontend exposed to the `ask` tool, when this approver is
 	/// backed by one. Children receive a stripped approver, so delegated runs

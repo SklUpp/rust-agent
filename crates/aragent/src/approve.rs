@@ -251,6 +251,9 @@ pub struct Approvals {
 	/// Bash command policy. Built-in destructive rules are always active;
 	/// `bash.patterns` / `bashInterceptor` from config layer on top.
 	bash_policy: BashPolicy,
+	/// Trusted subprocess hooks; only `PermissionRequest` is consulted here,
+	/// after the bash policy has already rejected forbidden commands.
+	hooks: Option<std::sync::Arc<pi_agent::hooks::HookEngine>>,
 }
 
 impl std::fmt::Debug for Approvals {
@@ -262,6 +265,7 @@ impl std::fmt::Debug for Approvals {
 			.field("has_input", &self.input.is_some())
 			.field("has_approver", &self.approver.is_some())
 			.field("bash_policy_rules", &self.bash_policy.rules().len())
+			.field("has_hooks", &self.hooks.is_some())
 			.finish()
 	}
 }
@@ -276,6 +280,7 @@ impl Approvals {
 			input: None,
 			approver: None,
 			bash_policy: BashPolicy::default(),
+			hooks: None,
 		}
 	}
 
@@ -285,6 +290,26 @@ impl Approvals {
 	pub fn with_bash_policy(mut self, policy: BashPolicy) -> Self {
 		self.bash_policy = policy;
 		self
+	}
+
+	/// Install or clear the trusted subprocess hook engine. `PermissionRequest`
+	/// runs only after the bash policy has allowed the command.
+	pub fn set_hooks(&mut self, hooks: Option<std::sync::Arc<pi_agent::hooks::HookEngine>>) {
+		self.hooks = hooks;
+	}
+
+	#[must_use]
+	pub fn with_hooks(
+		mut self,
+		hooks: Option<std::sync::Arc<pi_agent::hooks::HookEngine>>,
+	) -> Self {
+		self.set_hooks(hooks);
+		self
+	}
+
+	#[must_use]
+	pub fn hooks(&self) -> Option<std::sync::Arc<pi_agent::hooks::HookEngine>> {
+		self.hooks.clone()
 	}
 
 	/// Install or clear the alternate approver. The matrix still resolves
@@ -436,7 +461,22 @@ impl pi_agent::ToolApprover for Approvals {
 		Approvals::ask_channel(self)
 	}
 
+	fn supports_approval_hints(&self) -> bool {
+		true
+	}
+
 	async fn approve(&self, name: &str, args: &serde_json::Value) -> std::result::Result<(), String> {
+		self
+			.approve_with_hint(name, args, pi_agent::ApprovalHint::default())
+			.await
+	}
+
+	async fn approve_with_hint(
+		&self,
+		name: &str,
+		args: &serde_json::Value,
+		hint: pi_agent::ApprovalHint,
+	) -> std::result::Result<(), String> {
 		let tier = classify_tool(name, args);
 		// Policy runs before the matrix and before an alternate approver:
 		// `Forbidden` is a hard deny (yolo/`--allow bash`/ACP cannot override),
@@ -449,14 +489,30 @@ impl pi_agent::ToolApprover for Approvals {
 					.unwrap_or_else(|| format!("blocked by bash policy: {name}")),
 			);
 		}
-		if verdict.decision == PolicyDecision::Allow && verdict.explicit_allow {
+		// A forced prompt is operator-owned: neither the matrix, `--allow`, a
+		// hook, nor yolo may satisfy it.
+		let forced_prompt = verdict.decision == PolicyDecision::Prompt || hint.force_ask;
+		if !forced_prompt && verdict.decision == PolicyDecision::Allow && verdict.explicit_allow {
 			return Ok(());
 		}
-		let decision = if verdict.decision == PolicyDecision::Prompt {
+		let decision = if forced_prompt {
 			Decision::Ask
 		} else {
 			self.decide_tier(name, tier)
 		};
+		// A permission hook may answer a matrix prompt, but only when the prompt
+		// was not forced by policy or a `PreToolUse` hook. A denial always wins.
+		if decision == Decision::Ask
+			&& let Some(hooks) = &self.hooks
+			&& let Some(hook) = hooks.permission_request(name, args).await
+		{
+			match hook {
+				pi_agent::hooks::PermissionDecision::Allow if !forced_prompt => return Ok(()),
+				pi_agent::hooks::PermissionDecision::Allow => {},
+				pi_agent::hooks::PermissionDecision::Deny(reason) => return Err(reason),
+				pi_agent::hooks::PermissionDecision::Ask => {},
+			}
+		}
 		if let Some(approver) = self.approver.as_ref() {
 			// The matrix still owns the explicit auto decisions: `yolo`, `--allow`
 			// and per-run registered MCP names all resolve before a front-end is
@@ -464,7 +520,20 @@ impl pi_agent::ToolApprover for Approvals {
 			if decision == Decision::Auto {
 				return Ok(());
 			}
-			return approver.approve(name, args).await;
+			// A legacy front-end cannot distinguish a forced prompt from an
+			// ordinary ask, so it must not be allowed to auto-approve one.
+			if forced_prompt && !approver.supports_approval_hints() {
+				return Err(format!(
+					"approval required for {name}, but active approver does not honor forced prompts"
+				));
+			}
+			return approver
+				.approve_with_hint(
+					name,
+					args,
+					pi_agent::ApprovalHint { force_ask: forced_prompt },
+				)
+				.await;
 		}
 		match decision {
 			Decision::Auto => Ok(()),
@@ -570,6 +639,32 @@ mod tests {
 
 	fn approvals(mode: ApprovalMode, allow: &[&str]) -> Approvals {
 		Approvals::new(mode, allow.iter().map(ToString::to_string))
+	}
+
+	struct RecordingAlternate {
+		supported: bool,
+		seen:     std::sync::Mutex<Vec<pi_agent::ApprovalHint>>,
+	}
+
+	#[async_trait::async_trait]
+	impl pi_agent::ToolApprover for RecordingAlternate {
+		fn supports_approval_hints(&self) -> bool {
+			self.supported
+		}
+
+		async fn approve(&self, _name: &str, _args: &serde_json::Value) -> Result<(), String> {
+			Ok(())
+		}
+
+		async fn approve_with_hint(
+			&self,
+			_name: &str,
+			_args: &serde_json::Value,
+			hint: pi_agent::ApprovalHint,
+		) -> Result<(), String> {
+			self.seen.lock().expect("hint lock").push(hint);
+			Ok(())
+		}
 	}
 
 	#[test]
@@ -810,5 +905,166 @@ mod tests {
 			.approve("bash", &json!({"command": "git status --short"}))
 			.await
 			.expect("allow rule matches the whole line");
+	}
+
+	#[cfg(unix)]
+	fn permission_hook(script: &str) -> std::sync::Arc<pi_agent::hooks::HookEngine> {
+		use pi_agent::hooks::{HookConfig, HookEngine, HookEvent, HookInvocation, HookRule};
+
+		std::sync::Arc::new(HookEngine::new(
+			HookConfig::new(vec![HookRule {
+				event: HookEvent::PermissionRequest,
+				matcher: None,
+				invocation: HookInvocation::Shell(script.to_string()),
+				timeout_ms: 2_000,
+				fail_closed: false,
+			}]),
+			"approval-test",
+			std::env::temp_dir(),
+		))
+	}
+
+	#[cfg(unix)]
+	#[tokio::test]
+	async fn permission_hook_allow_answers_the_prompt() {
+		use pi_agent::ToolApprover;
+		use serde_json::json;
+
+		let approvals = approvals(ApprovalMode::AlwaysAsk, &[]).with_hooks(Some(permission_hook(
+			r#"printf '%s' '{"hookSpecificOutput":{"permissionDecision":"allow"}}'"#,
+		)));
+		approvals
+			.approve("write", &json!({"path": "file.txt"}))
+			.await
+			.expect("hook allow answers Ask");
+	}
+
+	#[cfg(unix)]
+	#[tokio::test]
+	async fn permission_hook_deny_blocks_the_call() {
+		use pi_agent::ToolApprover;
+		use serde_json::json;
+
+		let approvals = approvals(ApprovalMode::AlwaysAsk, &[])
+			.with_hooks(Some(permission_hook("printf 'denied by hook' >&2; exit 2")));
+		let error = approvals
+			.approve("write", &json!({"path": "file.txt"}))
+			.await
+			.expect_err("hook denies");
+		assert_eq!(error, "denied by hook");
+	}
+
+	#[cfg(unix)]
+	#[tokio::test]
+	async fn permission_hook_cannot_bypass_forbidden_bash() {
+		use pi_agent::ToolApprover;
+		use serde_json::json;
+
+		let approvals = approvals(ApprovalMode::AlwaysAsk, &[]).with_hooks(Some(permission_hook(
+			r#"printf '%s' '{"hookSpecificOutput":{"permissionDecision":"allow"}}'"#,
+		)));
+		let error = approvals
+			.approve("bash", &json!({"command": "shutdown -h now"}))
+			.await
+			.expect_err("forbidden command must be denied before hooks");
+		assert!(
+			error.contains("power control") || error.contains("forbidden"),
+			"unexpected reason: {error}"
+		);
+	}
+
+	#[cfg(unix)]
+	#[tokio::test]
+	async fn permission_hook_cannot_bypass_policy_prompt() {
+		use pi_agent::ToolApprover;
+		use pi_agent::shell_policy::{BashApproval, BashApprovalRule, BashPolicy};
+		use serde_json::json;
+
+		let policy = BashPolicy::new(vec![BashApprovalRule::new(
+			"git push*",
+			BashApproval::Prompt,
+		)]);
+		let approvals = approvals(ApprovalMode::Yolo, &[])
+			.with_bash_policy(policy)
+			.with_hooks(Some(permission_hook(
+				r#"printf '%s' '{"hookSpecificOutput":{"permissionDecision":"allow"}}'"#,
+			)))
+			.with_input(Some(std::sync::Arc::new(std::sync::Mutex::new(Box::new(
+				Cursor::new(b"n\n".to_vec()),
+			)))));
+		approvals
+			.approve("bash", &json!({"command": "git push origin main"}))
+			.await
+			.expect_err("policy prompt survives a hook allow");
+	}
+
+	#[cfg(unix)]
+	#[tokio::test]
+	async fn pre_tool_hint_forces_prompt_over_yolo_and_hook_allow() {
+		use pi_agent::{ApprovalHint, ToolApprover};
+		use serde_json::json;
+
+		let approvals = approvals(ApprovalMode::Yolo, &[])
+			.with_hooks(Some(permission_hook(
+				r#"printf '%s' '{"hookSpecificOutput":{"permissionDecision":"allow"}}'"#,
+			)))
+			.with_input(Some(std::sync::Arc::new(std::sync::Mutex::new(Box::new(
+				Cursor::new(b"n\n".to_vec()),
+			)))));
+		approvals
+			.approve_with_hint(
+				"write",
+				&json!({"path": "file.txt"}),
+				ApprovalHint { force_ask: true },
+			)
+			.await
+			.expect_err("forced ask survives yolo and hook allow");
+	}
+
+	#[tokio::test]
+	async fn legacy_alternate_cannot_auto_approve_a_policy_prompt() {
+		use pi_agent::ToolApprover;
+		use pi_agent::shell_policy::{BashApproval, BashApprovalRule, BashPolicy};
+		use serde_json::json;
+
+		let policy = BashPolicy::new(vec![BashApprovalRule::new(
+			"git push*",
+			BashApproval::Prompt,
+		)]);
+		let mut app = approvals(ApprovalMode::Yolo, &[]).with_bash_policy(policy);
+		app.set_approver(Some(std::sync::Arc::new(RecordingAlternate {
+			supported: false,
+			seen: std::sync::Mutex::new(Vec::new()),
+		})));
+		let error = app
+			.approve("bash", &json!({"command": "git push origin main"}))
+			.await
+			.expect_err("legacy approver must not swallow a policy prompt");
+		assert!(error.contains("does not honor forced prompts"), "{error}");
+	}
+
+	#[tokio::test]
+	async fn hint_aware_alternate_receives_force_ask() {
+		use pi_agent::ApprovalHint;
+		use pi_agent::ToolApprover;
+		use serde_json::json;
+
+		let recorder = std::sync::Arc::new(RecordingAlternate {
+			supported: true,
+			seen: std::sync::Mutex::new(Vec::new()),
+		});
+		let mut app = approvals(ApprovalMode::Yolo, &[]);
+		app.set_approver(Some(recorder.clone()));
+		app.approve_with_hint(
+			"write",
+			&json!({"path": "file.txt"}),
+			ApprovalHint { force_ask: true },
+		)
+		.await
+		.expect("hint-aware alternate is asked");
+		assert_eq!(
+			*recorder.seen.lock().expect("hint lock"),
+			[ApprovalHint { force_ask: true }]
+		);
 	}
 }

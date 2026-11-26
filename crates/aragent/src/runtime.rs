@@ -2286,7 +2286,9 @@ impl AgentRunner for PiAgentRunner {
 				registry.register(Arc::clone(&tool.0));
 			}
 		}
+		let session_hooks = request.approvals.hooks();
 		let mut agent = AgentLoop::with_approver(config, provider, registry, approvals)
+			.with_hooks(session_hooks.clone())
 			.with_plan(request.plan_mode.guard.clone())
 			.with_conflicts(Some(Arc::clone(&session.conflicts)))
 			.with_shell(Some(Arc::clone(&session.shell)))
@@ -2395,6 +2397,22 @@ impl AgentRunner for PiAgentRunner {
 			// Turn-scoped Android wake lock: dropped when the dialog future
 			// completes, is aborted, or the stream/runner drops it.
 			let _wake_lock = wake_lock;
+			// Fires once per engine (session), before the first provider turn.
+			if let Some(hooks) = &session_hooks {
+				// The engine caches the first result so a host that rebuilds its
+				// state each turn still receives the context. Re-inject only when
+				// the persisted history does not already carry it.
+				let summary = hooks.session_start().await;
+				for context in summary.additional_context {
+					let message = format!("Session hook context: {context}");
+					if !state.messages.iter().any(|existing| existing.content == message) {
+						state.messages.push(pi_agent::Message::developer(message));
+					}
+				}
+				for message in summary.system_messages {
+					eprintln!("hook: {message}");
+				}
+			}
 			agent
 				.run_dialog_message(dialog_message, &mut state, Some(steering_rx), Some(pi_events_tx))
 				.await

@@ -1285,6 +1285,11 @@ fn run() -> std::result::Result<(), CliError> {
 			 is unavailable (use --no-session for an explicit ephemeral run)",
 		));
 	}
+	// Hooks carry the real persisted/resumed id, not the provisional process id.
+	let hooks = session
+		.config
+		.hook_engine(store.id().to_string(), &session.cwd);
+	session.approvals.set_hooks(hooks);
 	// TS `main.ts:buildSessionOptions`: an explicit `--prompt-cache-key` always
 	// wins; otherwise a resumed/forked header key is inherited only when the
 	// provider route and prompt/tool shape are unchanged.
@@ -2776,6 +2781,15 @@ impl Session<'_> {
 			match event {
 				agent::Event::ToolStart { id, tool, .. } => {
 					tools.insert(id.clone(), tool.clone());
+				},
+				agent::Event::UserSteer { parts } => {
+					// `--no-session` keeps its own mirror; durable sessions already
+					// persisted the message through the loop's turn boundary.
+					if !store.enabled()
+						&& let Some(messages) = in_memory.as_mut()
+					{
+						messages.push(pi_agent::Message::user_with_parts(parts.clone()));
+					}
 				},
 				agent::Event::TurnEnd { message, tool_results, stop_reason, api, provider, model } => {
 					let now_evt = std::time::SystemTime::now();

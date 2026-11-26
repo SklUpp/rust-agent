@@ -369,7 +369,7 @@ impl RpcSession {
 	/// Open the session described by the launch inputs.
 	pub fn open(
 		launch: RpcLaunch,
-		approvals: Approvals,
+		mut approvals: Approvals,
 		host_tools: Arc<HostToolBridge>,
 		host_uris: Arc<HostUriBridge>,
 		internal_urls: Arc<InternalUrlRouter>,
@@ -450,6 +450,9 @@ impl RpcSession {
 				"cannot open session store: {reason}"
 			)));
 		}
+		// The engine must report the persisted/resumed store id, not the
+		// provisional id a transport chose before the store opened.
+		approvals.set_hooks(config.hook_engine(store.id().to_string(), &cwd));
 		let base_service_tiers = if store.has_service_tier_entry() {
 			store.service_tier_by_family()
 		} else {
@@ -1391,6 +1394,15 @@ impl RpcSession {
 
 	// ------------------------------------------------------------- sessions --
 
+	/// Rebind hook state to the current session id after a store swap so
+	/// `SessionStart` runs once for the new log.
+	fn rebind_hooks(&mut self) {
+		let hooks = self
+			.config
+			.hook_engine(self.store.id().to_string(), &self.cwd);
+		self.approvals.set_hooks(hooks);
+	}
+
 	/// Start a fresh session log, keeping the prompt inputs and route.
 	pub fn new_session(&mut self, parent_session: Option<&str>) -> Result<()> {
 		let old_scope = self.session_scope_identity();
@@ -1420,6 +1432,7 @@ impl RpcSession {
 		// `parent_session` is persisted in `SessionHeader` at creation, so the
 		// lineage survives a reload of the new log.
 		self.store = store;
+		self.rebind_hooks();
 		self.restore_service_tiers();
 		self.history.clear();
 		self.history_messages = None;
@@ -1543,6 +1556,7 @@ impl RpcSession {
 			.map(|turn| turn.assistant.clone())
 			.filter(|text| !text.is_empty());
 		self.store = store;
+		self.rebind_hooks();
 		self.restore_service_tiers();
 		self.checkpoint_host = CheckpointHost::new();
 		self.checkpoint_host.rehydrate(&self.store);

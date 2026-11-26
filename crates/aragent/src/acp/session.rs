@@ -2172,7 +2172,13 @@ impl AcpPermissionBroker {
 			.unwrap_or_else(PoisonError::into_inner) = session_id.to_string();
 	}
 
-	fn ask(&self, name: &str, args: &Value, token: &CancellationToken) -> Result<(), String> {
+	fn ask(
+		&self,
+		name: &str,
+		args: &Value,
+		token: &CancellationToken,
+		force_ask: bool,
+	) -> Result<(), String> {
 		let Some(intent) = PermissionIntent::for_call(name, args) else {
 			return Ok(());
 		};
@@ -2182,7 +2188,10 @@ impl AcpPermissionBroker {
 			.unwrap_or_else(PoisonError::into_inner)
 			.get(&intent.cache_key)
 		{
-			Some(PersistedDecision::AllowAlways) => return Ok(()),
+			// A cached allow never satisfies a prompt forced by policy or a
+			// `PreToolUse: ask`; the client must see this request.
+			Some(PersistedDecision::AllowAlways) if !force_ask => return Ok(()),
+			Some(PersistedDecision::AllowAlways) => {},
 			Some(PersistedDecision::RejectAlways) => {
 				return Err("Tool call rejected by user (preference)".to_string());
 			},
@@ -2239,9 +2248,26 @@ impl pi_agent::ToolApprover for AcpPermissionBroker {
 		None
 	}
 
+	fn supports_approval_hints(&self) -> bool {
+		true
+	}
+
 	async fn approve(&self, name: &str, args: &Value) -> std::result::Result<(), String> {
+		self
+			.approve_with_hint(name, args, pi_agent::ApprovalHint::default())
+			.await
+	}
+
+	async fn approve_with_hint(
+		&self,
+		name: &str,
+		args: &Value,
+		hint: pi_agent::ApprovalHint,
+	) -> std::result::Result<(), String> {
 		let tier = classify_tool(name, args);
-		if self.decide_tier(name, tier) == Decision::Auto {
+		// A forced prompt bypasses the auto matrix so the client sees it even
+		// under yolo/allow or for read-tier tools.
+		if !hint.force_ask && self.decide_tier(name, tier) == Decision::Auto {
 			return Ok(());
 		}
 		// TS `PERMISSION_REQUIRED_TOOLS`: bash/edit/delete/move only, and edit
@@ -2267,9 +2293,10 @@ impl pi_agent::ToolApprover for AcpPermissionBroker {
 		let broker = self.clone();
 		let name = name.to_string();
 		let args = args.clone();
+		let force_ask = hint.force_ask;
 		// The reverse call can wait a whole user decision; never block the
 		// runtime worker that called `approve`.
-		tokio::task::spawn_blocking(move || broker.ask(&name, &args, &token))
+		tokio::task::spawn_blocking(move || broker.ask(&name, &args, &token, force_ask))
 			.await
 			.map_err(|error| format!("permission task failed: {error}"))?
 	}

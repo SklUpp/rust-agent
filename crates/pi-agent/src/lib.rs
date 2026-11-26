@@ -3,6 +3,7 @@ pub mod dap;
 pub mod delivery;
 pub mod durable;
 pub mod eval;
+pub mod hooks;
 pub mod lsp;
 pub mod mailbox;
 pub mod mcp;
@@ -51,7 +52,7 @@ pub use provider::{
 pub use provider::timeout::{RequestTimeoutConfig, TimeoutProvider, is_timeout_error};
 pub use state::{
 	AcpClientBridge, AcpClientError, AgentConfig, AgentContext, AgentShell, AgentState,
-	Attribution,
+	ApprovalHint, Attribution,
 	CacheTtlUsage, ContentPart, ImagePart, Message, Role, ServerToolUsage, StopReason, TokenUsage,
 	UsagePresence,
 	StreamPartialConfig, ToolApprover, ToolCall, ToolResult, TurnResult, TurnStatus,
