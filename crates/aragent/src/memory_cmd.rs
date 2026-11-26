@@ -7,19 +7,21 @@
 //! project create/update/delete and is never re-imported after the one-time
 //! migration. Deleting a record never touches conversation history.
 //!
-//! Every action prints the scope (`global` or `project:<cwd>`) and origin, so a
-//! user can tell an asserted preference from an inferred agent lesson.
+//! Every action prints the scope (`global`, `project:<cwd>`, or
+//! `session:<id>`) and origin, so a user can tell an asserted preference from
+//! an inferred agent lesson.
 
 use std::{io::Write as _, path::Path};
 
 use crate::{
 	autolearn::MemoryBackend,
-	memory_protocol::{render_record, render_record_list},
+	memory_embeddings::{EmbeddingProvider, embed_best_effort_blocking},
+	memory_protocol::{render_record, render_record_list, scope_label},
 	memory_store::{self, Scope},
 };
 
 /// Actions accepted by the shared command.
-const USAGE: &str = "Usage: arag memory <action> [--global|--project] [--context TEXT]
+const USAGE: &str = "Usage: arag memory <action> [--global|--project|--session ID] [--context TEXT]
 Actions:
   list                         list visible records (global + this project)
   search <query>               lexical search (bounded)
@@ -29,7 +31,8 @@ Actions:
   delete <id>                  delete one record; conversation history is untouched
 
 Scope flags: --global for owner preferences, --project (default for create)
-for this project's knowledge. Both is an error.
+for this project's knowledge, --session ID for one conversation. Mutually
+exclusive.
 Options are read only before the first body word; use `--` to start literal
 text that begins with `--`.";
 
@@ -44,7 +47,53 @@ pub fn execute(
 	backend: MemoryBackend,
 	out: &mut dyn std::io::Write,
 ) -> Result<(), String> {
+	execute_with_session(argv, agent_dir, cwd, None, backend, out)
+}
+
+/// [`execute`] with the calling conversation's id, so `list`, `search`, `get`,
+/// and edits also see that session's own rows. An explicit `--session` flag
+/// selects one conversation and overrides `default_session`.
+pub fn execute_with_session(
+	argv: &[String],
+	agent_dir: &Path,
+	cwd: &Path,
+	default_session: Option<&str>,
+	backend: MemoryBackend,
+	out: &mut dyn std::io::Write,
+) -> Result<(), String> {
+	execute_with_session_and_embeddings(
+		argv,
+		agent_dir,
+		cwd,
+		default_session,
+		None,
+		backend,
+		out,
+	)
+}
+
+/// [`execute_with_session`] with an optional embedding provider. Search uses it
+/// for hybrid recall; create stores the embedding best-effort. Provider errors
+/// fall back to lexical FTS5 without failing the command.
+pub fn execute_with_session_and_embeddings(
+	argv: &[String],
+	agent_dir: &Path,
+	cwd: &Path,
+	default_session: Option<&str>,
+	provider: Option<&dyn EmbeddingProvider>,
+	backend: MemoryBackend,
+	out: &mut dyn std::io::Write,
+) -> Result<(), String> {
 	let parsed = parse(argv)?;
+	let effective_session = parsed
+		.session
+		.as_deref()
+		.or(default_session)
+		.map(str::trim)
+		.filter(|value| !value.is_empty());
+	if parsed.scope == Some(Scope::Session) && effective_session.is_none() {
+		return Err("--session requires a non-empty session id".to_string());
+	}
 	let Some(action) = parsed.action.as_deref() else {
 		writeln!(out, "{USAGE}").map_err(|error| error.to_string())?;
 		return Ok(());
@@ -61,7 +110,12 @@ pub fn execute(
 	}
 	match action {
 		"list" | "ls" => {
-			let records = match memory_store::list_scope(agent_dir, cwd, parsed.scope) {
+			let records = match memory_store::list_scope_with_session(
+				agent_dir,
+				cwd,
+				parsed.scope,
+				effective_session,
+			) {
 				Ok(records) => records,
 				Err(memory_store::MemoryStoreError::NotFound(_)) => Vec::new(),
 				Err(error) => return Err(error.to_string()),
@@ -77,8 +131,26 @@ pub fn execute(
 			if query.is_empty() {
 				return Err("search requires a query: arag memory search <query>".to_string());
 			}
-			let records = match memory_store::recall_scope(agent_dir, cwd, &query, parsed.scope, None)
-			{
+			// Redact/neutralize before a remote embedding call; lexical recall
+			// still uses the query exactly as the user typed it.
+			let embedding_query = crate::local_memory::normalize_lesson_for_embedding(&query);
+			let embedding = if embedding_query.is_empty() {
+				None
+			} else {
+				query_embedding(provider, &embedding_query)
+			};
+			let embedding = embedding
+				.as_ref()
+				.map(|(model, vector)| (model.as_str(), vector.as_slice()));
+			let records = match memory_store::recall_scope_with_session_and_embedding(
+				agent_dir,
+				cwd,
+				&query,
+				parsed.scope,
+				effective_session,
+				embedding,
+				None,
+			) {
 				Ok(records) => records,
 				Err(memory_store::MemoryStoreError::NotFound(_)) => Vec::new(),
 				Err(error) => return Err(error.to_string()),
@@ -93,8 +165,13 @@ pub fn execute(
 				.rest
 				.first()
 				.ok_or_else(|| "get requires an id: arag memory get <id>".to_string())?;
-			let record =
-				memory_store::get_visible(agent_dir, cwd, id).map_err(|error| error.to_string())?;
+			let record = memory_store::get_visible_with_session(
+				agent_dir,
+				cwd,
+				effective_session,
+				id,
+			)
+			.map_err(|error| error.to_string())?;
 			write!(out, "{}", render_record(&record)).map_err(|error| error.to_string())?;
 		},
 		"create" | "add" | "new" => {
@@ -103,22 +180,32 @@ pub fn execute(
 				return Err("create requires text: arag memory create [--global] <text>".to_string());
 			}
 			let scope = parsed.scope.unwrap_or(Scope::Project);
-			let record = memory_store::create_asserted_and_export(
+			let create_session = if scope == Scope::Session {
+				effective_session
+			} else {
+				None
+			};
+			let record = memory_store::create_asserted_with_session_and_export(
 				agent_dir,
 				cwd,
+				create_session,
 				scope,
 				&body,
 				parsed.context.as_deref(),
 			)
 			.map_err(|error| error.to_string())?;
-			let scope_label = match record.cwd.as_deref() {
-				Some(cwd) => format!("project:{cwd}"),
-				None => "global".to_string(),
-			};
+			let embedding_text = crate::local_memory::normalize_lesson_for_embedding(&body);
+			if let Some((model, vector)) = query_embedding(provider, &embedding_text)
+				&& let Ok(store) = memory_store::MemoryStore::open_existing(agent_dir)
+			{
+				// Best effort: the lexical row is already committed.
+				let _ = store.set_embedding(&record.id, &model, &vector);
+			}
 			writeln!(
 				out,
-				"Created {} [{scope_label}] origin={} actor={}",
+				"Created {} [{}] origin={} actor={}",
 				record.id,
+				scope_label(&record),
 				record.origin.as_str(),
 				record.actor.as_deref().unwrap_or("-")
 			)
@@ -135,8 +222,14 @@ pub fn execute(
 					"update requires replacement text: arag memory update <id> <text>".to_string(),
 				);
 			}
-			let record = memory_store::update_record_and_export(agent_dir, cwd, id, &body)
-				.map_err(|error| error.to_string())?;
+			let record = memory_store::update_record_and_export_with_session(
+				agent_dir,
+				cwd,
+				effective_session,
+				id,
+				&body,
+			)
+			.map_err(|error| error.to_string())?;
 			writeln!(
 				out,
 				"Updated {} [{}] origin={}",
@@ -151,10 +244,20 @@ pub fn execute(
 				.rest
 				.first()
 				.ok_or_else(|| "delete requires an id: arag memory delete <id>".to_string())?;
-			let record =
-				memory_store::get_visible(agent_dir, cwd, id).map_err(|error| error.to_string())?;
-			memory_store::delete_record_and_export(agent_dir, cwd, id)
-				.map_err(|error| error.to_string())?;
+			let record = memory_store::get_visible_with_session(
+				agent_dir,
+				cwd,
+				effective_session,
+				id,
+			)
+			.map_err(|error| error.to_string())?;
+			memory_store::delete_record_and_export_with_session(
+				agent_dir,
+				cwd,
+				effective_session,
+				id,
+			)
+			.map_err(|error| error.to_string())?;
 			writeln!(
 				out,
 				"Deleted {} [{}] origin={}. Conversation history is untouched.",
@@ -171,10 +274,19 @@ pub fn execute(
 	Ok(())
 }
 
+fn query_embedding(provider: Option<&dyn EmbeddingProvider>, text: &str) -> Option<(String, Vec<f32>)> {
+	let provider = provider?;
+	let texts = vec![text.to_string()];
+	let vector = embed_best_effort_blocking(Some(provider), &texts)?.into_iter().next()?;
+	Some((provider.model().to_string(), vector))
+}
+
+#[derive(Debug, Default)]
 struct Parsed {
 	action:  Option<String>,
 	rest:    Vec<String>,
 	scope:   Option<Scope>,
+	session: Option<String>,
 	context: Option<String>,
 }
 
@@ -182,6 +294,7 @@ fn parse(argv: &[String]) -> Result<Parsed, String> {
 	let mut action = None;
 	let mut rest = Vec::new();
 	let mut scope = None;
+	let mut session = None;
 	let mut context = None;
 	let mut end_of_options = false;
 	let mut index = 0;
@@ -198,18 +311,41 @@ fn parse(argv: &[String]) -> Result<Parsed, String> {
 					continue;
 				},
 				"--global" => {
-					if scope == Some(Scope::Project) {
-						return Err("--global conflicts with --project".to_string());
+					if matches!(scope, Some(Scope::Project | Scope::Session)) {
+						return Err("--global conflicts with --project/--session".to_string());
 					}
 					scope = Some(Scope::Global);
 					index += 1;
 					continue;
 				},
 				"--project" => {
-					if scope == Some(Scope::Global) {
-						return Err("--project conflicts with --global".to_string());
+					if matches!(scope, Some(Scope::Global | Scope::Session)) {
+						return Err("--project conflicts with --global/--session".to_string());
 					}
 					scope = Some(Scope::Project);
+					index += 1;
+					continue;
+				},
+				"--session" => {
+					if matches!(scope, Some(Scope::Global | Scope::Project)) {
+						return Err("--session conflicts with --global/--project".to_string());
+					}
+					if session.is_some() {
+						return Err("--session was supplied more than once".to_string());
+					}
+					index += 1;
+					let value = argv
+						.get(index)
+						.ok_or_else(|| "--session requires a value".to_string())?;
+					let value = value.trim();
+					if value.starts_with("--") {
+						return Err("--session requires a session id, not another option".to_string());
+					}
+					if value.is_empty() {
+						return Err("--session requires a non-empty session id".to_string());
+					}
+					session = Some(value.to_string());
+					scope = Some(Scope::Session);
 					index += 1;
 					continue;
 				},
@@ -232,7 +368,7 @@ fn parse(argv: &[String]) -> Result<Parsed, String> {
 		}
 		index += 1;
 	}
-	Ok(Parsed { action, rest, scope, context })
+	Ok(Parsed { action, rest, scope, session, context })
 }
 
 /// Join operands with single spaces, preserving embedded text as typed.
@@ -358,6 +494,15 @@ mod tests {
 		let error =
 			execute(&argv, &dir, &dir, MemoryBackend::Off, &mut out).expect_err("backend gate");
 		assert!(error.contains("memory.backend: local"), "{error}");
+
+		// A missing session value must not swallow the next option as an id.
+		let argv = vec![
+			"list".to_string(),
+			"--session".to_string(),
+			"--global".to_string(),
+		];
+		let error = parse(&argv).expect_err("option is not a session id");
+		assert!(error.contains("session id"), "{error}");
 	}
 
 	#[test]
@@ -403,6 +548,49 @@ mod tests {
 	}
 
 	#[test]
+	fn session_scope_is_isolated_from_project_and_default_views() {
+		let dir = temp_dir();
+		let agent_dir = dir.join("agent");
+		let project = dir.join("project");
+		fs::create_dir_all(&project).expect("project");
+		run(
+			&["create", "--session", "session-a", "session only marker"],
+			&agent_dir,
+			&project,
+		)
+		.expect("session create");
+		run(
+			&["create", "--session", "session-b", "other session marker"],
+			&agent_dir,
+			&project,
+		)
+		.expect("second session create");
+
+		let default_view = run(&["list"], &agent_dir, &project).expect("default list");
+		assert!(!default_view.contains("session only marker"), "{default_view}");
+		let session_view = run(&["list", "--session", "session-a"], &agent_dir, &project)
+			.expect("session list");
+		assert!(session_view.contains("session only marker"), "{session_view}");
+		assert!(!session_view.contains("other session marker"), "{session_view}");
+		assert!(session_view.contains("[session:session-a]"), "{session_view}");
+
+		let argv = vec!["search".to_string(), "marker".to_string()];
+		let mut out = Vec::new();
+		execute_with_session(
+			&argv,
+			&agent_dir,
+			&project,
+			Some("session-a"),
+			MemoryBackend::Local,
+			&mut out,
+		)
+		.expect("session-aware search");
+		let searched = String::from_utf8(out).expect("utf8");
+		assert!(searched.contains("session only marker"), "{searched}");
+		assert!(!searched.contains("other session marker"), "{searched}");
+	}
+
+	#[test]
 	fn global_recall_never_returns_project_rows() {
 		let dir = temp_dir();
 		let agent_dir = dir.join("agent");
@@ -438,5 +626,59 @@ mod tests {
 			.expect("global search hit");
 		assert!(found.contains("global shared marker"), "{found}");
 		assert!(!found.contains("project-only secret marker"), "{found}");
+	}
+
+	struct RecordingProvider {
+		seen: std::sync::Mutex<Vec<String>>,
+	}
+
+	#[async_trait::async_trait]
+	impl EmbeddingProvider for RecordingProvider {
+		fn model(&self) -> &str {
+			"recording"
+		}
+
+		async fn embed(
+			&self,
+			texts: &[String],
+		) -> Result<Vec<Vec<f32>>, crate::memory_embeddings::EmbeddingError> {
+			if let Ok(mut seen) = self.seen.lock() {
+				seen.extend(texts.iter().cloned());
+			}
+			Ok(texts.iter().map(|_| vec![1.0f32]).collect())
+		}
+	}
+
+	#[test]
+	fn search_redacts_the_remote_embedding_query() {
+		let dir = temp_dir();
+		let agent_dir = dir.join("agent");
+		let project = dir.join("project");
+		fs::create_dir_all(&project).expect("project");
+		run(&["create", "searchable lesson"], &agent_dir, &project).expect("create");
+
+		let provider = std::sync::Arc::new(RecordingProvider {
+			seen: std::sync::Mutex::new(Vec::new()),
+		});
+		let provider_ref: &dyn EmbeddingProvider = &*provider;
+		let argv = vec![
+			"search".to_string(),
+			"token sk-abcdefghijklmnop".to_string(),
+		];
+		let mut out = Vec::new();
+		execute_with_session_and_embeddings(
+			&argv,
+			&agent_dir,
+			&project,
+			None,
+			Some(provider_ref),
+			MemoryBackend::Local,
+			&mut out,
+		)
+		.expect("search");
+		let seen = provider.seen.lock().expect("seen");
+		assert_eq!(seen.len(), 1);
+		assert!(seen[0].contains("[REDACTED]"), "{}", seen[0]);
+		assert!(!seen[0].contains("sk-"), "{}", seen[0]);
 	}
 }

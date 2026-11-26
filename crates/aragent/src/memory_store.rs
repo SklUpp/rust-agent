@@ -8,21 +8,31 @@
 //! What this owns:
 //! - one `memory.db` per agent directory, separate from `sessions.db`, so a
 //!   memory delete can never touch a session message row;
-//! - persistent row ids, `global`/`project` scope (`project` rows are filtered
-//!   by `cwd`), body, `asserted`/`inferred` origin, optional actor/source, and
-//!   `created_at`/`updated_at` unix seconds;
-//! - `add`, `list`, `get`, `update`, `delete`, and bounded lexical `recall`;
+//! - persistent row ids, `global`/`project`/`session` scope (`project` rows are
+//!   filtered by `cwd`, `session` rows strictly by `session_id`), body,
+//!   `asserted`/`inferred` origin, optional actor/source, `created_at`/
+//!   `updated_at` unix seconds, and access/decay/consolidation metadata;
+//! - `add`, `list`, `get`, `update`, `delete`, bounded FTS5/BM25 `recall`, and
+//!   optional vector + MMR hybrid recall when stored embeddings exist;
+//! - deterministic consolidation: TTL expiry plus near-duplicate clusters
+//!   (`cosine_similarity_pairs`) marked through `consolidated_into`;
 //! - a one-time migration of legacy `learned.md` lessons per project scope,
 //!   guarded by a marker row committed atomically with the imported rows. The
 //!   file is read, never deleted, and afterwards is only a bounded export
 //!   artifact rebuilt from rows, so old readers (`memory://root`, prompt
 //!   guidance) keep working and a deleted row can never be re-imported.
 //!
-//! Deliberate simplifications (`ponytail:`): retrieval is SQLite `LIKE`
-//! token matching ranked in Rust, not FTS5/BM25. Add FTS5 as a rebuildable
-//! index only when the corpus grows enough that bounded LIKE scans hurt. All
-//! calls block on one mutex-guarded connection; move to a writer thread if a
-//! session starts issuing memory operations in the middle of model streaming.
+//! Retrieval uses an FTS5 external-content index (`memories_fts`) as the
+//! always-available lexical path, so recall works offline with no embedding
+//! provider. Embeddings are optional accelerators: when the caller supplies a
+//! query vector for a stored model, hybrid recall blends BM25 with cosine
+//! similarity and MMR diversity; otherwise the same query stays lexical.
+//!
+//! Schema v2 is a transactional, idempotent v1 upgrade: rows keep their ids,
+//! timestamps, dedupe keys and text, while new metadata columns get defaults
+//! and the FTS index is rebuilt from the preserved rows. All calls block on one
+//! mutex-guarded connection; move to a writer thread if a session starts
+//! issuing memory operations in the middle of model streaming.
 //! Writers of one `memory.db` serialize on a per-path lock that also covers
 //! store opens (WAL switch + schema init), so concurrent `learn` calls queue on
 //! a mutex instead of racing SQLite's `busy_timeout`, whose expiry surfaces as
@@ -37,6 +47,7 @@
 //! conversation history or provider logs — it removes one memory record only.
 
 use std::{
+	collections::{BTreeMap, BTreeSet},
 	fmt, fs,
 	path::{Path, PathBuf},
 	sync::{Mutex, MutexGuard},
@@ -52,27 +63,43 @@ use crate::local_memory::{
 	LEARNED_LESSONS_FILE, MAX_LEARNED_CONTENT_CHARS, MAX_LEARNED_CONTEXT_CHARS, MAX_LEARNED_LESSONS,
 	normalize_learned_text,
 };
+use crate::memory_vectors::{
+	cosine_similarity, cosine_similarity_pairs, mmr_rerank_indices, vector_index_top_k,
+};
 
 /// Database filename under the agent directory.
 pub const MEMORY_DB_FILE: &str = "memory.db";
 /// Schema version recorded in `PRAGMA user_version`.
-pub const SCHEMA_VERSION: i64 = 1;
+pub const SCHEMA_VERSION: i64 = 2;
 /// Default result bound for [`MemoryStore::recall`].
 pub const DEFAULT_RECALL_LIMIT: usize = 20;
 /// Hard upper bound for a recall result.
 pub const MAX_RECALL_LIMIT: usize = 50;
 /// Hard upper bound for [`MemoryStore::list`].
 pub const MAX_LIST_LIMIT: usize = 200;
+/// Weight of the lexical BM25 component in hybrid recall; the remainder is
+/// cosine similarity. Fixed so ranking is reproducible across runs.
+pub const HYBRID_LEXICAL_WEIGHT: f64 = 0.5;
+/// MMR diversity strength used after hybrid ranking.
+pub const HYBRID_MMR_LAMBDA: f64 = 0.7;
+/// Cosine threshold for near-duplicate consolidation.
+pub const CONSOLIDATION_SIMILARITY_THRESHOLD: f64 = 0.92;
 /// Candidate rows a recall may score before truncating to its result bound.
 const MAX_RECALL_CANDIDATES: usize = 200;
 /// Longest record id: `lower(hex(randomblob(16)))`.
 const RECORD_ID_LEN: usize = 32;
 
-const SCHEMA_V1_DDL: &str = "
+/// Columns selected by every record read, in [`row_to_record`] order.
+pub const RECORD_COLUMNS: &str = "id, scope, cwd, session_id, body, context, origin, actor, source, created_at, updated_at, access_count, last_accessed_at, confidence, ttl_secs, consolidated_into";
+/// [`RECORD_COLUMNS`] qualified for joins with `memory_embeddings`.
+const RECORD_COLUMNS_QUALIFIED: &str = "memories.id, memories.scope, memories.cwd, memories.session_id, memories.body, memories.context, memories.origin, memories.actor, memories.source, memories.created_at, memories.updated_at, memories.access_count, memories.last_accessed_at, memories.confidence, memories.ttl_secs, memories.consolidated_into";
+
+const MEMORIES_V2_TABLE_DDL: &str = "
 	CREATE TABLE memories (
 		id TEXT PRIMARY KEY,
-		scope TEXT NOT NULL CHECK (scope IN ('global', 'project')),
+		scope TEXT NOT NULL CHECK (scope IN ('global', 'project', 'session')),
 		cwd TEXT,
+		session_id TEXT,
 		body TEXT NOT NULL,
 		context TEXT,
 		origin TEXT NOT NULL CHECK (origin IN ('asserted', 'inferred')),
@@ -81,21 +108,75 @@ const SCHEMA_V1_DDL: &str = "
 		created_at INTEGER NOT NULL,
 		updated_at INTEGER NOT NULL,
 		dedupe_key TEXT,
+		access_count INTEGER NOT NULL DEFAULT 0 CHECK (access_count >= 0),
+		last_accessed_at INTEGER,
+		confidence REAL NOT NULL DEFAULT 1.0 CHECK (confidence >= 0.0 AND confidence <= 1.0),
+		ttl_secs INTEGER CHECK (ttl_secs IS NULL OR ttl_secs >= 0),
+		consolidated_into TEXT REFERENCES memories (id) ON DELETE SET NULL,
 		CHECK (
-			(scope = 'global' AND cwd IS NULL)
-			OR (scope = 'project' AND cwd IS NOT NULL AND length(cwd) > 0)
-		)
+			(scope = 'global' AND cwd IS NULL AND session_id IS NULL)
+			OR (scope = 'project' AND cwd IS NOT NULL AND length(cwd) > 0 AND session_id IS NULL)
+			OR (scope = 'session' AND cwd IS NULL AND session_id IS NOT NULL AND length(session_id) > 0)
+		),
+		CHECK (consolidated_into IS NULL OR consolidated_into != id)
 	);
+";
 
-	CREATE UNIQUE INDEX memories_dedupe
+const MEMORIES_V2_AUX_DDL: &str = "
+	CREATE UNIQUE INDEX IF NOT EXISTS memories_dedupe
 		ON memories (dedupe_key) WHERE dedupe_key IS NOT NULL;
-	CREATE INDEX memories_scope_updated
-		ON memories (scope, cwd, updated_at DESC);
+	CREATE INDEX IF NOT EXISTS memories_scope_updated
+		ON memories (scope, cwd, session_id, updated_at DESC);
+	CREATE INDEX IF NOT EXISTS memories_consolidated
+		ON memories (consolidated_into) WHERE consolidated_into IS NOT NULL;
 
-	CREATE TABLE memory_meta (
+	CREATE TABLE IF NOT EXISTS memory_meta (
 		key TEXT PRIMARY KEY,
 		value TEXT NOT NULL
 	);
+	CREATE TABLE IF NOT EXISTS memory_export_dirty (
+		cwd TEXT PRIMARY KEY,
+		dirty INTEGER NOT NULL DEFAULT 1,
+		dirty_gen INTEGER NOT NULL DEFAULT 1
+	);
+";
+
+const MEMORIES_FTS_DDL: &str = "
+	CREATE VIRTUAL TABLE IF NOT EXISTS memories_fts USING fts5(
+		body,
+		context,
+		content = 'memories',
+		content_rowid = 'rowid',
+		tokenize = 'unicode61'
+	);
+
+	CREATE TRIGGER IF NOT EXISTS memories_fts_ai AFTER INSERT ON memories BEGIN
+		INSERT INTO memories_fts (rowid, body, context)
+		VALUES (new.rowid, new.body, new.context);
+	END;
+	CREATE TRIGGER IF NOT EXISTS memories_fts_ad AFTER DELETE ON memories BEGIN
+		INSERT INTO memories_fts (memories_fts, rowid, body, context)
+		VALUES ('delete', old.rowid, old.body, old.context);
+	END;
+	CREATE TRIGGER IF NOT EXISTS memories_fts_au AFTER UPDATE OF body, context ON memories BEGIN
+		INSERT INTO memories_fts (memories_fts, rowid, body, context)
+		VALUES ('delete', old.rowid, old.body, old.context);
+		INSERT INTO memories_fts (rowid, body, context)
+		VALUES (new.rowid, new.body, new.context);
+	END;
+";
+
+const MEMORY_EMBEDDINGS_DDL: &str = "
+	CREATE TABLE IF NOT EXISTS memory_embeddings (
+		memory_id TEXT NOT NULL REFERENCES memories (id) ON DELETE CASCADE,
+		model TEXT NOT NULL,
+		dim INTEGER NOT NULL CHECK (dim > 0),
+		embedding BLOB NOT NULL,
+		created_at INTEGER NOT NULL,
+		PRIMARY KEY (memory_id, model)
+	);
+	CREATE INDEX IF NOT EXISTS memory_embeddings_model
+		ON memory_embeddings (model);
 ";
 
 /// Failure of one memory-store operation. Never downgraded to a warning.
@@ -172,6 +253,8 @@ pub enum Scope {
 	Global,
 	/// Knowledge about one project, visible only under its `cwd`.
 	Project,
+	/// Knowledge about one conversation, visible only under its `session_id`.
+	Session,
 }
 
 impl Scope {
@@ -180,6 +263,7 @@ impl Scope {
 		match self {
 			Self::Global => "global",
 			Self::Project => "project",
+			Self::Session => "session",
 		}
 	}
 
@@ -188,6 +272,7 @@ impl Scope {
 		match raw {
 			"global" => Some(Self::Global),
 			"project" => Some(Self::Project),
+			"session" => Some(Self::Session),
 			_ => None,
 		}
 	}
@@ -222,12 +307,14 @@ impl Origin {
 }
 
 /// One durable memory row.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct MemoryRecord {
 	pub id: String,
 	pub scope: Scope,
-	/// Project path for `project` rows; always `None` for `global`.
+	/// Project path for `project` rows; always `None` for `global`/`session`.
 	pub cwd: Option<String>,
+	/// Conversation id for `session` rows; `None` otherwise.
+	pub session_id: Option<String>,
 	pub body: String,
 	/// Legacy `learn` context (`_(context: ...)_` in `learned.md`).
 	pub context: Option<String>,
@@ -236,6 +323,14 @@ pub struct MemoryRecord {
 	pub source: Option<String>,
 	pub created_at: i64,
 	pub updated_at: i64,
+	pub access_count: u64,
+	pub last_accessed_at: Option<i64>,
+	/// Caller confidence in `0.0..=1.0`; defaults to `1.0`.
+	pub confidence: f64,
+	/// Record expiry relative to `created_at`; `None` never expires.
+	pub ttl_secs: Option<i64>,
+	/// Canonical row this duplicate was consolidated into.
+	pub consolidated_into: Option<String>,
 }
 
 /// One `add` request.
@@ -243,13 +338,14 @@ pub struct MemoryRecord {
 pub struct AddInput<'a> {
 	pub scope: Scope,
 	pub cwd: Option<&'a str>,
+	pub session_id: Option<&'a str>,
 	pub body: &'a str,
 	pub context: Option<&'a str>,
 	pub origin: Origin,
 	pub actor: Option<&'a str>,
 	pub source: Option<&'a str>,
-	/// When true, an identical `(scope, cwd, body, context)` record is touched
-	/// instead of duplicated. Legacy import and `learn` use this.
+	/// When true, an identical `(scope, cwd, session_id, body, context)` record
+	/// is touched instead of duplicated. Legacy import and `learn` use this.
 	pub dedupe: bool,
 }
 
@@ -260,6 +356,27 @@ impl<'a> AddInput<'a> {
 		Self {
 			scope: Scope::Project,
 			cwd: Some(cwd),
+			session_id: None,
+			body,
+			context,
+			origin: Origin::Inferred,
+			actor: Some("agent"),
+			source: Some("learn"),
+			dedupe: true,
+		}
+	}
+
+	/// Agent-captured lesson in one conversation.
+	#[must_use]
+	pub fn session_lesson(
+		session_id: &'a str,
+		body: &'a str,
+		context: Option<&'a str>,
+	) -> Self {
+		Self {
+			scope: Scope::Session,
+			cwd: None,
+			session_id: Some(session_id),
 			body,
 			context,
 			origin: Origin::Inferred,
@@ -275,6 +392,7 @@ impl<'a> AddInput<'a> {
 		Self {
 			scope,
 			cwd,
+			session_id: None,
 			body,
 			context: None,
 			origin: Origin::Asserted,
@@ -288,17 +406,21 @@ impl<'a> AddInput<'a> {
 /// Scope selector for [`MemoryStore::list`] and [`MemoryStore::recall`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ScopeFilter {
-	/// Global rows plus the rows of `cwd` when it is set; all rows otherwise.
+	/// Global rows plus the rows of `cwd` and/or `session_id` when set; all
+	/// rows otherwise.
 	All,
 	Global,
 	Project,
+	Session,
 }
 
-/// `list`/`recall` filter. `Project` requires a non-empty `cwd`.
+/// `list`/`recall` filter. `Project` requires a non-empty `cwd`; `Session`
+/// requires a non-empty `session_id`.
 #[derive(Debug, Clone, Default)]
 pub struct Filter {
 	pub scope: ScopeFilter,
 	pub cwd: Option<String>,
+	pub session_id: Option<String>,
 	pub limit: Option<usize>,
 }
 
@@ -306,19 +428,52 @@ impl Filter {
 	/// Global rows plus the given project (the normal session view).
 	#[must_use]
 	pub fn all(cwd: Option<&str>) -> Self {
-		Self { scope: ScopeFilter::All, cwd: cwd.map(str::to_string), limit: None }
+		Self {
+			scope: ScopeFilter::All,
+			cwd: cwd.map(str::to_string),
+			session_id: None,
+			limit: None,
+		}
 	}
 
 	/// One project only.
 	#[must_use]
 	pub fn project(cwd: &str) -> Self {
-		Self { scope: ScopeFilter::Project, cwd: Some(cwd.to_string()), limit: None }
+		Self {
+			scope: ScopeFilter::Project,
+			cwd: Some(cwd.to_string()),
+			session_id: None,
+			limit: None,
+		}
+	}
+
+	/// One conversation only.
+	#[must_use]
+	pub fn session(session_id: &str) -> Self {
+		Self {
+			scope: ScopeFilter::Session,
+			cwd: None,
+			session_id: Some(session_id.to_string()),
+			limit: None,
+		}
 	}
 
 	/// Global rows only.
 	#[must_use]
 	pub fn global() -> Self {
-		Self { scope: ScopeFilter::Global, cwd: None, limit: None }
+		Self {
+			scope: ScopeFilter::Global,
+			cwd: None,
+			session_id: None,
+			limit: None,
+		}
+	}
+
+	/// Include this conversation's rows in an `All` view.
+	#[must_use]
+	pub fn with_session(mut self, session_id: &str) -> Self {
+		self.session_id = Some(session_id.to_string());
+		self
 	}
 
 	#[must_use]
@@ -344,6 +499,19 @@ pub struct ImportReport {
 	/// True when this project scope was already migrated and the file was not
 	/// read (a later export/learn/delete must never re-import it).
 	pub already_imported: bool,
+}
+
+/// Outcome of one deterministic consolidation pass.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct ConsolidationReport {
+	/// TTL-expired rows deleted.
+	pub expired: usize,
+	/// Duplicate rows marked through `consolidated_into`.
+	pub consolidated: usize,
+	/// Near-duplicate clusters found.
+	pub clusters: usize,
+	/// Always zero: consolidation is deterministic and never calls an LLM.
+	pub llm_used: u8,
 }
 
 /// One connection per agent directory. `rusqlite::Connection` is `Send` and
@@ -431,6 +599,7 @@ impl MemoryStore {
 				)));
 			}
 			connection.pragma_update(None, "synchronous", "FULL")?;
+			connection.pragma_update(None, "foreign_keys", "ON")?;
 			initialize(&mut connection)?;
 			Ok(Self { path: path.clone(), connection: Mutex::new(connection) })
 		})
@@ -440,6 +609,7 @@ impl MemoryStore {
 	pub fn open_in_memory() -> MemoryResult<Self> {
 		let mut connection = Connection::open_in_memory()?;
 		connection.busy_timeout(std::time::Duration::from_secs(5))?;
+		connection.pragma_update(None, "foreign_keys", "ON")?;
 		initialize(&mut connection)?;
 		Ok(Self { path: PathBuf::from(":memory:"), connection: Mutex::new(connection) })
 	}
@@ -463,11 +633,18 @@ impl MemoryStore {
 			.map(|context| normalize_learned_text(context, MAX_LEARNED_CONTEXT_CHARS))
 			.filter(|context| !context.is_empty());
 		let cwd = normalize_scope(input.scope, input.cwd)?;
+		let session_id = normalize_session(input.scope, input.session_id)?;
 		let actor = clean_optional(input.actor);
 		let source = clean_optional(input.source);
-		let dedupe_key = input
-			.dedupe
-			.then(|| record_dedupe_key(input.scope, cwd.as_deref(), &body, context.as_deref()));
+		let dedupe_key = input.dedupe.then(|| {
+			record_dedupe_key(
+				input.scope,
+				cwd.as_deref(),
+				session_id.as_deref(),
+				&body,
+				context.as_deref(),
+			)
+		});
 
 		crate::local_memory::with_path_lock(&self.path, || {
 			let mut guard = self.lock();
@@ -481,7 +658,7 @@ impl MemoryStore {
 			{
 				let updated_at = next_timestamp(&transaction)?;
 				transaction.execute(
-					"UPDATE memories SET updated_at = ?1 WHERE id = ?2",
+					"UPDATE memories SET updated_at = ?1, consolidated_into = NULL WHERE id = ?2",
 					params![updated_at, id],
 				)?;
 				let record = load_record(&transaction, &id)?.ok_or_else(|| {
@@ -494,12 +671,13 @@ impl MemoryStore {
 			let updated_at = next_timestamp(&transaction)?;
 			let id: String = transaction.query_row(
 				"INSERT INTO memories \
-				 (id, scope, cwd, body, context, origin, actor, source, created_at, updated_at, dedupe_key) \
-				 VALUES (lower(hex(randomblob(16))), ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10) \
+				 (id, scope, cwd, session_id, body, context, origin, actor, source, created_at, updated_at, dedupe_key) \
+				 VALUES (lower(hex(randomblob(16))), ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11) \
 				 RETURNING id",
 				params![
 					input.scope.as_str(),
 					cwd,
+					session_id,
 					body,
 					context,
 					input.origin.as_str(),
@@ -545,18 +723,41 @@ impl MemoryStore {
 	/// Load one record. `cwd` is the caller's project: records from another
 	/// project are reported as not found rather than disclosed.
 	pub fn get(&self, id: &str, cwd: Option<&str>) -> MemoryResult<MemoryRecord> {
+		self.get_with_session(id, cwd, None)
+	}
+
+	/// Like [`Self::get`], also admitting this conversation's `session` rows.
+	pub fn get_with_session(
+		&self,
+		id: &str,
+		cwd: Option<&str>,
+		session_id: Option<&str>,
+	) -> MemoryResult<MemoryRecord> {
 		let id = normalize_record_id(id)?;
+		let session_id = clean_session_id(session_id);
 		let connection = self.lock();
 		let record = load_record(&connection, &id)?
 			.ok_or_else(|| MemoryStoreError::NotFound(format!("memory record not found: {id}")))?;
-		ensure_visible(&record, cwd)?;
+		ensure_visible(&record, cwd, session_id.as_deref())?;
 		Ok(record)
 	}
 
-	/// Replace a record body. Identity (id, scope, cwd, origin, actor, source)
-	/// is immutable; timestamps move `updated_at` forward.
+	/// Replace a record body. Identity (id, scope, cwd, session_id, origin,
+	/// actor, source) is immutable; timestamps move `updated_at` forward.
 	pub fn update(&self, id: &str, cwd: Option<&str>, body: &str) -> MemoryResult<MemoryRecord> {
+		self.update_with_session(id, cwd, None, body)
+	}
+
+	/// Like [`Self::update`], also admitting this conversation's `session` rows.
+	pub fn update_with_session(
+		&self,
+		id: &str,
+		cwd: Option<&str>,
+		session_id: Option<&str>,
+		body: &str,
+	) -> MemoryResult<MemoryRecord> {
 		let id = normalize_record_id(id)?;
+		let session_id = clean_session_id(session_id);
 		let body = normalize_learned_text(body, MAX_LEARNED_CONTENT_CHARS);
 		if body.is_empty() {
 			return Err(MemoryStoreError::Validation(
@@ -568,12 +769,13 @@ impl MemoryStore {
 			let transaction = guard.transaction_with_behavior(TransactionBehavior::Immediate)?;
 			let current = load_record(&transaction, &id)?
 				.ok_or_else(|| MemoryStoreError::NotFound(format!("memory record not found: {id}")))?;
-			ensure_visible(&current, cwd)?;
+			ensure_visible(&current, cwd, session_id.as_deref())?;
 			// Identity (dedupe key) follows the body, or a later legacy-free import
 			// and a re-learned original would otherwise duplicate or silently vanish.
 			let dedupe_key = record_dedupe_key(
 				current.scope,
 				current.cwd.as_deref(),
+				current.session_id.as_deref(),
 				&body,
 				current.context.as_deref(),
 			);
@@ -594,6 +796,11 @@ impl MemoryStore {
 				"UPDATE memories SET body = ?1, dedupe_key = ?2, updated_at = ?3 WHERE id = ?4",
 				params![body, dedupe_key, updated_at, id],
 			)?;
+			// The stored vector described the old text; never rank stale vectors.
+			transaction.execute(
+				"DELETE FROM memory_embeddings WHERE memory_id = ?1",
+				params![id],
+			)?;
 			let record = load_record(&transaction, &id)?
 				.ok_or_else(|| MemoryStoreError::NotFound(format!("memory record not found: {id}")))?;
 			transaction.commit()?;
@@ -604,13 +811,28 @@ impl MemoryStore {
 	/// Delete one record and nothing else. This never touches `sessions.db`
 	/// (conversation history is a different file and a different authority).
 	pub fn delete(&self, id: &str, cwd: Option<&str>) -> MemoryResult<()> {
+		self.delete_with_session(id, cwd, None)
+	}
+
+	/// Like [`Self::delete`], also admitting this conversation's `session` rows.
+	pub fn delete_with_session(
+		&self,
+		id: &str,
+		cwd: Option<&str>,
+		session_id: Option<&str>,
+	) -> MemoryResult<()> {
 		let id = normalize_record_id(id)?;
+		let session_id = clean_session_id(session_id);
 		crate::local_memory::with_path_lock(&self.path, || {
 			let mut guard = self.lock();
 			let transaction = guard.transaction_with_behavior(TransactionBehavior::Immediate)?;
 			let current = load_record(&transaction, &id)?
 				.ok_or_else(|| MemoryStoreError::NotFound(format!("memory record not found: {id}")))?;
-			ensure_visible(&current, cwd)?;
+			ensure_visible(&current, cwd, session_id.as_deref())?;
+			transaction.execute(
+				"DELETE FROM memory_embeddings WHERE memory_id = ?1",
+				params![id],
+			)?;
 			transaction.execute("DELETE FROM memories WHERE id = ?1", params![id])?;
 			transaction.commit()?;
 			Ok(())
@@ -619,45 +841,63 @@ impl MemoryStore {
 
 	/// Bounded lexical recall over the visible scope.
 	///
-	/// Every whitespace/punctuation-separated query token must appear as a
-	/// case-insensitive substring of `body` or `context`; candidates are ranked
-	/// by token occurrences, then recency, then id, and truncated to `limit`.
+	/// Tokens from `query` are prefix-matched through the FTS5 index and ranked
+	/// by BM25, then recency, then id. The SQL scope predicate is applied
+	/// before `LIMIT`, so other projects' or sessions' rows can never occupy
+	/// the candidate window. Recall increments `access_count` and
+	/// `last_accessed_at` for returned rows.
 	pub fn recall(
 		&self,
 		query: &str,
 		cwd: Option<&str>,
 		limit: Option<usize>,
 	) -> MemoryResult<Vec<MemoryRecord>> {
-		self.recall_with_scope(query, cwd, limit, ScopeFilter::All)
+		self.recall_with_scope(query, cwd, None, limit, ScopeFilter::All, None)
 	}
 
-	/// Global-only recall. The scope predicate is part of SQL before any
-	/// `LIMIT`, so other projects' rows can never occupy the candidate window.
+	/// Global-only recall.
 	pub fn recall_global(
 		&self,
 		query: &str,
 		limit: Option<usize>,
 	) -> MemoryResult<Vec<MemoryRecord>> {
-		self.recall_with_scope(query, None, limit, ScopeFilter::Global)
+		self.recall_with_scope(query, None, None, limit, ScopeFilter::Global, None)
+	}
+
+	/// Hybrid recall: BM25 always runs, and a supplied query embedding (for
+	/// `model`) blends in cosine similarity and MMR diversity when stored
+	/// vectors exist. Missing/partial vectors leave the lexical ranking intact
+	/// rather than failing the call, so offline recall never regresses.
+	pub fn recall_hybrid(
+		&self,
+		query: &str,
+		cwd: Option<&str>,
+		session_id: Option<&str>,
+		embedding: Option<(&str, &[f32])>,
+		limit: Option<usize>,
+	) -> MemoryResult<Vec<MemoryRecord>> {
+		self.recall_with_scope(query, cwd, session_id, limit, ScopeFilter::All, embedding)
 	}
 
 	fn recall_with_scope(
 		&self,
 		query: &str,
 		cwd: Option<&str>,
+		session_id: Option<&str>,
 		limit: Option<usize>,
 		scope: ScopeFilter,
+		embedding: Option<(&str, &[f32])>,
 	) -> MemoryResult<Vec<MemoryRecord>> {
 		let tokens = query_tokens(query);
-		if tokens.is_empty() {
-			return Err(MemoryStoreError::Validation(
-				"recall query has no searchable tokens".to_string(),
-			));
-		}
 		let limit = limit
 			.unwrap_or(DEFAULT_RECALL_LIMIT)
 			.clamp(1, MAX_RECALL_LIMIT);
-		let mut filter = Filter { scope, cwd: cwd.map(str::to_string), limit: None };
+		let mut filter = Filter {
+			scope,
+			cwd: cwd.map(str::to_string),
+			session_id: clean_session_id(session_id),
+			limit: None,
+		};
 		if filter
 			.cwd
 			.as_deref()
@@ -665,44 +905,573 @@ impl MemoryStore {
 		{
 			filter.cwd = None;
 		}
-		let (mut clause, mut values) = filter_clause(&filter)?;
-		for token in &tokens {
-			clause.push_str(
-				" AND (lower(body) LIKE ? ESCAPE '\\' \
-				 OR lower(COALESCE(context, '')) LIKE ? ESCAPE '\\')",
-			);
-			let pattern = like_pattern(token);
-			values.push(Value::Text(pattern.clone()));
-			values.push(Value::Text(pattern));
-		}
-		let candidates = limit
+		let (clause, clause_values) = filter_clause(&filter)?;
+		let now = now_seconds();
+		let candidate_limit = limit
 			.saturating_mul(4)
 			.min(MAX_RECALL_CANDIDATES)
 			.max(limit);
-		let sql = format!(
-			"SELECT {} FROM memories WHERE {clause} \
-			 ORDER BY updated_at DESC, rowid ASC LIMIT {candidates}",
-			RECORD_COLUMNS
-		);
 		let connection = self.lock();
-		let mut statement = connection.prepare(&sql)?;
-		let rows = statement.query_map(params_from_iter(values.iter()), row_to_record)?;
-		let mut ranked = Vec::new();
-		for row in rows {
-			let record = row?;
-			ranked.push((record_hits(&record, &tokens), record));
+
+		let (query_model, query_vector, vectors) = match embedding {
+			Some((model, vector)) => {
+				let model = model.trim();
+				if model.is_empty() {
+					return Err(MemoryStoreError::Validation(
+						"embedding model must not be empty".to_string(),
+					));
+				}
+				if vector.is_empty() || vector.iter().any(|value| !value.is_finite()) {
+					return Err(MemoryStoreError::Validation(
+						"query embedding must be finite and non-empty".to_string(),
+					));
+				}
+				let model = model.to_string();
+				let vectors = load_embeddings_for_model(&connection, &model)?;
+				(
+					Some(model),
+					Some(vector.iter().map(|&value| f64::from(value)).collect::<Vec<_>>()),
+					vectors,
+				)
+			},
+			None => (None, None, BTreeMap::new()),
+		};
+
+		let mut candidates: Vec<(MemoryRecord, f64)> = Vec::new();
+		if !tokens.is_empty() {
+			let mut values = clause_values.clone();
+			values.insert(0, Value::Text(fts_query(&tokens)));
+			values.push(Value::Integer(now));
+			let sql = format!(
+				"WITH hits AS ( \
+					SELECT rowid, bm25(memories_fts) AS rank FROM memories_fts \
+					WHERE memories_fts MATCH ? \
+				 ) \
+				 SELECT {RECORD_COLUMNS}, hits.rank FROM memories \
+				 JOIN hits ON hits.rowid = memories.rowid \
+				 WHERE {clause} AND consolidated_into IS NULL \
+				   AND (ttl_secs IS NULL OR created_at + ttl_secs > ? OR origin = 'asserted') \
+				 ORDER BY hits.rank ASC, updated_at DESC, memories.rowid ASC LIMIT {candidate_limit}"
+			);
+			let mut statement = connection.prepare(&sql)?;
+			let rows = statement.query_map(params_from_iter(values.iter()), |row| {
+				let record = row_to_record(row)?;
+				let rank: f64 = row.get(16)?;
+				Ok((record, rank))
+			})?;
+			for row in rows {
+				candidates.push(row?);
+			}
 		}
-		ranked.sort_by(|(left_hits, left), (right_hits, right)| {
-			right_hits
-				.cmp(left_hits)
+
+		// A semantic hit can have no lexical overlap at all. Union the scoped
+		// vector top-k into the FTS candidate set; absent vectors keep a neutral
+		// lexical score of zero and still flow through the same MMR pass.
+		let mut seen: BTreeSet<String> = candidates.iter().map(|(row, _)| row.id.clone()).collect();
+		if let (Some(model), Some(query_vector)) = (query_model.as_deref(), query_vector.as_ref()) {
+			let mut vector_values = clause_values;
+			vector_values.insert(0, Value::Text(model.to_string()));
+			vector_values.push(Value::Integer(now));
+			let sql = format!(
+				"SELECT {RECORD_COLUMNS_QUALIFIED}, e.dim, e.embedding FROM memories \
+				 JOIN memory_embeddings e ON e.memory_id = memories.id \
+				 WHERE e.model = ? AND {clause} AND memories.consolidated_into IS NULL \
+				   AND (memories.ttl_secs IS NULL OR memories.created_at + memories.ttl_secs > ? \
+				        OR memories.origin = 'asserted') \
+				 ORDER BY memories.rowid"
+			);
+			let mut vector_rows: Vec<(MemoryRecord, Vec<f32>)> = Vec::new();
+			{
+				let mut statement = connection.prepare(&sql)?;
+				let rows = statement.query_map(params_from_iter(vector_values.iter()), |row| {
+					let record = row_to_record(row)?;
+					let dim: i64 = row.get(16)?;
+					let blob: Vec<u8> = row.get(17)?;
+					Ok((record, dim, blob))
+				})?;
+				for row in rows {
+					let (record, dim, blob) = row?;
+					let Some(vector) = decode_embedding(&blob, dim) else {
+						continue;
+					};
+					if vector.len() == query_vector.len() {
+						vector_rows.push((record, vector));
+					}
+				}
+			}
+			let query_norm = query_vector
+				.iter()
+				.map(|value| value * value)
+				.sum::<f64>()
+				.sqrt();
+			if !vector_rows.is_empty() && query_norm > 0.0 && query_norm.is_finite() {
+				let dimensions = query_vector.len();
+				let mut matrix = Vec::with_capacity(vector_rows.len() * dimensions);
+				for (_, vector) in &vector_rows {
+					let norm = vector
+						.iter()
+						.map(|value| {
+							let value = f64::from(*value);
+							value * value
+						})
+						.sum::<f64>()
+						.sqrt();
+					if norm > 0.0 && norm.is_finite() {
+						matrix.extend(vector.iter().map(|value| (f64::from(*value) / norm) as f32));
+					} else {
+						matrix.extend(std::iter::repeat_n(0.0f32, dimensions));
+					}
+				}
+				let order = vector_index_top_k(
+					&matrix,
+					dimensions,
+					query_vector,
+					candidate_limit,
+				)
+				.map_err(|message| MemoryStoreError::Validation(message.to_string()))?;
+				for index in order.indices {
+					let Some((record, _)) = vector_rows.get(index as usize) else {
+						continue;
+					};
+					if seen.insert(record.id.clone()) {
+						candidates.push((record.clone(), 0.0));
+					}
+				}
+			}
+		}
+
+		let use_vectors = query_vector.as_ref().is_some_and(|query| {
+			candidates.iter().any(|(record, _)| {
+				vectors
+					.get(&record.id)
+					.is_some_and(|vector| vector.len() == query.len())
+			})
+		});
+		let max_lexical = candidates
+			.iter()
+			.map(|(_, rank)| (-rank).max(0.0))
+			.fold(0.0f64, f64::max);
+		let mut scored: Vec<(MemoryRecord, f64)> = candidates
+			.into_iter()
+			.map(|(record, rank)| {
+				let lexical = (-rank).max(0.0)
+					/ if max_lexical > 0.0 { max_lexical } else { 1.0 };
+				let score = if use_vectors {
+					let vector_score = query_vector.as_ref().map_or(0.5, |query| {
+						vectors
+							.get(&record.id)
+							.filter(|vector| vector.len() == query.len())
+							.map_or(0.5, |vector| {
+								let stored: Vec<f64> =
+									vector.iter().map(|&value| f64::from(value)).collect();
+								((cosine_similarity(query, &stored) + 1.0) / 2.0).clamp(0.0, 1.0)
+							})
+					});
+					HYBRID_LEXICAL_WEIGHT * lexical
+						+ (1.0 - HYBRID_LEXICAL_WEIGHT) * vector_score
+				} else {
+					lexical
+				};
+				(record, score)
+			})
+			.collect();
+		scored.sort_by(|(left, left_score), (right, right_score)| {
+			right_score
+				.total_cmp(left_score)
 				.then_with(|| right.updated_at.cmp(&left.updated_at))
 				.then_with(|| left.id.cmp(&right.id))
 		});
-		Ok(ranked
-			.into_iter()
-			.take(limit)
-			.map(|(_, record)| record)
-			.collect())
+
+		let mut records: Vec<MemoryRecord> = if use_vectors {
+			let bodies: Vec<&str> = scored
+				.iter()
+				.map(|(record, _)| record.body.as_str())
+				.collect();
+			let scores: Vec<f64> = scored.iter().map(|(_, score)| *score).collect();
+			let order = mmr_rerank_indices(&bodies, &scores, HYBRID_MMR_LAMBDA, limit)
+				.map_err(|message| MemoryStoreError::Validation(message.to_string()))?;
+			order
+				.into_iter()
+				.map(|index| scored[index as usize].0.clone())
+				.collect()
+		} else {
+			scored.truncate(limit);
+			scored.into_iter().map(|(record, _)| record).collect()
+		};
+
+		if !records.is_empty() {
+			let mut update = connection.prepare_cached(
+				"UPDATE memories SET access_count = access_count + 1, last_accessed_at = ?1 				 WHERE id = ?2",
+			)?;
+			for record in &mut records {
+				update.execute(params![now, record.id])?;
+				record.access_count = record.access_count.saturating_add(1);
+				record.last_accessed_at = Some(now);
+			}
+		}
+		Ok(records)
+	}
+
+	/// Store or replace one model's vector for a record. Vectors are `f32`
+	/// little-endian blobs; non-finite values are rejected so ranking never
+	/// sees corrupt input.
+	pub fn set_embedding(&self, id: &str, model: &str, vector: &[f32]) -> MemoryResult<()> {
+		let id = normalize_record_id(id)?;
+		let model = model.trim();
+		if model.is_empty() {
+			return Err(MemoryStoreError::Validation(
+				"embedding model must not be empty".to_string(),
+			));
+		}
+		if vector.is_empty() || vector.iter().any(|value| !value.is_finite()) {
+			return Err(MemoryStoreError::Validation(
+				"embedding must be finite and non-empty".to_string(),
+			));
+		}
+		let dim = i64::try_from(vector.len()).map_err(|_| {
+			MemoryStoreError::Validation("embedding dimensions do not fit in i64".to_string())
+		})?;
+		let encoded = encode_embedding(vector);
+		crate::local_memory::with_path_lock(&self.path, || {
+			let mut guard = self.lock();
+			let transaction = guard.transaction_with_behavior(TransactionBehavior::Immediate)?;
+			transaction.execute(
+				"INSERT INTO memory_embeddings (memory_id, model, dim, embedding, created_at) \
+				 VALUES (?1, ?2, ?3, ?4, ?5) \
+				 ON CONFLICT (memory_id, model) DO UPDATE SET \
+				   dim = excluded.dim, embedding = excluded.embedding, \
+				   created_at = excluded.created_at",
+				params![id, model, dim, encoded, now_seconds()],
+			)?;
+			transaction.commit()?;
+			Ok(())
+		})
+	}
+
+	/// Read one stored vector.
+	pub fn embedding(&self, id: &str, model: &str) -> MemoryResult<Option<Vec<f32>>> {
+		let id = normalize_record_id(id)?;
+		let connection = self.lock();
+		let row: Option<(i64, Vec<u8>)> = connection
+			.query_row(
+				"SELECT dim, embedding FROM memory_embeddings WHERE memory_id = ?1 AND model = ?2",
+				params![id, model.trim()],
+				|row| Ok((row.get(0)?, row.get(1)?)),
+			)
+			.optional()?;
+		Ok(row.and_then(|(dim, blob)| decode_embedding(&blob, dim)))
+	}
+
+	/// Delete one stored vector.
+	pub fn delete_embedding(&self, id: &str, model: &str) -> MemoryResult<()> {
+		let id = normalize_record_id(id)?;
+		crate::local_memory::with_path_lock(&self.path, || {
+			let guard = self.lock();
+			guard.execute(
+				"DELETE FROM memory_embeddings WHERE memory_id = ?1 AND model = ?2",
+				params![id, model.trim()],
+			)?;
+			Ok(())
+		})
+	}
+
+	/// Set or clear a record's TTL in seconds.
+	pub fn set_ttl(&self, id: &str, ttl_secs: Option<i64>) -> MemoryResult<()> {
+		let id = normalize_record_id(id)?;
+		if ttl_secs.is_some_and(|ttl| ttl < 0) {
+			return Err(MemoryStoreError::Validation(
+				"ttl_secs must be non-negative".to_string(),
+			));
+		}
+		self.update_metadata(&id, "ttl_secs", ttl_secs.map(Value::Integer).unwrap_or(Value::Null))
+	}
+
+	/// Set a record's confidence in `0.0..=1.0`.
+	pub fn set_confidence(&self, id: &str, confidence: f64) -> MemoryResult<()> {
+		let id = normalize_record_id(id)?;
+		if !confidence.is_finite() || !(0.0..=1.0).contains(&confidence) {
+			return Err(MemoryStoreError::Validation(
+				"confidence must be a finite value in 0.0..=1.0".to_string(),
+			));
+		}
+		self.update_metadata(&id, "confidence", Value::Real(confidence))
+	}
+
+	/// Mark a duplicate as consolidated into another record, or clear it.
+	///
+	/// A canonical target must belong to the same `(scope, cwd, session_id)`;
+	/// otherwise consolidation could hide a record behind another project's or
+	/// conversation's canonical row.
+	pub fn set_consolidated_into(&self, id: &str, canonical: Option<&str>) -> MemoryResult<()> {
+		let id = normalize_record_id(id)?;
+		let canonical = canonical.map(normalize_record_id).transpose()?;
+		if canonical.as_deref() == Some(id.as_str()) {
+			return Err(MemoryStoreError::Validation(
+				"a record cannot be consolidated into itself".to_string(),
+			));
+		}
+		crate::local_memory::with_path_lock(&self.path, || {
+			let mut guard = self.lock();
+			let transaction = guard.transaction_with_behavior(TransactionBehavior::Immediate)?;
+			let source = transaction
+				.query_row(
+					"SELECT scope, cwd, session_id FROM memories WHERE id = ?1",
+					params![id],
+					|row| {
+						Ok((
+							row.get::<_, String>(0)?,
+							row.get::<_, Option<String>>(1)?,
+							row.get::<_, Option<String>>(2)?,
+						))
+					},
+				)
+				.optional()?
+				.ok_or_else(|| {
+					MemoryStoreError::NotFound(format!("memory record not found: {id}"))
+				})?;
+			if let Some(canonical_id) = canonical.as_deref() {
+				let target = transaction
+					.query_row(
+						"SELECT scope, cwd, session_id FROM memories WHERE id = ?1",
+						params![canonical_id],
+						|row| {
+							Ok((
+								row.get::<_, String>(0)?,
+								row.get::<_, Option<String>>(1)?,
+								row.get::<_, Option<String>>(2)?,
+							))
+						},
+					)
+					.optional()?
+					.ok_or_else(|| {
+						MemoryStoreError::NotFound(format!(
+							"consolidation target not found: {canonical_id}"
+						))
+					})?;
+				if source != target {
+					return Err(MemoryStoreError::Validation(
+						"consolidation target must share scope, cwd, and session_id"
+							.to_string(),
+					));
+				}
+			}
+			let changed = transaction.execute(
+				"UPDATE memories SET consolidated_into = ?1 WHERE id = ?2",
+				params![canonical, id],
+			)?;
+			if changed == 0 {
+				return Err(MemoryStoreError::NotFound(format!(
+					"memory record not found: {id}"
+				)));
+			}
+			transaction.commit()?;
+			Ok(())
+		})
+	}
+
+	fn update_metadata(&self, id: &str, column: &str, value: Value) -> MemoryResult<()> {
+		crate::local_memory::with_path_lock(&self.path, || {
+			let guard = self.lock();
+			let changed = guard.execute(
+				&format!("UPDATE memories SET {column} = ?1 WHERE id = ?2"),
+				params![value, id],
+			)?;
+			if changed == 0 {
+				return Err(MemoryStoreError::NotFound(format!(
+					"memory record not found: {id}"
+				)));
+			}
+			Ok(())
+		})
+	}
+
+	/// Deterministic `sleep`-style maintenance: delete TTL-expired rows, then
+	/// mark near-duplicate clusters (cosine ≥
+	/// [`CONSOLIDATION_SIMILARITY_THRESHOLD`], same scope/cwd/session/model/dim)
+	/// through `consolidated_into`. The lowest id in a cluster is canonical.
+	/// No model call is made; `llm_used` is always zero.
+	pub fn consolidate(&self) -> MemoryResult<ConsolidationReport> {
+		self.consolidate_at(now_seconds())
+	}
+
+	/// [`Self::consolidate`] with an injected clock, for deterministic tests.
+	pub fn consolidate_at(&self, now: i64) -> MemoryResult<ConsolidationReport> {
+		let report = crate::local_memory::with_path_lock(&self.path, || {
+			let mut guard = self.lock();
+			let transaction = guard.transaction_with_behavior(TransactionBehavior::Immediate)?;
+			let mut report = ConsolidationReport::default();
+			// Asserted rows are user commitments and never expire silently.
+			let expired_project_cwds: Vec<String> = {
+				let mut statement = transaction.prepare(
+					"SELECT DISTINCT cwd FROM memories WHERE scope = 'project' \
+					 AND cwd IS NOT NULL AND origin = 'inferred' AND ttl_secs IS NOT NULL \
+					 AND created_at + ttl_secs <= ?1",
+				)?;
+				let rows = statement.query_map(params![now], |row| row.get::<_, String>(0))?;
+				let mut cwds = Vec::new();
+				for row in rows {
+					cwds.push(row?);
+				}
+				cwds
+			};
+			// Persist the export obligation before deleting rows: a crash or a
+			// failed `learned.md` write leaves a retry marker for the next pass.
+			for cwd in &expired_project_cwds {
+				transaction.execute(
+					"INSERT INTO memory_export_dirty (cwd, dirty, dirty_gen) VALUES (?1, 1, 1) \
+					 ON CONFLICT(cwd) DO UPDATE SET dirty = 1, dirty_gen = dirty_gen + 1",
+					params![cwd.as_str()],
+				)?;
+			}
+			report.expired = transaction.execute(
+				"DELETE FROM memories WHERE ttl_secs IS NOT NULL \
+				 AND created_at + ttl_secs <= ?1 AND origin = 'inferred'",
+				params![now],
+			)?;
+
+			let models: Vec<String> = {
+				let mut statement =
+					transaction.prepare("SELECT DISTINCT model FROM memory_embeddings ORDER BY model")?;
+				let rows = statement.query_map([], |row| row.get::<_, String>(0))?;
+				let mut models = Vec::new();
+				for row in rows {
+					models.push(row?);
+				}
+				models
+			};
+			for model in models {
+				let rows: Vec<(String, String, Option<String>, Option<String>, i64, Vec<u8>)> = {
+					let mut statement = transaction.prepare(
+						"SELECT m.id, m.scope, m.cwd, m.session_id, e.dim, e.embedding \
+						 FROM memories m JOIN memory_embeddings e ON e.memory_id = m.id \
+						 WHERE e.model = ?1 AND m.consolidated_into IS NULL \
+						 ORDER BY m.id",
+					)?;
+					let rows = statement.query_map(params![model], |row| {
+						Ok((
+							row.get::<_, String>(0)?,
+							row.get::<_, String>(1)?,
+							row.get::<_, Option<String>>(2)?,
+							row.get::<_, Option<String>>(3)?,
+							row.get::<_, i64>(4)?,
+							row.get::<_, Vec<u8>>(5)?,
+						))
+					})?;
+					let mut rows_out = Vec::new();
+					for row in rows {
+						rows_out.push(row?);
+					}
+					rows_out
+				};
+				let mut groups: BTreeMap<
+					(String, Option<String>, Option<String>, usize),
+					Vec<(String, Vec<f32>)>,
+				> = BTreeMap::new();
+				for (id, scope, cwd, session_id, dim, blob) in rows {
+					let Ok(dim) = usize::try_from(dim) else {
+						continue;
+					};
+					let Some(vector) = decode_embedding(&blob, dim as i64) else {
+						continue;
+					};
+					groups
+						.entry((scope, cwd, session_id, dim))
+						.or_default()
+						.push((id, vector));
+				}
+				for group in groups.values() {
+					if group.len() < 2 {
+						continue;
+					}
+					let dim = group[0].1.len();
+					let mut flattened = Vec::with_capacity(group.len() * dim);
+					for (_, vector) in group {
+						flattened.extend(vector.iter().map(|&value| f64::from(value)));
+					}
+					let pairs = cosine_similarity_pairs(
+						&flattened,
+						group.len(),
+						dim,
+						CONSOLIDATION_SIMILARITY_THRESHOLD,
+					)
+					.map_err(|message| MemoryStoreError::Validation(message.to_string()))?;
+					if pairs.is_empty() {
+						continue;
+					}
+					let mut parent: Vec<usize> = (0..group.len()).collect();
+					for pair in pairs.chunks_exact(2) {
+						union_indices(&mut parent, pair[0] as usize, pair[1] as usize);
+					}
+					let mut components: BTreeMap<usize, Vec<usize>> = BTreeMap::new();
+					for index in 0..group.len() {
+						let root = find_index(&mut parent, index);
+						components.entry(root).or_default().push(index);
+					}
+					for mut members in components.into_values() {
+						if members.len() < 2 {
+							continue;
+						}
+						members.sort_unstable();
+						report.clusters += 1;
+						let canonical = &group[members[0]].0;
+						for index in &members[1..] {
+							let id = &group[*index].0;
+							let changed = transaction.execute(
+								"UPDATE memories SET consolidated_into = ?1 \
+								 WHERE id = ?2 AND consolidated_into IS NULL AND id != ?1",
+								params![canonical, id],
+							)?;
+							report.consolidated += changed;
+						}
+					}
+				}
+			}
+			transaction.commit()?;
+			Ok(report)
+		})?;
+		// The database is the authority, but the derived project artifact must
+		// not keep showing lessons that TTL expired. Dirty markers survive a
+		// transient write failure, so the next consolidation retries them.
+		if let Some(agent_dir) = self.path.parent().filter(|dir| !dir.as_os_str().is_empty()) {
+			let dirty = {
+				let connection = self.lock();
+				let mut statement = connection.prepare(
+					"SELECT cwd, dirty_gen FROM memory_export_dirty WHERE dirty != 0 ORDER BY cwd",
+				)?;
+				let rows = statement.query_map([], |row| {
+					Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+				})?;
+				let mut entries = Vec::new();
+				for row in rows {
+					entries.push(row?);
+				}
+				entries
+			};
+			let mut first_error = None;
+			for (cwd, generation) in dirty {
+				match self.export_learned_lessons(agent_dir, Path::new(cwd.as_str())) {
+					Ok(()) => {
+						// A newer consolidation may have incremented the generation while
+						// this export ran; only retire the exact generation we exported.
+						let connection = self.lock();
+						connection.execute(
+							"UPDATE memory_export_dirty SET dirty = 0 \
+							 WHERE cwd = ?1 AND dirty_gen = ?2",
+							params![cwd.as_str(), generation],
+						)?;
+					},
+					Err(error) => {
+						if first_error.is_none() {
+							first_error = Some(error);
+						}
+					},
+				}
+			}
+			if let Some(error) = first_error {
+				return Err(error);
+			}
+		}
+		Ok(report)
 	}
 
 	/// Migrate bullets from the project's legacy `learned.md`, exactly once.
@@ -774,6 +1543,7 @@ impl MemoryStore {
 			let key = record_dedupe_key(
 				Scope::Project,
 				Some(&cwd_text),
+				None,
 				&lesson.body,
 				lesson.context.as_deref(),
 			);
@@ -788,8 +1558,8 @@ impl MemoryStore {
 			}
 			transaction.execute(
 				"INSERT INTO memories \
-				 (id, scope, cwd, body, context, origin, actor, source, created_at, updated_at, dedupe_key) \
-				 VALUES (lower(hex(randomblob(16))), 'project', ?1, ?2, ?3, 'inferred', NULL, ?4, ?5, ?5, ?6)",
+				 (id, scope, cwd, session_id, body, context, origin, actor, source, created_at, updated_at, dedupe_key) \
+				 VALUES (lower(hex(randomblob(16))), 'project', ?1, NULL, ?2, ?3, 'inferred', NULL, ?4, ?5, ?5, ?6)",
 				params![cwd_text, lesson.body, lesson.context, "learned.md", now, key],
 			)?;
 			imported += 1;
@@ -846,10 +1616,23 @@ impl MemoryStore {
 	}
 }
 
-/// Update one record and keep the legacy export in sync. User-facing edit path.
+/// Update one record and keep the legacy project export in sync. User-facing
+/// edit path.
 pub fn update_record_and_export(
 	agent_dir: &Path,
 	cwd: &Path,
+	id: &str,
+	body: &str,
+) -> MemoryResult<MemoryRecord> {
+	update_record_and_export_with_session(agent_dir, cwd, None, id, body)
+}
+
+/// Like [`update_record_and_export`], also admitting session-scoped rows.
+/// Session/global rows never touch `learned.md`; only project rows export.
+pub fn update_record_and_export_with_session(
+	agent_dir: &Path,
+	cwd: &Path,
+	session_id: Option<&str>,
 	id: &str,
 	body: &str,
 ) -> MemoryResult<MemoryRecord> {
@@ -858,27 +1641,43 @@ pub fn update_record_and_export(
 	// One-time legacy migration (marker-guarded), so ids from a pre-store file
 	// stay addressable. It never runs again after the first migration.
 	store.import_learned_lessons(agent_dir, cwd)?;
-	let record = store.update(id, Some(&cwd_text), body)?;
-	store.export_learned_lessons(agent_dir, cwd)?;
+	let record = store.update_with_session(id, Some(&cwd_text), session_id, body)?;
+	if record.scope == Scope::Project {
+		store.export_learned_lessons(agent_dir, cwd)?;
+	}
 	Ok(record)
 }
 
-/// Delete one record and keep the legacy export in sync. User-facing delete
-/// path. Conversation history in `sessions.db` is untouched by design.
+/// Delete one record and keep the legacy project export in sync. User-facing
+/// delete path. Conversation history in `sessions.db` is untouched by design.
 pub fn delete_record_and_export(agent_dir: &Path, cwd: &Path, id: &str) -> MemoryResult<()> {
+	delete_record_and_export_with_session(agent_dir, cwd, None, id)
+}
+
+/// Like [`delete_record_and_export`], also admitting session-scoped rows.
+pub fn delete_record_and_export_with_session(
+	agent_dir: &Path,
+	cwd: &Path,
+	session_id: Option<&str>,
+	id: &str,
+) -> MemoryResult<()> {
 	let store = MemoryStore::open_existing(agent_dir)?;
 	let cwd_text = project_cwd(cwd)?;
 	// Import before deleting so a legacy row gets a real id; the marker then
 	// prevents the still-present bullet from being resurrected by any export.
 	store.import_learned_lessons(agent_dir, cwd)?;
-	store.delete(id, Some(&cwd_text))?;
-	store.export_learned_lessons(agent_dir, cwd)?;
+	let record = store.get_with_session(id, Some(&cwd_text), session_id)?;
+	store.delete_with_session(id, Some(&cwd_text), session_id)?;
+	if record.scope == Scope::Project {
+		store.export_learned_lessons(agent_dir, cwd)?;
+	}
 	Ok(())
 }
 
 /// Create one explicit user assertion (`origin=asserted`, `actor=user`) and
-/// refresh the project's derived `learned.md`. Global rows have no file and are
-/// injected by [`crate::local_memory::build_memory_instructions`] instead.
+/// refresh the project's derived `learned.md`. Global/session rows have no file
+/// and are injected by [`crate::local_memory::build_memory_instructions`]
+/// (global) or read through a session-aware filter instead.
 pub fn create_asserted_and_export(
 	agent_dir: &Path,
 	cwd: &Path,
@@ -886,9 +1685,22 @@ pub fn create_asserted_and_export(
 	body: &str,
 	context: Option<&str>,
 ) -> MemoryResult<MemoryRecord> {
+	create_asserted_with_session_and_export(agent_dir, cwd, None, scope, body, context)
+}
+
+/// Like [`create_asserted_and_export`]; `session_id` is required for
+/// [`Scope::Session`] and must be absent otherwise.
+pub fn create_asserted_with_session_and_export(
+	agent_dir: &Path,
+	cwd: &Path,
+	session_id: Option<&str>,
+	scope: Scope,
+	body: &str,
+	context: Option<&str>,
+) -> MemoryResult<MemoryRecord> {
 	let store = MemoryStore::open(agent_dir)?;
 	let cwd_text = match scope {
-		Scope::Global => None,
+		Scope::Global | Scope::Session => None,
 		Scope::Project => Some(project_cwd(cwd)?),
 	};
 	if scope == Scope::Project {
@@ -898,13 +1710,14 @@ pub fn create_asserted_and_export(
 	}
 	let record = store.add(&AddInput {
 		scope,
-		cwd:     cwd_text.as_deref(),
+		cwd: cwd_text.as_deref(),
+		session_id,
 		body,
 		context,
-		origin:  Origin::Asserted,
-		actor:   Some("user"),
-		source:  Some("user"),
-		dedupe:  false,
+		origin: Origin::Asserted,
+		actor: Some("user"),
+		source: Some("user"),
+		dedupe: false,
 	})?;
 	if scope == Scope::Project {
 		store.export_learned_lessons(agent_dir, cwd)?;
@@ -914,9 +1727,19 @@ pub fn create_asserted_and_export(
 
 /// Read one visible record through the same migration path as a view.
 pub fn get_visible(agent_dir: &Path, cwd: &Path, id: &str) -> MemoryResult<MemoryRecord> {
+	get_visible_with_session(agent_dir, cwd, None, id)
+}
+
+/// Like [`get_visible`], also admitting this conversation's `session` rows.
+pub fn get_visible_with_session(
+	agent_dir: &Path,
+	cwd: &Path,
+	session_id: Option<&str>,
+	id: &str,
+) -> MemoryResult<MemoryRecord> {
 	let cwd_text = project_cwd(cwd)?;
 	let store = open_for_view(agent_dir, cwd)?;
-	store.get(id, Some(&cwd_text))
+	store.get_with_session(id, Some(&cwd_text), session_id)
 }
 
 /// All records a session for `cwd` may see: global plus this project.
@@ -925,9 +1748,22 @@ pub fn get_visible(agent_dir: &Path, cwd: &Path, id: &str) -> MemoryResult<Memor
 /// an empty database is never reported as an empty memory. When neither a
 /// store nor a legacy artifact exists the error is explicit.
 pub fn list_visible(agent_dir: &Path, cwd: &Path) -> MemoryResult<Vec<MemoryRecord>> {
+	list_visible_with_session(agent_dir, cwd, None)
+}
+
+/// Like [`list_visible`], also including this conversation's `session` rows.
+pub fn list_visible_with_session(
+	agent_dir: &Path,
+	cwd: &Path,
+	session_id: Option<&str>,
+) -> MemoryResult<Vec<MemoryRecord>> {
 	let cwd_text = project_cwd(cwd)?;
 	let store = open_for_view(agent_dir, cwd)?;
-	store.list(&Filter::all(Some(&cwd_text)))
+	let filter = match clean_session_id(session_id) {
+		Some(session_id) => Filter::all(Some(&cwd_text)).with_session(&session_id),
+		None => Filter::all(Some(&cwd_text)),
+	};
+	store.list(&filter)
 }
 
 /// Scope-selected list for the user command. `None` is the normal session view
@@ -938,12 +1774,31 @@ pub fn list_scope(
 	cwd: &Path,
 	scope: Option<Scope>,
 ) -> MemoryResult<Vec<MemoryRecord>> {
+	list_scope_with_session(agent_dir, cwd, scope, None)
+}
+
+/// Like [`list_scope`], with an optional conversation's rows included/selected.
+pub fn list_scope_with_session(
+	agent_dir: &Path,
+	cwd: &Path,
+	scope: Option<Scope>,
+	session_id: Option<&str>,
+) -> MemoryResult<Vec<MemoryRecord>> {
 	match scope {
-		None => list_visible(agent_dir, cwd),
+		None => list_visible_with_session(agent_dir, cwd, session_id),
 		Some(Scope::Global) => list_global(agent_dir),
 		Some(Scope::Project) => {
 			let store = open_for_view(agent_dir, cwd)?;
 			store.list(&Filter::project(&project_cwd(cwd)?))
+		},
+		Some(Scope::Session) => {
+			let session_id = clean_session_id(session_id).ok_or_else(|| {
+				MemoryStoreError::Validation(
+					"session scope requires a non-empty session id".to_string(),
+				)
+			})?;
+			let store = open_for_view(agent_dir, cwd)?;
+			store.list(&Filter::session(&session_id))
 		},
 	}
 }
@@ -956,7 +1811,7 @@ pub fn list_global(agent_dir: &Path) -> MemoryResult<Vec<MemoryRecord>> {
 	MemoryStore::open_existing(agent_dir)?.list(&Filter::global())
 }
 
-/// Scope-selected lexical recall, same rules as [`list_scope`].
+/// Scope-selected recall, same rules as [`list_scope`].
 pub fn recall_scope(
 	agent_dir: &Path,
 	cwd: &Path,
@@ -964,32 +1819,137 @@ pub fn recall_scope(
 	scope: Option<Scope>,
 	limit: Option<usize>,
 ) -> MemoryResult<Vec<MemoryRecord>> {
+	recall_scope_with_session(agent_dir, cwd, query, scope, None, limit)
+}
+
+/// Like [`recall_scope`], with an optional conversation's rows included.
+pub fn recall_scope_with_session(
+	agent_dir: &Path,
+	cwd: &Path,
+	query: &str,
+	scope: Option<Scope>,
+	session_id: Option<&str>,
+	limit: Option<usize>,
+) -> MemoryResult<Vec<MemoryRecord>> {
+	recall_scope_with_session_and_embedding(
+		agent_dir,
+		cwd,
+		query,
+		scope,
+		session_id,
+		None,
+		limit,
+	)
+}
+
+/// [`recall_scope_with_session`] with an optional query embedding for hybrid
+/// BM25 + cosine + MMR recall. Any absent/failed provider stays lexical.
+pub fn recall_scope_with_session_and_embedding(
+	agent_dir: &Path,
+	cwd: &Path,
+	query: &str,
+	scope: Option<Scope>,
+	session_id: Option<&str>,
+	embedding: Option<(&str, &[f32])>,
+	limit: Option<usize>,
+) -> MemoryResult<Vec<MemoryRecord>> {
 	match scope {
-		None => recall_visible(agent_dir, cwd, query, limit),
+		None => recall_visible_with_session_and_embedding(
+			agent_dir,
+			cwd,
+			query,
+			session_id,
+			embedding,
+			limit,
+		),
 		Some(Scope::Global) => {
 			if !MemoryStore::database_path(agent_dir).is_file() {
 				return Ok(Vec::new());
 			}
-			MemoryStore::open_existing(agent_dir)?.recall_global(query, limit)
+			let store = MemoryStore::open_existing(agent_dir)?;
+			store.recall_with_scope(
+				query,
+				None,
+				None,
+				limit,
+				ScopeFilter::Global,
+				embedding,
+			)
 		},
 		Some(Scope::Project) => {
 			let store = open_for_view(agent_dir, cwd)?;
-			store.recall(query, Some(&project_cwd(cwd)?), limit)
+			let cwd_text = project_cwd(cwd)?;
+			// Project recall is project-only: a default session id must not
+			// widen it to global or conversation rows.
+			store.recall_with_scope(
+				query,
+				Some(&cwd_text),
+				None,
+				limit,
+				ScopeFilter::Project,
+				embedding,
+			)
+		},
+		Some(Scope::Session) => {
+			let session_id = clean_session_id(session_id).ok_or_else(|| {
+				MemoryStoreError::Validation(
+					"session scope requires a non-empty session id".to_string(),
+				)
+			})?;
+			let store = open_for_view(agent_dir, cwd)?;
+			store.recall_with_scope(
+				query,
+				None,
+				Some(&session_id),
+				limit,
+				ScopeFilter::Session,
+				embedding,
+			)
 		},
 	}
 }
 
-/// Bounded lexical recall for a session at `cwd`, with the same legacy import
-/// rule as [`list_visible`].
+/// Bounded recall for a session at `cwd`, with the same legacy import rule as
+/// [`list_visible`].
 pub fn recall_visible(
 	agent_dir: &Path,
 	cwd: &Path,
 	query: &str,
 	limit: Option<usize>,
 ) -> MemoryResult<Vec<MemoryRecord>> {
+	recall_visible_with_session(agent_dir, cwd, query, None, limit)
+}
+
+/// Like [`recall_visible`], also including this conversation's `session` rows.
+pub fn recall_visible_with_session(
+	agent_dir: &Path,
+	cwd: &Path,
+	query: &str,
+	session_id: Option<&str>,
+	limit: Option<usize>,
+) -> MemoryResult<Vec<MemoryRecord>> {
+	recall_visible_with_session_and_embedding(
+		agent_dir,
+		cwd,
+		query,
+		session_id,
+		None,
+		limit,
+	)
+}
+
+/// [`recall_visible_with_session`] with an optional query embedding.
+pub fn recall_visible_with_session_and_embedding(
+	agent_dir: &Path,
+	cwd: &Path,
+	query: &str,
+	session_id: Option<&str>,
+	embedding: Option<(&str, &[f32])>,
+	limit: Option<usize>,
+) -> MemoryResult<Vec<MemoryRecord>> {
 	let cwd_text = project_cwd(cwd)?;
 	let store = open_for_view(agent_dir, cwd)?;
-	store.recall(query, Some(&cwd_text), limit)
+	store.recall_hybrid(query, Some(&cwd_text), session_id, embedding, limit)
 }
 
 /// Open the project's store for reading. A project whose only memory is a
@@ -1023,9 +1983,6 @@ pub fn render_learned_line(record: &MemoryRecord) -> String {
 	}
 }
 
-const RECORD_COLUMNS: &str =
-	"id, scope, cwd, body, context, origin, actor, source, created_at, updated_at";
-
 impl MemoryStore {
 	fn lock(&self) -> MutexGuard<'_, Connection> {
 		self
@@ -1041,8 +1998,8 @@ fn initialize(connection: &mut Connection) -> MemoryResult<()> {
 	match version {
 		0 => {
 			let existing: i64 = transaction.query_row(
-				"SELECT COUNT(*) FROM sqlite_master \
-				 WHERE type = 'table' AND name IN ('memories', 'memory_meta')",
+				"SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' \
+				 AND name IN ('memories', 'memory_meta', 'memories_fts', 'memory_embeddings')",
 				[],
 				|row| row.get(0),
 			)?;
@@ -1052,9 +2009,14 @@ fn initialize(connection: &mut Connection) -> MemoryResult<()> {
 						.to_string(),
 				));
 			}
-			transaction.execute_batch(SCHEMA_V1_DDL)?;
+			transaction.execute_batch(MEMORIES_V2_TABLE_DDL)?;
+			transaction.execute_batch(MEMORIES_V2_AUX_DDL)?;
+			ensure_export_dirty_gen(&transaction)?;
+			transaction.execute_batch(MEMORIES_FTS_DDL)?;
+			transaction.execute_batch(MEMORY_EMBEDDINGS_DDL)?;
 			transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
 		},
+		1 => migrate_v1_to_v2(&transaction)?,
 		SCHEMA_VERSION => {
 			let memories: i64 = transaction.query_row(
 				"SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'memories'",
@@ -1063,14 +2025,11 @@ fn initialize(connection: &mut Connection) -> MemoryResult<()> {
 			)?;
 			if memories == 0 {
 				return Err(MemoryStoreError::Schema(
-					"database records the memory schema version but has no memories table".to_string(),
+					"database records the memory schema version but has no memories table"
+						.to_string(),
 				));
 			}
-			// Additive: a v1 database created before the migration marker existed
-			// gets the table, never a silent empty store.
-			transaction.execute_batch(
-				"CREATE TABLE IF NOT EXISTS memory_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);",
-			)?;
+			repair_v2_aux(&transaction)?;
 		},
 		version if version > SCHEMA_VERSION => {
 			return Err(MemoryStoreError::Schema(format!(
@@ -1087,26 +2046,131 @@ fn initialize(connection: &mut Connection) -> MemoryResult<()> {
 	Ok(())
 }
 
+/// Transactional v1 -> v2 upgrade. Rows keep id, scope, cwd, text, origin,
+/// actor/source, timestamps and dedupe keys; new metadata columns take their
+/// defaults. The FTS index is rebuilt after the copy so pre-migration rows are
+/// searchable immediately. Runs inside the caller's `Immediate` transaction,
+/// so a failure leaves the v1 database untouched.
+fn migrate_v1_to_v2(transaction: &Connection) -> MemoryResult<()> {
+	let memories: i64 = transaction.query_row(
+		"SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'memories'",
+		[],
+		|row| row.get(0),
+	)?;
+	if memories == 0 {
+		return Err(MemoryStoreError::Schema(
+			"database records schema v1 but has no memories table".to_string(),
+		));
+	}
+	transaction.execute_batch("ALTER TABLE memories RENAME TO memories_v1;")?;
+	transaction.execute_batch(MEMORIES_V2_TABLE_DDL)?;
+	transaction.execute(
+		"INSERT INTO memories \
+		 (id, scope, cwd, session_id, body, context, origin, actor, source, \
+		  created_at, updated_at, dedupe_key) \
+		 SELECT id, scope, cwd, NULL, body, context, origin, actor, source, \
+		        created_at, updated_at, dedupe_key \
+		 FROM memories_v1",
+		[],
+	)?;
+	transaction.execute_batch("DROP TABLE memories_v1;")?;
+	transaction.execute_batch(MEMORIES_V2_AUX_DDL)?;
+	ensure_export_dirty_gen(transaction)?;
+	transaction.execute_batch(MEMORIES_FTS_DDL)?;
+	transaction.execute_batch(MEMORY_EMBEDDINGS_DDL)?;
+	transaction.execute_batch("INSERT INTO memories_fts (memories_fts) VALUES ('rebuild');")?;
+	transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
+	Ok(())
+}
+
+/// Recreate additive v2 indexes/tables/triggers if a hand-edited database
+/// missing them still claims v2. The FTS index is rebuilt only when the
+/// virtual table was actually absent.
+fn repair_v2_aux(transaction: &Connection) -> MemoryResult<()> {
+	let fts_existed: i64 = transaction.query_row(
+		"SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'memories_fts'",
+		[],
+		|row| row.get(0),
+	)?;
+	transaction.execute_batch(MEMORIES_V2_AUX_DDL)?;
+	ensure_export_dirty_gen(transaction)?;
+	transaction.execute_batch(MEMORIES_FTS_DDL)?;
+	transaction.execute_batch(MEMORY_EMBEDDINGS_DDL)?;
+	if fts_existed == 0 {
+		transaction.execute_batch("INSERT INTO memories_fts (memories_fts) VALUES ('rebuild');")?;
+	}
+	Ok(())
+}
+
+/// Upgrade a pre-generation `memory_export_dirty` table in place. The table is
+/// additive schema; `CREATE TABLE IF NOT EXISTS` cannot add columns to an
+/// existing v2 database, so check `PRAGMA table_info` once per open.
+fn ensure_export_dirty_gen(connection: &Connection) -> MemoryResult<()> {
+	let columns = {
+		let mut statement = connection.prepare("PRAGMA table_info(memory_export_dirty)")?;
+		let rows = statement.query_map([], |row| row.get::<_, String>(1))?;
+		let mut columns = Vec::new();
+		for row in rows {
+			columns.push(row?);
+		}
+		columns
+	};
+	if !columns.iter().any(|name| name.as_str() == "dirty_gen") {
+		connection.execute_batch(
+			"ALTER TABLE memory_export_dirty ADD COLUMN dirty_gen INTEGER NOT NULL DEFAULT 1",
+		)?;
+	}
+	if !columns.iter().any(|name| name.as_str() == "dirty") {
+		connection.execute_batch(
+			"ALTER TABLE memory_export_dirty ADD COLUMN dirty INTEGER NOT NULL DEFAULT 1",
+		)?;
+	}
+	Ok(())
+}
+
 fn row_to_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<MemoryRecord> {
 	let id: String = row.get(0)?;
 	let scope_raw: String = row.get(1)?;
 	let scope = Scope::parse(&scope_raw).ok_or_else(|| unusable_column(1, "scope"))?;
 	let cwd: Option<String> = row.get(2)?;
+	let session_id: Option<String> = row.get(3)?;
 	// Write path sanitizes; read repeats it so a hand-edited or corrupted
 	// database row still cannot inject prompt delimiters or leak a secret.
-	let raw_body: String = row.get(3)?;
+	let raw_body: String = row.get(4)?;
 	let body = normalize_learned_text(&raw_body, MAX_LEARNED_CONTENT_CHARS);
-	let raw_context: Option<String> = row.get(4)?;
+	let raw_context: Option<String> = row.get(5)?;
 	let context = raw_context
 		.map(|context| normalize_learned_text(&context, MAX_LEARNED_CONTEXT_CHARS))
 		.filter(|context| !context.is_empty());
-	let origin_raw: String = row.get(5)?;
-	let origin = Origin::parse(&origin_raw).ok_or_else(|| unusable_column(5, "origin"))?;
-	let actor: Option<String> = row.get(6)?;
-	let source: Option<String> = row.get(7)?;
-	let created_at: i64 = row.get(8)?;
-	let updated_at: i64 = row.get(9)?;
-	Ok(MemoryRecord { id, scope, cwd, body, context, origin, actor, source, created_at, updated_at })
+	let origin_raw: String = row.get(6)?;
+	let origin = Origin::parse(&origin_raw).ok_or_else(|| unusable_column(6, "origin"))?;
+	let actor: Option<String> = row.get(7)?;
+	let source: Option<String> = row.get(8)?;
+	let created_at: i64 = row.get(9)?;
+	let updated_at: i64 = row.get(10)?;
+	let access_count: i64 = row.get(11)?;
+	let last_accessed_at: Option<i64> = row.get(12)?;
+	let confidence: f64 = row.get(13)?;
+	let ttl_secs: Option<i64> = row.get(14)?;
+	let consolidated_into: Option<String> = row.get(15)?;
+	Ok(MemoryRecord {
+		id,
+		scope,
+		cwd,
+		session_id,
+		body,
+		context,
+		origin,
+		actor,
+		source,
+		created_at,
+		updated_at,
+		access_count: u64::try_from(access_count).unwrap_or(0),
+		last_accessed_at,
+		confidence,
+		ttl_secs,
+		consolidated_into,
+	})
 }
 
 fn unusable_column(index: usize, name: &str) -> rusqlite::Error {
@@ -1122,11 +2186,12 @@ fn load_record(connection: &Connection, id: &str) -> MemoryResult<Option<MemoryR
 
 fn normalize_scope(scope: Scope, cwd: Option<&str>) -> MemoryResult<Option<String>> {
 	match scope {
-		Scope::Global => {
+		Scope::Global | Scope::Session => {
 			if cwd.is_some_and(|value| !value.trim().is_empty()) {
-				return Err(MemoryStoreError::Validation(
-					"global memory must not carry a project cwd".to_string(),
-				));
+				return Err(MemoryStoreError::Validation(format!(
+					"{} memory must not carry a project cwd",
+					scope.as_str()
+				)));
 			}
 			Ok(None)
 		},
@@ -1142,15 +2207,69 @@ fn normalize_scope(scope: Scope, cwd: Option<&str>) -> MemoryResult<Option<Strin
 	}
 }
 
-fn ensure_visible(record: &MemoryRecord, cwd: Option<&str>) -> MemoryResult<()> {
-	if record.scope == Scope::Global {
-		return Ok(());
+fn normalize_session(scope: Scope, session_id: Option<&str>) -> MemoryResult<Option<String>> {
+	match scope {
+		Scope::Session => {
+			let session_id = session_id
+				.map(str::trim)
+				.filter(|value| !value.is_empty())
+				.ok_or_else(|| {
+					MemoryStoreError::Validation(
+						"session memory requires a non-empty session_id".to_string(),
+					)
+				})?;
+			Ok(Some(session_id.to_string()))
+		},
+		Scope::Global | Scope::Project => {
+			if session_id.is_some_and(|value| !value.trim().is_empty()) {
+				return Err(MemoryStoreError::Validation(format!(
+					"{} memory must not carry a session_id",
+					scope.as_str()
+				)));
+			}
+			Ok(None)
+		},
 	}
-	let cwd = cwd.map(str::trim).filter(|value| !value.is_empty());
-	if cwd.is_some() && cwd == record.cwd.as_deref() {
-		return Ok(());
+}
+
+fn ensure_visible(
+	record: &MemoryRecord,
+	cwd: Option<&str>,
+	session_id: Option<&str>,
+) -> MemoryResult<()> {
+	match record.scope {
+		Scope::Global => Ok(()),
+		Scope::Project => {
+			let cwd = cwd.map(str::trim).filter(|value| !value.is_empty());
+			if cwd.is_some() && cwd == record.cwd.as_deref() {
+				Ok(())
+			} else {
+				Err(MemoryStoreError::NotFound(format!(
+					"memory record not found: {}",
+					record.id
+				)))
+			}
+		},
+		Scope::Session => {
+			let session_id = session_id.map(str::trim).filter(|value| !value.is_empty());
+			if session_id.is_some() && session_id == record.session_id.as_deref() {
+				Ok(())
+			} else {
+				Err(MemoryStoreError::NotFound(format!(
+					"memory record not found: {}",
+					record.id
+				)))
+			}
+		},
 	}
-	Err(MemoryStoreError::NotFound(format!("memory record not found: {}", record.id)))
+}
+
+/// Trimmed non-empty session id; embeddings/session filters ignore blanks.
+fn clean_session_id(session_id: Option<&str>) -> Option<String> {
+	session_id
+		.map(str::trim)
+		.filter(|value| !value.is_empty())
+		.map(str::to_string)
 }
 
 /// Record ids are `lower(hex(randomblob(16)))`; case-insensitive on input.
@@ -1175,13 +2294,29 @@ fn filter_clause(filter: &Filter) -> MemoryResult<(String, Vec<Value>)> {
 		.as_deref()
 		.map(str::trim)
 		.filter(|value| !value.is_empty());
+	let session_id = filter
+		.session_id
+		.as_deref()
+		.map(str::trim)
+		.filter(|value| !value.is_empty());
 	match filter.scope {
-		ScopeFilter::All => match cwd {
-			Some(cwd) => Ok((
-				"(scope = 'global' OR (scope = 'project' AND cwd = ?))".to_string(),
-				vec![Value::Text(cwd.to_string())],
-			)),
-			None => Ok(("1 = 1".to_string(), Vec::new())),
+		ScopeFilter::All => {
+			if cwd.is_none() && session_id.is_none() {
+				// Unscoped reads are global/project only. Session rows require an
+				// explicit conversation id; otherwise every session would leak.
+				return Ok(("scope != 'session'".to_string(), Vec::new()));
+			}
+			let mut parts = vec!["scope = 'global'".to_string()];
+			let mut values = Vec::new();
+			if let Some(cwd) = cwd {
+				parts.push("(scope = 'project' AND cwd = ?)".to_string());
+				values.push(Value::Text(cwd.to_string()));
+			}
+			if let Some(session_id) = session_id {
+				parts.push("(scope = 'session' AND session_id = ?)".to_string());
+				values.push(Value::Text(session_id.to_string()));
+			}
+			Ok((format!("({})", parts.join(" OR ")), values))
 		},
 		ScopeFilter::Global => Ok(("scope = 'global'".to_string(), Vec::new())),
 		ScopeFilter::Project => {
@@ -1189,6 +2324,17 @@ fn filter_clause(filter: &Filter) -> MemoryResult<(String, Vec<Value>)> {
 				MemoryStoreError::Validation("project filter requires a non-empty cwd".to_string())
 			})?;
 			Ok(("scope = 'project' AND cwd = ?".to_string(), vec![Value::Text(cwd.to_string())]))
+		},
+		ScopeFilter::Session => {
+			let session_id = session_id.ok_or_else(|| {
+				MemoryStoreError::Validation(
+					"session filter requires a non-empty session_id".to_string(),
+				)
+			})?;
+			Ok((
+				"scope = 'session' AND session_id = ?".to_string(),
+				vec![Value::Text(session_id.to_string())],
+			))
 		},
 	}
 }
@@ -1210,38 +2356,100 @@ fn query_tokens(query: &str) -> Vec<String> {
 	tokens
 }
 
-fn like_pattern(token: &str) -> String {
-	let mut pattern = String::with_capacity(token.len() + 2);
-	pattern.push('%');
-	for ch in token.chars() {
-		if matches!(ch, '\\' | '%' | '_') {
-			pattern.push('\\');
-		}
-		pattern.push(ch);
-	}
-	pattern.push('%');
-	pattern
-}
-
-fn record_hits(record: &MemoryRecord, tokens: &[String]) -> usize {
-	let body = record.body.to_lowercase();
-	let context = record.context.as_deref().unwrap_or_default().to_lowercase();
+/// All tokens are alphanumeric (see [`query_tokens`]), so quoting plus a
+/// prefix wildcard is safe and gives FTS5 `unicode61` prefix matching.
+fn fts_query(tokens: &[String]) -> String {
 	tokens
 		.iter()
-		.map(|token| body.matches(token.as_str()).count() + context.matches(token.as_str()).count())
-		.sum()
+		.map(|token| format!("\"{token}\"*"))
+		.collect::<Vec<_>>()
+		.join(" OR ")
 }
 
-fn record_dedupe_key(scope: Scope, cwd: Option<&str>, body: &str, context: Option<&str>) -> String {
+fn record_dedupe_key(
+	scope: Scope,
+	cwd: Option<&str>,
+	session_id: Option<&str>,
+	body: &str,
+	context: Option<&str>,
+) -> String {
 	let mut hasher = Sha256::new();
 	hasher.update(scope.as_str().as_bytes());
 	hasher.update([0x1f]);
-	hasher.update(cwd.unwrap_or_default().as_bytes());
+	// The slot after the scope held the project cwd in v1; session rows use it
+	// for the conversation id, so existing v1 dedupe keys stay valid.
+	if scope == Scope::Session {
+		hasher.update(session_id.unwrap_or_default().as_bytes());
+	} else {
+		hasher.update(cwd.unwrap_or_default().as_bytes());
+	}
 	hasher.update([0x1f]);
 	hasher.update(body.as_bytes());
 	hasher.update([0x1f]);
 	hasher.update(context.unwrap_or_default().as_bytes());
 	hex(&hasher.finalize())
+}
+
+fn encode_embedding(vector: &[f32]) -> Vec<u8> {
+	let mut bytes = Vec::with_capacity(vector.len() * 4);
+	for value in vector {
+		bytes.extend_from_slice(&value.to_le_bytes());
+	}
+	bytes
+}
+
+fn decode_embedding(blob: &[u8], dim: i64) -> Option<Vec<f32>> {
+	let dim = usize::try_from(dim).ok()?;
+	if dim == 0 || blob.len() != dim.checked_mul(4)? {
+		return None;
+	}
+	let mut vector = Vec::with_capacity(dim);
+	for chunk in blob.chunks_exact(4) {
+		let bytes: [u8; 4] = chunk.try_into().ok()?;
+		vector.push(f32::from_le_bytes(bytes));
+	}
+	Some(vector)
+}
+
+fn load_embeddings_for_model(
+	connection: &Connection,
+	model: &str,
+) -> MemoryResult<BTreeMap<String, Vec<f32>>> {
+	let mut statement = connection.prepare(
+		"SELECT memory_id, dim, embedding FROM memory_embeddings WHERE model = ?1",
+	)?;
+	let rows = statement.query_map(params![model], |row| {
+		Ok((
+			row.get::<_, String>(0)?,
+			row.get::<_, i64>(1)?,
+			row.get::<_, Vec<u8>>(2)?,
+		))
+	})?;
+	let mut embeddings = BTreeMap::new();
+	for row in rows {
+		let (id, dim, blob) = row?;
+		if let Some(vector) = decode_embedding(&blob, dim) {
+			embeddings.insert(id, vector);
+		}
+	}
+	Ok(embeddings)
+}
+
+fn find_index(parent: &mut [usize], mut index: usize) -> usize {
+	while parent[index] != index {
+		let grandparent = parent[parent[index]];
+		parent[index] = grandparent;
+		index = grandparent;
+	}
+	index
+}
+
+fn union_indices(parent: &mut [usize], left: usize, right: usize) {
+	let left_root = find_index(parent, left);
+	let right_root = find_index(parent, right);
+	if left_root != right_root {
+		parent[right_root] = left_root;
+	}
 }
 
 fn hex(bytes: &[u8]) -> String {
@@ -1486,6 +2694,7 @@ mod tests {
 			.add(&AddInput {
 				scope: Scope::Global,
 				cwd: None,
+				session_id: None,
 				body: "the owner prefers staging",
 				context: None,
 				origin: Origin::Asserted,
@@ -1506,6 +2715,7 @@ mod tests {
 				.add(&AddInput {
 					scope: Scope::Project,
 					cwd: None,
+					session_id: None,
 					body: "missing cwd",
 					context: None,
 					origin: Origin::Inferred,
@@ -1577,9 +2787,8 @@ mod tests {
 		assert!(
 			store
 				.recall("...", Some("/work/one"), None)
-				.expect_err("no tokens")
-				.to_string()
-				.contains("no searchable tokens")
+				.expect("no tokens")
+				.is_empty()
 		);
 		assert!(
 			store
@@ -1955,5 +3164,382 @@ mod tests {
 			let expected = format!("record {index}");
 			assert!(records.iter().any(|record| record.body == expected), "missing {expected}");
 		}
+	}
+
+	#[test]
+	fn schema_v1_migrates_to_v2_preserving_rows_and_dedupe_identity() {
+		let dir = temp_dir();
+		let path = MemoryStore::database_path(&dir);
+		let id = "0123456789abcdef0123456789abcdef";
+		let body = "preserved migration lesson";
+		let dedupe = record_dedupe_key(Scope::Project, Some("/work/one"), None, body, None);
+		{
+			let connection = Connection::open(&path).expect("raw v1 open");
+			connection
+				.execute_batch(
+					"CREATE TABLE memories (
+						id TEXT PRIMARY KEY,
+						scope TEXT NOT NULL CHECK (scope IN ('global', 'project')),
+						cwd TEXT,
+						body TEXT NOT NULL,
+						context TEXT,
+						origin TEXT NOT NULL CHECK (origin IN ('asserted', 'inferred')),
+						actor TEXT,
+						source TEXT,
+						created_at INTEGER NOT NULL,
+						updated_at INTEGER NOT NULL,
+						dedupe_key TEXT
+					);
+					CREATE UNIQUE INDEX memories_dedupe
+						ON memories (dedupe_key) WHERE dedupe_key IS NOT NULL;
+					CREATE INDEX memories_scope_updated
+						ON memories (scope, cwd, updated_at DESC);
+					CREATE TABLE memory_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+					PRAGMA user_version = 1;",
+				)
+				.expect("v1 schema");
+			connection
+				.execute(
+					"INSERT INTO memories \
+					 (id, scope, cwd, body, context, origin, actor, source, created_at, updated_at, dedupe_key) \
+					 VALUES (?1, 'project', '/work/one', ?2, 'old context', 'inferred', 'agent', 'learn', 100, 200, ?3)",
+					params![id, body, dedupe],
+				)
+				.expect("v1 row");
+		}
+		{
+			let store = MemoryStore::open(&dir).expect("migrate");
+			let record = store.get(id, Some("/work/one")).expect("preserved row");
+			assert_eq!(record.body, body);
+			assert_eq!(record.context.as_deref(), Some("old context"));
+			assert_eq!(record.created_at, 100);
+			assert_eq!(record.updated_at, 200);
+			assert_eq!(record.session_id, None);
+			assert_eq!(record.access_count, 0);
+			assert_eq!(record.last_accessed_at, None);
+			assert_eq!(record.confidence, 1.0);
+			assert_eq!(record.ttl_secs, None);
+			assert_eq!(record.consolidated_into, None);
+			let hits = store.recall("migration lesson", Some("/work/one"), None).expect("fts after migration");
+			assert_eq!(hits.len(), 1);
+			assert_eq!(hits[0].id, id);
+			// The v1 dedupe key still matches a post-migration learn of the same text.
+			let touched = store
+				.add(&AddInput::project_lesson("/work/one", body, Some("old context")))
+				.expect("dedupe after migration");
+			assert_eq!(touched.id, id);
+			assert_eq!(store.list(&Filter::project("/work/one")).expect("list").len(), 1);
+		}
+		let store = MemoryStore::open(&dir).expect("idempotent reopen");
+		let version: i64 = store
+			.lock()
+			.query_row("PRAGMA user_version", [], |row| row.get(0))
+			.expect("version");
+		assert_eq!(version, SCHEMA_VERSION);
+		assert_eq!(store.list(&Filter::project("/work/one")).expect("still one").len(), 1);
+	}
+
+	#[test]
+	fn session_scope_is_strictly_isolated_and_checked() {
+		let store = MemoryStore::open_in_memory().expect("store");
+		let project = add_project(&store, "/work/one", "project deploy note");
+		let other = store
+			.add(&AddInput::session_lesson("session-a", "session deploy note", None))
+			.expect("session add");
+		let second = store
+			.add(&AddInput::session_lesson("session-b", "other deploy note", None))
+			.expect("second session add");
+
+		let project_view = store.list(&Filter::all(Some("/work/one"))).expect("project view");
+		assert!(!project_view.iter().any(|record| record.id == other.id));
+		let session_view = store
+			.list(&Filter::all(Some("/work/one")).with_session("session-a"))
+			.expect("session view");
+		assert!(session_view.iter().any(|record| record.id == other.id));
+		assert!(!session_view.iter().any(|record| record.id == second.id));
+		let only_session = store.list(&Filter::session("session-a")).expect("session filter");
+		assert_eq!(only_session.len(), 1);
+		assert_eq!(only_session[0].id, other.id);
+		let unscoped = store.list(&Filter::default()).expect("unscoped list");
+		assert!(unscoped.iter().all(|record| record.scope != Scope::Session));
+
+		assert!(store.get(&other.id, Some("/work/one")).is_err(), "session rows need a session");
+		assert!(store.get_with_session(&other.id, Some("/work/one"), Some("session-b")).is_err());
+		assert_eq!(
+			store
+				.get_with_session(&other.id, Some("/work/one"), Some("session-a"))
+				.expect("owner session"),
+			other
+		);
+		assert!(
+			store
+				.update_with_session(&other.id, Some("/work/one"), Some("session-b"), "hijack")
+				.is_err()
+		);
+		assert!(
+			store
+				.delete_with_session(&other.id, Some("/work/one"), Some("session-b"))
+				.is_err()
+		);
+		assert!(
+			store
+				.add(&AddInput::asserted(Scope::Session, None, "missing session"))
+				.expect_err("session requires id")
+				.to_string()
+				.contains("session_id")
+		);
+
+		// The table CHECK rejects a session row that also carries a cwd, and a
+		// project row that carries a session id.
+		let guard = store.lock();
+		let insert = "INSERT INTO memories \
+		 (id, scope, cwd, session_id, body, origin, created_at, updated_at) \
+		 VALUES ('ffffffffffffffffffffffffffffffff', ?1, ?2, ?3, 'bad', 'inferred', 1, 1)";
+		assert!(guard.execute(insert, params!["session", "/work/one", "session-a"]).is_err());
+		assert!(guard.execute(insert, params!["project", "/work/one", "session-a"]).is_err());
+		assert!(guard.execute(insert, params!["session", None, ""]).is_err());
+		assert_eq!(project.id.len(), RECORD_ID_LEN);
+	}
+
+	#[test]
+	fn embeddings_roundtrip_hybrid_recall_and_invalidate_on_update() {
+		let store = MemoryStore::open_in_memory().expect("store");
+		let alpha = add_project(&store, "/work/one", "deploy staging alpha");
+		let beta = add_project(&store, "/work/one", "deploy staging beta");
+		let query = [1.0f32, 0.0, 0.0, 0.0];
+		store.set_embedding(&alpha.id, "test-model", &query).expect("alpha vector");
+		store
+			.set_embedding(&beta.id, "test-model", &[0.0, 1.0, 0.0, 0.0])
+			.expect("beta vector");
+		assert_eq!(
+			store.embedding(&alpha.id, "test-model").expect("read vector"),
+			Some(query.to_vec())
+		);
+		assert!(store.set_embedding(&alpha.id, "test-model", &[f32::NAN]).is_err());
+
+		let semantic = add_project(&store, "/work/one", "unrelated garden note");
+		store.set_embedding(&semantic.id, "test-model", &query).expect("semantic vector");
+		let lexical = store.recall("deploy staging", Some("/work/one"), Some(2)).expect("lexical");
+		assert_eq!(lexical.len(), 2);
+		let hybrid = store
+			.recall_hybrid(
+				"deploy staging",
+				Some("/work/one"),
+				None,
+				Some(("test-model", query.as_slice())),
+				Some(2),
+			)
+			.expect("hybrid");
+		assert_eq!(hybrid.len(), 2);
+		assert_eq!(hybrid[0].id, alpha.id, "matching vector ranks first");
+		assert!(hybrid[0].access_count >= 1);
+		assert!(hybrid[0].last_accessed_at.is_some());
+		let union = store
+			.recall_hybrid(
+				"deploy staging",
+				Some("/work/one"),
+				None,
+				Some(("test-model", query.as_slice())),
+				Some(10),
+			)
+			.expect("vector candidates union FTS");
+		assert!(union.iter().any(|record| record.id == semantic.id), "semantic-only row");
+		let punctuation = store
+			.recall_hybrid(
+				"?!?!",
+				Some("/work/one"),
+				None,
+				Some(("test-model", query.as_slice())),
+				Some(10),
+			)
+			.expect("punctuation falls through to vectors");
+		assert!(punctuation.iter().any(|record| record.id == semantic.id));
+		assert!(
+			store
+				.recall("?!?!", Some("/work/one"), Some(10))
+				.expect("punctuation lexical is empty")
+				.is_empty()
+		);
+
+		// A body edit invalidates the stale vector.
+		store
+			.update(&alpha.id, Some("/work/one"), "deploy staging rewritten")
+			.expect("update");
+		assert_eq!(store.embedding(&alpha.id, "test-model").expect("after update"), None);
+		store
+			.recall_hybrid("deploy staging", Some("/work/one"), None, Some(("test-model", query.as_slice())), Some(2))
+			.expect("hybrid falls back when vectors are missing");
+	}
+
+	#[test]
+	fn asserted_ttl_rows_survive_and_consolidation_targets_stay_in_scope() {
+		let store = MemoryStore::open_in_memory().expect("store");
+		let asserted = store
+			.add(&AddInput::asserted(Scope::Project, Some("/work/one"), "asserted ttl"))
+			.expect("asserted");
+		store.set_ttl(&asserted.id, Some(1)).expect("ttl");
+		let inferred = add_project(&store, "/work/one", "inferred ttl");
+		store.set_ttl(&inferred.id, Some(1)).expect("ttl");
+		let report = store
+			.consolidate_at(now_seconds().saturating_add(60))
+			.expect("consolidate");
+		assert_eq!(report.expired, 1, "only inferred rows expire");
+		assert!(store.get(&asserted.id, Some("/work/one")).is_ok());
+		assert!(store.get(&inferred.id, Some("/work/one")).is_err());
+		// Expired against the real wall clock, not just the injected clock.
+		store.set_ttl(&asserted.id, Some(0)).expect("past asserted ttl");
+		let hits = store
+			.recall("asserted ttl", Some("/work/one"), Some(10))
+			.expect("asserted recall");
+		assert!(
+			hits.iter().any(|record| record.id == asserted.id),
+			"asserted rows stay recallable after TTL"
+		);
+
+		let same_scope = add_project(&store, "/work/one", "same scope");
+		let other_scope = add_project(&store, "/work/two", "other scope");
+		assert!(
+			store
+				.set_consolidated_into(&same_scope.id, Some(other_scope.id.as_str()))
+				.is_err()
+		);
+		store
+			.set_consolidated_into(&same_scope.id, Some(asserted.id.as_str()))
+			.expect("same scope");
+		assert_eq!(
+			store
+				.get(&same_scope.id, Some("/work/one"))
+				.expect("record")
+				.consolidated_into
+				.as_deref(),
+			Some(asserted.id.as_str())
+		);
+	}
+
+	#[test]
+	fn ttl_consolidation_refreshes_the_derived_learned_file() {
+		let dir = temp_dir();
+		let agent_dir = dir.join("agent");
+		let cwd = dir.join("project");
+		fs::create_dir_all(&agent_dir).expect("agent");
+		fs::create_dir_all(&cwd).expect("project");
+		let cwd_text = cwd.to_string_lossy().to_string();
+		let store = MemoryStore::open(&agent_dir).expect("store");
+		let expired = store
+			.add(&AddInput::project_lesson(&cwd_text, "stale exported lesson", None))
+			.expect("lesson");
+		store.set_ttl(&expired.id, Some(1)).expect("ttl");
+		store
+			.export_learned_lessons(&agent_dir, &cwd)
+			.expect("initial export");
+		let learned = crate::local_memory::memory_root(&agent_dir, &cwd)
+			.join(crate::local_memory::LEARNED_LESSONS_FILE);
+		assert!(fs::read_to_string(&learned).expect("learned").contains("stale exported lesson"));
+		store
+			.consolidate_at(now_seconds().saturating_add(60))
+			.expect("consolidate");
+		assert!(
+			!fs::read_to_string(&learned)
+				.expect("learned after expiry")
+				.contains("stale exported lesson")
+		);
+	}
+
+	#[test]
+	fn failed_ttl_export_retries_on_the_next_consolidation() {
+		let dir = temp_dir();
+		let agent_dir = dir.join("agent");
+		let cwd = dir.join("project");
+		fs::create_dir_all(&agent_dir).expect("agent");
+		fs::create_dir_all(&cwd).expect("project");
+		let cwd_text = cwd.to_string_lossy().to_string();
+		let store = MemoryStore::open(&agent_dir).expect("store");
+		let expired = store
+			.add(&AddInput::project_lesson(&cwd_text, "retry export lesson", None))
+			.expect("lesson");
+		store.set_ttl(&expired.id, Some(1)).expect("ttl");
+		store
+			.export_learned_lessons(&agent_dir, &cwd)
+			.expect("initial export");
+		let learned = crate::local_memory::memory_root(&agent_dir, &cwd)
+			.join(crate::local_memory::LEARNED_LESSONS_FILE);
+		// Block the atomic rename by making the destination a directory.
+		fs::remove_file(&learned).expect("remove learned");
+		fs::create_dir_all(&learned).expect("block learned");
+
+		assert!(
+			store
+				.consolidate_at(now_seconds().saturating_add(60))
+				.is_err(),
+			"blocked export must surface"
+		);
+		assert!(store.get(&expired.id, Some(cwd_text.as_str())).is_err());
+		let dirty: i64 = store
+			.lock()
+			.query_row(
+				"SELECT COUNT(*) FROM memory_export_dirty WHERE dirty != 0",
+				[],
+				|row| row.get(0),
+			)
+			.expect("dirty count");
+		assert_eq!(dirty, 1, "failed export stays marked");
+
+		fs::remove_dir_all(&learned).expect("unblock learned");
+		store
+			.consolidate_at(now_seconds().saturating_add(60))
+			.expect("retry export");
+		assert!(
+			!fs::read_to_string(&learned)
+				.expect("learned repaired")
+				.contains("retry export lesson")
+		);
+		let dirty: i64 = store
+			.lock()
+			.query_row(
+				"SELECT COUNT(*) FROM memory_export_dirty WHERE dirty != 0",
+				[],
+				|row| row.get(0),
+			)
+			.expect("clean count");
+		assert_eq!(dirty, 0);
+	}
+
+	#[test]
+	fn consolidation_expires_ttl_and_clusters_near_duplicates_per_scope() {
+		let store = MemoryStore::open_in_memory().expect("store");
+		let first = add_project(&store, "/work/one", "staging deploy alpha");
+		let second = add_project(&store, "/work/one", "staging deploy beta");
+		let other_scope = add_project(&store, "/work/two", "staging deploy alpha");
+		let expired = add_project(&store, "/work/one", "staging deploy expired");
+		store.set_ttl(&expired.id, Some(10)).expect("ttl");
+		let vector = [1.0f32, 0.0, 0.0, 0.0];
+		let near = [0.999f32, 0.01, 0.0, 0.0];
+		store.set_embedding(&first.id, "test-model", &vector).expect("first");
+		store.set_embedding(&second.id, "test-model", &near).expect("second");
+		store.set_embedding(&other_scope.id, "test-model", &vector).expect("other");
+
+		let report = store
+			.consolidate_at(now_seconds().saturating_add(60))
+			.expect("consolidate");
+		assert_eq!(report.expired, 1);
+		assert_eq!(report.consolidated, 1);
+		assert_eq!(report.clusters, 1);
+		assert_eq!(report.llm_used, 0);
+
+		let canonical = if first.id < second.id { &first.id } else { &second.id };
+		let duplicate = if first.id < second.id { &second.id } else { &first.id };
+		let duplicate_record = store.get(duplicate, Some("/work/one")).expect("duplicate row");
+		assert_eq!(duplicate_record.consolidated_into.as_deref(), Some(canonical.as_str()));
+		let cross_scope = store.get(&other_scope.id, Some("/work/two")).expect("other scope");
+		assert_eq!(cross_scope.consolidated_into, None);
+		assert!(store.get(&expired.id, Some("/work/one")).is_err(), "ttl row expired");
+
+		let hits = store.recall("staging deploy", Some("/work/one"), Some(10)).expect("recall");
+		assert!(hits.iter().all(|record| record.id != *duplicate), "duplicates hidden");
+		assert!(hits.iter().any(|record| record.id == *canonical));
+
+		store.set_ttl(&first.id, Some(0)).expect("immediate ttl");
+		let report = store.consolidate_at(now_seconds()).expect("second pass");
+		assert_eq!(report.expired, 1);
 	}
 }

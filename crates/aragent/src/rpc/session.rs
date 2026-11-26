@@ -332,6 +332,9 @@ pub struct RpcSession {
 	/// schemes here, and the runner hands the same handle to root and child
 	/// `read`/`write` tools.
 	pub(crate) internal_urls: Arc<InternalUrlRouter>,
+	/// Live `memory://` session-id slot, updated on `new_session`/`switch_session`
+	/// so record reads and writes follow the persisted conversation.
+	pub(crate) memory_session: Option<Arc<std::sync::RwLock<Option<String>>>>,
 	/// Observer fed to `RunRequest.subagent_observer` so the runner subscribes
 	/// the registry to whichever supervisor it builds.
 	pub(crate) observer: Arc<dyn SubagentObserver>,
@@ -422,11 +425,6 @@ impl RpcSession {
 			.agent_dir
 			.clone()
 			.unwrap_or_else(crate::dirs::agent_dir);
-		if let Err(error) = internal_urls.register(Arc::new(
-			crate::memory_protocol::MemoryUrlHandler::new(memory_agent_dir, config.memory_backend()),
-		)) {
-			return Err(Error::new(error));
-		}
 
 		let mut store = match preopened_store {
 			Some(store) => store,
@@ -439,6 +437,20 @@ impl RpcSession {
 			return Err(Error::new(
 				"cannot run RPC on a legacy JSONL session: read-only; import it into the SQLite store first",
 			));
+		}
+		// Bind `memory://` to the persisted session id so session-scoped rows are
+		// visible only to this conversation. The store must open first; a
+		// disabled store has no id to scope.
+		let memory_session_id = store.enabled().then(|| store.id().to_owned());
+		let memory_handler = crate::memory_protocol::MemoryUrlHandler::new(
+			memory_agent_dir,
+			config.memory_backend(),
+		)
+		.with_session_id(memory_session_id)
+		.with_embedding_provider(config.embedding_provider());
+		let memory_session = Some(memory_handler.session_slot());
+		if let Err(error) = internal_urls.register(Arc::new(memory_handler)) {
+			return Err(Error::new(error));
 		}
 		// Requested persistence must never silently become ephemeral.
 		if store_options.enabled && !store.enabled() {
@@ -564,6 +576,7 @@ impl RpcSession {
 			subagent_level: SubagentSubscriptionLevel::Off,
 			protocol_version: 1,
 			internal_urls,
+			memory_session,
 			observer,
 			goal: Arc::new(crate::goal::GoalRuntime::new()),
 			acp_bridge: None,
@@ -1394,6 +1407,17 @@ impl RpcSession {
 
 	// ------------------------------------------------------------- sessions --
 
+	/// Keep `memory://` scoped to the current persisted session after a swap.
+	fn rebind_memory(&self) {
+		let Some(slot) = &self.memory_session else {
+			return;
+		};
+		let session_id = self.store.enabled().then(|| self.store.id().to_owned());
+		if let Ok(mut current) = slot.write() {
+			*current = session_id;
+		}
+	}
+
 	/// Rebind hook state to the current session id after a store swap so
 	/// `SessionStart` runs once for the new log.
 	fn rebind_hooks(&mut self) {
@@ -1433,6 +1457,7 @@ impl RpcSession {
 		// lineage survives a reload of the new log.
 		self.store = store;
 		self.rebind_hooks();
+		self.rebind_memory();
 		self.restore_service_tiers();
 		self.history.clear();
 		self.history_messages = None;
@@ -1557,6 +1582,7 @@ impl RpcSession {
 			.filter(|text| !text.is_empty());
 		self.store = store;
 		self.rebind_hooks();
+		self.rebind_memory();
 		self.restore_service_tiers();
 		self.checkpoint_host = CheckpointHost::new();
 		self.checkpoint_host.rehydrate(&self.store);
@@ -1866,11 +1892,12 @@ impl RpcSession {
 			let tool: Arc<dyn pi_agent::tool::Tool> = Arc::new(tool);
 			tools.push(crate::agent::ExtraTool::from(tool));
 		}
-		if learn && let Some(tool) = crate::autolearn::LocalLearnTool::create_if(
+		if learn && let Some(tool) = crate::autolearn::LocalLearnTool::create_if_with_embeddings(
 			true,
 			crate::autolearn::MemoryBackend::Local,
 			self.skill_options.clone(),
 			self.skill_snapshot.clone(),
+			self.config.embedding_provider(),
 		) {
 			let tool: Arc<dyn pi_agent::tool::Tool> = Arc::new(tool);
 			tools.push(crate::agent::ExtraTool::from(tool));

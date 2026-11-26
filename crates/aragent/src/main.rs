@@ -317,10 +317,13 @@ fn run() -> std::result::Result<(), CliError> {
 			argv.extend(args.iter().cloned());
 			let stdout = io::stdout();
 			let mut out = io::BufWriter::new(stdout.lock());
-			aragent::memory_cmd::execute(
+			let embedding = config.embedding_provider();
+			aragent::memory_cmd::execute_with_session_and_embeddings(
 				&argv,
 				&dirs::agent_dir(),
 				&base,
+				None,
+				embedding.as_deref(),
 				config.memory_backend(),
 				&mut out,
 			)
@@ -756,9 +759,6 @@ fn run() -> std::result::Result<(), CliError> {
 		.agent_dir
 		.clone()
 		.unwrap_or_else(dirs::agent_dir);
-	let _ = internal_urls
-		.register(Arc::new(MemoryUrlHandler::new(memory_agent_dir, config.memory_backend())))
-		.map_err(Error::new)?;
 	let catalog = Arc::new(Catalog::load(&cwd)?);
 	let approvals =
 		Approvals::new(config.approval_mode.unwrap_or_default(), config.allow.iter().cloned())
@@ -1339,6 +1339,19 @@ fn run() -> std::result::Result<(), CliError> {
 		);
 	}
 	session.store = store;
+	// `memory://` is mounted after the store opens so the handler can bind this
+	// conversation's id; session-scoped rows stay invisible to other sessions.
+	let memory_session_id = session.store.enabled().then(|| session.store.id().to_owned());
+	let memory_backend = session.config.memory_backend();
+	let memory_embedding = session.config.embedding_provider();
+	let _ = session
+		.internal_urls
+		.register(Arc::new(
+			MemoryUrlHandler::new(memory_agent_dir, memory_backend)
+				.with_session_id(memory_session_id)
+				.with_embedding_provider(memory_embedding),
+		))
+		.map_err(Error::new)?;
 	// One authoritative live selection, resolved once at launch with the TS
 	// precedence (explicit flag, then the recorded entry including a reset,
 	let base_service_tiers = if session.store.has_service_tier_entry() {
@@ -1614,11 +1627,15 @@ fn run_repl<W: Write, E: Write>(
 					.agent_dir
 					.clone()
 					.unwrap_or_else(dirs::agent_dir);
+				let session_id = session.store.enabled().then(|| session.store.id().to_owned());
+				let embedding = session.config.embedding_provider();
 				let mut err = io::stderr();
-				if let Err(error) = aragent::memory_cmd::execute(
+				if let Err(error) = aragent::memory_cmd::execute_with_session_and_embeddings(
 					&argv,
 					&agent_dir,
 					&session.cwd,
+					session_id.as_deref(),
+					embedding.as_deref(),
 					session.config.memory_backend(),
 					&mut err,
 				) {
@@ -2055,11 +2072,12 @@ impl Session<'_> {
 			tools.push(ExtraTool::from(tool));
 		}
 		if learn
-			&& let Some(tool) = LocalLearnTool::create_if(
+			&& let Some(tool) = LocalLearnTool::create_if_with_embeddings(
 				true,
 				MemoryBackend::Local,
 				self.skill_options.clone(),
 				self.skill_snapshot.clone(),
+				self.config.embedding_provider(),
 			) {
 			let tool: Arc<dyn pi_agent::tool::Tool> = Arc::new(tool);
 			tools.push(ExtraTool::from(tool));

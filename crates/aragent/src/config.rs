@@ -1059,6 +1059,14 @@ pub struct Config {
 	pub memories_enabled: Option<bool>,
 	/// `memories.summaryInjectionTokenLimit`; absent means 5000.
 	pub memories_summary_injection_token_limit: Option<usize>,
+	/// `memory.embeddingsUrl`: OpenAI-compatible embeddings endpoint.
+	pub memory_embeddings_url: Option<String>,
+	/// `memory.embeddingsModel`; defaults to `text-embedding-3-small`.
+	pub memory_embeddings_model: Option<String>,
+	/// `memory.embeddingsApiKey`; also auto-detected from a `9router` provider.
+	pub memory_embeddings_api_key: Option<String>,
+	/// `memory.embeddingsLocal`: opt into the `local-embeddings` feature.
+	pub memory_embeddings_local: Option<bool>,
 	/// `autolearn.*`: post-stop capture settings.
 	pub autolearn: AutolearnConfig,
 	/// `skills.*`: discovery toggles and filters.
@@ -1234,6 +1242,66 @@ impl Config {
 			.unwrap_or(MemoryBackend::Off)
 	}
 
+	/// Optional embedding provider for hybrid memory recall.
+	///
+	/// Priority: an explicitly configured local model (when the
+	/// `local-embeddings` feature is compiled in), then an explicit
+	/// `memory.embeddingsUrl`, then a configured `9router`/`ninerouter` provider.
+	/// Any construction failure (offline, missing model, bad URL) returns `None`
+	/// so lexical FTS5 recall remains available.
+	#[must_use]
+	pub fn embedding_provider(
+		&self,
+	) -> Option<std::sync::Arc<dyn crate::memory_embeddings::EmbeddingProvider>> {
+		if self.memory_backend() != MemoryBackend::Local {
+			return None;
+		}
+		#[cfg(feature = "local-embeddings")]
+		if self.memory_embeddings_local.unwrap_or(false) {
+			let mut config = crate::memory_embeddings::FastEmbedConfig::default();
+			if let Some(model) = self.memory_embeddings_model.as_deref() {
+				config.model = model.to_string();
+			}
+			if let Ok(provider) = crate::memory_embeddings::FastEmbedProvider::new(config) {
+				return Some(std::sync::Arc::new(provider));
+			}
+			return None;
+		}
+		let provider = self
+			.providers
+			.iter()
+			.find(|(name, _)| {
+				name.eq_ignore_ascii_case("9router")
+					|| name.eq_ignore_ascii_case("ninerouter")
+			})
+			.map(|(_, provider)| provider);
+		let url = self
+			.memory_embeddings_url
+			.clone()
+			.or_else(|| provider.and_then(|provider| provider.base_url.clone()))?;
+		let model = self
+			.memory_embeddings_model
+			.as_deref()
+			.unwrap_or("text-embedding-3-small");
+		let mut config = crate::memory_embeddings::HttpEmbeddingConfig::new(url, model);
+		let api_key = self
+			.memory_embeddings_api_key
+			.clone()
+			.or_else(|| provider.and_then(ProviderConfig::resolve_api_key));
+		if let Some(api_key) = api_key.filter(|key| !key.trim().is_empty()) {
+			// A literal config key skips `resolve_api_key`; register it here so
+			// every log path can mask it, not just embedding error redaction.
+			crate::auth::known_secrets::register(&api_key);
+			config = config.with_api_key(api_key);
+		}
+		crate::memory_embeddings::HttpEmbeddingProvider::new(config)
+			.ok()
+			.map(|provider| {
+				std::sync::Arc::new(provider)
+					as std::sync::Arc<dyn crate::memory_embeddings::EmbeddingProvider>
+			})
+	}
+
 	/// `memories.summaryInjectionTokenLimit`, default 5000.
 	#[must_use]
 	pub fn summary_injection_token_limit(&self) -> usize {
@@ -1281,6 +1349,18 @@ impl Config {
 		if overlay.memories_summary_injection_token_limit.is_some() {
 			self.memories_summary_injection_token_limit =
 				overlay.memories_summary_injection_token_limit;
+		}
+		if overlay.memory_embeddings_url.is_some() {
+			self.memory_embeddings_url = overlay.memory_embeddings_url;
+		}
+		if overlay.memory_embeddings_model.is_some() {
+			self.memory_embeddings_model = overlay.memory_embeddings_model;
+		}
+		if overlay.memory_embeddings_api_key.is_some() {
+			self.memory_embeddings_api_key = overlay.memory_embeddings_api_key;
+		}
+		if overlay.memory_embeddings_local.is_some() {
+			self.memory_embeddings_local = overlay.memory_embeddings_local;
 		}
 		self.prewalk.merge(overlay.prewalk);
 		self.security.merge(overlay.security);
@@ -1970,6 +2050,25 @@ fn apply_nested_settings(config: &mut Config, value: &Value, path: &Path) -> Res
 	) {
 		config.memories_summary_injection_token_limit =
 			expect_usize(limit, "memories.summaryInjectionTokenLimit", path)?;
+	}
+	if let Some(url) = settings_leaf(value, "memory", "embeddingsUrl", "memory.embeddingsUrl") {
+		config.memory_embeddings_url =
+			expect_text(url, "memory.embeddingsUrl", path)?;
+	}
+	if let Some(model) = settings_leaf(value, "memory", "embeddingsModel", "memory.embeddingsModel") {
+		config.memory_embeddings_model =
+			expect_text(model, "memory.embeddingsModel", path)?;
+	}
+	if let Some(api_key) =
+		settings_leaf(value, "memory", "embeddingsApiKey", "memory.embeddingsApiKey")
+	{
+		config.memory_embeddings_api_key =
+			expect_text(api_key, "memory.embeddingsApiKey", path)?;
+	}
+	if let Some(local) = settings_leaf(value, "memory", "embeddingsLocal", "memory.embeddingsLocal")
+	{
+		config.memory_embeddings_local =
+			expect_bool(local, "memory.embeddingsLocal", path)?;
 	}
 	for (leaf, dotted) in [
 		("enabled", "autolearn.enabled"),

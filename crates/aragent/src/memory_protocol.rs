@@ -29,6 +29,7 @@ use std::{
 	fs,
 	io::Read as _,
 	path::{Path, PathBuf},
+	sync::{Arc, RwLock},
 };
 
 use async_trait::async_trait;
@@ -39,6 +40,7 @@ use pi_agent::tools::internal_urls::{
 use crate::{
 	autolearn::MemoryBackend,
 	local_memory,
+	memory_embeddings::{EmbeddingProvider, embed_best_effort},
 	memory_store::{self, MemoryRecord},
 	skill_protocol::{content_type_for, decode_percent, validate_relative_path},
 };
@@ -56,28 +58,77 @@ const DEFAULT_MEMORY_FILE: &str = "memory_summary.md";
 /// `root` reads legacy file artifacts; record ids read and write the SQLite
 /// memory store. The file namespace remains the export/import surface.
 pub struct MemoryUrlHandler {
-	agent_dir: PathBuf,
-	backend:   MemoryBackend,
+	agent_dir:  PathBuf,
+	backend:    MemoryBackend,
+	session_id: Arc<RwLock<Option<String>>>,
+	embedding:  Option<Arc<dyn EmbeddingProvider>>,
 }
 
 impl MemoryUrlHandler {
 	#[must_use]
 	pub fn new(agent_dir: PathBuf, backend: MemoryBackend) -> Self {
-		Self { agent_dir, backend }
+		Self {
+			agent_dir,
+			backend,
+			session_id: Arc::new(RwLock::new(None)),
+			embedding: None,
+		}
+	}
+
+	/// Bind this handler to one conversation, so `list`, `search`, record reads,
+	/// and writes include that session's own rows.
+	#[must_use]
+	pub fn with_session_id(self, session_id: Option<String>) -> Self {
+		self.set_session_id(session_id);
+		self
+	}
+
+	/// Shared slot for session swaps: an RPC session keeps this handle and
+	/// updates it after `new_session`/`switch_session` without re-registering
+	/// the protocol scheme.
+	#[must_use]
+	pub fn session_slot(&self) -> Arc<RwLock<Option<String>>> {
+		Arc::clone(&self.session_id)
+	}
+
+	/// Replace the live conversation id.
+	pub fn set_session_id(&self, session_id: Option<String>) {
+		if let Ok(mut slot) = self.session_id.write() {
+			*slot = session_id;
+		}
+	}
+
+	/// Attach the optional provider used to embed `memory://search/<query>`.
+	#[must_use]
+	pub fn with_embedding_provider(
+		mut self,
+		embedding: Option<Arc<dyn EmbeddingProvider>>,
+	) -> Self {
+		self.embedding = embedding;
+		self
+	}
+
+	fn current_session_id(&self) -> Option<String> {
+		self.session_id.read().ok().and_then(|slot| slot.clone())
 	}
 
 	/// `list`, `search/<query>`, and record-id namespaces backed by the SQLite
 	/// store. `root` is handled by the file path in [`ProtocolHandler::resolve`].
-	fn resolve_record_namespace(
+	async fn resolve_record_namespace(
 		&self,
 		url: &InternalUrl,
 		namespace: &str,
 		context: &ResolveContext,
 	) -> Result<InternalResource, String> {
 		let relative = url.path.trim_start_matches('/');
+		let session_id = self.current_session_id();
 		let mut resource = match namespace {
 			LIST_NAMESPACE if relative.is_empty() => {
-				let records = match memory_store::list_visible(&self.agent_dir, &context.cwd) {
+				let records = match memory_store::list_visible_with_session(
+					&self.agent_dir,
+					&context.cwd,
+					session_id.as_deref(),
+				) {
 					Ok(records) => records,
 					Err(memory_store::MemoryStoreError::NotFound(_)) => Vec::new(),
 					Err(error) => return Err(error.to_string()),
@@ -86,10 +137,32 @@ impl MemoryUrlHandler {
 			},
 			SEARCH_NAMESPACE if !relative.is_empty() => {
 				let query = decode_percent(relative);
-				let records = match memory_store::recall_visible(
+				let embedding = match &self.embedding {
+					Some(provider) => {
+						// Search queries can contain pasted credentials; redact
+						// before they reach a remote embedding endpoint.
+						let text = local_memory::normalize_lesson_for_embedding(&query);
+						if text.is_empty() {
+							None
+						} else {
+							let texts = vec![text];
+							embed_best_effort(Some(provider.as_ref()), &texts)
+								.await
+								.and_then(|mut vectors| vectors.pop())
+								.map(|vector| (provider.model().to_string(), vector))
+						}
+					},
+					None => None,
+				};
+				let embedding = embedding
+					.as_ref()
+					.map(|(model, vector)| (model.as_str(), vector.as_slice()));
+				let records = match memory_store::recall_visible_with_session_and_embedding(
 					&self.agent_dir,
 					&context.cwd,
 					&query,
+					session_id.as_deref(),
+					embedding,
 					None,
 				) {
 					Ok(records) => records,
@@ -103,7 +176,7 @@ impl MemoryUrlHandler {
 					.map_err(|error| error.to_string())?;
 				let cwd = context.cwd.to_string_lossy();
 				let record = store
-					.get(namespace, Some(cwd.as_ref()))
+					.get_with_session(namespace, Some(cwd.as_ref()), session_id.as_deref())
 					.map_err(|error| error.to_string())?;
 				InternalResource::text(&url.href, render_record(&record))
 			},
@@ -166,8 +239,15 @@ impl ProtocolHandler for MemoryUrlHandler {
 		}
 		// Edit only: identity (scope, cwd, origin, actor, source) is immutable.
 		// The derived `learned.md` export is refreshed from the store.
-		memory_store::update_record_and_export(&self.agent_dir, &context.cwd, namespace, content)
-			.map_err(|error| error.to_string())?;
+		let session_id = self.current_session_id();
+		memory_store::update_record_and_export_with_session(
+			&self.agent_dir,
+			&context.cwd,
+			session_id.as_deref(),
+			namespace,
+			content,
+		)
+		.map_err(|error| error.to_string())?;
 		Ok(())
 	}
 
@@ -192,7 +272,7 @@ impl ProtocolHandler for MemoryUrlHandler {
 			);
 		}
 		if namespace != MEMORY_NAMESPACE {
-			return self.resolve_record_namespace(url, namespace, context);
+			return self.resolve_record_namespace(url, namespace, context).await;
 		}
 
 		// Root is per calling session cwd (`memoryRootsForContext`), not global.
@@ -294,12 +374,20 @@ pub fn render_record_list(records: &[MemoryRecord]) -> String {
 	out
 }
 
-/// `global` or `project:<cwd>`; the one scope spelling every surface uses.
+/// `global`, `project:<cwd>`, or `session:<id>`; the one scope spelling every
+/// surface uses.
 #[must_use]
 pub fn scope_label(record: &MemoryRecord) -> String {
-	match &record.cwd {
-		Some(cwd) => format!("project:{cwd}"),
-		None => "global".to_string(),
+	match record.scope {
+		crate::memory_store::Scope::Global => "global".to_string(),
+		crate::memory_store::Scope::Project => format!(
+			"project:{}",
+			record.cwd.as_deref().unwrap_or_default()
+		),
+		crate::memory_store::Scope::Session => format!(
+			"session:{}",
+			record.session_id.as_deref().unwrap_or_default()
+		),
 	}
 }
 
@@ -309,6 +397,9 @@ pub fn render_record(record: &MemoryRecord) -> String {
 	let mut out = format!("# Memory {}\n\n- scope: {}\n", record.id, record.scope.as_str());
 	if let Some(cwd) = &record.cwd {
 		out.push_str(&format!("- cwd: {cwd}\n"));
+	}
+	if let Some(session_id) = &record.session_id {
+		out.push_str(&format!("- session: {session_id}\n"));
 	}
 	out.push_str(&format!("- origin: {}\n", record.origin.as_str()));
 	if let Some(actor) = &record.actor {
@@ -502,6 +593,50 @@ mod tests {
 		let listing = resolve(&handler, &cwd, "memory://list").await.expect("imported list");
 		assert!(listing.content.contains("legacy deploy lesson"), "{}", listing.content);
 		assert!(memory_store::MemoryStore::database_path(&agent_dir).is_file());
+	}
+
+	struct RecordingProvider {
+		seen: std::sync::Mutex<Vec<String>>,
+	}
+
+	#[async_trait::async_trait]
+	impl EmbeddingProvider for RecordingProvider {
+		fn model(&self) -> &str {
+			"recording"
+		}
+
+		async fn embed(
+			&self,
+			texts: &[String],
+		) -> Result<Vec<Vec<f32>>, crate::memory_embeddings::EmbeddingError> {
+			if let Ok(mut seen) = self.seen.lock() {
+				seen.extend(texts.iter().cloned());
+			}
+			Ok(texts.iter().map(|_| vec![1.0f32]).collect())
+		}
+	}
+
+	#[tokio::test]
+	async fn search_redacts_the_remote_embedding_query() {
+		let (cwd, agent_dir, handler) = fixture();
+		std::fs::write(
+			local_memory::memory_root(&agent_dir, &cwd).join(local_memory::LEARNED_LESSONS_FILE),
+			"- legacy searchable lesson\n",
+		)
+		.expect("legacy");
+		let provider = std::sync::Arc::new(RecordingProvider {
+			seen: std::sync::Mutex::new(Vec::new()),
+		});
+		let embedding =
+			provider.clone() as std::sync::Arc<dyn EmbeddingProvider>;
+		let handler = handler.with_embedding_provider(Some(embedding));
+		resolve(&handler, &cwd, "memory://search/token%20sk-abcdefghijklmnop")
+			.await
+			.expect("search");
+		let seen = provider.seen.lock().expect("seen");
+		assert_eq!(seen.len(), 1);
+		assert!(seen[0].contains("[REDACTED]"), "{}", seen[0]);
+		assert!(!seen[0].contains("sk-"), "{}", seen[0]);
 	}
 
 	#[tokio::test]

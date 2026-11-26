@@ -262,6 +262,15 @@ pub(crate) fn normalize_learned_text(text: &str, max_chars: usize) -> String {
 	bound_chars(redact_secrets(&neutralize_injection(text)).trim(), max_chars)
 }
 
+/// Body exactly as the memory store will persist it, for embedding calls.
+///
+/// Call this before sending lesson text to a remote embedding provider so
+/// credentials and prompt-injection delimiters never leave the process.
+#[must_use]
+pub fn normalize_lesson_for_embedding(text: &str) -> String {
+	normalize_learned_text(text, MAX_LEARNED_CONTENT_CHARS)
+}
+
 /// One `learn` capture.
 #[derive(Debug, Clone, Copy)]
 pub struct SaveInput<'a> {
@@ -286,8 +295,8 @@ pub struct Status {
 	pub message: &'static str,
 }
 
-/// `localBackend.status()`: the SQLite store is writable and lexically
-/// searchable (bounded LIKE recall; no FTS/embeddings yet).
+/// `localBackend.status()`: the SQLite store is writable and searchable through
+/// an FTS5/BM25 index; embeddings are optional accelerators, never required.
 #[must_use]
 pub fn status() -> Status {
 	Status {
@@ -295,7 +304,7 @@ pub fn status() -> Status {
 		active: true,
 		writable: true,
 		searchable: true,
-		message: "Local SQLite memory is active; `learn` lessons are stored with provenance and `memory://` records support bounded lexical recall.",
+		message: "Local SQLite memory is active; `learn` lessons are stored with provenance and `memory://` records support bounded FTS5/BM25 recall.",
 	}
 }
 
@@ -317,6 +326,18 @@ pub fn save_learned_lesson(
 	input: &SaveInput<'_>,
 	cancel: Option<&CancelProbe<'_>>,
 ) -> Result<SaveResult> {
+	save_learned_lesson_with_embedding(agent_dir, cwd, input, cancel, None)
+}
+
+/// [`save_learned_lesson`] with an optional `(model, vector)` to store for
+/// hybrid recall. An embedding failure never fails the lexical lesson.
+pub fn save_learned_lesson_with_embedding(
+	agent_dir: &Path,
+	cwd: &Path,
+	input: &SaveInput<'_>,
+	cancel: Option<&CancelProbe<'_>>,
+	embedding: Option<(&str, &[f32])>,
+) -> Result<SaveResult> {
 	let content = normalize_learned_text(input.content, MAX_LEARNED_CONTENT_CHARS);
 	if content.is_empty() {
 		return Ok(SaveResult { stored: 0, message: "Empty lesson; nothing stored.".to_string() });
@@ -333,16 +354,24 @@ pub fn save_learned_lesson(
 	// the store keeps the canonical rows.
 	store.import_learned_lessons(agent_dir, cwd)?;
 	let cwd_text = cwd.to_string_lossy();
-	store.add(&AddInput {
-		scope:   Scope::Project,
-		cwd:     Some(cwd_text.as_ref()),
-		body:    &content,
-		context: context.as_deref(),
-		origin:  Origin::Inferred,
-		actor:   Some("agent"),
-		source:  Some("learn"),
-		dedupe:  true,
+	let record = store.add(&AddInput {
+		scope:      Scope::Project,
+		cwd:        Some(cwd_text.as_ref()),
+		session_id: None,
+		body:       &content,
+		context:    context.as_deref(),
+		origin:     Origin::Inferred,
+		actor:      Some("agent"),
+		source:     Some("learn"),
+		dedupe:     true,
 	})?;
+	if let Some((model, vector)) = embedding
+		&& !model.trim().is_empty()
+		&& !vector.is_empty()
+	{
+		// Best effort: the lexical row above is already authoritative.
+		let _ = store.set_embedding(&record.id, model, vector);
+	}
 	// Derived export: bullets come from rows only (no append to the old file).
 	store.export_learned_lessons(agent_dir, cwd)?;
 
