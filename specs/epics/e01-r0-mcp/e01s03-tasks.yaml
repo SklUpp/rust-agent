@@ -7,7 +7,7 @@ status: failing
 historical_status: completed
 provenance: "docs/agent-preliminary-implementation-plan.md:38"
 bcps: 2
-verify: "cargo test --locked -p pi-agent --lib initialize_http_status_excludes_secret_response_body"
+verify: "cargo test --locked -p pi-agent --test mcp rmcp_initialize_transport_error_does_not_leak_query_or_body"
 tasks:
   - id: 1
     description: "Verify map_initialize_error preserves rmcp step and category without URL query or body preview in existing unit test"
@@ -20,8 +20,8 @@ tasks:
         - "Security"
         - "MCP"
   - id: 2
-    description: "Add concrete regression test initialize_http_status_excludes_secret_response_body supplying a secret-bearing response body (HttpStatusError with non-empty secret body string) asserting map_initialize_error excludes body text from Display output (task specifies adding missing test; existing test only checked None body)"
-    verify: "cargo test --locked -p pi-agent --lib initialize_http_status_excludes_secret_response_body"
+    description: "Add loopback integration test rmcp_initialize_transport_error_does_not_leak_query_or_body asserting connect_to_server excludes query and response body secrets from McpError Display"
+    verify: "cargo test --locked -p pi-agent --test mcp rmcp_initialize_transport_error_does_not_leak_query_or_body"
     risk: P1
     status: failing
     allure:

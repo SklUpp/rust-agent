@@ -29,57 +29,65 @@ epics:
     scope_ref: R1
     wsjf: 4.5
     capsule_dir: epics/e02-r1-durable-task
-    status: planned
+    status: done
     dependencies: ["e01"]
+    note: "Closed at 0ec6d99 (CI 45827228390 success): schema v7 producer_generation, DurableWriter::barrier, owned replay, deliveries spool, park quiescence, 2 SIGKILL tests. Live Termux proof still required before e10/e11."
   - id: e03
     title: "SQLite Concurrency & SQLITE_BUSY Boundary (R2 / S5)"
     scope_ref: R2
     wsjf: 4.25
     capsule_dir: epics/e03-r2-sqlite-concurrency
-    status: planned
+    status: done
     dependencies: ["e02"]
+    note: "Closed at 6828ab0 (CI 45839280446 success): 12 IMMEDIATE txns, StoreError::Busy/UnknownOutcome, call_async_tracked, DurableUnknownOutcome propagation, contended/two-writer/cancel tests."
   - id: e04
     title: "Process Engine, Lease & Bash Protection (R3 / S3)"
     scope_ref: R3
     wsjf: 4.0
     capsule_dir: epics/e04-r3-process-bash-protection
-    status: planned
+    status: done
     dependencies: ["e03"]
+    note: "Closed at c309722 (CI 45856046782 success): crash_handler + panic_scope_active, wake_lock Condvar, lsp/edits WorkspaceWriter lease, 2-process flock & grandchild TERM->KILL & cwd tests, pi-shell policy + config/Approvals wiring. Kernel sandbox & process-wrap deferred."
   - id: e05
     title: "Semantic Code Matrix & Navigation (R4 / S8)"
     scope_ref: R4
     wsjf: 3.2
     capsule_dir: epics/e05-r4-semantic-code-matrix
-    status: planned
+    status: done
     dependencies: ["e04"]
+    note: "Closed at e615b1f..4e8af00 (CI 45893863926 success): utok (ruzstd 0.9 + xutf 1.4, O(N log N) BPE), model-aware Tokenizer/Compactor, pi-ast core/full-grammars split, tree-sitter-tags 0.25 + PageRank RepoMap (MAP_MAX_TOKENS=1024)."
   - id: e06
     title: "Memory Extraction, Experience Consolidation & Skills Lifecycle (R5 / S9)"
     scope_ref: R5
     wsjf: 3.0
     capsule_dir: epics/e06-r5-memory-consolidation
-    status: planned
+    status: done
     dependencies: ["e04"]
+    note: "Closed at d25f2c3..87d82d2 (CI 45893863926 success): memory_store v2 (Scope::Session, FTS5, asserted TTL protection, memory_export_dirty), memory_vectors, HTTP /v1/embeddings + opt-in fastembed local-embeddings, redaction before embed."
   - id: e07
     title: "Session Export, Import & Inspector (R6 / S10)"
     scope_ref: R6
     wsjf: 2.8
     capsule_dir: epics/e07-r6-session-export-import
-    status: planned
+    status: deferred
     dependencies: ["e04"]
+    note: "Deferred by user decision (2026-11-26) in favor of R4, R5, R7, and R8 hooks."
   - id: e08
     title: "Subagent Isolation & Parallel Worktree Merge (R7 / S11)"
     scope_ref: R7
     wsjf: 3.5
     capsule_dir: epics/e08-r7-parallel-worktree-merge
-    status: planned
+    status: done
     dependencies: ["e03", "e04"]
+    note: "Closed at ce27d22, 70183b2..14ad1a5 (CI 45893863926 success): pi-vcs git (gix 0.85 + Unsupported CLI fallback), pi-iso xxh3 + 1 GiB rcopy cap, 3-way merge + [PENDING_APPLY]/PlainKind::Excluded."
   - id: e09
     title: "Subprocess Hooks & Packaging Contracts (R8 / S12)"
     scope_ref: R8
     wsjf: 2.6
     capsule_dir: epics/e09-r8-subprocess-hooks-packaging
-    status: planned
+    status: done
     dependencies: ["e04"]
+    note: "Closed at d73b753 (CI 45873202054 & 45893863926 success): Claude Code/Codex subprocess JSON hooks with trust-gating, -pgid cleanup, fail-closed BashPolicy/force_ask; macOS/Windows CI matrix deferred."
   - id: e10
     title: "Path Migration & Dual-Read Storage (R9)"
     scope_ref: R9
