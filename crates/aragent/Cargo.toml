@@ -27,6 +27,8 @@ async-trait.workspace = true
 aho-corasick = "1.1.5"
 base64.workspace = true
 clap.workspace = true
+# Opt-in local embeddings; onnxruntime is loaded dynamically at runtime.
+fastembed = { workspace = true, optional = true }
 flate2 = "1.1"
 globset.workspace = true
 grep-searcher.workspace = true
@@ -49,6 +51,7 @@ xxhash-rust.workspace = true
 
 [features]
 default = []
+local-embeddings = ["dep:fastembed"]
 test-support = ["pi-agent/test-support"]
 
 [dev-dependencies]

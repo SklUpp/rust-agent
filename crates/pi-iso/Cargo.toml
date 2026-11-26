@@ -11,6 +11,7 @@ workspace = true
 
 [dependencies]
 async-trait.workspace = true
+pi-vcs.workspace = true
 similar.workspace = true
 tokio.workspace = true
 

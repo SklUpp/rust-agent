@@ -7,6 +7,7 @@ members = [
    "crates/pi-grep-pattern",
    "crates/pi-iso",
    "crates/pi-shell",
+   "crates/pi-vcs",
    "crates/pi-walker",
    "crates/vendor/brush-core",
 ]
@@ -216,12 +217,37 @@ bytes = "1"
 clap = { version = "4", features = ["derive"] }
 dashmap = "6.1"
 flume = "0.11"
+fastembed = { version = "7.8", default-features = false, features = [
+   "onnx",
+   "ort-load-dynamic",
+   "hf-hub-rustls-tls",
+   "fancy-regex",
+] }
 futures = "0.3"
 globset = "0.4"
 grep-matcher = "0.1"
 grep-pcre2 = "0.1"
 grep-regex = "0.1"
 grep-searcher = "0.1"
+# gix powers the in-process git backend. No transport/credential features:
+# network ops (clone/fetch/push) deliberately shell out to the git CLI for
+# auth parity.
+gix = { version = "0.85", default-features = false, features = [
+   "attributes",
+   "blob-diff",
+   "dirwalk",
+   "excludes",
+   "index",
+   "max-performance-safe",
+   "merge",
+   "revision",
+   "sha1",
+   "sha256",
+   "status",
+   "tree-editor",
+   "worktree-mutation",
+   "zlib-rs",
+] }
 ignore = "0.4"
 libc = "0.2"
 os_pipe = "1"
@@ -230,6 +256,7 @@ phf = { version = "0.13", features = ["macros"] }
 pi-ast = { path = "crates/pi-ast" }
 pi-builtins = { path = "crates/pi-builtins" }
 pi-iso = { path = "crates/pi-iso" }
+pi-vcs = { path = "crates/pi-vcs" }
 pi-shell = { path = "crates/pi-shell" }
 pi-walker = { path = "crates/pi-walker" }
 portable-pty = "0.9"
@@ -240,6 +267,7 @@ reqwest = { version = "0.13", default-features = false, features = ["json", "str
 # local bionic builds). `rustls-no-provider` + ring here keeps exactly one
 # provider compiled; rustls auto-installs it, main.rs pins it explicitly.
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "logging", "tls12"] }
+ruzstd = "0.9"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = { version = "1.0", features = ["preserve_order"] }
 similar = "3.1.0"
@@ -297,6 +325,7 @@ tree-sitter-sql = { version = "0.3.11", package = "tree-sitter-sequel" }
 tree-sitter-starlark = "1.3"
 tree-sitter-svelte = { version = "0.1.1", package = "tree-sitter-svelte-next" }
 tree-sitter-swift = "0.7"
+tree-sitter-tags = "0.25"
 tree-sitter-tlaplus = "1.5"
 tree-sitter-toml-ng = "0.7"
 tree-sitter-typescript = "0.23"
@@ -309,4 +338,4 @@ webpki-roots = "1.0.11"
 windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Media_Audio", "Win32_Media_Multimedia", "Win32_Security", "Win32_Storage_FileSystem", "Win32_Storage_ProjectedFileSystem", "Win32_System_Com", "Win32_System_LibraryLoader", "Win32_System_IO", "Win32_System_Ioctl", "Win32_System_Threading"] }
 winreg = "0.56"
 xutf = "1.4"
-xxhash-rust = { version = "0.8", features = ["xxh64", "xxh32"] }
+xxhash-rust = { version = "0.8", features = ["xxh64", "xxh32", "xxh3"] }
