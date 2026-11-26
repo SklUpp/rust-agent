@@ -20,9 +20,7 @@ pub(crate) fn run(
 	_session: &mut crate::Session<'_>,
 	_runner: &std::sync::Arc<aragent::runtime::PiAgentRunner>,
 ) -> aragent::Result<()> {
-	Err(aragent::Error::new(
-		"interactive TUI requires a POSIX terminal; use `arag repl`",
-	))
+	Err(aragent::Error::new("interactive TUI requires a POSIX terminal; use `arag repl`"))
 }
 
 #[cfg(unix)]
@@ -30,29 +28,23 @@ mod imp {
 	use std::collections::{BTreeMap, BTreeSet, VecDeque};
 	use std::io::{self, Write};
 	use std::panic::{AssertUnwindSafe, catch_unwind};
+	use std::sync::Arc;
 	use std::sync::atomic::{AtomicBool, AtomicPtr, Ordering};
 	use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
-	use std::sync::Arc;
 	use std::time::{Duration, Instant};
 
-	use async_trait::async_trait;
 	use aragent::agent::Event;
-	use aragent::approve::{
-		Approvals, Decision, classify_tool, extract_tool_detail,
-	};
+	use aragent::approve::{Approvals, Decision, classify_tool, extract_tool_detail};
 	use aragent::output::{OutputMode, Reporter};
 	use aragent::runtime::PiAgentRunner;
+	use async_trait::async_trait;
 	use pi_agent::ContentPart;
-	use pi_agent::supervisor::{
-		SubagentEvent, SubagentLifecycleStatus, SubagentObserver,
-	};
-	use pi_agent::tools::ask::{
-		AskAnswer, AskChannel, AskOutcome, AskQuestion,
-	};
+	use pi_agent::supervisor::{SubagentEvent, SubagentLifecycleStatus, SubagentObserver};
+	use pi_agent::tools::ask::{AskAnswer, AskChannel, AskOutcome, AskQuestion};
 	use tokio_util::sync::CancellationToken;
 
-	use aragent::Result;
 	use crate::Session;
+	use aragent::Result;
 
 	/// One message from a worker turn, an observer, or an approval/ask request.
 	///
@@ -122,7 +114,9 @@ mod imp {
 				.send(UiMsg::Approval {
 					name: name.to_string(),
 					detail: extract_tool_detail(name, args).or_else(|| {
-						serde_json::to_string(args).ok().map(|text| clip(&text, 400))
+						serde_json::to_string(args)
+							.ok()
+							.map(|text| clip(&text, 400))
 					}),
 					reply,
 				})
@@ -141,19 +135,11 @@ mod imp {
 
 	#[async_trait]
 	impl AskChannel for TuiAsk {
-		async fn ask(
-			&self,
-			questions: &[AskQuestion],
-			cancel: CancellationToken,
-		) -> AskOutcome {
+		async fn ask(&self, questions: &[AskQuestion], cancel: CancellationToken) -> AskOutcome {
 			let (reply, rx) = tokio::sync::oneshot::channel();
 			if self
 				.tx
-				.send(UiMsg::Ask {
-					questions: questions.to_vec(),
-					cancel: cancel.clone(),
-					reply,
-				})
+				.send(UiMsg::Ask { questions: questions.to_vec(), cancel: cancel.clone(), reply })
 				.is_err()
 			{
 				return AskOutcome::Aborted;
@@ -175,14 +161,10 @@ mod imp {
 			// clone so per-child event payloads never cross the channel.
 			let message = match event {
 				SubagentEvent::Lifecycle(lifecycle) => {
-					Some(UiMsg::Subagent(SubagentEvent::Lifecycle(
-						lifecycle.clone(),
-					)))
+					Some(UiMsg::Subagent(SubagentEvent::Lifecycle(lifecycle.clone())))
 				},
 				SubagentEvent::Progress(progress) => {
-					Some(UiMsg::Subagent(SubagentEvent::Progress(
-						progress.clone(),
-					)))
+					Some(UiMsg::Subagent(SubagentEvent::Progress(progress.clone())))
 				},
 				SubagentEvent::Event { .. } => None,
 			};
@@ -196,15 +178,13 @@ mod imp {
 	/// Children get a stripped approver (`without_ask`) and an empty injected
 	/// input, so no child turn can read the terminal the TUI owns.
 	fn install_surfaces(session: &mut Session<'_>, tx: &Sender<UiMsg>) {
-		let policy = Approvals::new(
-			session.approvals.mode,
-			session.approvals.allow.iter().cloned(),
-		);
-		session.approvals.set_approver(Some(Arc::new(TuiApprover {
-			policy,
-			tx: tx.clone(),
-		})));
-		session.approvals.set_ask(Some(Arc::new(TuiAsk { tx: tx.clone() })));
+		let policy = Approvals::new(session.approvals.mode, session.approvals.allow.iter().cloned());
+		session
+			.approvals
+			.set_approver(Some(Arc::new(TuiApprover { policy, tx: tx.clone() })));
+		session
+			.approvals
+			.set_ask(Some(Arc::new(TuiAsk { tx: tx.clone() })));
 		let empty: Box<dyn io::BufRead + Send> = Box::new(io::Cursor::new(Vec::<u8>::new()));
 		session
 			.approvals
@@ -313,29 +293,16 @@ mod imp {
 				return Err(aragent::Error::new("cannot enter raw terminal mode"));
 			}
 
-			let mut terminal = Self {
-				out: io::stdout(),
-				saved,
-				old_term,
-				old_hup,
-				old_int,
-			};
+			let mut terminal = Self { out: io::stdout(), saved, old_term, old_hup, old_int };
 			write!(terminal.out, "\x1b[?1049h\x1b[H\x1b[2J\x1b[?25l")?;
 			terminal.out.flush()?;
 			Ok(terminal)
 		}
 
 		fn size(&self) -> (usize, usize) {
-			let mut size = libc::winsize {
-				ws_row: 0,
-				ws_col: 0,
-				ws_xpixel: 0,
-				ws_ypixel: 0,
-			};
+			let mut size = libc::winsize { ws_row: 0, ws_col: 0, ws_xpixel: 0, ws_ypixel: 0 };
 			// SAFETY: writable out-parameter for the process's stdout.
-			let ok = unsafe {
-				libc::ioctl(libc::STDOUT_FILENO, libc::TIOCGWINSZ, &mut size)
-			} == 0;
+			let ok = unsafe { libc::ioctl(libc::STDOUT_FILENO, libc::TIOCGWINSZ, &mut size) } == 0;
 			if ok && size.ws_col > 0 && size.ws_row > 0 {
 				(usize::from(size.ws_col), usize::from(size.ws_row))
 			} else {
@@ -355,16 +322,11 @@ mod imp {
 				frame.push_str(row);
 				frame.push_str("\x1b[K");
 			}
-			frame.push_str(&format!(
-				"\x1b[{};{}H\x1b[?25h",
-				cursor_row.max(1),
-				cursor_col.max(1)
-			));
+			frame.push_str(&format!("\x1b[{};{}H\x1b[?25h", cursor_row.max(1), cursor_col.max(1)));
 			self.out.write_all(frame.as_bytes())?;
 			self.out.flush()?;
 			Ok(())
 		}
-
 	}
 
 	impl Drop for Terminal {
@@ -427,9 +389,7 @@ mod imp {
 						index += 1;
 					} else if buffer[index + 1] == b'[' {
 						let mut end = index + 2;
-						while end < buffer.len()
-							&& !(0x40..=0x7e).contains(&buffer[end])
-						{
+						while end < buffer.len() && !(0x40..=0x7e).contains(&buffer[end]) {
 							end += 1;
 						}
 						if end >= buffer.len() {
@@ -738,10 +698,7 @@ mod imp {
 
 	impl WorkerRow {
 		fn running(&self) -> bool {
-			!matches!(
-				self.status.as_str(),
-				"completed" | "failed" | "aborted"
-			)
+			!matches!(self.status.as_str(), "completed" | "failed" | "aborted")
 		}
 	}
 
@@ -800,7 +757,9 @@ mod imp {
 		}
 
 		fn expired(&self) -> bool {
-			self.deadline.is_some_and(|deadline| Instant::now() >= deadline)
+			self
+				.deadline
+				.is_some_and(|deadline| Instant::now() >= deadline)
 		}
 
 		fn answer(&mut self, timed_out: bool) -> Option<AskOutcome> {
@@ -813,7 +772,10 @@ mod imp {
 					.and_then(|value| usize::try_from(value).ok())
 					.filter(|value| *value < question.options.len())
 					.unwrap_or(0);
-				(!question.options.is_empty()).then_some(recommended).into_iter().collect()
+				(!question.options.is_empty())
+					.then_some(recommended)
+					.into_iter()
+					.collect()
 			} else {
 				self.selected.iter().copied().collect()
 			};
@@ -874,12 +836,11 @@ mod imp {
 					Key::CtrlC => return Some(AskOutcome::Cancelled),
 					Key::Backspace => self.custom_input.backspace(),
 					Key::Left => {
-						self.custom_input.cursor =
-							self.custom_input.cursor.saturating_sub(1);
+						self.custom_input.cursor = self.custom_input.cursor.saturating_sub(1);
 					},
 					Key::Right => {
-						self.custom_input.cursor = (self.custom_input.cursor + 1)
-							.min(self.custom_input.chars.len());
+						self.custom_input.cursor =
+							(self.custom_input.cursor + 1).min(self.custom_input.chars.len());
 					},
 					Key::Char(ch) => self.custom_input.insert(ch),
 					_ => {},
@@ -928,11 +889,7 @@ mod imp {
 	}
 
 	enum Dialog {
-		Approval {
-			name: String,
-			detail: Option<String>,
-			reply: tokio::sync::oneshot::Sender<bool>,
-		},
+		Approval { name: String, detail: Option<String>, reply: tokio::sync::oneshot::Sender<bool> },
 		Ask(AskState),
 	}
 
@@ -981,9 +938,7 @@ mod imp {
 			"/cwd" => Some(UiCommand::Cwd(argument)),
 			"/memory" => Some(UiCommand::Memory(
 				argument
-					.map(|argument| {
-						argument.split_whitespace().map(str::to_string).collect()
-					})
+					.map(|argument| argument.split_whitespace().map(str::to_string).collect())
 					.unwrap_or_default(),
 			)),
 			_ => None,
@@ -1065,10 +1020,9 @@ mod imp {
 			self.live_text = None;
 			self.live_thinking = None;
 			self.tools.clear();
-			self.entries.push(Entry {
-				kind: Kind::Separator,
-				text: String::new(),
-			});
+			self
+				.entries
+				.push(Entry { kind: Kind::Separator, text: String::new() });
 			self.dirty = true;
 		}
 
@@ -1084,10 +1038,9 @@ mod imp {
 					let index = match self.live_text {
 						Some(index) => index,
 						None => {
-							self.entries.push(Entry {
-								kind: Kind::Assistant,
-								text: String::new(),
-							});
+							self
+								.entries
+								.push(Entry { kind: Kind::Assistant, text: String::new() });
 							let index = self.entries.len() - 1;
 							self.live_text = Some(index);
 							index
@@ -1099,10 +1052,9 @@ mod imp {
 					let index = match self.live_thinking {
 						Some(index) => index,
 						None => {
-							self.entries.push(Entry {
-								kind: Kind::Thinking,
-								text: String::new(),
-							});
+							self
+								.entries
+								.push(Entry { kind: Kind::Thinking, text: String::new() });
 							let index = self.entries.len() - 1;
 							self.live_thinking = Some(index);
 							index
@@ -1125,10 +1077,9 @@ mod imp {
 						.collect::<Vec<_>>()
 						.join(" ");
 					if !text.trim().is_empty() {
-						self.entries.push(Entry {
-							kind: Kind::User,
-							text: format!("› {text}"),
-						});
+						self
+							.entries
+							.push(Entry { kind: Kind::User, text: format!("› {text}") });
 					}
 				},
 				Event::TurnEnd { .. } => {
@@ -1141,10 +1092,9 @@ mod imp {
 		}
 
 		fn on_tool_start(&mut self, id: String, tool: String, args: &serde_json::Value) {
-			self.entries.push(Entry {
-				kind: Kind::Tool,
-				text: format!("→ {tool} {}", summarize(args)),
-			});
+			self
+				.entries
+				.push(Entry { kind: Kind::Tool, text: format!("→ {tool} {}", summarize(args)) });
 			let index = self.entries.len() - 1;
 			self.tools.insert(id, index);
 			self.dirty = true;
@@ -1162,10 +1112,7 @@ mod imp {
 		fn on_tool_end(&mut self, id: &str, tool: &str, error: Option<&str>) {
 			let index = self.tools.remove(id);
 			let (kind, text) = match error {
-				Some(error) => (
-					Kind::ToolError,
-					format!("✗ {tool}: {}", first_line(error)),
-				),
+				Some(error) => (Kind::ToolError, format!("✗ {tool}: {}", first_line(error))),
 				None => (Kind::Tool, format!("✓ {tool}")),
 			};
 			match index.and_then(|index| self.entries.get_mut(index)) {
@@ -1248,11 +1195,15 @@ mod imp {
 				UiMsg::Advisor(text) => self.push(Kind::Advisor, format!("advisor: {text}")),
 				UiMsg::Subagent(event) => self.on_subagent(event),
 				UiMsg::Approval { name, detail, reply } => {
-					self.queue.push_back(UiMsg::Approval { name, detail, reply });
+					self
+						.queue
+						.push_back(UiMsg::Approval { name, detail, reply });
 					self.maybe_open_dialog();
 				},
 				UiMsg::Ask { questions, cancel, reply } => {
-					self.queue.push_back(UiMsg::Ask { questions, cancel, reply });
+					self
+						.queue
+						.push_back(UiMsg::Ask { questions, cancel, reply });
 					self.maybe_open_dialog();
 				},
 				UiMsg::TurnError(error) => self.push(Kind::ToolError, error),
@@ -1308,12 +1259,8 @@ mod imp {
 							let _ = reply.send(AskOutcome::Answered(Vec::new()));
 							continue;
 						}
-						self.dialog = Some(Dialog::Ask(AskState::new(
-							questions,
-							reply,
-							cancel,
-							self.ask_timeout,
-						)));
+						self.dialog =
+							Some(Dialog::Ask(AskState::new(questions, reply, cancel, self.ask_timeout)));
 						self.dirty = true;
 						return;
 					},
@@ -1374,10 +1321,7 @@ mod imp {
 					Dialog::Approval { name, detail, reply } => {
 						let decision = match key {
 							Key::Char('y') | Key::Char('Y') => Some(true),
-							Key::Char('n')
-							| Key::Char('N')
-							| Key::Esc
-							| Key::CtrlC => Some(false),
+							Key::Char('n') | Key::Char('N') | Key::Esc | Key::CtrlC => Some(false),
 							_ => None,
 						};
 						match decision {
@@ -1387,11 +1331,7 @@ mod imp {
 								return Some(Action::None);
 							},
 							None => {
-								self.dialog = Some(Dialog::Approval {
-									name,
-									detail,
-									reply,
-								});
+								self.dialog = Some(Dialog::Approval { name, detail, reply });
 							},
 						}
 					},
@@ -1419,8 +1359,7 @@ mod imp {
 						}
 					},
 					Key::PageUp => {
-						self.scroll =
-							(self.scroll + self.height / 2).min(self.last_max_scroll);
+						self.scroll = (self.scroll + self.height / 2).min(self.last_max_scroll);
 					},
 					Key::PageDown => {
 						self.scroll = self.scroll.saturating_sub(self.height / 2);
@@ -1464,8 +1403,7 @@ mod imp {
 								if matches!(
 									&command,
 									UiCommand::Help
-										| UiCommand::Status
-										| UiCommand::History
+										| UiCommand::Status | UiCommand::History
 										| UiCommand::Workers(_)
 								) {
 									return Some(Action::Command(command));
@@ -1502,8 +1440,7 @@ mod imp {
 					self.input.cursor = self.input.cursor.saturating_sub(1);
 				},
 				Key::Right => {
-					self.input.cursor =
-						(self.input.cursor + 1).min(self.input.chars.len());
+					self.input.cursor = (self.input.cursor + 1).min(self.input.chars.len());
 				},
 				Key::Home => self.input.cursor = 0,
 				Key::End => self.input.cursor = self.input.chars.len(),
@@ -1558,9 +1495,7 @@ mod imp {
 				View::Chat => self
 					.entries
 					.iter()
-					.map(|entry| {
-						wrap_text(&sanitize(&entry.text), width).len().max(1)
-					})
+					.map(|entry| wrap_text(&sanitize(&entry.text), width).len().max(1))
 					.sum(),
 				View::Text { lines, .. } => lines
 					.iter()
@@ -1595,9 +1530,7 @@ mod imp {
 					let lines = self.worker_transcript(&selector);
 					self.open_text_view(format!("Worker {selector}"), lines);
 				},
-				command => self.push_system(format!(
-					"{command:?} is unavailable while a turn runs"
-				)),
+				command => self.push_system(format!("{command:?} is unavailable while a turn runs")),
 			}
 			self.dirty = true;
 		}
@@ -1625,11 +1558,7 @@ mod imp {
 					}
 				),
 				format!("history:   {} lines", self.history_lines.len()),
-				format!(
-					"workers:   {} running / {} seen",
-					self.running_workers(),
-					self.workers.len()
-				),
+				format!("workers:   {} running / {} seen", self.running_workers(), self.workers.len()),
 				format!("state:     {}", if self.busy { "busy" } else { "idle" }),
 			]
 		}
@@ -1657,9 +1586,9 @@ mod imp {
 		fn worker_transcript(&self, selector: &str) -> Vec<String> {
 			let mut rows: Vec<&WorkerRow> = self.workers.values().collect();
 			rows.sort_by_key(|row| row.index);
-			let selected = rows.into_iter().find(|row| {
-				row.index.to_string() == selector || row.agent == selector
-			});
+			let selected = rows
+				.into_iter()
+				.find(|row| row.index.to_string() == selector || row.agent == selector);
 			let Some(row) = selected else {
 				return vec![format!("no worker matches '{selector}'")];
 			};
@@ -1709,18 +1638,12 @@ mod imp {
 								if recommended { " (Recommended)" } else { "" }
 							));
 							if let Some(description) = option.description.as_deref() {
-								lines.push(format!(
-									"      {}",
-									one_line(description)
-								));
+								lines.push(format!("      {}", one_line(description)));
 							}
 						}
 					}
 					if state.custom_mode {
-						lines.push(format!(
-							"custom> {}",
-							one_line(&state.custom_input.text())
-						));
+						lines.push(format!("custom> {}", one_line(&state.custom_input.text())));
 					} else if let Some(custom) = state.custom.as_deref() {
 						lines.push(format!("custom: {}", one_line(custom)));
 					}
@@ -1823,10 +1746,7 @@ mod imp {
 				rows.push(String::new());
 			}
 			for line in &dialog {
-				rows.push(format!(
-					"\x1b[1m{}\x1b[0m",
-					clip(&sanitize(line), content_width)
-				));
+				rows.push(format!("\x1b[1m{}\x1b[0m", clip(&sanitize(line), content_width)));
 			}
 			let viewing = view_title.is_some();
 			let input_text = self.input.text();
@@ -1837,10 +1757,7 @@ mod imp {
 					clip(&one_line(title), content_width.saturating_sub(16))
 				)
 			} else {
-				let text = clip(
-					&one_line(&input_text),
-					content_width.saturating_sub(3),
-				);
+				let text = clip(&one_line(&input_text), content_width.saturating_sub(3));
 				format!("\x1b[1m> \x1b[0m{text}")
 			};
 			let cursor_prefix = self.input.prefix();
@@ -1941,7 +1858,10 @@ mod imp {
 		// Recovered draft: explicitly not a turn, never replayed, never tool
 		// calls. Shown so an interrupted stream is visible, not silent.
 		if let Some(fragment) = interrupted_fragment {
-			lines.push("── interrupted fragment (not journaled; sent to the model once, no tool calls) ──".to_string());
+			lines.push(
+				"── interrupted fragment (not journaled; sent to the model once, no tool calls) ──"
+					.to_string(),
+			);
 			for line in fragment.lines().take(200) {
 				lines.push(format!("  {line}"));
 			}
@@ -1955,8 +1875,7 @@ mod imp {
 			&& metadata.len() > 2 * 1024 * 1024
 		{
 			return vec![
-				"child transcript is larger than 2 MiB; open the file directly:"
-					.to_string(),
+				"child transcript is larger than 2 MiB; open the file directly:".to_string(),
 				file.to_string(),
 			];
 		}
@@ -1975,10 +1894,7 @@ mod imp {
 						.get("role")
 						.and_then(serde_json::Value::as_str)
 						.unwrap_or("?");
-					let text = message
-						.get("content")
-						.map(content_text)
-						.unwrap_or_default();
+					let text = message.get("content").map(content_text).unwrap_or_default();
 					lines.push(format!("{role}: {}", text.trim()));
 				}
 				if slice.messages.is_empty() {
@@ -2027,8 +1943,7 @@ mod imp {
 
 	fn config_lines(session: &Session<'_>) -> Vec<String> {
 		vec![
-			"effective settings (read-only; edit config.yml outside the TUI)"
-				.to_string(),
+			"effective settings (read-only; edit config.yml outside the TUI)".to_string(),
 			format!(
 				"model:          {}",
 				session
@@ -2055,22 +1970,23 @@ mod imp {
 			),
 			format!(
 				"tools:          {}",
-				if session.tools_enabled { "enabled" } else { "disabled" }
+				if session.tools_enabled {
+					"enabled"
+				} else {
+					"disabled"
+				}
 			),
-			format!(
-				"memory backend: {:?}",
-				session.config.memory_backend()
-			),
-			format!(
-				"providers:      {} configured",
-				session.catalog.providers.len()
-			),
+			format!("memory backend: {:?}", session.config.memory_backend()),
+			format!("providers:      {} configured", session.catalog.providers.len()),
 			format!("cwd:            {}", session.cwd.display()),
-			format!("session dir:    {}", session
-				.session_dir
-				.as_ref()
-				.map(|path| path.display().to_string())
-				.unwrap_or_else(|| "(no session)".to_string())),
+			format!(
+				"session dir:    {}",
+				session
+					.session_dir
+					.as_ref()
+					.map(|path| path.display().to_string())
+					.unwrap_or_else(|| "(no session)".to_string())
+			),
 		]
 	}
 
@@ -2099,11 +2015,7 @@ mod imp {
 	// ── Commands ───────────────────────────────────────────────────────────
 
 	/// Execute an idle command. Returns `true` when the UI should exit.
-	fn handle_command(
-		session: &mut Session<'_>,
-		app: &mut App,
-		command: UiCommand,
-	) -> Result<bool> {
+	fn handle_command(session: &mut Session<'_>, app: &mut App, command: UiCommand) -> Result<bool> {
 		match command {
 			UiCommand::Exit => return Ok(true),
 			UiCommand::Help => app.open_text_view("Help", help_lines()),
@@ -2112,7 +2024,8 @@ mod imp {
 				app.open_text_view("Status", lines);
 			},
 			UiCommand::History => {
-				app.history_lines = history_lines(&session.history, session.interrupted_fragment.as_deref());
+				app.history_lines =
+					history_lines(&session.history, session.interrupted_fragment.as_deref());
 				let lines = app.history_lines.clone();
 				app.open_text_view("History", lines);
 			},
@@ -2141,10 +2054,9 @@ mod imp {
 				session.select_model(id.clone());
 				app.push_system(format!("model: {id}"));
 			},
-			UiCommand::Model(None) => app.push_system(format!(
-				"model: {}",
-				session.model.as_deref().unwrap_or("(default)")
-			)),
+			UiCommand::Model(None) => {
+				app.push_system(format!("model: {}", session.model.as_deref().unwrap_or("(default)")))
+			},
 			UiCommand::Cwd(Some(path)) => {
 				session.change_cwd(std::path::PathBuf::from(path))?;
 				app.push_system(format!("cwd: {}", session.cwd.display()));
@@ -2185,30 +2097,22 @@ mod imp {
 						Some(UiMsg::Event(Event::MessageUpdate { delta: delta.clone() }))
 					},
 					Event::ThinkingUpdate { delta } => {
-						Some(UiMsg::Event(Event::ThinkingUpdate {
-							delta: delta.clone(),
-						}))
+						Some(UiMsg::Event(Event::ThinkingUpdate { delta: delta.clone() }))
 					},
 					Event::UserSteer { parts } => {
 						Some(UiMsg::Event(Event::UserSteer { parts: parts.clone() }))
 					},
-					Event::ToolStart { id, tool, args } => Some(UiMsg::ToolStart {
-						id: id.clone(),
-						tool: tool.clone(),
-						args: args.clone(),
-					}),
-					Event::ToolUpdate { id, tool, partial, .. } => {
-						Some(UiMsg::ToolUpdate {
-							id: id.clone(),
-							tool: tool.clone(),
-							partial: partial.clone(),
-						})
+					Event::ToolStart { id, tool, args } => {
+						Some(UiMsg::ToolStart { id: id.clone(), tool: tool.clone(), args: args.clone() })
 					},
-					Event::ToolEnd { id, tool, error, .. } => Some(UiMsg::ToolEnd {
+					Event::ToolUpdate { id, tool, partial, .. } => Some(UiMsg::ToolUpdate {
 						id: id.clone(),
 						tool: tool.clone(),
-						error: error.clone(),
+						partial: partial.clone(),
 					}),
+					Event::ToolEnd { id, tool, error, .. } => {
+						Some(UiMsg::ToolEnd { id: id.clone(), tool: tool.clone(), error: error.clone() })
+					},
 					// `MessageEnd`/`TurnEnd`/`AgentEnd` carry full messages and
 					// tool-result vectors and are not needed: `MessageStart`
 					// resets the live block for the next message.
@@ -2265,34 +2169,23 @@ mod imp {
 
 	/// Non-blocking readiness of stdin, distinguishing hangup.
 	fn stdin_ready(timeout_ms: i32) -> (bool, bool) {
-		let mut poll_fd = libc::pollfd {
-			fd: libc::STDIN_FILENO,
-			events: libc::POLLIN,
-			revents: 0,
-		};
+		let mut poll_fd = libc::pollfd { fd: libc::STDIN_FILENO, events: libc::POLLIN, revents: 0 };
 		// SAFETY: one valid pollfd, bounded timeout.
 		let result = unsafe { libc::poll(&mut poll_fd, 1, timeout_ms) };
 		if result <= 0 {
 			return (false, false);
 		}
-		let eof =
-			poll_fd.revents & (libc::POLLHUP | libc::POLLERR | libc::POLLNVAL) != 0;
+		let eof = poll_fd.revents & (libc::POLLHUP | libc::POLLERR | libc::POLLNVAL) != 0;
 		(poll_fd.revents & libc::POLLIN != 0, eof)
 	}
 
 	fn read_stdin(buffer: &mut [u8]) -> Option<usize> {
 		// SAFETY: writable buffer, stdin descriptor.
-		let read = unsafe {
-			libc::read(
-				libc::STDIN_FILENO,
-				buffer.as_mut_ptr().cast(),
-				buffer.len(),
-			)
-		};
+		let read =
+			unsafe { libc::read(libc::STDIN_FILENO, buffer.as_mut_ptr().cast(), buffer.len()) };
 		if read < 0 {
 			let error = io::Error::last_os_error();
-			if error.kind() == io::ErrorKind::Interrupted
-				|| error.kind() == io::ErrorKind::WouldBlock
+			if error.kind() == io::ErrorKind::Interrupted || error.kind() == io::ErrorKind::WouldBlock
 			{
 				return Some(0);
 			}
@@ -2343,18 +2236,15 @@ mod imp {
 								Action::Cancel => {
 									cancel_turn(context.cancel);
 									context.app.fail_dialogs();
-									context
-										.app
-										.push_system("cancelling turn (Ctrl-C)…");
+									context.app.push_system("cancelling turn (Ctrl-C)…");
 								},
 								Action::Steer(text) => {
-									let accepted = context
-										.runner
-										.steer(vec![ContentPart::text(text.as_str())]);
+									let accepted =
+										context.runner.steer(vec![ContentPart::text(text.as_str())]);
 									if !accepted {
-										context.app.push_system(
-											"steering unavailable: the turn is finishing",
-										);
+										context
+											.app
+											.push_system("steering unavailable: the turn is finishing");
 										context.app.input.set_text(&text);
 									}
 								},
@@ -2401,10 +2291,7 @@ mod imp {
 
 	// ── Entry point ────────────────────────────────────────────────────────
 
-	pub(crate) fn run(
-		session: &mut Session<'_>,
-		runner: &Arc<PiAgentRunner>,
-	) -> Result<()> {
+	pub(crate) fn run(session: &mut Session<'_>, runner: &Arc<PiAgentRunner>) -> Result<()> {
 		let mut terminal = Terminal::enter()?;
 		let (tx, receiver) = mpsc::channel::<UiMsg>();
 		install_surfaces(session, &tx);
@@ -2413,14 +2300,16 @@ mod imp {
 		app.history_lines = history_lines(&session.history, session.interrupted_fragment.as_deref());
 		if let Some(fragment) = session.interrupted_fragment.as_deref() {
 			let preview: String = fragment.chars().take(240).collect();
-			let ellipsis = if fragment.chars().count() > 240 { "…" } else { "" };
+			let ellipsis = if fragment.chars().count() > 240 {
+				"…"
+			} else {
+				""
+			};
 			app.push_system(format!(
 				"recovered interrupted assistant fragment (not journaled; sent to the model once, no tool calls): {preview}{ellipsis}"
 			));
 		}
-		app.push_system(
-			"arag interactive TUI — /help lists commands; Ctrl-C cancels a turn",
-		);
+		app.push_system("arag interactive TUI — /help lists commands; Ctrl-C cancels a turn");
 
 		let outcome = (|| -> Result<()> {
 			loop {
@@ -2445,7 +2334,8 @@ mod imp {
 					},
 					Action::Submit(prompt) => {
 						app.start_turn(&prompt);
-						app.history_lines = history_lines(&session.history, session.interrupted_fragment.as_deref());
+						app.history_lines =
+							history_lines(&session.history, session.interrupted_fragment.as_deref());
 						// No cancel can meaningfully survive into a new turn;
 						// one that arrives after this point is kept as pending
 						// and applied when `turn_inner` publishes its token.
@@ -2484,7 +2374,8 @@ mod imp {
 						})?;
 						app.finish_turn();
 						app.status = status_of(session);
-						app.history_lines = history_lines(&session.history, session.interrupted_fragment.as_deref());
+						app.history_lines =
+							history_lines(&session.history, session.interrupted_fragment.as_deref());
 						app.dirty = true;
 						if app.quit {
 							break;
@@ -2507,14 +2398,8 @@ mod imp {
 
 		#[test]
 		fn wrapping_respects_wide_and_combining_chars() {
-			assert_eq!(
-				wrap_text("你好世界", 5),
-				vec!["你好".to_string(), "世界".to_string()]
-			);
-			assert_eq!(
-				wrap_text("hello world", 5),
-				vec!["hello".to_string(), "world".to_string()]
-			);
+			assert_eq!(wrap_text("你好世界", 5), vec!["你好".to_string(), "世界".to_string()]);
+			assert_eq!(wrap_text("hello world", 5), vec!["hello".to_string(), "world".to_string()]);
 			// Combining mark adds no column.
 			assert_eq!(display_width("e\u{301}"), 1);
 			assert_eq!(clip("你好世界", 5), "你好…");
@@ -2579,11 +2464,8 @@ mod imp {
 				tool: "read".into(),
 				args: serde_json::json!({ "path": "a" }),
 			});
-			let _ = app.handle_msg(UiMsg::ToolEnd {
-				id: "t1".into(),
-				tool: "read".into(),
-				error: None,
-			});
+			let _ =
+				app.handle_msg(UiMsg::ToolEnd { id: "t1".into(), tool: "read".into(), error: None });
 			let tool = app.entries.last().expect("tool entry");
 			assert!(tool.text.starts_with("✓ read"), "{}", tool.text);
 			assert!(app.tools.is_empty());
@@ -2611,12 +2493,7 @@ mod imp {
 				multi: false,
 				recommended: Some(1),
 			};
-			let mut state = AskState::new(
-				vec![question],
-				reply,
-				CancellationToken::new(),
-				None,
-			);
+			let mut state = AskState::new(vec![question], reply, CancellationToken::new(), None);
 			let outcome = state.on_key(Key::Enter);
 			match outcome {
 				Some(AskOutcome::Answered(answers)) => {
@@ -2631,11 +2508,7 @@ mod imp {
 			assert_eq!(parse_ui_command("/status"), Some(UiCommand::Status));
 			assert_eq!(
 				parse_ui_command("/memory create keep terse"),
-				Some(UiCommand::Memory(vec![
-					"create".into(),
-					"keep".into(),
-					"terse".into()
-				]))
+				Some(UiCommand::Memory(vec!["create".into(), "keep".into(), "terse".into()]))
 			);
 			assert_eq!(parse_ui_command("/unknown x"), None);
 		}
