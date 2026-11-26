@@ -2848,6 +2848,7 @@ async fn park_waits_for_in_flight_tool_before_a_revive_can_reuse_the_session() {
 	supervisor.set_child_session_root(Some(root.clone()));
 	let (id, mut contract) = adoptable_child(&supervisor, &root);
 	contract.tools.push("slow".to_string());
+	contract.write(&root).expect("write contract");
 	let reviver: Arc<dyn PersistedChildReviverFactory> =
 		Arc::new(DefaultPersistedReviverFactory::new(
 			provider,
