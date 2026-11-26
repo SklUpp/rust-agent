@@ -4213,6 +4213,7 @@ name = "pi-agent"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "fancy-regex",
  "flume",
  "futures",
  "libc",
@@ -4235,6 +4236,7 @@ dependencies = [
  "tokio",
  "tokio-util",
  "webpki-roots",
+ "xutf",
  "xxhash-rust",
 ]
 
@@ -4417,6 +4419,7 @@ dependencies = [
  "similar 3.2.0",
  "tokio",
  "windows-sys 0.61.2",
+ "xxhash-rust",
 ]
 
 [[package]]

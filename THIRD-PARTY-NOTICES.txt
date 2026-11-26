@@ -294,7 +294,7 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 
 -------------------------------------------------------------------------------
-crates/pi-natives/data/LICENSE.ctok
+crates/pi-agent/src/utok/data/LICENSE.ctok (and crates/pi-natives/data/LICENSE.ctok)
 
 MIT License
 
@@ -304,7 +304,7 @@ Copyright (c) 2026 Sander Land
 Copyright (c) 2026 Can Bölük and the Oh My Pi contributors
 Copyright (c) 2026 Stencil Labs, Inc.
   (Rust implementation and the compact binary vocabulary encoding in
-  crates/pi-natives/src/utok/claude)
+  crates/pi-agent/src/utok/claude and crates/pi-natives/src/utok/claude)
 
 Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files (the "Software"), to deal
