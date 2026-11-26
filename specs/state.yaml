@@ -1,17 +1,17 @@
 active_flow: execute-plan
-active_epic_id: e07
+active_epic_id: e10
 active_story_id: null
 git:
   branch: feat/standalone-runtime
-  head: 14ad1a5
+  head: 54f0fb1
 handoff:
-  last_step_completed: "R8 Hooks (d73b753, CI 45873202054) and R4/R5/R7 (e615b1f..14ad1a5, CI 45893863926) closed and CI-green (Host 11m36s + Android arm64 12m29s)."
+  last_step_completed: "R4+R5 polish (0b36bc7), R6 export/import/inspector (ebce4aa), and R8 D20 trust store (ec00906, 54f0fb1) closed on feat/standalone-runtime."
   open_decisions:
     - "R0.4: live Termux filesystem MCP smoke written (cf1e673) behind ARAGENT_LIVE_FILESYSTEM_SMOKE; skipped in CI."
-    - "Live device proof of arag artifact (CI 45893863926) on Termux/Android arm64 pending before R9/R10."
-    - "fastproot/Linux env and deferred R3 kernel sandbox (seccompiler/landlock/bwrap) scheduled after R8/R6."
+    - "Live device proof of arag artifact on Termux/Android arm64 pending before R9/R10."
+    - "fastproot/Linux env, deferred R3 kernel sandbox, and macOS/Windows CI matrix excluded/deferred by user decision."
 next_skill: execute-plan
 next_work:
-  - "R6 (e07): session export / import / inspector round-trip."
+  - "Green CI verification for 0b36bc7..54f0fb1."
   - "Live device smoke on Termux/Android arm64 (R0.4–R8)."
-  - "fastproot / Linux env integration + deferred R3 kernel sandbox, then R9–R12."
+  - "R9–R12 (or fastproot/lkl/OMP sync per user roadmap)."

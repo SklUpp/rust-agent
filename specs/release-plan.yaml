@@ -55,7 +55,7 @@ epics:
     capsule_dir: epics/e05-r4-semantic-code-matrix
     status: done
     dependencies: ["e04"]
-    note: "Closed at e615b1f..4e8af00 (CI 45893863926 success): utok (ruzstd 0.9 + xutf 1.4, O(N log N) BPE), model-aware Tokenizer/Compactor, pi-ast core/full-grammars split, tree-sitter-tags 0.25 + PageRank RepoMap (MAP_MAX_TOKENS=1024)."
+    note: "Closed at e615b1f..4e8af00, 0b36bc7 (CI 45893863926 + follow-up): utok (ruzstd 0.9 + xutf 1.4, O(N log N) BPE), model-aware Tokenizer/Compactor, pi-ast core/full-grammars split, tree-sitter-tags 0.25 + PageRank RepoMap (MAP_MAX_TOKENS=1024), semantic capability matrix (lsp matrix), per-workspace idleTimeoutMs=300000."
   - id: e06
     title: "Memory Extraction, Experience Consolidation & Skills Lifecycle (R5 / S9)"
     scope_ref: R5
@@ -63,15 +63,15 @@ epics:
     capsule_dir: epics/e06-r5-memory-consolidation
     status: done
     dependencies: ["e04"]
-    note: "Closed at d25f2c3..87d82d2 (CI 45893863926 success): memory_store v2 (Scope::Session, FTS5, asserted TTL protection, memory_export_dirty), memory_vectors, HTTP /v1/embeddings + opt-in fastembed local-embeddings, redaction before embed."
+    note: "Closed at d25f2c3..87d82d2, 0b36bc7 (CI 45893863926 + follow-up): memory_store v2 (Scope::Session, FTS5, asserted TTL protection, memory_export_dirty), memory_vectors, HTTP /v1/embeddings + opt-in fastembed local-embeddings, redaction before embed, production consolidate() wiring in local_memory.rs."
   - id: e07
     title: "Session Export, Import & Inspector (R6 / S10)"
     scope_ref: R6
     wsjf: 2.8
     capsule_dir: epics/e07-r6-session-export-import
-    status: deferred
+    status: done
     dependencies: ["e04"]
-    note: "Deferred by user decision (2026-11-26) in favor of R4, R5, R7, and R8 hooks."
+    note: "Closed at ebce4aa: loss-free JSON bundle v7 export/import/inspector across all 10 tables, D55/D27 redaction + startup env credential registration, BEGIN IMMEDIATE seq allocation, non-mutating Validation/Conflict, D74 context breakdown, CLI export/import/inspect."
   - id: e08
     title: "Subagent Isolation & Parallel Worktree Merge (R7 / S11)"
     scope_ref: R7
@@ -87,7 +87,7 @@ epics:
     capsule_dir: epics/e09-r8-subprocess-hooks-packaging
     status: done
     dependencies: ["e04"]
-    note: "Closed at d73b753 (CI 45873202054 & 45893863926 success): Claude Code/Codex subprocess JSON hooks with trust-gating, -pgid cleanup, fail-closed BashPolicy/force_ask; macOS/Windows CI matrix deferred."
+    note: "Closed at d73b753, ec00906, 54f0fb1 (CI 45873202054 & 45893863926 + D20 trust store): Claude Code/Codex subprocess JSON hooks with trust-gating, -pgid cleanup, fail-closed BashPolicy/force_ask, D20 workspace trust store (<agent_dir>/trust.json, SHA-256 invalidation, arag trust CLI); macOS/Windows CI matrix deferred."
   - id: e10
     title: "Path Migration & Dual-Read Storage (R9)"
     scope_ref: R9
