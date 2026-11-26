@@ -4,6 +4,11 @@
 //! execs, `write` auto-approves read-only tools, and `yolo` approves everything;
 //! an explicit `--allow <tool>` always approves that tool. Mirrors
 //! `packages/coding-agent` approval semantics.
+//!
+//! Bash command policy (`crate::config::BashConfig`) runs before this matrix:
+//! `Forbidden` is a hard deny that `yolo`, `--allow bash`, and a remote
+//! approver cannot override, and `Prompt` forces an ask even when the matrix
+//! would auto-approve.
 
 use std::collections::BTreeSet;
 use std::io::{BufRead, Write};
@@ -11,6 +16,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use async_trait::async_trait;
 use clap::ValueEnum;
+use pi_agent::shell_policy::{BashPolicy, PolicyDecision, PolicyVerdict};
 
 use crate::{Error, Result};
 
@@ -242,6 +248,9 @@ pub struct Approvals {
 	/// `session/request_permission`). The alternate owns the policy decision;
 	/// this matrix is not consulted when it is installed.
 	approver: Option<std::sync::Arc<dyn pi_agent::ToolApprover>>,
+	/// Bash command policy. Built-in destructive rules are always active;
+	/// `bash.patterns` / `bashInterceptor` from config layer on top.
+	bash_policy: BashPolicy,
 }
 
 impl std::fmt::Debug for Approvals {
@@ -252,6 +261,7 @@ impl std::fmt::Debug for Approvals {
 			.field("has_ask", &self.ask.is_some())
 			.field("has_input", &self.input.is_some())
 			.field("has_approver", &self.approver.is_some())
+			.field("bash_policy_rules", &self.bash_policy.rules().len())
 			.finish()
 	}
 }
@@ -265,7 +275,16 @@ impl Approvals {
 			ask: None,
 			input: None,
 			approver: None,
+			bash_policy: BashPolicy::default(),
 		}
+	}
+
+	/// Install the bash command policy. [`Approvals::new`] already enables the
+	/// built-in destructive rules; hosts layer `Config::bash` rules on top.
+	#[must_use]
+	pub fn with_bash_policy(mut self, policy: BashPolicy) -> Self {
+		self.bash_policy = policy;
+		self
 	}
 
 	/// Install or clear the alternate approver. The matrix still resolves
@@ -372,7 +391,21 @@ impl Approvals {
 		input: &mut impl BufRead,
 		prompt: &mut impl Write,
 	) -> Result<bool> {
-		if self.decide(tool, read_only) == Decision::Auto {
+		self.confirm_decision(self.decide(tool, read_only), tool, detail, input, prompt)
+	}
+
+	/// Prompt for an already-resolved decision. Unlike [`Self::confirm`] this
+	/// never re-consults the matrix, so a policy-forced `Ask` still prompts
+	/// under `yolo` or `--allow bash`.
+	fn confirm_decision(
+		&self,
+		decision: Decision,
+		tool: &str,
+		detail: Option<&str>,
+		input: &mut impl BufRead,
+		prompt: &mut impl Write,
+	) -> Result<bool> {
+		if decision == Decision::Auto {
 			return Ok(true);
 		}
 		write!(prompt, "{}", approval_prompt(tool, detail))?;
@@ -384,6 +417,17 @@ impl Approvals {
 		let answer = line.trim().to_ascii_lowercase();
 		Ok(matches!(answer.as_str(), "y" | "yes"))
 	}
+
+	/// Policy verdict for one tool call. Shell policy only applies to `bash`.
+	fn bash_verdict(&self, name: &str, args: &serde_json::Value) -> PolicyVerdict {
+		if name != "bash" {
+			return PolicyVerdict::allow();
+		}
+		args
+			.get("command")
+			.and_then(|value| value.as_str())
+			.map_or_else(PolicyVerdict::allow, |command| self.bash_policy.evaluate(command))
+	}
 }
 
 #[async_trait]
@@ -394,16 +438,35 @@ impl pi_agent::ToolApprover for Approvals {
 
 	async fn approve(&self, name: &str, args: &serde_json::Value) -> std::result::Result<(), String> {
 		let tier = classify_tool(name, args);
+		// Policy runs before the matrix and before an alternate approver:
+		// `Forbidden` is a hard deny (yolo/`--allow bash`/ACP cannot override),
+		// and `Prompt` forces an ask even when the matrix would auto-approve.
+		let verdict = self.bash_verdict(name, args);
+		if verdict.decision == PolicyDecision::Forbidden {
+			return Err(
+				verdict
+					.reason
+					.unwrap_or_else(|| format!("blocked by bash policy: {name}")),
+			);
+		}
+		if verdict.decision == PolicyDecision::Allow && verdict.explicit_allow {
+			return Ok(());
+		}
+		let decision = if verdict.decision == PolicyDecision::Prompt {
+			Decision::Ask
+		} else {
+			self.decide_tier(name, tier)
+		};
 		if let Some(approver) = self.approver.as_ref() {
 			// The matrix still owns the explicit auto decisions: `yolo`, `--allow`
 			// and per-run registered MCP names all resolve before a front-end is
 			// asked. The alternate decides every *ask* outcome.
-			if self.decide_tier(name, tier) == Decision::Auto {
+			if decision == Decision::Auto {
 				return Ok(());
 			}
 			return approver.approve(name, args).await;
 		}
-		match self.decide_tier(name, tier) {
+		match decision {
 			Decision::Auto => Ok(()),
 			Decision::Ask => {
 				let detail = extract_tool_detail(name, args);
@@ -413,9 +476,9 @@ impl pi_agent::ToolApprover for Approvals {
 					let mut input =
 						input.lock().map_err(|_| "approval input poisoned".to_string())?;
 					let mut prompt = std::io::stderr().lock();
-					return match self.confirm(
+					return match self.confirm_decision(
+						decision,
 						name,
-						tier == ToolTier::Read,
 						detail.as_deref(),
 						&mut *input,
 						&mut prompt,
@@ -693,5 +756,59 @@ mod tests {
 		// Exact origin match authorizes execution
 		app.allow_mcp_tool_origin("my_server", "my_tool", "mcp__my_server_my_tool");
 		assert_eq!(app.decide("mcp__my_server_my_tool", false), Decision::Auto);
+	}
+
+	#[tokio::test]
+	async fn bash_policy_forbidden_beats_yolo_and_allow_bash() {
+		use pi_agent::ToolApprover;
+		use serde_json::json;
+
+		for app in [
+			approvals(ApprovalMode::Yolo, &["bash"]),
+			approvals(ApprovalMode::AlwaysAsk, &["bash"]),
+		] {
+			let error = app
+				.approve("bash", &json!({"command": "rm -rf /"}))
+				.await
+				.expect_err("hard deny");
+			assert!(error.contains("root"), "unexpected reason: {error}");
+		}
+	}
+
+	#[tokio::test]
+	async fn bash_policy_prompt_overrides_allow_bash_and_yolo() {
+		use pi_agent::ToolApprover;
+		use serde_json::json;
+
+		let closed: Box<dyn std::io::BufRead + Send> =
+			Box::new(Cursor::new(Vec::<u8>::new()));
+		let input: ApprovalInput =
+			std::sync::Arc::new(std::sync::Mutex::new(closed));
+		let approvals = approvals(ApprovalMode::Yolo, &["bash"]).with_input(Some(input));
+		let error = approvals
+			.approve("bash", &json!({"command": "git push --force origin main"}))
+			.await
+			.expect_err("policy must force a prompt");
+		assert!(
+			error.contains("stdin closed") || error.contains("denied"),
+			"unexpected reason: {error}"
+		);
+	}
+
+	#[tokio::test]
+	async fn bash_allow_rule_auto_approves_only_the_whole_line() {
+		use pi_agent::ToolApprover;
+		use pi_agent::shell_policy::{BashApproval, BashApprovalRule, BashPolicy};
+		use serde_json::json;
+
+		let policy = BashPolicy::new(vec![BashApprovalRule::new(
+			"git status*",
+			BashApproval::Allow,
+		)]);
+		let approvals = approvals(ApprovalMode::AlwaysAsk, &[]).with_bash_policy(policy);
+		approvals
+			.approve("bash", &json!({"command": "git status --short"}))
+			.await
+			.expect("allow rule matches the whole line");
 	}
 }

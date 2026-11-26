@@ -22,6 +22,7 @@ use aragent::{
 	runtime::PiAgentRunner,
 };
 use pi_agent::CancellationToken;
+use pi_agent::shell_policy::{BashApproval, BashApprovalRule, BashPolicy};
 use serde_json::json;
 
 /// Mock listeners must outlive the runner's own `max_time` (10s) and full-suite
@@ -565,6 +566,50 @@ fn test_approval_mode_write_read_only_permits() {
 		!side_effect_file.exists(),
 		"bash side effect must not run when denied"
 	);
+}
+
+#[test]
+fn test_bash_policy_deny_beats_yolo_and_allow_bash() {
+	let temp = TempDir::new("bash-policy-deny");
+	let target = temp.path.join("blocked");
+	let (addr, handle) = spawn_mock_model_server(
+		"bash",
+		json!({
+			"command": format!("mkdir {}", target.display())
+		}),
+	);
+
+	// yolo + `--allow bash` would auto-approve the tier; the user deny rule
+	// must still hard-deny before the tool ever runs.
+	let policy = BashPolicy::new(vec![BashApprovalRule::new("mkdir *", BashApproval::Deny)]);
+	let req = make_run_request(
+		addr,
+		&temp.path,
+		closed_approvals(ApprovalMode::Yolo, vec!["bash".to_string()])
+			.with_bash_policy(policy),
+	);
+
+	let runner = PiAgentRunner::new().expect("runner");
+	let stream = runner.run(&req).expect("run");
+	let mut tool_results = Vec::new();
+	for ev in stream {
+		if let Ok(Event::ToolEnd { id, tool, result, error, .. }) = ev {
+			tool_results.push((id, tool, result, error));
+		}
+	}
+	handle.join().unwrap();
+
+	assert_eq!(tool_results.len(), 1);
+	assert_eq!(tool_results[0].1, "bash");
+	assert!(tool_results[0].3.is_some(), "deny must surface as a tool error");
+	let combined =
+		format!("{} {:?}", tool_results[0].2, tool_results[0].3).to_lowercase();
+	assert!(
+		combined.contains("bash pattern") || combined.contains("denied"),
+		"rejection must come from the bash policy: result was '{}'",
+		tool_results[0].2
+	);
+	assert!(!target.exists(), "denied bash must not run");
 }
 
 #[test]

@@ -9,6 +9,7 @@
 //! stateless.
 pub mod cancel;
 pub mod minimizer;
+pub mod policy;
 pub mod process;
 pub mod shell;
 pub mod state;

@@ -24,6 +24,11 @@ pub mod workspace_writer;
 pub mod tls;
 
 pub use compaction::{CompactionReport, Compactor};
+// Aragent consumes these without a direct `pi-shell` dependency (its
+// `Cargo.toml` stays pinned): the shell policy used by the approval gate and
+// the recoverable-panic probe used by the crash reporter.
+pub use pi_shell::panic_scope_active;
+pub use pi_shell::policy as shell_policy;
 pub use tls::{ensure_crypto_provider, http_client_builder, shared_rustls_config};
 pub use durable::{
 	ChildDurability, ChildDurabilityFactory, DURABILITY_ADMISSION_FAILURE_CODE,

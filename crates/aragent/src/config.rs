@@ -13,6 +13,9 @@ use pi_agent::mcp::{
 	MCPHttpServerConfig, MCPServerConfig, MCPSseServerConfig, MCPStdioServerConfig, RequestIdFormat,
 	validate_server_config,
 };
+use pi_agent::shell_policy::{
+	BashApproval, BashApprovalRule, BashInterceptor, BashInterceptorRule,
+};
 use pi_agent::tools::task_isolation::{IsolationCommitStyle, IsolationMergeMode, IsolationMode};
 use pi_agent::tools::web_search::SearxngConfig;
 
@@ -590,6 +593,63 @@ impl EvalConfig {
 	}
 }
 
+/// `bash.*` / `bashInterceptor.*` settings groups.
+///
+/// `bash.patterns` is an ordered array of `{match, approval}` rule objects;
+/// `approval` is `allow`, `prompt`, or `deny`, and only `*` is a wildcard.
+/// `bashInterceptor` blocks commands that have a dedicated tool.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct BashConfig {
+	/// `bash.patterns`; `None` when the layer did not set the key, so a higher
+	/// layer's rules still apply.
+	pub patterns: Option<Vec<BashApprovalRule>>,
+	/// `bashInterceptor.{enabled,patterns}`; absent leaves the interceptor off.
+	pub interceptor: Option<BashInterceptor>,
+}
+
+impl BashConfig {
+	/// Merge monotonically: higher layers may add rules and enable the
+	/// interceptor, but can never clear/replace inherited patterns or weaken
+	/// `enabled: true`. Untrusted layers are pre-filtered by
+	/// `Config::drop_untrusted_permissions`, so they can only append
+	/// deny/prompt rules here.
+	fn merge(&mut self, overlay: Self) {
+		if let Some(patterns) = overlay.patterns {
+			match self.patterns.as_mut() {
+				Some(existing) => existing.extend(patterns),
+				None => self.patterns = Some(patterns),
+			}
+		}
+		if let Some(overlay) = overlay.interceptor {
+			let interceptor = self.interceptor.get_or_insert_with(BashInterceptor::default);
+			if overlay.enabled == Some(true) || interceptor.enabled.is_none() {
+				interceptor.enabled = overlay.enabled.or(interceptor.enabled);
+			}
+			for rule in overlay.rules {
+				if !interceptor
+					.rules
+					.iter()
+					.any(|existing| existing.pattern == rule.pattern && existing.tool == rule.tool)
+				{
+					interceptor.rules.push(rule);
+				}
+			}
+		}
+	}
+
+	/// Approval policy for this layer: built-in destructive rules plus the
+	/// configured user rules and interceptor.
+	#[must_use]
+	pub fn policy(&self) -> pi_agent::shell_policy::BashPolicy {
+		let mut policy =
+			pi_agent::shell_policy::BashPolicy::new(self.patterns.clone().unwrap_or_default());
+		if let Some(interceptor) = self.interceptor.clone() {
+			policy = policy.with_interceptor(interceptor);
+		}
+		policy
+	}
+}
+
 /// `autolearn.*`: the experimental post-stop capture surface.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct AutolearnConfig {
@@ -1017,6 +1077,8 @@ pub struct Config {
 	pub stream_partial: StreamPartialDurabilityConfig,
 	/// `eval.*` backend enablement and interpreter groups.
 	pub eval_config: EvalConfig,
+	/// `bash.*` approval patterns and the dedicated-tool interceptor.
+	pub bash: BashConfig,
 	/// `searxng.*`: the web-search endpoint and its credentials.
 	pub searxng: SearxngConfig,
 	/// `task.isolation.mode`; `None` means unset (defaults to `none`).
@@ -1080,6 +1142,13 @@ pub struct Config {
 }
 
 impl Config {
+	/// Effective bash approval policy: built-in destructive rules plus the
+	/// merged `bash.patterns` / `bashInterceptor` settings.
+	#[must_use]
+	pub fn bash_policy(&self) -> pi_agent::shell_policy::BashPolicy {
+		self.bash.policy()
+	}
+
 	/// Effective memory backend. An explicit `memory.backend` wins; otherwise
 	/// the legacy `memories.enabled` boolean maps exactly like the TS settings
 	/// migration (`config/settings.ts:1934-1945`): `true` -> `local`, `false`
@@ -1159,6 +1228,7 @@ impl Config {
 			.merge(overlay.model_request_timeout);
 		self.stream_partial.merge(overlay.stream_partial);
 		self.eval_config.merge(overlay.eval_config);
+		self.bash.merge(overlay.bash);
 		// `searxng.*` merges per leaf so an explicit host overlay can add
 		// credentials to a globally configured endpoint (and vice versa).
 		// Project layers never reach here with `searxng` set: see
@@ -1447,6 +1517,19 @@ impl Config {
 		}
 		// Untrusted implicit files can never supply launch-time provenance.
 		overlay.explicit_allow.clear();
+		// `bash.patterns` allow rules auto-approve a shell line, so an
+		// untrusted layer may only contribute deny/prompt (tightening) rules.
+		if let Some(patterns) = overlay.bash.patterns.as_mut() {
+			let before = patterns.len();
+			patterns.retain(|rule| rule.approval != BashApproval::Allow);
+			if patterns.len() != before {
+				eprintln!(
+					"warning: ignoring bash.patterns allow rules from untrusted config {}: \
+					 allow rules require an operator layer",
+					path.display()
+				);
+			}
+		}
 	}
 
 	/// Repository-controlled layers must never set the web-search endpoint or
@@ -2227,6 +2310,28 @@ fn apply_nested_settings(config: &mut Config, value: &Value, path: &Path) -> Res
 		config.eval_config.auto_background_threshold_ms =
 			expect_millis(threshold, "eval.autoBackground.thresholdMs", path)?;
 	}
+	if let Some(patterns) = settings_leaf(value, "bash", "patterns", "bash.patterns") {
+		config.bash.patterns = Some(parse_bash_patterns(patterns, path)?);
+	}
+	let interceptor_enabled =
+		settings_leaf(value, "bashInterceptor", "enabled", "bashInterceptor.enabled");
+	let interceptor_patterns =
+		settings_leaf(value, "bashInterceptor", "patterns", "bashInterceptor.patterns");
+	if interceptor_enabled.is_some() || interceptor_patterns.is_some() {
+		let interceptor = config
+			.bash
+			.interceptor
+			.get_or_insert_with(BashInterceptor::default);
+		if let Some(enabled) = interceptor_enabled {
+			interceptor.enabled = expect_bool(enabled, "bashInterceptor.enabled", path)?;
+		}
+		if let Some(patterns) = interceptor_patterns {
+			interceptor.rules = parse_bash_interceptor_rules(patterns, path)?;
+		} else if interceptor.enabled == Some(true) && interceptor.rules.is_empty() {
+			// Schema default list, only when the layer did not pin patterns.
+			interceptor.rules = pi_agent::shell_policy::default_interceptor_rules();
+		}
+	}
 	if let Some(timeout) = settings_leaf(value, "tools", "maxTimeout", "tools.maxTimeout") {
 		config.max_tool_timeout_secs =
 			expect_usize(timeout, "tools.maxTimeout", path)?.map(|seconds| seconds as u64);
@@ -2315,6 +2420,111 @@ fn parse_kernel_mode(
 		"per-call" => Ok(Some(pi_agent::eval::KernelMode::PerCall)),
 		_ => Err(invalid(path, key, "expected `session` or `per-call`")),
 	}
+}
+
+/// `bash.patterns`: ordered `{match, approval}` rules. Empty matches are
+/// dropped like the upstream accessor; a bad shape fails the layer load so a
+/// typo cannot silently disable a deny rule.
+fn parse_bash_patterns(value: &Value, path: &Path) -> Result<Vec<BashApprovalRule>> {
+	if matches!(value, Value::Null) {
+		return Ok(Vec::new());
+	}
+	let Some(items) = value.as_list() else {
+		return Err(invalid(path, "bash.patterns", "expected a sequence of {match, approval} objects"));
+	};
+	let mut rules = Vec::new();
+	for item in items {
+		if item.as_map().is_none() {
+			return Err(invalid(
+				path,
+				"bash.patterns",
+				"expected a sequence of {match, approval} objects",
+			));
+		}
+		let pattern = item
+			.get("match")
+			.and_then(Value::as_str)
+			.map(str::trim)
+			.unwrap_or_default();
+		if pattern.is_empty() {
+			continue;
+		}
+		let Some(approval) = item
+			.get("approval")
+			.and_then(Value::as_str)
+			.and_then(BashApproval::parse)
+		else {
+			return Err(invalid(
+				path,
+				"bash.patterns",
+				"each rule needs an `approval` of allow, prompt, or deny",
+			));
+		};
+		rules.push(BashApprovalRule::new(pattern, approval));
+	}
+	Ok(rules)
+}
+
+/// `bashInterceptor.patterns`: `{pattern, tool, message}` rule objects.
+fn parse_bash_interceptor_rules(
+	value: &Value,
+	path: &Path,
+) -> Result<Vec<BashInterceptorRule>> {
+	if matches!(value, Value::Null) {
+		return Ok(Vec::new());
+	}
+	let Some(items) = value.as_list() else {
+		return Err(invalid(
+			path,
+			"bashInterceptor.patterns",
+			"expected a sequence of {pattern, tool, message} objects",
+		));
+	};
+	let mut rules = Vec::new();
+	for item in items {
+		if item.as_map().is_none() {
+			return Err(invalid(
+				path,
+				"bashInterceptor.patterns",
+				"expected a sequence of {pattern, tool, message} objects",
+			));
+		}
+		let pattern = item
+			.get("pattern")
+			.and_then(Value::as_str)
+			.map(str::trim)
+			.unwrap_or_default();
+		let tool = item
+			.get("tool")
+			.and_then(Value::as_str)
+			.map(str::trim)
+			.unwrap_or_default();
+		if pattern.is_empty() || tool.is_empty() {
+			return Err(invalid(
+				path,
+				"bashInterceptor.patterns",
+				"each rule needs non-empty `pattern` and `tool` strings",
+			));
+		}
+		if let Err(reason) = pi_agent::shell_policy::validate_interceptor_pattern(pattern) {
+			return Err(invalid(
+				path,
+				"bashInterceptor.patterns",
+				&format!("invalid regex `{pattern}`: {reason}"),
+			));
+		}
+		let message = item
+			.get("message")
+			.and_then(Value::as_str)
+			.unwrap_or_default()
+			.to_string();
+		rules.push(BashInterceptorRule {
+			pattern: pattern.to_string(),
+			tool: tool.to_string(),
+			message,
+		});
+	}
+	Ok(rules)
 }
 
 /// Settings leaf written either nested (`lsp: { enabled: … }`) or as a quoted
@@ -3924,6 +4134,193 @@ mod tests {
 		// Dotted `tools.maxTimeout` is the schema path form of the nested key.
 		let dotted_timeout = parse_config("\"tools.maxTimeout\": 30\n").expect("dotted maxTimeout");
 		assert_eq!(dotted_timeout.max_tool_timeout_secs, Some(30));
+	}
+
+	#[test]
+	fn bash_patterns_and_interceptor_parse_and_merge() {
+		let nested = parse_config(concat!(
+			"bash:\n",
+			"  patterns:\n",
+			"    - match: 'git push --force*'\n",
+			"      approval: deny\n",
+			"    - match: 'git status*'\n",
+			"      approval: allow\n",
+		))
+		.expect("nested bash patterns");
+		let rules = nested.bash.patterns.as_ref().expect("patterns");
+		assert_eq!(rules.len(), 2);
+		assert_eq!(rules[0].approval, BashApproval::Deny);
+		assert_eq!(rules[1].approval, BashApproval::Allow);
+
+		// Quoted dotted schema path form.
+		let dotted = parse_config(
+			"\"bash.patterns\":\n  - match: 'rm -rf*'\n    approval: prompt\n",
+		)
+		.expect("dotted bash patterns");
+		assert_eq!(
+			dotted.bash.patterns.as_ref().expect("patterns")[0].approval,
+			BashApproval::Prompt
+		);
+
+		let interceptor = parse_config(concat!(
+			"bashInterceptor:\n",
+			"  enabled: true\n",
+			"  patterns:\n",
+			"    - pattern: '^cat\\b'\n",
+			"      tool: read\n",
+			"      message: use read\n",
+		))
+		.expect("interceptor");
+		let interceptor = interceptor.bash.interceptor.expect("interceptor group");
+		assert_eq!(interceptor.enabled, Some(true));
+		assert_eq!(interceptor.rules.len(), 1);
+		assert_eq!(interceptor.rules[0].tool, "read");
+
+		// Layers append; no layer can clear or replace inherited rules.
+		let mut layered = parse_config(
+			"bash:\n  patterns:\n    - match: a\n      approval: allow\n",
+		)
+		.expect("base");
+		layered.merge(
+			parse_config("bash:\n  patterns:\n    - match: b\n      approval: deny\n")
+				.expect("overlay"),
+		);
+		let layered_rules = layered.bash.patterns.expect("patterns");
+		assert_eq!(layered_rules.len(), 2);
+		assert_eq!(layered_rules[0].pattern, "a");
+		assert_eq!(layered_rules[1].pattern, "b");
+
+		// The accessor keeps built-ins and exposes configured allow rules.
+		let policy = parse_config(
+			"bash:\n  patterns:\n    - match: 'git status*'\n      approval: allow\n",
+		)
+		.expect("policy config")
+		.bash
+		.policy();
+		let allowed = policy.evaluate("git status --short");
+		assert_eq!(allowed.decision, pi_agent::shell_policy::PolicyDecision::Allow);
+		assert!(allowed.explicit_allow);
+		assert_eq!(
+			policy.evaluate("rm -rf /").decision,
+			pi_agent::shell_policy::PolicyDecision::Forbidden
+		);
+
+		// Repository-controlled layers may only tighten: allow rules are
+		// dropped, deny/prompt rules survive.
+		let mut untrusted = parse_config(concat!(
+			"bash:\n",
+			"  patterns:\n",
+			"    - match: 'git status*'\n",
+			"      approval: allow\n",
+			"    - match: 'rm *'\n",
+			"      approval: deny\n",
+		))
+		.expect("untrusted rules");
+		Config::drop_untrusted_permissions(
+			&mut untrusted,
+			&Config::default(),
+			Path::new("settings.json"),
+		);
+		let rules = untrusted.bash.patterns.expect("patterns");
+		assert_eq!(rules.len(), 1);
+		assert_eq!(rules[0].approval, BashApproval::Deny);
+
+		// An untrusted overlay cannot clear inherited patterns, cannot disable
+		// an enabled interceptor, and cannot erase inherited interceptor rules.
+		let mut inherited = parse_config(concat!(
+			"bash:\n",
+			"  patterns:\n",
+			"    - match: 'rm *'\n",
+			"      approval: deny\n",
+			"bashInterceptor:\n",
+			"  enabled: true\n",
+			"  patterns:\n",
+			"    - pattern: '^cat\\b'\n",
+			"      tool: read\n",
+			"      message: use read\n",
+		))
+		.expect("inherited");
+		let mut hostile = parse_config(concat!(
+			"bash:\n",
+			"  patterns: []\n",
+			"bashInterceptor:\n",
+			"  enabled: false\n",
+		))
+		.expect("hostile overlay");
+		Config::drop_untrusted_permissions(
+			&mut hostile,
+			&inherited,
+			Path::new("project/settings.json"),
+		);
+		inherited.merge(hostile);
+		let inherited_rules = inherited.bash.patterns.as_ref().expect("patterns");
+		assert_eq!(inherited_rules.len(), 1);
+		assert_eq!(inherited_rules[0].approval, BashApproval::Deny);
+		let inherited_interceptor = inherited.bash.interceptor.as_ref().expect("interceptor");
+		assert_eq!(inherited_interceptor.enabled, Some(true));
+		assert_eq!(inherited_interceptor.rules.len(), 1);
+		assert_eq!(inherited_interceptor.rules[0].tool, "read");
+
+		// An untrusted layer may still *add* restrictions.
+		let mut stricter = parse_config(concat!(
+			"bash:\n",
+			"  patterns:\n",
+			"    - match: 'curl *'\n",
+			"      approval: prompt\n",
+			"bashInterceptor:\n",
+			"  patterns:\n",
+			"    - pattern: '^grep\\b'\n",
+			"      tool: grep\n",
+		))
+		.expect("stricter overlay");
+		Config::drop_untrusted_permissions(
+			&mut stricter,
+			&inherited,
+			Path::new("project/settings.json"),
+		);
+		inherited.merge(stricter);
+		assert_eq!(inherited.bash.patterns.as_ref().expect("patterns").len(), 2);
+		assert_eq!(
+			inherited
+				.bash
+				.interceptor
+				.as_ref()
+				.expect("interceptor")
+				.rules
+				.len(),
+			2
+		);
+
+		// `enabled: true` without explicit patterns loads the schema defaults,
+		// and every default compiles under the Rust regex engine.
+		let defaults = parse_config("bashInterceptor:\n  enabled: true\n").expect("defaults");
+		let interceptor = defaults
+			.bash
+			.interceptor
+			.as_ref()
+			.expect("interceptor group");
+		assert_eq!(interceptor.enabled, Some(true));
+		assert_eq!(interceptor.rules.len(), 11);
+		for rule in &interceptor.rules {
+			pi_agent::shell_policy::validate_interceptor_pattern(&rule.pattern)
+				.expect("default pattern compiles");
+		}
+		assert_eq!(
+			defaults.bash.policy().evaluate("cat file").decision,
+			pi_agent::shell_policy::PolicyDecision::Forbidden
+		);
+
+		// Malformed shapes fail the layer load instead of silently disabling a
+		// deny rule.
+		for text in [
+			"bash:\n  patterns: nope\n",
+			"bash:\n  patterns:\n    - match: x\n      approval: maybe\n",
+			"bashInterceptor:\n  patterns:\n    - pattern: x\n",
+			"bashInterceptor:\n  patterns:\n    - pattern: '(?<!x)cat'\n      tool: read\n",
+			"bashInterceptor:\n  patterns:\n    - pattern: '['\n      tool: read\n",
+		] {
+			assert!(parse_config(text).is_err(), "{text:?}");
+		}
 	}
 
 	#[test]
