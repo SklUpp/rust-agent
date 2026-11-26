@@ -1336,6 +1336,14 @@ impl SubagentLifecycleManager {
 
         let (owned_durability, fresh_open, fresh_replay) = if contract.durable {
             let worker_id = contract.result_key.as_deref().ok_or_else(|| format!("cannot revive agent \"{id}\": durable child has no spawn-time result key"))?;
+            // Fail closed: without a recorded epoch the store cannot prove this
+            // contract belongs to the durable session, so never replay it.
+            let generation = contract.producer_generation.ok_or_else(|| format!(
+                "cannot revive agent \"{id}\": durable child has no recorded producer generation"
+            ))?;
+            supervisor
+                .validate_child_generation(worker_id, generation)
+                .map_err(|error| format!("cannot reopen agent \"{id}\" durable session: {error}"))?;
             let opened = supervisor.open_child_durable_with_freshness(id, Some(worker_id))
                 .map_err(|error| format!("cannot reopen agent \"{id}\" durable session: {error}"))?;
             opened.map_or((None, false, None), |(child, fresh, replay)| (Some(child), fresh, replay))

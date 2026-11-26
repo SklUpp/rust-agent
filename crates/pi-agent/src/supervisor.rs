@@ -1398,6 +1398,9 @@ impl Supervisor {
             }
             if let Some(existing) = self.state.lock().unwrap().durable_children.get(id).cloned() {
                 if existing.identity().worker_id == worker_id {
+                    // Cached ownership is retained: it keeps the shared writer
+                    // alive, so a revive replays through the barrier-backed
+                    // owned read instead of taking a second lease.
                     return Ok(Some((existing, false, None)));
                 }
             }
@@ -1490,6 +1493,11 @@ impl Supervisor {
     }
 
     /// Load replay while retaining already-open child ownership.
+    ///
+    /// A cached child is exactly the ownership a revive gets: the cached handle
+    /// keeps the shared writer alive, so the factory barrier flushes queued
+    /// writes before the owned read. Cached replay therefore observes the same
+    /// state a fresh open would, without taking a second lease.
     pub fn load_child_messages_owned(
         &self,
         worker_id: &str,
@@ -1499,6 +1507,22 @@ impl Supervisor {
             return Ok(None);
         };
         factory.load_child_messages_owned(worker_id, child).map_err(|error| error.to_string())
+    }
+
+    /// Verify a persisted contract's producer epoch against the parent's
+    /// recorded lineage before reopening the child. Refuses on any mismatch;
+    /// revive fails closed.
+    pub fn validate_child_generation(
+        &self,
+        worker_id: &str,
+        producer_generation: u64,
+    ) -> Result<(), String> {
+        let Some(factory) = self.child_durability_factory() else {
+            return Err("durable child factory is not configured".to_string());
+        };
+        factory
+            .validate_child_generation(worker_id, producer_generation)
+            .map_err(|error| error.to_string())
     }
     pub fn load_child_messages_fresh(
         &self,

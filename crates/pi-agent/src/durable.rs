@@ -188,11 +188,14 @@ pub trait DurableBoundary: Send + Sync + std::fmt::Debug {
 /// result key, never a reusable `task-N` display index. `session_id` /
 /// `origin_branch_id` name the root scope that owns the parent notification and
 /// are frozen here so a later branch cut cannot redirect it.
+/// `producer_generation` is the admitting parent's producer epoch at spawn; a
+/// persisted contract records it and revive validates it against the parent.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WorkerIdentity {
 	pub worker_id: String,
 	pub session_id: String,
 	pub origin_branch_id: String,
+	pub producer_generation: u64,
 }
 
 /// Host completion writer: the worker completion and its parent delivery commit
@@ -297,6 +300,21 @@ pub trait ChildDurabilityFactory: Send + Sync + std::fmt::Debug {
 		_child: &ChildDurability,
 	) -> Result<Option<Vec<Message>>, DurableError> {
 		Err(DurableError::new("durable child replay requires a quiescent owner"))
+	}
+
+	/// Prove that a persisted child contract's producer epoch belongs to the
+	/// durable parent before reopening it: the parent's recorded epoch must be
+	/// at least the contract epoch, and the child session must be parented to
+	/// that parent. The default refuses: a store that cannot verify the epoch
+	/// must not replay the child.
+	fn validate_child_generation(
+		&self,
+		_worker_id: &str,
+		_producer_generation: u64,
+	) -> Result<(), DurableError> {
+		Err(DurableError::new(
+			"durable child producer generation validation is not implemented",
+		))
 	}
 
     /// Load replay after this call acquired fresh exclusive child ownership.

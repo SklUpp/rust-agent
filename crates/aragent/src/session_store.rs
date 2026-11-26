@@ -45,7 +45,7 @@ use serde_json::{Value, json};
 
 use crate::durable_session::StoredProjection;
 /// Current schema version. Bump only with a new branch in [`SqliteStore::initialize`].
-pub const SCHEMA_VERSION: i64 = 6;
+pub const SCHEMA_VERSION: i64 = 7;
 const SCHEMA_VERSION_DDL: &str = "
 	CREATE TABLE IF NOT EXISTS schema_version (
 		id INTEGER PRIMARY KEY CHECK (id = 1),
@@ -191,6 +191,32 @@ const SCHEMA_V6_MIGRATION_DDL: &str = "
 	DROP INDEX IF EXISTS task_admissions_worker_idx;
 	CREATE UNIQUE INDEX task_admissions_worker_idx ON task_admissions(worker_id, producer_generation);
 ";
+
+/// v7 records the producer epoch that last acquired writer ownership of a
+/// session. A persisted child contract stores the epoch observed at spawn; the
+/// revive path refuses a contract whose epoch the store has never recorded.
+/// Nullable: sessions written before v7 and sessions with no admission keep
+/// no epoch, and only durable children ever read it.
+const SCHEMA_V7_MIGRATION_DDL: &str = "
+	ALTER TABLE sessions ADD COLUMN producer_generation INTEGER \
+	 CHECK (producer_generation IS NULL OR producer_generation >= 0);
+";
+
+/// SQLite has no `ADD COLUMN IF NOT EXISTS`, so the column is probed first.
+/// The probe keeps a retried migration idempotent even though the surrounding
+/// transaction already makes a failed attempt roll back.
+fn migrate_producer_generation(transaction: &rusqlite::Transaction<'_>) -> StoreResult<()> {
+	let has_column: bool = transaction.query_row(
+		"SELECT EXISTS(SELECT 1 FROM pragma_table_info('sessions') \
+		 WHERE name = 'producer_generation')",
+		[],
+		|row| row.get(0),
+	)?;
+	if !has_column {
+		transaction.execute_batch(SCHEMA_V7_MIGRATION_DDL)?;
+	}
+	Ok(())
+}
 
 /// Immutable fork-only classification of a copied tool-result message. Not an
 /// intent: rows here never appear in `executions` and can never be recovered as
@@ -1460,6 +1486,7 @@ impl SqliteStore {
 				transaction.execute_batch(SCHEMA_V4_MIGRATION_DDL)?;
 				transaction.execute_batch(SCHEMA_V5_MIGRATION_DDL)?;
 				transaction.execute_batch(SCHEMA_V6_MIGRATION_DDL)?;
+				migrate_producer_generation(&transaction)?;
 				transaction.execute(
 					"INSERT INTO schema_version (id, version) VALUES (1, ?1)",
 					params![SCHEMA_VERSION],
@@ -1471,6 +1498,7 @@ impl SqliteStore {
 				transaction.execute_batch(SCHEMA_V4_MIGRATION_DDL)?;
 				transaction.execute_batch(SCHEMA_V5_MIGRATION_DDL)?;
 				transaction.execute_batch(SCHEMA_V6_MIGRATION_DDL)?;
+				migrate_producer_generation(&transaction)?;
 				transaction.execute(
 					"UPDATE schema_version SET version = ?1 WHERE id = 1",
 					params![SCHEMA_VERSION],
@@ -1481,6 +1509,7 @@ impl SqliteStore {
 				transaction.execute_batch(SCHEMA_V4_MIGRATION_DDL)?;
 				transaction.execute_batch(SCHEMA_V5_MIGRATION_DDL)?;
 				transaction.execute_batch(SCHEMA_V6_MIGRATION_DDL)?;
+				migrate_producer_generation(&transaction)?;
 				transaction.execute(
 					"UPDATE schema_version SET version = ?1 WHERE id = 1",
 					params![SCHEMA_VERSION],
@@ -1490,6 +1519,7 @@ impl SqliteStore {
 				transaction.execute_batch(SCHEMA_V4_MIGRATION_DDL)?;
 				transaction.execute_batch(SCHEMA_V5_MIGRATION_DDL)?;
 				transaction.execute_batch(SCHEMA_V6_MIGRATION_DDL)?;
+				migrate_producer_generation(&transaction)?;
 				transaction.execute(
 					"UPDATE schema_version SET version = ?1 WHERE id = 1",
 					params![SCHEMA_VERSION],
@@ -1498,6 +1528,7 @@ impl SqliteStore {
 			Some(4) => {
 				transaction.execute_batch(SCHEMA_V5_MIGRATION_DDL)?;
 				transaction.execute_batch(SCHEMA_V6_MIGRATION_DDL)?;
+				migrate_producer_generation(&transaction)?;
 				transaction.execute(
 					"UPDATE schema_version SET version = ?1 WHERE id = 1",
 					params![SCHEMA_VERSION],
@@ -1505,6 +1536,14 @@ impl SqliteStore {
 			},
 			Some(5) => {
 				transaction.execute_batch(SCHEMA_V6_MIGRATION_DDL)?;
+				migrate_producer_generation(&transaction)?;
+				transaction.execute(
+					"UPDATE schema_version SET version = ?1 WHERE id = 1",
+					params![SCHEMA_VERSION],
+				)?;
+			},
+			Some(6) => {
+				migrate_producer_generation(&transaction)?;
 				transaction.execute(
 					"UPDATE schema_version SET version = ?1 WHERE id = 1",
 					params![SCHEMA_VERSION],
@@ -3212,6 +3251,52 @@ impl SqliteStore {
 			});
 		}
 		Ok(admissions)
+	}
+
+	/// Record the producer epoch that just acquired writer ownership of
+	/// `session_id`. Kept beside task admissions so a persisted child contract
+	/// can prove the session it replays belongs to this lineage.
+	pub fn set_session_producer_generation(
+		&mut self,
+		session_id: &str,
+		generation: u64,
+	) -> StoreResult<()> {
+		validate_id("session id", session_id)?;
+		let generation = i64::try_from(generation).map_err(|_| {
+			StoreError::Validation("producer generation is out of range".to_string())
+		})?;
+		let changed = self.connection.execute(
+			"UPDATE sessions SET producer_generation = ?2 WHERE id = ?1",
+			params![session_id, generation],
+		)?;
+		if changed == 0 {
+			return Err(StoreError::NotFound(format!("session {session_id} does not exist")));
+		}
+		Ok(())
+	}
+
+	/// Producer epoch recorded for `session_id`. `None` means the session
+	/// predates v7 or has not been opened since; a missing session is an error.
+	pub fn session_producer_generation(&self, session_id: &str) -> StoreResult<Option<u64>> {
+		validate_id("session id", session_id)?;
+		let recorded: Option<Option<i64>> = self
+			.connection
+			.query_row(
+				"SELECT producer_generation FROM sessions WHERE id = ?1",
+				params![session_id],
+				|row| row.get(0),
+			)
+			.optional()?;
+		match recorded {
+			None => Err(StoreError::NotFound(format!("session {session_id} does not exist"))),
+			Some(None) => Ok(None),
+			Some(Some(value)) => match u64::try_from(value) {
+				Ok(value) => Ok(Some(value)),
+				Err(_) => Err(StoreError::Corrupt(format!(
+					"session {session_id} has bad producer generation"
+				))),
+			},
+		}
 	}
 
 	/// Next producer generation for a session: one above every generation this

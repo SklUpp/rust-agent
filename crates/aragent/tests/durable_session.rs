@@ -15,9 +15,9 @@ use std::{
 
 use async_trait::async_trait;
 use pi_agent::{
-	AgentConfig, AgentError, AgentLoop, AgentState, ChunkStream, ContentPart, DurableBoundary,
-	DurableError, Message, ModelProvider, ProviderError, Role, SteeringEvent, StopReason, Tool,
-	ToolCall, ToolChoice, ToolRegistry, ToolResult,
+	AgentConfig, AgentError, AgentLoop, AgentState, ChildDurabilityFactory, ChunkStream,
+	ContentPart, DurableBoundary, DurableError, Message, ModelProvider, ProviderError, Role,
+	SteeringEvent, StopReason, Tool, ToolCall, ToolChoice, ToolRegistry, ToolResult,
 };
 use serde_json::{Value, json};
 
@@ -28,7 +28,7 @@ use aragent::{
 		CURRENT_SESSION_VERSION, MessageContent, MessageEntry, SessionEntry, SessionHeader,
 		SessionMessage, SessionOptions, SessionStore,
 	},
-	session_store::{NewIntent, SqliteStore, StoreError},
+	session_store::{NewIntent, NewSession, SqliteStore, StoreError},
 };
 
 struct CountingTool {
@@ -3941,5 +3941,76 @@ async fn durable_session_resume_after_compaction_preserves_projection_and_masks_
 		.expect("query matching rows");
 	assert_eq!(msg_count, 0, "secret must not appear in any message row in the database");
 
+	let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn child_generation_validation_tracks_parent_lineage() {
+	let dir = temp_dir("child-generation");
+	let db = dir.join("sessions.db");
+	let root = DurableSession::create(&db, header("root", &dir)).expect("root session");
+	let spawn_epoch = root.producer_generation();
+	let factory = root.durable_child_factory();
+	let (child, _) = factory
+		.open_child_with_replay("ns:epoch-child")
+		.expect("child scope");
+	assert_eq!(
+		child.identity().producer_generation,
+		spawn_epoch,
+		"the contract epoch is the admitting parent epoch"
+	);
+	assert!(factory.validate_child_generation("ns:epoch-child", spawn_epoch).is_ok());
+	assert!(
+		factory.validate_child_generation("ns:epoch-child", spawn_epoch + 1).is_err(),
+		"a contract epoch newer than the parent must fail closed"
+	);
+	assert!(
+		factory.validate_child_generation("ns:missing-child", spawn_epoch).is_err(),
+		"a missing child session must fail closed"
+	);
+	{
+		let mut store = SqliteStore::open(&db).expect("store");
+		store
+			.create_session(NewSession {
+				id: "foreign".to_string(),
+				parent_session_id: None,
+				payload: json!({}),
+				initial_branch_id: "b-foreign".to_string(),
+				initial_branch_payload: json!({}),
+			})
+			.expect("foreign session");
+	}
+	assert!(
+		factory.validate_child_generation("foreign", spawn_epoch).is_err(),
+		"a session from another lineage must fail closed"
+	);
+
+	// One admission pins the current root epoch, so reopening advances it.
+	factory
+		.admit_child("ns:epoch-child", &json!({"task": "epoch"}))
+		.expect("admit child");
+	drop(child);
+	drop(factory);
+	drop(root);
+
+	let root = DurableSession::open(&db, "root", header("root", &dir))
+		.expect("reopen root")
+		.0;
+	let resumed_epoch = root.producer_generation();
+	assert!(resumed_epoch > spawn_epoch, "reopen must advance the root epoch");
+	let factory = root.durable_child_factory();
+	assert!(
+		factory.validate_child_generation("ns:epoch-child", spawn_epoch).is_ok(),
+		"a contract from an earlier root epoch stays valid"
+	);
+	assert!(factory.validate_child_generation("ns:epoch-child", resumed_epoch).is_ok());
+	assert!(
+		factory
+			.validate_child_generation("ns:epoch-child", resumed_epoch + 1)
+			.is_err(),
+		"a future epoch must fail closed"
+	);
+	drop(factory);
+	drop(root);
 	let _ = std::fs::remove_dir_all(dir);
 }

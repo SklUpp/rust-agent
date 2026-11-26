@@ -107,6 +107,11 @@ pub struct PersistedChildSession {
 	/// `load` then accepts a contract without a legacy JSONL transcript.
 	#[serde(default, skip_serializing_if = "is_false")]
 	pub durable: bool,
+	/// The admitting parent's producer epoch at spawn. Revive requires it for a
+	/// durable contract and refuses when the parent store has no matching
+	/// epoch; older contracts omit it and cannot be replayed durably.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub producer_generation: Option<u64>,
 	/// Agent definition name (for example `scout` or `reviewer`).
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub agent: Option<String>,
@@ -416,6 +421,41 @@ pub struct RevivedChild {
 	pub durable:   bool,
 }
 
+/// Fail closed unless a durable contract carries an epoch its supervisor can
+/// prove against the store. Runs on every revive entry point (the
+/// `revive_with_durability` default and the default factory's `revive`), so no
+/// caller can reopen a durable child without lineage proof.
+fn validate_durable_contract(
+	contract: &PersistedChildSession,
+	supervisor: Option<&Arc<Supervisor>>,
+) -> Result<(), String> {
+	if !contract.durable {
+		return Ok(());
+	}
+	let worker_id = contract.result_key.as_deref().ok_or_else(|| {
+		format!(
+			"durable child \"{}\" has no spawn-time result key; refusing an ambiguous revive",
+			contract.id
+		)
+	})?;
+	let generation = contract.producer_generation.ok_or_else(|| {
+		format!(
+			"durable child \"{}\" has no recorded producer generation; refusing to replay it",
+			contract.id
+		)
+	})?;
+	let Some(supervisor) = supervisor else {
+		return Err(format!(
+			"durable child \"{}\" cannot be revived without a supervisor to validate its \
+			 producer generation",
+			contract.id
+		));
+	};
+	supervisor
+		.validate_child_generation(worker_id, generation)
+		.map_err(|error| format!("cannot reopen durable child \"{}\": {error}", contract.id))
+}
+
 /// Host-owned cold-revive factory (upstream
 /// `PersistedSubagentReviverFactory`).
 ///
@@ -441,6 +481,7 @@ pub trait PersistedChildReviverFactory: Send + Sync {
         supervisor: Option<&Arc<Supervisor>>,
         _durability: Option<crate::durable::ChildDurability>,
     ) -> Result<RevivedChild, String> {
+        validate_durable_contract(contract, supervisor)?;
         self.revive(contract, replayed, supervisor)
     }
 }
@@ -622,6 +663,7 @@ impl PersistedChildReviverFactory for DefaultPersistedReviverFactory {
 		mut replayed: Vec<Message>,
 		supervisor: Option<&Arc<Supervisor>>,
 	) -> Result<RevivedChild, String> {
+		validate_durable_contract(contract, supervisor)?;
 		if !contract.cwd.is_dir() {
 			return Err(format!(
 				"recorded workspace {} no longer exists; agent \"{}\" is transcript-only \
@@ -720,6 +762,8 @@ impl PersistedChildReviverFactory for DefaultPersistedReviverFactory {
 				durable = true;
 				effective_contract.durable = true;
 				effective_contract.result_key = Some(worker_id);
+				effective_contract.producer_generation =
+					Some(child.identity().producer_generation);
 			}
 		}
 		let agent = supervisor

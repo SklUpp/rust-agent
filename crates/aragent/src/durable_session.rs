@@ -370,6 +370,22 @@ impl DurableWriter {
 		})
 	}
 
+	/// Queue a no-op job and wait for it. Every write enqueued before this call
+	/// has been applied by the writer thread when it returns, so a subsequent
+	/// read on any connection observes them.
+	pub fn barrier(&self) -> StoreResult<()> {
+		let (reply, receiver) = mpsc::channel();
+		self.send(Box::new(move |_store| {
+			let _ = reply.send(());
+		}))?;
+		receiver.recv().map_err(|_| {
+			StoreError::Io(std::io::Error::new(
+				std::io::ErrorKind::BrokenPipe,
+				"session store writer stopped before replying",
+			))
+		})
+	}
+
 	/// Blocking call for the synchronous session manager. The SQLite work still
 	/// happens on the writer thread; this thread only waits for the reply.
 	pub fn call<T: Send + 'static>(
@@ -569,7 +585,10 @@ impl DurableSession {
 		})?;
 		let generation = {
 			let id = session_id.clone();
-			writer.call(move |store| store.next_producer_generation(&id))?
+			let generation = writer.call(move |store| store.next_producer_generation(&id))?;
+			let id = session_id.clone();
+			writer.call(move |store| store.set_session_producer_generation(&id, generation))?;
+			generation
 		};
 		Ok(empty_session_fields(writer, session_id, branch_id, None, generation, None, None, None))
 	}
@@ -612,6 +631,9 @@ impl DurableSession {
 		};
 		match existing {
 			Some(_) => {
+				// Record the epoch this ownership claims before mutating.
+				let id = id.clone();
+				writer.call(move |store| store.set_session_producer_generation(&id, generation))?;
 				// Exclusive ownership is proven: recover trailing unresolved
 				// intents and close child admissions orphaned by the previous
 				// owner before loading. Failure is fatal to writer open.
@@ -667,6 +689,10 @@ impl DurableSession {
 						initial_branch_payload: Value::Null,
 					})
 				})?;
+				let persist_id = id.clone();
+				writer.call(move |store| {
+					store.set_session_producer_generation(&persist_id, generation)
+				})?;
 				Ok((
 					empty_session_fields(
 						writer,
@@ -687,6 +713,13 @@ impl DurableSession {
 	#[must_use]
 	pub fn session_id(&self) -> &str {
 		&self.session_id
+	}
+
+	/// Producer epoch claimed when this handle opened the session. Persisted on
+	/// the session row and recorded in a child contract at spawn.
+	#[must_use]
+	pub fn producer_generation(&self) -> u64 {
+		self.producer_generation
 	}
 
 	#[must_use]
@@ -1981,6 +2014,11 @@ impl StoreChildDurabilityFactory {
 			worker_id: worker_id.to_string(),
 			session_id: self.session_id.clone(),
 			origin_branch_id,
+			// The contract records the *parent* producer epoch that admitted
+			// this child, so revive validates lineage against the parent's
+			// recorded epoch (the child's own counter stays at 1 until it
+			// spawns sub-workers and is not a lineage proof).
+			producer_generation: self.producer_generation,
 		};
 		Ok((child, identity, loaded))
 	}
@@ -2196,6 +2234,65 @@ impl ChildDurabilityFactory for StoreChildDurabilityFactory {
 		})
 		.map_err(|error| DurableError::new(error.to_string()))?;
 		Ok(messages)
+	}
+
+	/// Cached ownership keeps the writer shared with the child, so a writer
+	/// barrier is a proof of quiescence: every previously queued write is
+	/// applied before the read-only snapshot opens. Without it a cached read
+	/// could miss a write still sitting in the writer channel.
+	fn load_child_messages_owned(
+		&self,
+		worker_id: &str,
+		child: &ChildDurability,
+	) -> Result<Option<Vec<Message>>, DurableError> {
+		if child.identity().worker_id != worker_id {
+			return Err(DurableError::new(
+				"owned replay worker id does not match the cached child",
+			));
+		}
+		let writer = Arc::clone(&self.writer);
+		run_blocking(move || writer.barrier())
+			.map_err(|error| DurableError::new(error.to_string()))?;
+		self.load_child_messages(worker_id)
+	}
+
+	fn validate_child_generation(
+		&self,
+		worker_id: &str,
+		producer_generation: u64,
+	) -> Result<(), DurableError> {
+		let parent_id = self.session_id.clone();
+		let child_id = worker_id.to_string();
+		writer_call(&self.writer, move |store| {
+			// A contract epoch must never be newer than the epoch the parent
+			// store has recorded: the parent only ever advances, so a stale
+			// contract (spawned under an earlier root epoch) still passes.
+			let Some(recorded) = store.session_producer_generation(&parent_id)? else {
+				return Err(StoreError::Conflict(format!(
+					"parent session {parent_id} has no recorded producer epoch"
+				)));
+			};
+			if recorded < producer_generation {
+				return Err(StoreError::Conflict(format!(
+					"contract producer epoch {producer_generation} is newer than parent \
+					 {parent_id} epoch {recorded}"
+				)));
+			}
+			// The child row must belong to this parent; otherwise the contract
+			// names a session owned by another lineage.
+			let Some(child) = store.session(&child_id)? else {
+				return Err(StoreError::NotFound(format!(
+					"durable child session {child_id} does not exist"
+				)));
+			};
+			if child.parent_session_id.as_deref() != Some(parent_id.as_str()) {
+				return Err(StoreError::Corrupt(format!(
+					"durable child session {child_id} is not parented to {parent_id}"
+				)));
+			}
+			Ok(())
+		})
+		.map_err(|error| DurableError::new(error.to_string()))
 	}
 
 	fn enqueue_peer_delivery(
@@ -3060,6 +3157,91 @@ mod tests {
 			.expect("exists");
 		assert_eq!(revived.len(), 1);
 		assert_eq!(revived[0].content, "history");
+		let _ = std::fs::remove_dir_all(dir);
+	}
+
+	#[test]
+	fn owned_replay_barrier_flushes_a_queued_write() {
+		let (dir, path) = temp_db("owned-replay-barrier");
+		let root = Arc::new(
+			DurableSession::create(&path, header("root", None)).expect("create root session"),
+		);
+		let factory = root.durable_child_factory();
+		let worker_id = "ns:barrier-child";
+		let child = factory.open_child(worker_id).expect("open child");
+
+		// Occupy the writer thread so the queued write cannot be applied yet.
+		let (blocked_tx, blocked_rx) = std::sync::mpsc::channel();
+		let (release_tx, release_rx) = std::sync::mpsc::channel();
+		let writer = Arc::clone(&root.writer);
+		let blocker = std::thread::spawn(move || {
+			writer.call(move |_store| {
+				blocked_tx.send(()).expect("signal writer blocked");
+				release_rx.recv().expect("wait for release");
+				Ok(())
+			})
+		});
+		blocked_rx
+			.recv_timeout(std::time::Duration::from_secs(2))
+			.expect("writer thread is blocked");
+
+		// Queue the child write behind the blocker; `send` returns only after the
+		// job is in the channel, so a later barrier is strictly behind it.
+		let entry = MessageEntry {
+			kind: "message".to_string(),
+			id: "msg-barrier-1".to_string(),
+			parent_id: None,
+			timestamp: output::iso8601(SystemTime::now()),
+			message: SessionMessage::user(
+				MessageContent::Text("barrier flush".to_string()),
+				u64::try_from(unix_ms()).unwrap_or_default(),
+			),
+			extra: serde_json::Map::new(),
+		};
+		let branch_id = root_branch_id(worker_id);
+		let session_id = worker_id.to_string();
+		root.writer
+			.send(Box::new(move |store| {
+				store
+					.append_message(NewMessage {
+						id: entry.id.clone(),
+						session_id,
+						branch_id,
+						parent_message_id: None,
+						payload: serde_json::to_value(&entry).expect("encode message entry"),
+					})
+					.expect("queued child write");
+			}))
+			.expect("queue child write");
+
+		let (started_tx, started_rx) = std::sync::mpsc::channel();
+		let (result_tx, result_rx) = std::sync::mpsc::channel();
+		let read_factory = Arc::clone(&factory);
+		let read_child = child.clone();
+		let reader = std::thread::spawn(move || {
+			started_tx.send(()).expect("signal reader start");
+			let replayed = read_factory.load_child_messages_owned(worker_id, &read_child);
+			result_tx.send(replayed).expect("send replay");
+		});
+		started_rx
+			.recv_timeout(std::time::Duration::from_secs(2))
+			.expect("reader started");
+		assert!(
+			result_rx.recv_timeout(std::time::Duration::from_millis(200)).is_err(),
+			"owned replay must wait for the queued write to be applied"
+		);
+
+		release_tx.send(()).expect("release writer");
+		let replayed = result_rx
+			.recv_timeout(std::time::Duration::from_secs(5))
+			.expect("owned replay after the barrier")
+			.expect("replay read")
+			.expect("replay messages");
+		assert_eq!(replayed.len(), 1);
+		assert_eq!(replayed[0].content, "barrier flush");
+
+		reader.join().expect("reader thread");
+		let _ = blocker.join().expect("blocker thread");
 		let _ = std::fs::remove_dir_all(dir);
 	}
 

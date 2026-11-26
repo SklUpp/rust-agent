@@ -341,6 +341,7 @@ fn contract(id: &str, root: &Path) -> PersistedChildSession {
 		id: id.to_string(),
 		result_key: None,
 		durable: false,
+		producer_generation: None,
 		agent: Some("scout".to_string()),
 		task: "investigate".to_string(),
 		system_prompt: "child system prompt".to_string(),

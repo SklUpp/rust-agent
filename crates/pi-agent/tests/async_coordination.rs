@@ -20,6 +20,9 @@ use pi_agent::{
 	supervisor::{
 		ChildStatus, DelegationLimits, MAX_OUTSTANDING_RESULTS, Supervisor,
 	},
+	task_persisted_revive::{
+		DefaultPersistedReviverFactory, PersistedChildReviverFactory, PersistedChildSession,
+	},
 	tools::{
 		hub::{HubTool, HubToolDetails},
 		registry::ToolRegistry,
@@ -515,6 +518,7 @@ impl pi_agent::durable::ChildDurabilityFactory for MockChildDurabilityFactory {
 			worker_id: worker_id.to_string(),
 			session_id: "s1".to_string(),
 			origin_branch_id: "b1".to_string(),
+			producer_generation: 1,
 		};
 		Ok(pi_agent::durable::ChildDurability::new(
 			identity,
@@ -527,6 +531,37 @@ impl pi_agent::durable::ChildDurabilityFactory for MockChildDurabilityFactory {
 	}
 	fn open_child_with_replay(&self, worker_id: &str) -> Result<(pi_agent::durable::ChildDurability, Option<Vec<Message>>), pi_agent::durable::DurableError> {
 		self.open_child(worker_id).map(|child| (child, None))
+	}
+}
+
+/// Uses only trait defaults: owned replay must stay fail-closed here.
+#[derive(Debug)]
+struct DefaultChildDurabilityFactory;
+
+impl pi_agent::durable::ChildDurabilityFactory for DefaultChildDurabilityFactory {}
+
+/// Counts the quiescence hook so the test proves it runs before the read.
+#[derive(Debug)]
+struct CountingOwnedFactory {
+	barriers: Arc<AtomicUsize>,
+}
+
+impl pi_agent::durable::ChildDurabilityFactory for CountingOwnedFactory {
+	fn open_child(&self, worker_id: &str) -> Result<pi_agent::durable::ChildDurability, pi_agent::durable::DurableError> {
+		MockChildDurabilityFactory.open_child(worker_id)
+	}
+
+	fn load_child_messages_owned(
+		&self,
+		worker_id: &str,
+		child: &pi_agent::durable::ChildDurability,
+	) -> Result<Option<Vec<Message>>, pi_agent::durable::DurableError> {
+		// The barrier is the quiescence proof and must be the first effect.
+		self.barriers.fetch_add(1, Ordering::SeqCst);
+		if child.identity().worker_id != worker_id {
+			return Err(pi_agent::durable::DurableError::new("worker id mismatch"));
+		}
+		Ok(Some(vec![Message::user("cached replay")]))
 	}
 }
 #[derive(Debug)]
@@ -619,13 +654,89 @@ fn shutdown_closes_durable_admission_before_publication() {
 	assert!(error.contains("shutdown"));
 }
 #[test]
-fn cached_child_replay_fails_closed_without_quiescence_proof() {
-    let factory = MockChildDurabilityFactory;
-    let child = factory.open_child("cached-revive").expect("child");
+fn default_owned_replay_refuses_without_a_quiescent_owner() {
+    let factory = DefaultChildDurabilityFactory;
+    let child = MockChildDurabilityFactory
+        .open_child("default-refusal")
+        .expect("child");
     let error = factory
-        .load_child_messages_owned("cached-revive", &child)
-        .expect_err("cached replay must refuse without proof");
+        .load_child_messages_owned("default-refusal", &child)
+        .expect_err("trait default must stay fail-closed");
     assert_eq!(error.message(), "durable child replay requires a quiescent owner");
+}
+
+#[test]
+fn cached_child_replay_runs_the_quiescence_hook_before_reading() {
+    let barriers = Arc::new(AtomicUsize::new(0));
+    let factory = CountingOwnedFactory { barriers: Arc::clone(&barriers) };
+    let child = factory.open_child("cached-revive").expect("child");
+    assert_eq!(barriers.load(Ordering::SeqCst), 0, "no read before the barrier");
+    let messages = factory
+        .load_child_messages_owned("cached-revive", &child)
+        .expect("cached child owns the writer, so its barrier-backed read must replay")
+        .expect("owned replay returns the persisted history");
+    assert_eq!(
+        barriers.load(Ordering::SeqCst),
+        1,
+        "the quiescence hook must run exactly once, before the read"
+    );
+    assert_eq!(messages, vec![Message::user("cached replay")]);
+}
+
+fn durable_contract(producer_generation: Option<u64>) -> PersistedChildSession {
+    PersistedChildSession {
+        id: "durable-revive".to_string(),
+        result_key: Some("w-durable-revive".to_string()),
+        durable: true,
+        producer_generation,
+        agent: Some("task".to_string()),
+        task: "work".to_string(),
+        system_prompt: "system".to_string(),
+        tools: Vec::new(),
+        model_role: None,
+        resolved_model: None,
+        output_schema: None,
+        output_schema_mode: None,
+        restrict_tool_names: Some(true),
+        spawns: None,
+        read_summarize: None,
+        advisor: None,
+        read_only: Some(true),
+        cwd: std::env::temp_dir(),
+        depth: 1,
+        max_turns: 20,
+        context_limit: 100_000,
+        display_name: None,
+        parent_id: None,
+        output_id: None,
+        output_published: false,
+    }
+}
+
+#[test]
+fn durable_revive_without_producer_generation_fails_closed() {
+    let reviver = DefaultPersistedReviverFactory::new(provider("done"), ToolRegistry::new());
+    let contract = durable_contract(None);
+    let error = reviver
+        .revive_with_durability(&contract, Vec::new(), None, None)
+        .map(|_| ())
+        .expect_err("a durable contract without an epoch must not replay");
+    assert!(error.contains("no recorded producer generation"), "{error}");
+    let error = reviver
+        .revive(&contract, Vec::new(), None)
+        .map(|_| ())
+        .expect_err("direct revive must enforce the same gate");
+    assert!(error.contains("no recorded producer generation"), "{error}");
+}
+
+#[test]
+fn durable_revive_without_supervisor_fails_closed() {
+    let reviver = DefaultPersistedReviverFactory::new(provider("done"), ToolRegistry::new());
+    let error = reviver
+        .revive_with_durability(&durable_contract(Some(1)), Vec::new(), None, None)
+        .map(|_| ())
+        .expect_err("an epoch cannot be validated without a supervisor");
+    assert!(error.contains("without a supervisor"), "{error}");
 }
 
 #[tokio::test]

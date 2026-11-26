@@ -835,7 +835,7 @@ impl TaskTool {
 				model_role.as_deref(),
 				prompt_schema.as_ref(),
 				spawn_result_key.as_deref(),
-				child_durability.is_some(),
+				child_durability.as_ref(),
 			);
 		}
 
@@ -2199,7 +2199,7 @@ async fn run_background_child(
 			child_durable
 				.as_ref()
 				.map(|durable| durable.identity().worker_id.as_str()),
-			child_durable.is_some(),
+			child_durable.as_ref(),
 		);
 	}
 	let child_approver = supervisor.child_approver();
@@ -3306,7 +3306,7 @@ fn persist_child_contract(
 	model_role: Option<&str>,
 	output_schema: Option<&Value>,
 	result_key: Option<&str>,
-	durable: bool,
+	durability: Option<&ChildDurability>,
 ) {
 	if crate::subagent_lifecycle::lookup(supervisor).is_none() {
 		return;
@@ -3329,7 +3329,9 @@ fn persist_child_contract(
 	let contract = PersistedChildSession {
 		id:               child_id.to_string(),
 		result_key:       result_key.map(str::to_string),
-		durable,
+		durable:          durability.is_some(),
+		producer_generation: durability
+			.map(|durable| durable.identity().producer_generation),
 		agent:            Some(item.agent.name.clone()),
 		task:             item.task.clone(),
 		system_prompt:    config.system_prompt.clone().unwrap_or_default(),
@@ -4492,6 +4494,7 @@ mod tests {
 			id: "task-1".to_string(),
 			result_key: None,
 			durable: false,
+			producer_generation: None,
 			agent: Some("task".to_string()),
 			task: "work".to_string(),
 			system_prompt: "system".to_string(),
@@ -4619,6 +4622,7 @@ mod tests {
 			id: id.clone(),
 			result_key: None,
 			durable: false,
+			producer_generation: None,
 			agent: Some("task".to_string()),
 			task: "work".to_string(),
 			system_prompt: "system".to_string(),
