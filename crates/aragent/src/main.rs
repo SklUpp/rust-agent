@@ -49,6 +49,7 @@ use aragent::{
 };
 use clap::Parser;
 
+#[derive(Debug)]
 struct CliError {
 	message: String,
 	code: u8,
@@ -89,6 +90,21 @@ fn base_dir(cli: &Cli) -> Result<PathBuf> {
 		Some(cwd) => Ok(dirs::absolute(&std::env::current_dir()?, cwd)),
 		None => Ok(std::env::current_dir()?),
 	}
+}
+
+/// `arag trust` dispatch: an explicit relative `PATH` is relative to the
+/// effective `--cwd`, not to the process working directory.
+fn run_trust_cli(
+	action: Option<&str>,
+	path: Option<&Path>,
+	json: bool,
+	cwd: &Path,
+	agent_dir: &Path,
+	out: &mut dyn Write,
+) -> std::result::Result<(), CliError> {
+	let target = path.map(|path| dirs::absolute(cwd, path));
+	aragent::trust::run_trust_command(action, target.as_deref(), json, cwd, agent_dir, out)
+		.map_err(|err| CliError::fail(err.to_string()))
 }
 
 /// Best-effort credential registration for commands that render or inspect
@@ -452,6 +468,21 @@ fn run() -> std::result::Result<(), CliError> {
 			let stdout = io::stdout();
 			let mut out = io::BufWriter::new(stdout.lock());
 			config_cmd::run(&request, &mut out).map_err(|err| CliError::fail(err.to_string()))?;
+			out.flush().map_err(|err| CliError::fail(err.to_string()))?;
+			return Ok(());
+		},
+		Some(Command::Trust { action, path, json }) => {
+			let cwd = base_dir(&cli)?;
+			let stdout = io::stdout();
+			let mut out = io::BufWriter::new(stdout.lock());
+			run_trust_cli(
+				action.as_deref(),
+				path.as_deref(),
+				*json,
+				&cwd,
+				&dirs::agent_dir(),
+				&mut out,
+			)?;
 			out.flush().map_err(|err| CliError::fail(err.to_string()))?;
 			return Ok(());
 		},
@@ -5219,6 +5250,95 @@ mod tests {
 			.expect("git rev-parse");
 		assert!(!head.status.success(), "nothing may be committed on a clean tree");
 		let _ = std::fs::remove_dir_all(&dir);
+	}
+
+	/// `run()` forwards `Command::Trust` straight to `run_trust_command`; this
+	/// drives that handler through grant -> status -> list -> revoke against a
+	/// throwaway agent dir so the wiring and its JSON contract stay honest.
+	#[test]
+	fn trust_command_grant_status_list_and_revoke() {
+		let root = std::env::temp_dir().join(format!("aragent-trust-cli-{}", std::process::id()));
+		let _ = std::fs::remove_dir_all(&root);
+		let workspace = root.join("repo");
+		let agent_dir = root.join("agent");
+		std::fs::create_dir_all(&workspace).expect("workspace dir");
+
+		let mut out = Vec::new();
+		aragent::trust::run_trust_command(
+			Some("grant"),
+			Some(&workspace),
+			true,
+			&workspace,
+			&agent_dir,
+			&mut out,
+		)
+		.expect("grant");
+		let granted: serde_json::Value = serde_json::from_slice(&out).expect("grant json");
+		assert_eq!(granted["configFiles"], 0);
+
+		let mut out = Vec::new();
+		aragent::trust::run_trust_command(None, None, true, &workspace, &agent_dir, &mut out)
+			.expect("status");
+		let status: serde_json::Value = serde_json::from_slice(&out).expect("status json");
+		assert_eq!(status["status"], "trusted");
+		assert_eq!(status["trusted"], true);
+
+		let mut out = Vec::new();
+		aragent::trust::run_trust_command(Some("list"), None, true, &workspace, &agent_dir, &mut out)
+			.expect("list");
+		let list: serde_json::Value = serde_json::from_slice(&out).expect("list json");
+		assert_eq!(
+			list["workspaces"]
+				.as_array()
+				.expect("workspaces array")
+				.len(),
+			1
+		);
+
+		let mut out = Vec::new();
+		aragent::trust::run_trust_command(
+			Some("revoke"),
+			Some(&workspace),
+			true,
+			&workspace,
+			&agent_dir,
+			&mut out,
+		)
+		.expect("revoke");
+		let revoked: serde_json::Value = serde_json::from_slice(&out).expect("revoke json");
+		assert_eq!(revoked["revoked"], true);
+
+		let _ = std::fs::remove_dir_all(&root);
+	}
+
+	/// `arag --cwd <work> trust grant repo` must trust `<work>/repo`, not
+	/// `<process cwd>/repo`: a relative `PATH` resolves against the effective
+	/// `--cwd` handed to the dispatch helper.
+	#[test]
+	fn trust_relative_path_resolves_against_explicit_cwd() {
+		let root = std::env::temp_dir().join(format!("aragent-trust-cwd-{}", std::process::id()));
+		let _ = std::fs::remove_dir_all(&root);
+		let work = root.join("work");
+		let repo = work.join("repo");
+		let agent_dir = root.join("agent");
+		std::fs::create_dir_all(&repo).expect("repo dir");
+
+		let mut out = Vec::new();
+		run_trust_cli(Some("grant"), Some(Path::new("repo")), true, &work, &agent_dir, &mut out)
+			.expect("grant");
+		let granted: serde_json::Value = serde_json::from_slice(&out).expect("grant json");
+		let expected = std::fs::canonicalize(&repo)
+			.expect("canonical repo")
+			.to_string_lossy()
+			.into_owned();
+		assert_eq!(granted["path"], expected);
+
+		let mut out = Vec::new();
+		run_trust_cli(None, None, true, &repo, &agent_dir, &mut out).expect("status");
+		let status: serde_json::Value = serde_json::from_slice(&out).expect("status json");
+		assert_eq!(status["status"], "trusted");
+
+		let _ = std::fs::remove_dir_all(&root);
 	}
 
 	#[test]

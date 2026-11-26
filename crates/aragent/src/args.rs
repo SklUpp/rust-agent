@@ -1383,6 +1383,22 @@ pub enum Command {
 		max_bytes:    Option<u64>,
 	},
 
+	/// Inspect or change workspace trust for project hook/MCP surfaces.
+	///
+	/// Usage: `arag trust [grant|revoke|list|status] [PATH] [--json]`.
+	/// A bare `arag trust` reports the status of the current directory.
+	Trust {
+		/// Action: `status` (default), `grant`, `revoke`, or `list`.
+		#[arg(value_name = "ACTION", value_parser = ["grant", "revoke", "list", "status"])]
+		action: Option<String>,
+		/// Workspace path to grant, revoke, or inspect (default: current dir).
+		#[arg(value_name = "PATH")]
+		path:   Option<PathBuf>,
+		/// Print machine-readable JSON.
+		#[arg(long)]
+		json:   bool,
+	},
+
 	/// Render a headless tool-lifecycle preview to stdout (ANSI/plain).
 	///
 	/// This is a deterministic preview of the native tool catalog's call/result
@@ -2419,6 +2435,48 @@ mod tests {
 			})
 		);
 		assert!(Cli::try_parse_from(["arag", "ttsr", "bogus"]).is_err());
+	}
+
+	#[test]
+	fn trust_subcommand_parses_actions_paths_and_json() {
+		assert_eq!(
+			parse(&["arag", "trust"]).command,
+			Some(Command::Trust { action: None, path: None, json: false })
+		);
+		assert_eq!(
+			parse(&["arag", "trust", "grant"]).command,
+			Some(Command::Trust { action: Some("grant".to_string()), path: None, json: false })
+		);
+		assert_eq!(
+			parse(&["arag", "trust", "grant", "/tmp/repo"]).command,
+			Some(Command::Trust {
+				action: Some("grant".to_string()),
+				path:   Some(PathBuf::from("/tmp/repo")),
+				json:   false,
+			})
+		);
+		assert_eq!(
+			parse(&["arag", "trust", "revoke", "/tmp/repo"]).command,
+			Some(Command::Trust {
+				action: Some("revoke".to_string()),
+				path:   Some(PathBuf::from("/tmp/repo")),
+				json:   false,
+			})
+		);
+		assert_eq!(
+			parse(&["arag", "trust", "list", "--json"]).command,
+			Some(Command::Trust { action: Some("list".to_string()), path: None, json: true })
+		);
+		assert_eq!(
+			parse(&["arag", "trust", "status", "--json"]).command,
+			Some(Command::Trust { action: Some("status".to_string()), path: None, json: true })
+		);
+		// `--json` may precede the positional action.
+		assert_eq!(
+			parse(&["arag", "trust", "--json", "list"]).command,
+			Some(Command::Trust { action: Some("list".to_string()), path: None, json: true })
+		);
+		assert!(Cli::try_parse_from(["arag", "trust", "bogus"]).is_err());
 	}
 
 	#[test]
