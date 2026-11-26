@@ -25,6 +25,7 @@ use crate::{
 	approve::ApprovalMode,
 	autolearn::MemoryBackend,
 	dirs,
+	trust::TrustStore,
 	yaml::{self, Value},
 };
 
@@ -1180,8 +1181,10 @@ impl Config {
 
 	/// Load trusted hook files for `cwd`. Home settings are operator-owned and
 	/// only rejected when the file is a symlink/hardlink alias; project files
-	/// are loaded only with an explicit workspace-trust decision.
-	pub(crate) fn discover_hooks(
+	/// are loaded only when `trust_project` is true (the caller derives it from
+	/// the persisted workspace trust store).
+	#[must_use]
+	pub fn discover_hooks(
 		cwd: &Path,
 		home: Option<&Path>,
 		trust_project: bool,
@@ -1213,6 +1216,15 @@ impl Config {
 			if !trust_project {
 				eprintln!(
 					"warning: ignoring project hook file {}: workspace is not trusted",
+					path.display()
+				);
+				continue;
+			}
+			// A symlinked `.claude`/`.codex` parent (or file) can point outside
+			// the checkout; trust only canonical paths inside `cwd`.
+			if !project_surface_is_local(&path, cwd) {
+				eprintln!(
+					"warning: ignoring project hook file {}: path escapes the project root",
 					path.display()
 				);
 				continue;
@@ -1548,6 +1560,10 @@ impl Config {
 		if let Some(explicit) = &explicit_root {
 			roots.push(absolute_canonical(explicit));
 		}
+		// D20: project hooks are enabled only by a persisted grant whose
+		// hook/MCP fingerprint still matches. Trust never relaxes approvals.
+		let workspace_trusted =
+			TrustStore::load_from_agent_dir(&dirs::agent_dir()).is_trusted(&cwd);
 
 		let mut config = Self::default();
 		if let Some((path, mut overlay)) = base_overlay {
@@ -1573,12 +1589,12 @@ impl Config {
 			}
 			config.merge(overlay);
 		}
-		Self::apply_project_layers(&mut config, &cwd)?;
+		Self::apply_project_layers(&mut config, &cwd, workspace_trusted)?;
 		// User home hook settings are trusted operator configuration. Project
-		// `.claude`/`.codex` files are repository-controlled and stay disabled:
-		// there is no workspace-trust prompt in this runtime, so enabling them
-		// would let a checkout register arbitrary subprocesses.
-		let discovered = Self::discover_hooks(&cwd, dirs::home_dir().as_deref(), false);
+		// `.claude`/`.codex` files stay disabled unless the operator granted
+		// workspace trust in this agent directory and the recorded hook/MCP
+		// fingerprint still matches (D20).
+		let discovered = Self::discover_hooks(&cwd, dirs::home_dir().as_deref(), workspace_trusted);
 		config.hooks.merge(discovered);
 		for path in env_overlays.iter().chain(overlays) {
 			let resolved = resolve_layer_path(&cwd, path);
@@ -1600,16 +1616,30 @@ impl Config {
 		}
 	}
 
-	fn apply_project_layers(config: &mut Self, cwd: &Path) -> Result<()> {
+	/// Apply repository-controlled `.omp` layers. Project layers may tighten
+	/// policy but never grant it; workspace trust (`D20`) only preserves the
+	/// project `hooks` block, and only from a regular local file.
+	///
+	/// # Errors
+	///
+	/// Fails when `.omp/config.yml` is invalid (fatal by contract) or unreadable.
+	pub fn apply_project_layers(
+		config: &mut Self,
+		cwd: &Path,
+		workspace_trusted: bool,
+	) -> Result<()> {
 		let project_dir = dirs::project_config_dir(cwd);
 		let settings_path = project_dir.join("settings.json");
 		if settings_path.is_file() {
 			match Self::load_settings_json(&settings_path) {
-				Ok(Some(mut overlay)) => {
-					Self::drop_project_searxng(&mut overlay, &settings_path);
-					Self::drop_untrusted_permissions(&mut overlay, config, &settings_path);
-					Self::drop_project_diagnostics_reenable(&mut overlay, config);
-					config.merge(overlay);
+				Ok(Some(overlay)) => {
+					Self::merge_project_overlay(
+						config,
+						overlay,
+						&settings_path,
+						cwd,
+						workspace_trusted,
+					);
 				},
 				Ok(None) => {
 					eprintln!(
@@ -1630,13 +1660,31 @@ impl Config {
 		// `PI_CONFIG_FILES` overlays are fatal for the same contract reason.
 		let project_config = project_dir.join("config.yml");
 		if project_config.is_file() {
-			let mut overlay = Self::load_file(&project_config)?;
-			Self::drop_project_searxng(&mut overlay, &project_config);
-			Self::drop_untrusted_permissions(&mut overlay, config, &project_config);
-			Self::drop_project_diagnostics_reenable(&mut overlay, config);
-			config.merge(overlay);
+			let overlay = Self::load_file(&project_config)?;
+			Self::merge_project_overlay(config, overlay, &project_config, cwd, workspace_trusted);
 		}
 		Ok(())
+	}
+
+	/// Merge one project overlay. `drop_untrusted_permissions` always strips
+	/// approval grants, allowlists, `bash.patterns` allow rules and searxng
+	/// settings; only hooks survive when the workspace is trusted.
+	fn merge_project_overlay(
+		config: &mut Self,
+		mut overlay: Self,
+		path: &Path,
+		cwd: &Path,
+		workspace_trusted: bool,
+	) {
+		Self::drop_project_searxng(&mut overlay, path);
+		let trusted_hooks = (workspace_trusted && project_surface_is_local(path, cwd))
+			.then(|| std::mem::take(&mut overlay.hooks));
+		Self::drop_untrusted_permissions(&mut overlay, config, path);
+		if let Some(hooks) = trusted_hooks {
+			overlay.hooks = hooks;
+		}
+		Self::drop_project_diagnostics_reenable(&mut overlay, config);
+		config.merge(overlay);
 	}
 
 	/// Repository-controlled layers may tighten the approval posture but never
@@ -3225,6 +3273,11 @@ pub struct McpDiscoveryReport {
 	pub servers: Vec<DiscoveredMcpServer>,
 	pub all_server_names: Vec<String>,
 	pub warnings: Vec<String>,
+	/// True only when the persisted workspace grant for `cwd` verified and no
+	/// project MCP file escapes the project root. Project MCP servers still
+	/// carry `trusted = false` (host provenance only), so the runtime launch
+	/// gate and deferred `${ENV}` expansion keep applying.
+	pub workspace_trusted: bool,
 }
 
 /// Validate server name against
@@ -3598,6 +3651,22 @@ pub fn expand_mcp_server_config_env(config: &mut MCPServerConfig) {
 	}
 }
 
+/// A repository-controlled MCP/hook file may inherit workspace trust only if
+/// it is a regular single-link file whose canonical path stays inside the
+/// project root. File symlinks, hardlink aliases, and symlinked parent
+/// directories (`.omp`, `.claude`, `.codex`) escaping the checkout are all
+/// rejected because the canonical target is outside the root.
+fn project_surface_is_local(path: &Path, project_root: &Path) -> bool {
+	if implicit_config_is_untrusted(path, &[]) {
+		return false;
+	}
+	let root = absolute_canonical(project_root);
+	let Ok(canonical) = fs::canonicalize(path) else {
+		return false;
+	};
+	canonical.starts_with(&root)
+}
+
 /// Discover MCP servers following discovery priority:
 /// 1. <cwd>/.omp/mcp.json
 /// 2. <cwd>/.omp/.mcp.json
@@ -3625,6 +3694,27 @@ pub fn discover_mcp_servers_with_paths(cwd: &Path, agent_dir: &Path) -> McpDisco
 		.unwrap_or_else(|_| cwd.to_path_buf());
 	let trust_roots = [project_root.clone()];
 	let is_untrusted = |path: &Path| implicit_config_is_untrusted(path, &trust_roots);
+	// D20: a verified workspace grant is a discovery fact only. Project MCP
+	// servers keep `trusted = false` so the runtime launch gate and deferred
+	// `${ENV}` expansion still apply to repository-controlled transports.
+	let mut workspace_trusted = TrustStore::load_from_agent_dir(agent_dir)
+		.verify_workspace(cwd)
+		.is_trusted();
+	if workspace_trusted {
+		for (path, host_class) in &candidate_paths {
+			if *host_class || !path.is_file() {
+				continue;
+			}
+			if !project_surface_is_local(path, &project_root) {
+				report.warnings.push(format!(
+					"ignoring workspace trust for project MCP file {}: path escapes the project \
+					 root",
+					path.display()
+				));
+				workspace_trusted = false;
+			}
+		}
+	}
 
 	// Step 1: Collect user-level disabledServers and enabledServers ONLY from
 	// agent_dir configs. A host path that resolves into the project (symlink
@@ -3669,7 +3759,9 @@ pub fn discover_mcp_servers_with_paths(cwd: &Path, agent_dir: &Path) -> McpDisco
 			continue;
 		}
 		// Host candidates that resolve into, or share an inode with, the project
-		// are aliases of repository-controlled bytes, not host trust.
+		// are aliases of repository-controlled bytes, not host trust. Project
+		// candidates are always `trusted = false`: workspace trust is reported
+		// separately and never bypasses the launch-time approval gate.
 		let trusted = *host_class && !implicit_config_is_untrusted(path, &trust_roots);
 
 		let content = match fs::read_to_string(path) {
@@ -3752,6 +3844,7 @@ pub fn discover_mcp_servers_with_paths(cwd: &Path, agent_dir: &Path) -> McpDisco
 	let mut all_names: Vec<String> = seen_servers.into_iter().collect();
 	all_names.sort();
 	report.all_server_names = all_names;
+	report.workspace_trusted = workspace_trusted;
 
 	report
 }
@@ -3841,7 +3934,7 @@ mod tests {
 		// Host opt-out wins over an implicit project re-enable.
 		let mut host_off = Config::default();
 		host_off.diagnostics.enabled = Some(false);
-		Config::apply_project_layers(&mut host_off, &root).expect("project layer");
+		Config::apply_project_layers(&mut host_off, &root, false).expect("project layer");
 		assert_eq!(host_off.diagnostics.enabled, Some(false));
 		// An explicit operator overlay is applied after the project layers and
 		// may deliberately re-enable the trace.
@@ -3852,13 +3945,13 @@ mod tests {
 
 		let mut host_on = Config::default();
 		host_on.diagnostics.enabled = Some(true);
-		Config::apply_project_layers(&mut host_on, &root).expect("project layer");
+		Config::apply_project_layers(&mut host_on, &root, false).expect("project layer");
 		assert_eq!(host_on.diagnostics.enabled, Some(true));
 
 		// A project may still tighten (disable) a host default.
 		fs::write(&settings, r#"{"diagnostics":{"enabled":false}}"#).expect("settings");
 		let mut defaulted = Config::default();
-		Config::apply_project_layers(&mut defaulted, &root).expect("project layer");
+		Config::apply_project_layers(&mut defaulted, &root, false).expect("project layer");
 		assert_eq!(defaulted.diagnostics.enabled, Some(false));
 
 		let _ = fs::remove_dir_all(root);

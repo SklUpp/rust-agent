@@ -65,6 +65,7 @@ pub mod session_store;
 pub mod skill_protocol;
 pub mod skills;
 pub mod tool_commands;
+pub mod trust;
 pub mod wake_lock;
 pub mod worktree_cmd;
 pub mod yaml;
