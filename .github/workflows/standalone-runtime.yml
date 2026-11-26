@@ -56,8 +56,8 @@ jobs:
         run: cargo test --locked -p pi-agent -p aragent
       - name: Check MCP smoke test support
         run: cargo test --locked -p aragent --features test-support --test mcp_filesystem_smoke
-      - name: Test persistent shell session and env allowlist
-        run: cargo test --locked -p pi-shell --test persistent_session --test session_env_allowlist
+      - name: Test persistent shell session, env allowlist, policy, and tree kill
+        run: cargo test --locked -p pi-shell --lib policy --test persistent_session --test session_env_allowlist --test process_tree_kill
       - name: Build CLI for the smoke run
         run: cargo build --locked -p aragent
       - name: Run real CLI against local OpenAI-compatible fixture

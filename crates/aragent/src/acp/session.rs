@@ -363,7 +363,8 @@ impl AcpRuntime {
 		let registry = Arc::new(SubagentRegistry::new());
 		let observer = registry.observer(Arc::clone(&sink));
 		let mut approvals =
-			Approvals::new(self.recipe.approval_mode, self.recipe.allow.iter().cloned());
+			Approvals::new(self.recipe.approval_mode, self.recipe.allow.iter().cloned())
+				.with_bash_policy(launch.config.bash_policy());
 		let permission = Arc::new(AcpPermissionBroker {
 			session_id: Arc::clone(&session_id_slot),
 			reverse: self.reverse.clone(),

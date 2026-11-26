@@ -721,6 +721,7 @@ impl RpcMode {
 			launch.approval_mode,
 			launch.allow.iter().cloned(),
 		)
+		.with_bash_policy(launch.config.bash_policy())
 		.with_input(Some(approval_input));
 		approvals.set_ask(Some(Arc::new(super::input::RpcAskChannel::new(
 			Arc::clone(&ui),

@@ -127,11 +127,10 @@ impl From<std::io::Error> for CliError {
 }
 
 fn main() -> std::process::ExitCode {
-	// Crash diagnostics before anything else can panic. The recoverable-panic
-	// probe is wired once `pi-agent` re-exports the shell's panic scope; until
-	// then every panic is treated as fatal (recovered panics are still caught
-	// at their own boundary, this only controls the stderr dump).
-	aragent::crash_handler::install();
+	// Crash diagnostics before anything else can panic. `panic_scope_active`
+	// distinguishes shell/builtin recovered panics (persisted quietly) from
+	// fatal crashes (persisted + printed + chained).
+	aragent::crash_handler::install_with_probe(Some(pi_agent::panic_scope_active));
 	// reqwest is compiled with `rustls-no-provider`; pin ring as the process
 	// provider before any HTTP client is built.
 	pi_agent::ensure_crypto_provider();
@@ -762,7 +761,8 @@ fn run() -> std::result::Result<(), CliError> {
 		.map_err(Error::new)?;
 	let catalog = Arc::new(Catalog::load(&cwd)?);
 	let approvals =
-		Approvals::new(config.approval_mode.unwrap_or_default(), config.allow.iter().cloned());
+		Approvals::new(config.approval_mode.unwrap_or_default(), config.allow.iter().cloned())
+			.with_bash_policy(config.bash_policy());
 	let default_model = config.default_model.clone();
 	// TS findInitialModel: an explicit `--model` wins, then the first model in
 	// the `--models` scope for a fresh session. A resumed session keeps its own
