@@ -2865,7 +2865,7 @@ async fn park_waits_for_in_flight_tool_before_a_revive_can_reuse_the_session() {
 	let receipt = hub_details(sent).receipts.expect("receipts").remove(0);
 	assert!(receipt.error.is_none(), "{:?}", receipt.error);
 
-	let transcript = transcript_path(&supervisor, &id).expect("transcript path");
+	let transcript = hub_park::transcript_path(&supervisor, &id).expect("transcript path");
 	// The permit proves `SlowTool::execute` itself is running (the journal entry
 	// alone precedes the effect and cannot establish that).
 	let _entered = tokio::time::timeout(Duration::from_secs(5), entered.acquire())

@@ -4032,7 +4032,7 @@ async fn peer_deliveries_replay_once_and_withdraw_unaccepted() {
 		let root = Arc::new(
 			DurableSession::create(&path, header(session_id, &dir)).expect("create root"),
 		);
-		let factory = root.child_durability_factory();
+		let factory = root.durable_child_factory();
 		delivery_id = factory
 			.enqueue_peer_delivery(None, "peer-a", "msg-1", text)
 			.expect("enqueue peer delivery");

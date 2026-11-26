@@ -254,7 +254,7 @@ fn sigkill_during_turn_replays_peer_message_exactly_once() {
 		let root = Arc::new(
 			DurableSession::create(&db, header(id, &dir)).expect("create root session"),
 		);
-		let factory = root.child_durability_factory();
+		let factory = root.durable_child_factory();
 		delivery_id = factory
 			.enqueue_peer_delivery(None, "peer-a", "msg-1", &text)
 			.expect("accept peer delivery");
