@@ -1695,7 +1695,7 @@ fn capture_plain(
 		copy_plain_node(&merged.join(relative), &destination, *entry)?;
 		changed += 1;
 	}
-	for (relative, entry) in &baseline.entries {
+	for (relative, entry) in baseline.entries.iter() {
 		if entry.kind == PlainKind::Excluded
 			|| has_excluded_ancestor(relative, &baseline.entries)
 		{
