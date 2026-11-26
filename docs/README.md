@@ -46,14 +46,18 @@
 - `research-2026-11-06-code-analysis.md`, `research-2026-11-06-memory-skills.md`, `research-2026-11-06-frontends.md`
 - `research-2026-11-06-packaging.md`, `research-2026-11-06-profiles-hooks.md`
 
-### Исследования 2026-11-27 (с независимым ревью)
+### Исследования 2026-11-27 (7 треков + независимый аудит ревью)
 
-Синтез 7 треков и вердиктов ревью (`ResearchReviewPlatform`, `ResearchReviewCoreEcosystem`). Не являются нормативными требованиями.
+Не являются нормативными требованиями; каждый документ включает поправки и ограничения из `ResearchReviewPlatform` и `ResearchReviewCoreEcosystem`.
 
-- `research-2026-11-27-omp-sync-and-tools.md` — выборочный перенос OMP/`omp-termux` → `arag` + оптимизация/унификация инструментов
-- `research-2026-11-27-fastproot-lkl-android.md` — `fastproot` + `lkl`, кросс-OS бэкенды и адаптация под Android (SDK 28, ядра, Bionic, пробы)
-- `research-2026-11-27-ecosystem-and-9router.md` — зрелые крейты, Android-профили и интеграция `9router`/`9routerx`/`CLIProxyAPI` (fork/upstream sync)
-- `research-2026-11-27-multiplatform-fallback.md` — мультиплатформенный remote offload, проброс окружения/слепка и деградирующий fallback
+- `research-2026-11-27-01-omp-sync.md` — Track 1: выборочный перенос из `OMP` / `omp-termux` → `arag`
+- `research-2026-11-27-02-tools-unification.md` — Track 2: оптимизация, унификация и упрощение инструментов `arag`
+- `research-2026-11-27-03-fastproot-lkl.md` — Track 3: интеграция `fastproot` + `lkl` и единая модульная кросс-OS система
+- `research-2026-11-27-04-android-sdk-kernel.md` — Track 4: адаптация к Android (SDK 28, ядра, Bionic, SELinux, fork-пробы)
+- `research-2026-11-27-05-ecosystem-crates-profiles.md` — Track 5: экосистема крейтов/проектов и адаптивные Android-профили
+- `research-2026-11-27-06-9router-fork-sync.md` — Track 6: интеграция `9router` / `9routerx` / `CLIProxyAPI` (fork/upstream sync)
+- `research-2026-11-27-07-multiplatform-fallback.md` — Track 7: мультиплатформенная одновременная работа, remote offload и fallback
+- `research-2026-11-27-08-reviews-audit.md` — Сводный аудит независимых ревью (`ResearchReviewPlatform` и `ResearchReviewCoreEcosystem`) + матрица Go/No-Go
 
 ## Правила обновления
 
