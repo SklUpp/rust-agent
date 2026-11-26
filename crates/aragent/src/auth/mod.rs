@@ -130,6 +130,19 @@ const ENV_KEYS: &[(&str, &[&str])] = &[
 	("tavily", &["TAVILY_API_KEY"]),
 ];
 
+fn env_api_key_from_env(provider_id: &str) -> Option<String> {
+	let keys = ENV_KEYS
+		.iter()
+		.find(|(id, _)| *id == provider_id)
+		.map(|(_, keys)| *keys)?;
+	keys.iter().find_map(|key| {
+		std::env::var(key)
+			.ok()
+			.map(|value| value.trim().to_string())
+			.filter(|value| !value.is_empty())
+	})
+}
+
 /// `getOAuthApiKey` shapes a JSON envelope for providers whose transport needs
 /// credential metadata; everything else gets the bare bearer.
 const STRUCTURED_API_KEY_PROVIDERS: &[&str] =
@@ -280,16 +293,16 @@ impl AuthBackend {
 	/// Registry `envKeys` fallback (`getEnvApiKey`, single-variable resolvers).
 	#[must_use]
 	pub fn env_api_key(&self, provider_id: &str) -> Option<String> {
-		let keys = ENV_KEYS
+		env_api_key_from_env(provider_id)
+	}
+
+	/// Every declared environment variable name for `provider_id`.
+	#[must_use]
+	pub fn env_var_names(provider_id: &str) -> Option<&'static [&'static str]> {
+		ENV_KEYS
 			.iter()
 			.find(|(id, _)| *id == provider_id)
-			.map(|(_, keys)| *keys)?;
-		keys.iter().find_map(|key| {
-			std::env::var(key)
-				.ok()
-				.map(|value| value.trim().to_string())
-				.filter(|value| !value.is_empty())
-		})
+			.map(|(_, keys)| *keys)
 	}
 
 	/// Resolve the API key to use for `provider_id` from the store.

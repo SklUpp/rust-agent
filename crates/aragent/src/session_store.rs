@@ -32,7 +32,7 @@
 //!   at-least-once; marking processed is not implied by handing it to a context.
 
 use std::{
-	collections::{HashMap, HashSet},
+	collections::{BTreeMap, HashMap, HashSet},
 	path::{Path, PathBuf},
 	sync::atomic::{AtomicU64, Ordering},
 	time::{SystemTime, UNIX_EPOCH},
@@ -40,10 +40,17 @@ use std::{
 
 use rusqlite::{
 	Connection, OpenFlags, OptionalExtension as _, Transaction, TransactionBehavior, params,
+	params_from_iter,
 };
 use serde_json::{Value, json};
 
-use crate::durable_session::StoredProjection;
+use crate::{
+	auth::error::{
+		redact_free_text, redact_json_strings, redact_message_payload, redact_session_payload,
+	},
+	durable_session::StoredProjection,
+};
+
 /// Current schema version. Bump only with a new branch in [`SqliteStore::initialize`].
 pub const SCHEMA_VERSION: i64 = 7;
 const SCHEMA_VERSION_DDL: &str = "
@@ -354,6 +361,989 @@ impl From<std::io::Error> for StoreError {
 	}
 }
 pub type StoreResult<T> = Result<T, StoreError>;
+
+/// Portable session export format marker.
+pub const SESSION_EXPORT_FORMAT: &str = "aragent-session-export";
+/// Portable session export layout version; independent of [`SCHEMA_VERSION`].
+pub const SESSION_EXPORT_VERSION: u32 = 1;
+
+/// Session-scoped tables carried by a portable export and the column that
+/// scopes each row to the exported session. Order is insertion order at
+/// import: parents before children.
+///
+/// `artifacts` is deliberately absent: D55 exports history and metadata only,
+/// and artifact files/workspace state are not part of the portable document.
+/// The credential store is a separate database and is never opened here.
+const SESSION_EXPORT_TABLES: &[(&str, &str)] = &[
+	("sessions", "id"),
+	("branches", "session_id"),
+	("messages", "session_id"),
+	("executions", "session_id"),
+	("deliveries", "session_id"),
+	("worker_completions", "session_id"),
+	("stream_drafts", "session_id"),
+	("task_admissions", "parent_session_id"),
+	("fork_provenance", "session_id"),
+];
+
+/// Versioned, portable snapshot of one session: exact SQLite column values for
+/// every history/metadata table row owned by the session.
+///
+/// TEXT payload columns stay strings, so import never decodes or executes
+/// saved tool calls. Credentials are not present because the session store is
+/// a separate database from the credential store.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct SessionExport {
+	pub format: String,
+	pub version: u32,
+	pub schema_version: i64,
+	pub exported_at_ms: i64,
+	pub session_id: String,
+	/// Table name to rows. Each row maps every column of the live schema to its
+	/// exact value; BLOB values use a `{"$blob": [bytes]}` marker.
+	pub tables: BTreeMap<String, Vec<Value>>,
+}
+
+/// Portable session bundle format marker (R6/D55). The bundle carries history
+/// and metadata only; workspace files, checkpoints, artifact bodies, and
+/// credentials are never packaged.
+pub const SESSION_BUNDLE_FORMAT: &str = "aragent.session.v1";
+
+/// One exported `sessions` row, including `producer_generation` which
+/// [`SessionRecord`] deliberately does not expose to live callers.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct SessionBundleSession {
+	pub id: String,
+	#[serde(default)]
+	pub parent_session_id: Option<String>,
+	#[serde(default)]
+	pub active_branch_id: Option<String>,
+	pub payload: Value,
+	pub created_at_ms: i64,
+	pub updated_at_ms: i64,
+	#[serde(default)]
+	pub producer_generation: Option<i64>,
+}
+
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct SessionBundleBranch {
+	pub id: String,
+	pub session_id: String,
+	#[serde(default)]
+	pub parent_branch_id: Option<String>,
+	#[serde(default)]
+	pub parent_message_id: Option<String>,
+	#[serde(default)]
+	pub leaf_message_id: Option<String>,
+	pub payload: Value,
+	pub created_at_ms: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct SessionBundleMessage {
+	pub seq: i64,
+	pub id: String,
+	pub session_id: String,
+	pub branch_id: String,
+	#[serde(default)]
+	pub parent_message_id: Option<String>,
+	pub payload: Value,
+	pub created_at_ms: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct SessionBundleExecution {
+	pub seq: i64,
+	pub execution_id: String,
+	pub session_id: String,
+	pub branch_id: String,
+	pub provider_call_id: String,
+	pub tool_name: String,
+	pub intent: Value,
+	pub created_at_ms: i64,
+	#[serde(default)]
+	pub outcome: Option<Value>,
+	#[serde(default)]
+	pub outcome_at_ms: Option<i64>,
+}
+
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct SessionBundleDelivery {
+	pub delivery_id: String,
+	pub worker_id: String,
+	pub session_id: String,
+	pub origin_branch_id: String,
+	pub payload: Value,
+	pub created_at_ms: i64,
+	#[serde(default)]
+	pub delivered_at_ms: Option<i64>,
+	#[serde(default)]
+	pub processed_at_ms: Option<i64>,
+	#[serde(default)]
+	pub message_id: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct SessionBundleWorkerCompletion {
+	pub worker_id: String,
+	pub session_id: String,
+	pub origin_branch_id: String,
+	pub delivery_id: String,
+	pub completion: Value,
+	pub completed_at_ms: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct SessionBundleArtifact {
+	pub artifact_id: String,
+	pub session_id: String,
+	#[serde(default)]
+	pub branch_id: Option<String>,
+	#[serde(default)]
+	pub execution_id: Option<String>,
+	pub location: String,
+	pub metadata: Value,
+	pub created_at_ms: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct SessionBundleForkProvenance {
+	pub message_id: String,
+	pub session_id: String,
+	pub source_execution_id: String,
+	pub provider_call_id: String,
+	pub outcome_resolved: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct SessionBundleTaskAdmission {
+	pub task_id: String,
+	pub parent_session_id: String,
+	pub parent_branch_id: String,
+	pub worker_id: String,
+	pub producer_generation: i64,
+	pub state: String,
+	pub spec: Value,
+	pub created_at_ms: i64,
+	pub updated_at_ms: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct SessionBundleStreamDraft {
+	pub branch_id: String,
+	pub session_id: String,
+	pub payload: Value,
+	pub updated_at_ms: i64,
+}
+
+/// Versioned, portable, redacted snapshot of one session across every
+/// session-scoped v7 table. Payload values are opaque strings/JSON; import
+/// never executes recorded calls.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct SessionBundle {
+	pub format: String,
+	pub schema_version: i64,
+	pub exported_at_ms: i64,
+	pub session: SessionBundleSession,
+	#[serde(default)]
+	pub branches: Vec<SessionBundleBranch>,
+	#[serde(default)]
+	pub messages: Vec<SessionBundleMessage>,
+	#[serde(default)]
+	pub executions: Vec<SessionBundleExecution>,
+	#[serde(default)]
+	pub deliveries: Vec<SessionBundleDelivery>,
+	#[serde(default)]
+	pub worker_completions: Vec<SessionBundleWorkerCompletion>,
+	#[serde(default)]
+	pub artifacts: Vec<SessionBundleArtifact>,
+	#[serde(default)]
+	pub fork_provenance: Vec<SessionBundleForkProvenance>,
+	#[serde(default)]
+	pub task_admissions: Vec<SessionBundleTaskAdmission>,
+	#[serde(default)]
+	pub stream_drafts: Vec<SessionBundleStreamDraft>,
+}
+
+/// Counts written by one validated bundle import.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct ImportBundleReport {
+	pub session_id: String,
+	pub detached: bool,
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub detached_parent_session_id: Option<String>,
+	pub branches: usize,
+	pub messages: usize,
+	pub executions: usize,
+	pub deliveries: usize,
+	pub worker_completions: usize,
+	pub artifacts: usize,
+	pub fork_provenance: usize,
+	pub task_admissions: usize,
+	pub stream_drafts: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct ArtifactSummary {
+	pub artifact_id: String,
+	pub location: String,
+	pub exists_on_disk: bool,
+}
+
+/// D74 token estimate. Deliberately separate from provider-reported usage:
+/// these are local estimates, not measured token counts.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize, Default)]
+pub struct ContextTokenEstimate {
+	#[serde(default)]
+	pub system_prompt: usize,
+	#[serde(default)]
+	pub user: usize,
+	#[serde(default)]
+	pub assistant: usize,
+	#[serde(default)]
+	pub tool_calls_and_results: usize,
+	#[serde(default)]
+	pub thinking: usize,
+	#[serde(default)]
+	pub total: usize,
+}
+
+/// Provider-reported token totals, summed from stored message usage. `None`
+/// means no provider usage was recorded; never zero-filled.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize, Default)]
+pub struct ProviderUsageTotals {
+	#[serde(default)]
+	pub input: u64,
+	#[serde(default)]
+	pub output: u64,
+	#[serde(default)]
+	pub cache_read: u64,
+	#[serde(default)]
+	pub cache_write: u64,
+	#[serde(default)]
+	pub total_tokens: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct SessionInspectorReport {
+	pub id: String,
+	#[serde(default)]
+	pub parent_session_id: Option<String>,
+	#[serde(default)]
+	pub active_branch_id: Option<String>,
+	#[serde(default)]
+	pub producer_generation: Option<i64>,
+	pub created_at_ms: i64,
+	pub updated_at_ms: i64,
+	#[serde(default)]
+	pub cwd: Option<String>,
+	#[serde(default)]
+	pub title: Option<String>,
+	pub branches: usize,
+	pub messages: usize,
+	pub active_branch_messages: usize,
+	pub executions: usize,
+	pub unresolved_executions: usize,
+	pub deliveries: usize,
+	pub pending_deliveries: usize,
+	pub worker_completions: usize,
+	pub artifacts: usize,
+	pub missing_artifacts_on_disk: usize,
+	pub fork_provenance: usize,
+	pub task_admissions: usize,
+	pub stream_drafts: usize,
+	pub artifact_summaries: Vec<ArtifactSummary>,
+	pub context_estimate: ContextTokenEstimate,
+	#[serde(skip_serializing_if = "Option::is_none")]
+	pub provider_usage: Option<ProviderUsageTotals>,
+}
+
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct DatabaseSessionSummary {
+	pub id: String,
+	#[serde(default)]
+	pub parent_session_id: Option<String>,
+	#[serde(default)]
+	pub active_branch_id: Option<String>,
+	#[serde(default)]
+	pub title: Option<String>,
+	pub created_at_ms: i64,
+	pub updated_at_ms: i64,
+	pub branches: i64,
+	pub messages: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct DatabaseInspectorReport {
+	pub schema_version: i64,
+	pub table_counts: BTreeMap<String, i64>,
+	pub sessions: Vec<DatabaseSessionSummary>,
+}
+
+/// Convert one SQLite row into the export JSON object, preserving the exact
+/// column value and type.
+fn session_export_row_json(row: &rusqlite::Row<'_>, columns: &[String]) -> StoreResult<Value> {
+	let mut object = serde_json::Map::with_capacity(columns.len());
+	for (index, column) in columns.iter().enumerate() {
+		let value = match row.get_ref(index)? {
+			rusqlite::types::ValueRef::Null => Value::Null,
+			rusqlite::types::ValueRef::Integer(value) => Value::from(value),
+			rusqlite::types::ValueRef::Real(value) => Value::from(value),
+			rusqlite::types::ValueRef::Text(bytes) => {
+				Value::from(std::str::from_utf8(bytes).map_err(|error| {
+					StoreError::Corrupt(format!("export column {column} is not UTF-8: {error}"))
+				})?)
+			},
+			rusqlite::types::ValueRef::Blob(bytes) => json!({ "$blob": bytes }),
+		};
+		object.insert(column.clone(), value);
+	}
+	Ok(Value::Object(object))
+}
+
+/// Decode one export value back into a SQLite bind value.
+fn session_export_value_from_json(
+	table: &str,
+	column: &str,
+	value: &Value,
+) -> StoreResult<rusqlite::types::Value> {
+	use rusqlite::types::Value as SqlValue;
+	fn blob(bytes: &[Value], table: &str, column: &str) -> StoreResult<SqlValue> {
+		let mut decoded = Vec::with_capacity(bytes.len());
+		for byte in bytes {
+			let byte = byte
+				.as_u64()
+				.filter(|byte| *byte <= u64::from(u8::MAX))
+				.ok_or_else(|| {
+					StoreError::Validation(format!("{table}.{column} blob entry is not a byte"))
+				})?;
+			decoded.push(byte as u8);
+		}
+		Ok(SqlValue::Blob(decoded))
+	}
+	match value {
+		Value::Null => Ok(SqlValue::Null),
+		Value::Bool(flag) => Ok(SqlValue::Integer(i64::from(*flag))),
+		Value::Number(number) => number
+			.as_i64()
+			.map(SqlValue::Integer)
+			.or_else(|| number.as_f64().map(SqlValue::Real))
+			.ok_or_else(|| StoreError::Validation(format!("{table}.{column} number is out of range"))),
+		Value::String(text) => Ok(SqlValue::Text(text.clone())),
+		Value::Array(bytes) => blob(bytes, table, column),
+		Value::Object(map) => match map.get("$blob") {
+			Some(Value::Array(bytes)) if map.len() == 1 => blob(bytes, table, column),
+			_ => {
+				Err(StoreError::Validation(format!("{table}.{column} is not a supported export value")))
+			},
+		},
+	}
+}
+
+/// Live column order for one exported table. The table name is a compile-time
+/// allowlist entry, never caller input.
+fn session_export_table_columns(connection: &Connection, table: &str) -> StoreResult<Vec<String>> {
+	let statement = connection.prepare(&format!("SELECT * FROM {table} WHERE 0"))?;
+	Ok(statement
+		.column_names()
+		.iter()
+		.map(|name| (*name).to_string())
+		.collect())
+}
+
+fn redact_bundle_string(value: &mut String) {
+	let redacted = redact_free_text(value);
+	if redacted != *value {
+		*value = redacted;
+	}
+}
+
+fn redact_bundle_optional(value: &mut Option<String>) {
+	if let Some(text) = value.as_mut() {
+		redact_bundle_string(text);
+	}
+}
+
+fn redact_bundle_payload(payload: &mut Value) {
+	redact_json_strings(payload);
+}
+
+fn redact_bundle_session_payload(payload: &mut Value) {
+	redact_session_payload(payload);
+	// The schema-aware pass preserves structural ids by design; the generic
+	// pass then masks any remaining string, including ids, so no opaque
+	// credential can hide there.
+	redact_json_strings(payload);
+}
+
+fn redact_bundle_message_payload(payload: &mut Value) {
+	redact_message_payload(payload);
+	// The schema-aware pass preserves structural ids by design; the generic
+	// pass then masks any remaining string, including ids, so no opaque
+	// credential can hide there.
+	redact_json_strings(payload);
+}
+
+/// D55/D27: every string and JSON payload leaving the store through a bundle is
+/// redacted. References are redacted with the same deterministic function, so
+/// a valid bundle stays internally consistent.
+fn redact_session_bundle(bundle: &mut SessionBundle) {
+	redact_bundle_string(&mut bundle.session.id);
+	redact_bundle_optional(&mut bundle.session.parent_session_id);
+	redact_bundle_optional(&mut bundle.session.active_branch_id);
+	redact_bundle_session_payload(&mut bundle.session.payload);
+	for branch in &mut bundle.branches {
+		redact_bundle_string(&mut branch.id);
+		redact_bundle_string(&mut branch.session_id);
+		redact_bundle_optional(&mut branch.parent_branch_id);
+		redact_bundle_optional(&mut branch.parent_message_id);
+		redact_bundle_optional(&mut branch.leaf_message_id);
+		redact_bundle_payload(&mut branch.payload);
+	}
+	for message in &mut bundle.messages {
+		redact_bundle_string(&mut message.id);
+		redact_bundle_string(&mut message.session_id);
+		redact_bundle_string(&mut message.branch_id);
+		redact_bundle_optional(&mut message.parent_message_id);
+		redact_bundle_message_payload(&mut message.payload);
+	}
+	for execution in &mut bundle.executions {
+		redact_bundle_string(&mut execution.execution_id);
+		redact_bundle_string(&mut execution.session_id);
+		redact_bundle_string(&mut execution.branch_id);
+		redact_bundle_string(&mut execution.provider_call_id);
+		redact_bundle_string(&mut execution.tool_name);
+		redact_bundle_payload(&mut execution.intent);
+		if let Some(outcome) = execution.outcome.as_mut() {
+			redact_bundle_payload(outcome);
+		}
+	}
+	for delivery in &mut bundle.deliveries {
+		redact_bundle_string(&mut delivery.delivery_id);
+		redact_bundle_string(&mut delivery.worker_id);
+		redact_bundle_string(&mut delivery.session_id);
+		redact_bundle_string(&mut delivery.origin_branch_id);
+		redact_bundle_optional(&mut delivery.message_id);
+		redact_bundle_payload(&mut delivery.payload);
+	}
+	for completion in &mut bundle.worker_completions {
+		redact_bundle_string(&mut completion.worker_id);
+		redact_bundle_string(&mut completion.session_id);
+		redact_bundle_string(&mut completion.origin_branch_id);
+		redact_bundle_string(&mut completion.delivery_id);
+		redact_bundle_payload(&mut completion.completion);
+	}
+	for artifact in &mut bundle.artifacts {
+		redact_bundle_string(&mut artifact.artifact_id);
+		redact_bundle_string(&mut artifact.session_id);
+		redact_bundle_optional(&mut artifact.branch_id);
+		redact_bundle_optional(&mut artifact.execution_id);
+		redact_bundle_string(&mut artifact.location);
+		redact_bundle_payload(&mut artifact.metadata);
+	}
+	for provenance in &mut bundle.fork_provenance {
+		redact_bundle_string(&mut provenance.message_id);
+		redact_bundle_string(&mut provenance.session_id);
+		redact_bundle_string(&mut provenance.source_execution_id);
+		redact_bundle_string(&mut provenance.provider_call_id);
+	}
+	for admission in &mut bundle.task_admissions {
+		redact_bundle_string(&mut admission.task_id);
+		redact_bundle_string(&mut admission.parent_session_id);
+		redact_bundle_string(&mut admission.parent_branch_id);
+		redact_bundle_string(&mut admission.worker_id);
+		redact_bundle_string(&mut admission.state);
+		redact_bundle_payload(&mut admission.spec);
+	}
+	for draft in &mut bundle.stream_drafts {
+		redact_bundle_string(&mut draft.branch_id);
+		redact_bundle_string(&mut draft.session_id);
+		redact_bundle_payload(&mut draft.payload);
+	}
+}
+
+fn insert_unique_bundle_id<'a>(
+	set: &mut HashSet<&'a str>,
+	value: &'a str,
+	label: &str,
+) -> StoreResult<()> {
+	if value.is_empty() {
+		return Err(StoreError::Validation(format!("{label} must not be empty")));
+	}
+	if !set.insert(value) {
+		return Err(StoreError::Validation(format!("duplicate {label} {value}")));
+	}
+	Ok(())
+}
+
+fn require_bundle_session(
+	row_session_id: &str,
+	session_id: &str,
+	label: &str,
+) -> StoreResult<()> {
+	if row_session_id != session_id {
+		return Err(StoreError::Validation(format!(
+			"{label} session_id {row_session_id} does not match session {session_id}"
+		)));
+	}
+	Ok(())
+}
+
+/// Structural validation before any write. References are checked against the
+/// bundle itself; journal execution history is never executed.
+fn validate_session_bundle(bundle: &SessionBundle) -> StoreResult<()> {
+	if bundle.format != SESSION_BUNDLE_FORMAT {
+		return Err(StoreError::Validation(format!(
+			"unsupported session bundle format {:?}",
+			bundle.format
+		)));
+	}
+	if bundle.schema_version < 1 || bundle.schema_version > SCHEMA_VERSION {
+		return Err(StoreError::Validation(format!(
+			"session bundle schema v{} is outside supported range 1..={SCHEMA_VERSION}",
+			bundle.schema_version
+		)));
+	}
+	let session = &bundle.session;
+	if !crate::session::valid_session_id(&session.id) {
+		return Err(StoreError::Validation(format!(
+			"invalid session bundle session id `{}`: allowed characters are [A-Za-z0-9._-] and the id may not be `.`/`..`",
+			session.id
+		)));
+	}
+	if session.parent_session_id.as_deref() == Some(session.id.as_str()) {
+		return Err(StoreError::Validation("a session cannot be its own parent".into()));
+	}
+	if let Some(generation) = session.producer_generation
+		&& generation < 0
+	{
+		return Err(StoreError::Validation(
+			"session producer_generation must be non-negative".into(),
+		));
+	}
+
+	let mut branch_ids: HashSet<&str> = HashSet::new();
+	for branch in &bundle.branches {
+		insert_unique_bundle_id(&mut branch_ids, &branch.id, "branch id")?;
+		require_bundle_session(&branch.session_id, &session.id, "branch")?;
+	}
+	let mut message_ids: HashSet<&str> = HashSet::new();
+	for message in &bundle.messages {
+		insert_unique_bundle_id(&mut message_ids, &message.id, "message id")?;
+		require_bundle_session(&message.session_id, &session.id, "message")?;
+	}
+	let mut execution_ids: HashSet<&str> = HashSet::new();
+	for execution in &bundle.executions {
+		insert_unique_bundle_id(&mut execution_ids, &execution.execution_id, "execution id")?;
+		require_bundle_session(&execution.session_id, &session.id, "execution")?;
+	}
+	let mut delivery_ids: HashSet<&str> = HashSet::new();
+	for delivery in &bundle.deliveries {
+		insert_unique_bundle_id(&mut delivery_ids, &delivery.delivery_id, "delivery id")?;
+		require_bundle_session(&delivery.session_id, &session.id, "delivery")?;
+	}
+	let mut worker_ids: HashSet<&str> = HashSet::new();
+	for completion in &bundle.worker_completions {
+		insert_unique_bundle_id(&mut worker_ids, &completion.worker_id, "worker completion id")?;
+		require_bundle_session(&completion.session_id, &session.id, "worker completion")?;
+	}
+	let mut artifact_ids: HashSet<&str> = HashSet::new();
+	for artifact in &bundle.artifacts {
+		insert_unique_bundle_id(&mut artifact_ids, &artifact.artifact_id, "artifact id")?;
+		require_bundle_session(&artifact.session_id, &session.id, "artifact")?;
+		if artifact.location.is_empty() {
+			return Err(StoreError::Validation("artifact location must not be empty".into()));
+		}
+	}
+	let mut provenance_ids: HashSet<&str> = HashSet::new();
+	for provenance in &bundle.fork_provenance {
+		insert_unique_bundle_id(&mut provenance_ids, &provenance.message_id, "fork provenance message id")?;
+		require_bundle_session(&provenance.session_id, &session.id, "fork provenance")?;
+	}
+	let mut task_ids: HashSet<&str> = HashSet::new();
+	for admission in &bundle.task_admissions {
+		insert_unique_bundle_id(&mut task_ids, &admission.task_id, "task admission id")?;
+		require_bundle_session(&admission.parent_session_id, &session.id, "task admission")?;
+		if admission.producer_generation < 0 {
+			return Err(StoreError::Validation(
+				"task admission producer_generation must be non-negative".into(),
+			));
+		}
+		if !matches!(
+			admission.state.as_str(),
+			"admitted" | "started" | "completed" | "failed" | "abandoned"
+		) {
+			return Err(StoreError::Validation(format!(
+				"task admission {} has invalid state {:?}",
+				admission.task_id, admission.state
+			)));
+		}
+	}
+	let mut draft_branch_ids: HashSet<&str> = HashSet::new();
+	for draft in &bundle.stream_drafts {
+		insert_unique_bundle_id(&mut draft_branch_ids, &draft.branch_id, "stream draft branch id")?;
+		require_bundle_session(&draft.session_id, &session.id, "stream draft")?;
+	}
+
+	let active_branch_id = session.active_branch_id.as_deref().ok_or_else(|| {
+		StoreError::Validation("session bundle active_branch_id is required".into())
+	})?;
+	if !branch_ids.contains(active_branch_id) {
+		return Err(StoreError::Validation(format!(
+			"active branch {active_branch_id} is not present in the bundle"
+		)));
+	}
+	for branch in &bundle.branches {
+		if let Some(parent) = branch.parent_branch_id.as_deref() {
+			if parent == branch.id {
+				return Err(StoreError::Validation(format!(
+					"branch {} cannot parent itself",
+					branch.id
+				)));
+			}
+			if !branch_ids.contains(parent) {
+				return Err(StoreError::Validation(format!(
+					"branch {} references missing parent branch {parent}",
+					branch.id
+				)));
+			}
+		}
+		if let Some(message) = branch.parent_message_id.as_deref()
+			&& !message_ids.contains(message)
+		{
+			return Err(StoreError::Validation(format!(
+				"branch {} references missing parent message {message}",
+				branch.id
+			)));
+		}
+		if let Some(message) = branch.leaf_message_id.as_deref()
+			&& !message_ids.contains(message)
+		{
+			return Err(StoreError::Validation(format!(
+				"branch {} references missing leaf message {message}",
+				branch.id
+			)));
+		}
+	}
+	for message in &bundle.messages {
+		if !branch_ids.contains(message.branch_id.as_str()) {
+			return Err(StoreError::Validation(format!(
+				"message {} references missing branch {}",
+				message.id, message.branch_id
+			)));
+		}
+		if let Some(parent) = message.parent_message_id.as_deref() {
+			if parent == message.id {
+				return Err(StoreError::Validation(format!(
+					"message {} cannot parent itself",
+					message.id
+				)));
+			}
+			if !message_ids.contains(parent) {
+				return Err(StoreError::Validation(format!(
+					"message {} references missing parent message {parent}",
+					message.id
+				)));
+			}
+		}
+	}
+	for execution in &bundle.executions {
+		if !branch_ids.contains(execution.branch_id.as_str()) {
+			return Err(StoreError::Validation(format!(
+				"execution {} references missing branch {}",
+				execution.execution_id, execution.branch_id
+			)));
+		}
+	}
+	for delivery in &bundle.deliveries {
+		if !branch_ids.contains(delivery.origin_branch_id.as_str()) {
+			return Err(StoreError::Validation(format!(
+				"delivery {} references missing branch {}",
+				delivery.delivery_id, delivery.origin_branch_id
+			)));
+		}
+		if let Some(message) = delivery.message_id.as_deref()
+			&& !message_ids.contains(message)
+		{
+			return Err(StoreError::Validation(format!(
+				"delivery {} references missing message {message}",
+				delivery.delivery_id
+			)));
+		}
+	}
+	for completion in &bundle.worker_completions {
+		if !branch_ids.contains(completion.origin_branch_id.as_str()) {
+			return Err(StoreError::Validation(format!(
+				"worker completion {} references missing branch {}",
+				completion.worker_id, completion.origin_branch_id
+			)));
+		}
+		if !delivery_ids.contains(completion.delivery_id.as_str()) {
+			return Err(StoreError::Validation(format!(
+				"worker completion {} references missing delivery {}",
+				completion.worker_id, completion.delivery_id
+			)));
+		}
+	}
+	for artifact in &bundle.artifacts {
+		if let Some(branch) = artifact.branch_id.as_deref()
+			&& !branch_ids.contains(branch)
+		{
+			return Err(StoreError::Validation(format!(
+				"artifact {} references missing branch {branch}",
+				artifact.artifact_id
+			)));
+		}
+		if let Some(execution) = artifact.execution_id.as_deref()
+			&& !execution_ids.contains(execution)
+		{
+			return Err(StoreError::Validation(format!(
+				"artifact {} references missing execution {execution}",
+				artifact.artifact_id
+			)));
+		}
+	}
+	for provenance in &bundle.fork_provenance {
+		if !message_ids.contains(provenance.message_id.as_str()) {
+			return Err(StoreError::Validation(format!(
+				"fork provenance references missing message {}",
+				provenance.message_id
+			)));
+		}
+	}
+	for admission in &bundle.task_admissions {
+		if !branch_ids.contains(admission.parent_branch_id.as_str()) {
+			return Err(StoreError::Validation(format!(
+				"task admission {} references missing branch {}",
+				admission.task_id, admission.parent_branch_id
+			)));
+		}
+	}
+	for draft in &bundle.stream_drafts {
+		if !branch_ids.contains(draft.branch_id.as_str()) {
+			return Err(StoreError::Validation(format!(
+				"stream draft references missing branch {}",
+				draft.branch_id
+			)));
+		}
+	}
+	Ok(())
+}
+
+fn order_session_bundle_branches(
+	branches: &[SessionBundleBranch],
+) -> StoreResult<Vec<&SessionBundleBranch>> {
+	let mut remaining: Vec<&SessionBundleBranch> = branches.iter().collect();
+	let mut inserted: HashSet<&str> = HashSet::new();
+	let mut ordered = Vec::with_capacity(branches.len());
+	while !remaining.is_empty() {
+		let before = remaining.len();
+		remaining.retain(|branch| {
+			let ready = branch
+				.parent_branch_id
+				.as_deref()
+				.is_none_or(|parent| inserted.contains(parent));
+			if ready {
+				inserted.insert(branch.id.as_str());
+				ordered.push(*branch);
+			}
+			ready
+		});
+		if remaining.len() == before {
+			return Err(StoreError::Validation(
+				"branch parent references form a cycle".to_string(),
+			));
+		}
+	}
+	Ok(ordered)
+}
+
+fn order_session_bundle_messages(
+	messages: &[SessionBundleMessage],
+) -> StoreResult<Vec<&SessionBundleMessage>> {
+	let mut remaining: Vec<&SessionBundleMessage> = messages.iter().collect();
+	remaining.sort_by_key(|message| message.seq);
+	let mut inserted: HashSet<&str> = HashSet::new();
+	let mut ordered = Vec::with_capacity(messages.len());
+	while !remaining.is_empty() {
+		let before = remaining.len();
+		remaining.retain(|message| {
+			let ready = message
+				.parent_message_id
+				.as_deref()
+				.is_none_or(|parent| inserted.contains(parent));
+			if ready {
+				inserted.insert(message.id.as_str());
+				ordered.push(*message);
+			}
+			ready
+		});
+		if remaining.len() == before {
+			return Err(StoreError::Validation(
+				"message parent references form a cycle".to_string(),
+			));
+		}
+	}
+	Ok(ordered)
+}
+
+fn record_imported_parent_session(payload: &mut Value, parent_session_id: &str) {
+	if let Some(map) = payload.as_object_mut() {
+		map.insert(
+			"_imported_parent_session_id".to_string(),
+			Value::String(parent_session_id.to_string()),
+		);
+		return;
+	}
+	let previous = std::mem::take(payload);
+	*payload = json!({
+		"_imported_parent_session_id": parent_session_id,
+		"importedPayload": previous,
+	});
+}
+
+/// Path-like artifact locations are probed without failing; URI-like locations
+/// are treated as externally owned and therefore not "missing on disk".
+fn artifact_local_path(location: &str) -> Option<&str> {
+	if let Some(path) = location.strip_prefix("file://") {
+		return Some(path);
+	}
+	if location.contains("://") {
+		return None;
+	}
+	Some(location)
+}
+
+fn artifact_exists_on_disk(location: &str) -> bool {
+	match artifact_local_path(location) {
+		Some(path) => Path::new(path).exists(),
+		None => true,
+	}
+}
+
+fn count_tokens(text: &str) -> usize {
+	pi_agent::Tokenizer::count_text(text)
+}
+
+/// D74 estimate over the active branch only. The result contains counts, never
+/// message bodies; provider usage is accumulated separately and only when the
+/// provider actually reported it.
+fn estimate_branch_context(
+	messages: &[MessageRecord],
+	session_payload: &Value,
+) -> (ContextTokenEstimate, Option<ProviderUsageTotals>) {
+	let mut estimate = ContextTokenEstimate::default();
+	let mut usage: Option<ProviderUsageTotals> = None;
+	if let Some(text) = session_payload.get("systemPrompt").and_then(Value::as_str) {
+		estimate.system_prompt = estimate.system_prompt.saturating_add(count_tokens(text));
+	}
+	for record in messages {
+		let mut payload = record.payload.clone();
+		redact_message_payload(&mut payload);
+		let Ok(entry) = serde_json::from_value::<crate::session::MessageEntry>(payload.clone()) else {
+			estimate.assistant =
+				estimate.assistant.saturating_add(count_tokens(&payload.to_string()));
+			continue;
+		};
+		if let Some(message_usage) = entry.message.usage.as_ref() {
+			let totals = usage.get_or_insert_with(ProviderUsageTotals::default);
+			totals.input = totals.input.saturating_add(message_usage.input);
+			totals.output = totals.output.saturating_add(message_usage.output);
+			totals.cache_read = totals.cache_read.saturating_add(message_usage.cache_read);
+			totals.cache_write = totals.cache_write.saturating_add(message_usage.cache_write);
+			totals.total_tokens = totals.total_tokens.saturating_add(message_usage.total_tokens);
+		}
+		let role = entry.message.role.as_str();
+		let parts = entry.message.content.parts();
+		if parts.is_empty() {
+			let tokens = count_tokens(&entry.message.content.text());
+			match role {
+				"system" => estimate.system_prompt = estimate.system_prompt.saturating_add(tokens),
+				"user" => estimate.user = estimate.user.saturating_add(tokens),
+				"toolResult" => {
+					estimate.tool_calls_and_results =
+						estimate.tool_calls_and_results.saturating_add(tokens);
+				},
+				_ => estimate.assistant = estimate.assistant.saturating_add(tokens),
+			}
+			continue;
+		}
+		for part in parts {
+			match part.kind.as_str() {
+				"thinking" => {
+					if let Some(text) = part.thinking_text() {
+						estimate.thinking = estimate.thinking.saturating_add(count_tokens(text));
+					}
+				},
+				"toolCall" => {
+					let arguments = Value::Object(part.extra.clone()).to_string();
+					estimate.tool_calls_and_results = estimate
+						.tool_calls_and_results
+						.saturating_add(count_tokens(&arguments));
+				},
+				"text" => {
+					let tokens = count_tokens(part.text.as_deref().unwrap_or_default());
+					match role {
+						"system" => {
+							estimate.system_prompt = estimate.system_prompt.saturating_add(tokens);
+						},
+						"user" => estimate.user = estimate.user.saturating_add(tokens),
+						"toolResult" => {
+							estimate.tool_calls_and_results =
+								estimate.tool_calls_and_results.saturating_add(tokens);
+						},
+						_ => estimate.assistant = estimate.assistant.saturating_add(tokens),
+					}
+				},
+				_ => {},
+			}
+		}
+	}
+	estimate.total = estimate
+		.system_prompt
+		.saturating_add(estimate.user)
+		.saturating_add(estimate.assistant)
+		.saturating_add(estimate.tool_calls_and_results)
+		.saturating_add(estimate.thinking);
+	(estimate, usage)
+}
+
+fn count_rows(connection: &Connection, sql: &str, session_id: &str) -> StoreResult<usize> {
+	let count: i64 = connection.query_row(sql, params![session_id], |row| row.get(0))?;
+	usize::try_from(count)
+		.map_err(|_| StoreError::Corrupt(format!("negative inspector row count {count}")))
+}
+
+fn count_session_rows(
+	connection: &Connection,
+	table: &str,
+	scope_column: &str,
+	session_id: &str,
+) -> StoreResult<usize> {
+	count_rows(
+		connection,
+		&format!("SELECT COUNT(*) FROM {table} WHERE {scope_column} = ?1"),
+		session_id,
+	)
+}
+
+/// True when a column exists; used only to read databases older than the
+/// current schema through `open_read_only` without migrating them.
+fn session_table_has_column(
+	connection: &Connection,
+	table: &str,
+	column: &str,
+) -> StoreResult<bool> {
+	let mut statement = connection.prepare(&format!("PRAGMA table_info({table})"))?;
+	let mut rows = statement.query([])?;
+	while let Some(row) = rows.next()? {
+		let name: String = row.get(1)?;
+		if name == column {
+			return Ok(true);
+		}
+	}
+	Ok(false)
+}
 
 /// Read execution rows by id on the caller's connection so a snapshot can copy
 /// provenance inside its read transaction.
@@ -1349,6 +2339,925 @@ impl SqliteStore {
 		connection.busy_timeout(std::time::Duration::from_secs(5))?;
 		connection.pragma_update(None, "foreign_keys", "ON")?;
 		Ok(Self { path, connection })
+	}
+
+	/// Export one session's exact schema rows into a portable document. Read-only
+	/// from the caller's perspective: no recovery, no reconcile, no timestamp
+	/// refresh. Artifacts and workspace state are excluded (D55).
+	pub fn export_session(&self, session_id: &str) -> StoreResult<SessionExport> {
+		validate_id("session id", session_id)?;
+		let transaction = self.connection.unchecked_transaction()?;
+		let schema_version: Option<i64> = transaction
+			.query_row("SELECT version FROM schema_version WHERE id = 1", [], |row| row.get(0))
+			.optional()?;
+		let schema_version = schema_version.ok_or_else(|| {
+			StoreError::Schema("session database has no schema_version row".to_string())
+		})?;
+		if schema_version != SCHEMA_VERSION {
+			return Err(StoreError::Schema(format!(
+				"session database schema v{schema_version} cannot be exported by a v{SCHEMA_VERSION} binary; migrate it first"
+			)));
+		}
+		let exists: bool = transaction.query_row(
+			"SELECT EXISTS(SELECT 1 FROM sessions WHERE id = ?1)",
+			params![session_id],
+			|row| row.get(0),
+		)?;
+		if !exists {
+			return Err(StoreError::NotFound(format!("session {session_id} not found")));
+		}
+		let mut tables = BTreeMap::new();
+		for (table, scope) in SESSION_EXPORT_TABLES {
+			let rows = {
+				let mut statement = transaction
+					.prepare(&format!("SELECT * FROM {table} WHERE {scope} = ?1 ORDER BY rowid"))?;
+				let columns: Vec<String> = statement
+					.column_names()
+					.iter()
+					.map(|name| (*name).to_string())
+					.collect();
+				let mut rows = statement.query(params![session_id])?;
+				let mut exported = Vec::new();
+				while let Some(row) = rows.next()? {
+					exported.push(session_export_row_json(row, &columns)?);
+				}
+				exported
+			};
+			tables.insert((*table).to_string(), rows);
+		}
+		transaction.commit()?;
+		Ok(SessionExport {
+			format: SESSION_EXPORT_FORMAT.to_string(),
+			version: SESSION_EXPORT_VERSION,
+			schema_version,
+			exported_at_ms: now_ms(),
+			session_id: session_id.to_string(),
+			tables,
+		})
+	}
+
+	/// Serialize [`Self::export_session`] to a file, replacing the target only
+	/// after the complete document is on disk.
+	pub fn export_session_to_path(
+		&self,
+		session_id: &str,
+		path: impl AsRef<Path>,
+	) -> StoreResult<()> {
+		let export = self.export_session(session_id)?;
+		let path = path.as_ref();
+		if let Some(parent) = path
+			.parent()
+			.filter(|parent| !parent.as_os_str().is_empty())
+		{
+			std::fs::create_dir_all(parent)?;
+		}
+		let bytes = serde_json::to_vec_pretty(&export)?;
+		let file_name = path
+			.file_name()
+			.and_then(|name| name.to_str())
+			.ok_or_else(|| StoreError::Validation("export path must name a file".to_string()))?;
+		let temporary = path.with_file_name(format!(".{file_name}.{}.tmp", std::process::id()));
+		std::fs::write(&temporary, bytes)?;
+		if let Err(error) = std::fs::rename(&temporary, path) {
+			let _ = std::fs::remove_file(&temporary);
+			return Err(error.into());
+		}
+		Ok(())
+	}
+
+	/// Import one portable session document atomically. Every row is inserted
+	/// with its exact exported columns; saved tool calls are never executed.
+	/// An existing session id is refused rather than overwritten.
+	pub fn import_session(&mut self, export: SessionExport) -> StoreResult<()> {
+		if export.format != SESSION_EXPORT_FORMAT {
+			return Err(StoreError::Validation(format!(
+				"unsupported session export format {:?}",
+				export.format
+			)));
+		}
+		if export.version != SESSION_EXPORT_VERSION {
+			return Err(StoreError::Schema(format!(
+				"session export version {} is not supported; expected {}",
+				export.version, SESSION_EXPORT_VERSION
+			)));
+		}
+		if export.schema_version != SCHEMA_VERSION {
+			return Err(StoreError::Schema(format!(
+				"session export schema v{} does not match store schema v{SCHEMA_VERSION}",
+				export.schema_version
+			)));
+		}
+		validate_id("session id", &export.session_id)?;
+		if self.session(&export.session_id)?.is_some() {
+			return Err(StoreError::Conflict(format!("session {} already exists", export.session_id)));
+		}
+		for (table, _) in SESSION_EXPORT_TABLES {
+			if !export.tables.contains_key(*table) {
+				return Err(StoreError::Validation(format!("session export is missing table {table}")));
+			}
+		}
+		if export.tables.len() != SESSION_EXPORT_TABLES.len() {
+			return Err(StoreError::Validation("session export contains unknown tables".to_string()));
+		}
+		let session_rows = export.tables.get("sessions").expect("checked above");
+		let [session_row] = session_rows.as_slice() else {
+			return Err(StoreError::Validation(
+				"session export must contain exactly one session row".to_string(),
+			));
+		};
+		let session_object = session_row.as_object().ok_or_else(|| {
+			StoreError::Validation("session export session row is not an object".to_string())
+		})?;
+		if session_object.get("id").and_then(Value::as_str) != Some(export.session_id.as_str()) {
+			return Err(StoreError::Validation(
+				"session export session row id does not match session_id".to_string(),
+			));
+		}
+		let parent_session = session_object
+			.get("parent_session_id")
+			.and_then(Value::as_str)
+			.map(str::to_string);
+		if parent_session.as_deref() == Some(export.session_id.as_str()) {
+			return Err(StoreError::Validation("session export cannot parent itself".to_string()));
+		}
+		let transaction = self
+			.connection
+			.transaction_with_behavior(TransactionBehavior::Immediate)?;
+		// Branch parent_message_id and message branch_id form a cycle, so checks
+		// are deferred to COMMIT; the session parent is verified explicitly
+		// because its row may legitimately live in another database.
+		transaction.pragma_update(None, "defer_foreign_keys", "ON")?;
+		if let Some(parent) = parent_session.as_deref() {
+			let parent_exists: bool = transaction.query_row(
+				"SELECT EXISTS(SELECT 1 FROM sessions WHERE id = ?1)",
+				params![parent],
+				|row| row.get(0),
+			)?;
+			if !parent_exists {
+				return Err(StoreError::NotFound(format!(
+					"parent session {parent} is not present; import it first"
+				)));
+			}
+		}
+		for (table, scope) in SESSION_EXPORT_TABLES {
+			let rows = export.tables.get(*table).expect("checked above");
+			let columns = session_export_table_columns(&transaction, table)?;
+			let placeholders = (1..=columns.len())
+				.map(|index| format!("?{index}"))
+				.collect::<Vec<_>>()
+				.join(", ");
+			let sql = format!("INSERT INTO {table} ({}) VALUES ({placeholders})", columns.join(", "));
+			for (index, row) in rows.iter().enumerate() {
+				let object = row.as_object().ok_or_else(|| {
+					StoreError::Validation(format!("{table} row {index} is not an object"))
+				})?;
+				if object.len() != columns.len()
+					|| !columns.iter().all(|column| object.contains_key(column))
+				{
+					return Err(StoreError::Validation(format!(
+						"{table} row {index} does not match the live schema columns"
+					)));
+				}
+				if object.get(*scope).and_then(Value::as_str) != Some(export.session_id.as_str()) {
+					return Err(StoreError::Validation(format!(
+						"{table} row {index} is outside session {}",
+						export.session_id
+					)));
+				}
+				let values = columns
+					.iter()
+					.map(|column| session_export_value_from_json(table, column, &object[column]))
+					.collect::<StoreResult<Vec<_>>>()?;
+				transaction.execute(&sql, params_from_iter(values))?;
+			}
+		}
+		transaction.commit()?;
+		Ok(())
+	}
+
+	/// Read and validate a portable export file, then import it atomically.
+	pub fn import_session_from_path(&mut self, path: impl AsRef<Path>) -> StoreResult<()> {
+		let bytes = std::fs::read(path)?;
+		let export: SessionExport = serde_json::from_slice(&bytes)?;
+		self.import_session(export)
+	}
+
+	fn transaction_immediate(&self) -> StoreResult<Transaction<'_>> {
+		Ok(Transaction::new_unchecked(
+			&self.connection,
+			TransactionBehavior::Immediate,
+		)?)
+	}
+
+	/// Export one session across all ten session-scoped v7 tables into a
+	/// validated, redacted bundle. Read-only: no migration, recovery, reconcile,
+	/// or timestamp refresh. Artifact files and workspace state are never read.
+	pub fn export_session_bundle(&self, session_id: &str) -> StoreResult<SessionBundle> {
+		validate_id("session id", session_id)?;
+		let transaction = self.connection.unchecked_transaction()?;
+		let schema_version: Option<i64> = transaction
+			.query_row("SELECT version FROM schema_version WHERE id = 1", [], |row| row.get(0))
+			.optional()?;
+		let schema_version = schema_version.ok_or_else(|| {
+			StoreError::Schema("session database has no schema_version row".to_string())
+		})?;
+		let has_producer_generation =
+			session_table_has_column(&transaction, "sessions", "producer_generation")?;
+		let session_sql = if has_producer_generation {
+			"SELECT id, parent_session_id, active_branch_id, payload_json, created_at_ms, updated_at_ms, producer_generation \
+			 FROM sessions WHERE id = ?1"
+		} else {
+			"SELECT id, parent_session_id, active_branch_id, payload_json, created_at_ms, updated_at_ms, NULL \
+			 FROM sessions WHERE id = ?1"
+		};
+		let session_row = transaction
+			.query_row(session_sql, params![session_id], |row| {
+				Ok((
+					row.get::<_, String>(0)?,
+					row.get::<_, Option<String>>(1)?,
+					row.get::<_, Option<String>>(2)?,
+					row.get::<_, String>(3)?,
+					row.get::<_, i64>(4)?,
+					row.get::<_, i64>(5)?,
+					row.get::<_, Option<i64>>(6)?,
+				))
+			})
+			.optional()?;
+		let Some((
+			id,
+			parent_session_id,
+			active_branch_id,
+			payload_json,
+			created_at_ms,
+			updated_at_ms,
+			producer_generation,
+		)) = session_row
+		else {
+			return Err(StoreError::NotFound(format!("session {session_id} not found")));
+		};
+
+		let mut branches = Vec::new();
+		{
+			let mut statement = transaction.prepare(
+				"SELECT id, session_id, parent_branch_id, parent_message_id, leaf_message_id, payload_json, created_at_ms \
+				 FROM branches WHERE session_id = ?1 ORDER BY created_at_ms, id",
+			)?;
+			let mut rows = statement.query(params![session_id])?;
+			while let Some(row) = rows.next()? {
+				branches.push(SessionBundleBranch {
+					id: row.get(0)?,
+					session_id: row.get(1)?,
+					parent_branch_id: row.get(2)?,
+					parent_message_id: row.get(3)?,
+					leaf_message_id: row.get(4)?,
+					payload: decode_json(&row.get::<_, String>(5)?)?,
+					created_at_ms: row.get(6)?,
+				});
+			}
+		}
+		let mut messages = Vec::new();
+		{
+			let mut statement = transaction.prepare(
+				"SELECT seq, id, session_id, branch_id, parent_message_id, payload_json, created_at_ms \
+				 FROM messages WHERE session_id = ?1 ORDER BY seq ASC",
+			)?;
+			let mut rows = statement.query(params![session_id])?;
+			while let Some(row) = rows.next()? {
+				messages.push(SessionBundleMessage {
+					seq: row.get(0)?,
+					id: row.get(1)?,
+					session_id: row.get(2)?,
+					branch_id: row.get(3)?,
+					parent_message_id: row.get(4)?,
+					payload: decode_json(&row.get::<_, String>(5)?)?,
+					created_at_ms: row.get(6)?,
+				});
+			}
+		}
+		let mut executions = Vec::new();
+		{
+			let mut statement = transaction.prepare(
+				"SELECT seq, execution_id, session_id, branch_id, provider_call_id, tool_name, intent_json, created_at_ms, outcome_json, outcome_at_ms \
+				 FROM executions WHERE session_id = ?1 ORDER BY seq ASC",
+			)?;
+			let mut rows = statement.query(params![session_id])?;
+			while let Some(row) = rows.next()? {
+				let outcome_json: Option<String> = row.get(8)?;
+				executions.push(SessionBundleExecution {
+					seq: row.get(0)?,
+					execution_id: row.get(1)?,
+					session_id: row.get(2)?,
+					branch_id: row.get(3)?,
+					provider_call_id: row.get(4)?,
+					tool_name: row.get(5)?,
+					intent: decode_json(&row.get::<_, String>(6)?)?,
+					created_at_ms: row.get(7)?,
+					outcome: outcome_json.as_deref().map(decode_json).transpose()?,
+					outcome_at_ms: row.get(9)?,
+				});
+			}
+		}
+		let mut deliveries = Vec::new();
+		{
+			let mut statement = transaction.prepare(
+				"SELECT delivery_id, worker_id, session_id, origin_branch_id, payload_json, created_at_ms, delivered_at_ms, processed_at_ms, message_id \
+				 FROM deliveries WHERE session_id = ?1 ORDER BY created_at_ms, delivery_id",
+			)?;
+			let mut rows = statement.query(params![session_id])?;
+			while let Some(row) = rows.next()? {
+				deliveries.push(SessionBundleDelivery {
+					delivery_id: row.get(0)?,
+					worker_id: row.get(1)?,
+					session_id: row.get(2)?,
+					origin_branch_id: row.get(3)?,
+					payload: decode_json(&row.get::<_, String>(4)?)?,
+					created_at_ms: row.get(5)?,
+					delivered_at_ms: row.get(6)?,
+					processed_at_ms: row.get(7)?,
+					message_id: row.get(8)?,
+				});
+			}
+		}
+		let mut worker_completions = Vec::new();
+		{
+			let mut statement = transaction.prepare(
+				"SELECT worker_id, session_id, origin_branch_id, delivery_id, completion_json, completed_at_ms \
+				 FROM worker_completions WHERE session_id = ?1 ORDER BY completed_at_ms, worker_id",
+			)?;
+			let mut rows = statement.query(params![session_id])?;
+			while let Some(row) = rows.next()? {
+				worker_completions.push(SessionBundleWorkerCompletion {
+					worker_id: row.get(0)?,
+					session_id: row.get(1)?,
+					origin_branch_id: row.get(2)?,
+					delivery_id: row.get(3)?,
+					completion: decode_json(&row.get::<_, String>(4)?)?,
+					completed_at_ms: row.get(5)?,
+				});
+			}
+		}
+		let mut artifacts = Vec::new();
+		{
+			let mut statement = transaction.prepare(
+				"SELECT artifact_id, session_id, branch_id, execution_id, location, metadata_json, created_at_ms \
+				 FROM artifacts WHERE session_id = ?1 ORDER BY created_at_ms, artifact_id",
+			)?;
+			let mut rows = statement.query(params![session_id])?;
+			while let Some(row) = rows.next()? {
+				artifacts.push(SessionBundleArtifact {
+					artifact_id: row.get(0)?,
+					session_id: row.get(1)?,
+					branch_id: row.get(2)?,
+					execution_id: row.get(3)?,
+					location: row.get(4)?,
+					metadata: decode_json(&row.get::<_, String>(5)?)?,
+					created_at_ms: row.get(6)?,
+				});
+			}
+		}
+		let mut fork_provenance = Vec::new();
+		if table_exists_conn(&transaction, "fork_provenance")? {
+			let mut statement = transaction.prepare(
+				"SELECT message_id, session_id, source_execution_id, provider_call_id, outcome_resolved \
+				 FROM fork_provenance WHERE session_id = ?1 ORDER BY message_id",
+			)?;
+			let mut rows = statement.query(params![session_id])?;
+			while let Some(row) = rows.next()? {
+				fork_provenance.push(SessionBundleForkProvenance {
+					message_id: row.get(0)?,
+					session_id: row.get(1)?,
+					source_execution_id: row.get(2)?,
+					provider_call_id: row.get(3)?,
+					outcome_resolved: row.get::<_, i64>(4)? != 0,
+				});
+			}
+		}
+		let mut task_admissions = Vec::new();
+		if table_exists_conn(&transaction, "task_admissions")? {
+			let mut statement = transaction.prepare(
+				"SELECT task_id, parent_session_id, parent_branch_id, worker_id, producer_generation, state, spec_json, created_at_ms, updated_at_ms \
+				 FROM task_admissions WHERE parent_session_id = ?1 ORDER BY created_at_ms, task_id",
+			)?;
+			let mut rows = statement.query(params![session_id])?;
+			while let Some(row) = rows.next()? {
+				let spec_json: String = row.get(6)?;
+				task_admissions.push(SessionBundleTaskAdmission {
+					task_id: row.get(0)?,
+					parent_session_id: row.get(1)?,
+					parent_branch_id: row.get(2)?,
+					worker_id: row.get(3)?,
+					producer_generation: row.get(4)?,
+					state: row.get(5)?,
+					spec: decode_json(&spec_json)?,
+					created_at_ms: row.get(7)?,
+					updated_at_ms: row.get(8)?,
+				});
+			}
+		}
+		let mut stream_drafts = Vec::new();
+		if table_exists_conn(&transaction, "stream_drafts")? {
+			let mut statement = transaction.prepare(
+				"SELECT branch_id, session_id, payload_json, updated_at_ms \
+				 FROM stream_drafts WHERE session_id = ?1 ORDER BY branch_id",
+			)?;
+			let mut rows = statement.query(params![session_id])?;
+			while let Some(row) = rows.next()? {
+				stream_drafts.push(SessionBundleStreamDraft {
+					branch_id: row.get(0)?,
+					session_id: row.get(1)?,
+					payload: decode_json(&row.get::<_, String>(2)?)?,
+					updated_at_ms: row.get(3)?,
+				});
+			}
+		}
+		transaction.commit()?;
+		let mut bundle = SessionBundle {
+			format: SESSION_BUNDLE_FORMAT.to_string(),
+			schema_version,
+			exported_at_ms: now_ms(),
+			session: SessionBundleSession {
+				id,
+				parent_session_id,
+				active_branch_id,
+				payload: decode_json(&payload_json)?,
+				created_at_ms,
+				updated_at_ms,
+				producer_generation,
+			},
+			branches,
+			messages,
+			executions,
+			deliveries,
+			worker_completions,
+			artifacts,
+			fork_provenance,
+			task_admissions,
+			stream_drafts,
+		};
+		redact_session_bundle(&mut bundle);
+		Ok(bundle)
+	}
+
+	/// Validate and import one redacted bundle atomically under `BEGIN
+	/// IMMEDIATE`. Recorded tool calls, shell commands, and hooks are only ever
+	/// stored as opaque payloads and are never executed (D55).
+	pub fn import_session_bundle(
+		&self,
+		bundle: &SessionBundle,
+		detach_parent: bool,
+	) -> StoreResult<ImportBundleReport> {
+		let mut bundle = bundle.clone();
+		redact_session_bundle(&mut bundle);
+		validate_session_bundle(&bundle)?;
+		let transaction = self.transaction_immediate()?;
+		// Branch parent_message_id can point at a message inserted later; checks
+		// are deferred to COMMIT after the whole graph exists.
+		transaction.pragma_update(None, "defer_foreign_keys", "ON")?;
+		let exists: bool = transaction.query_row(
+			"SELECT EXISTS(SELECT 1 FROM sessions WHERE id = ?1)",
+			params![bundle.session.id],
+			|row| row.get(0),
+		)?;
+		if exists {
+			return Err(StoreError::Conflict(format!(
+				"session {} already exists",
+				bundle.session.id
+			)));
+		}
+		let mut detached = false;
+		let mut detached_parent_session_id = None;
+		if let Some(parent) = bundle.session.parent_session_id.clone() {
+			let parent_exists: bool = transaction.query_row(
+				"SELECT EXISTS(SELECT 1 FROM sessions WHERE id = ?1)",
+				params![parent],
+				|row| row.get(0),
+			)?;
+			if !parent_exists {
+				if !detach_parent {
+					return Err(StoreError::Validation(format!(
+						"parent session {parent} does not exist; import it first or detach the parent"
+					)));
+				}
+				bundle.session.parent_session_id = None;
+				record_imported_parent_session(&mut bundle.session.payload, &parent);
+				detached = true;
+				detached_parent_session_id = Some(parent);
+			}
+		}
+		let session_payload = encode_json(&bundle.session.payload)?;
+		transaction.execute(
+			"INSERT INTO sessions \
+			 (id, parent_session_id, active_branch_id, payload_json, created_at_ms, updated_at_ms, producer_generation) \
+			 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+			params![
+				bundle.session.id,
+				bundle.session.parent_session_id,
+				bundle.session.active_branch_id,
+				session_payload,
+				bundle.session.created_at_ms,
+				bundle.session.updated_at_ms,
+				bundle.session.producer_generation,
+			],
+		)?;
+		for branch in order_session_bundle_branches(&bundle.branches)? {
+			transaction.execute(
+				"INSERT INTO branches \
+				 (id, session_id, parent_branch_id, parent_message_id, leaf_message_id, payload_json, created_at_ms) \
+				 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+				params![
+					branch.id,
+					branch.session_id,
+					branch.parent_branch_id,
+					branch.parent_message_id,
+					branch.leaf_message_id,
+					encode_json(&branch.payload)?,
+					branch.created_at_ms,
+				],
+			)?;
+		}
+		// `seq` is database-wide, not session-local. Keep the bundle's relative
+		// order but allocate fresh monotonic values so an import into a
+		// non-empty database cannot collide with another session.
+		let message_base: i64 = transaction.query_row(
+			"SELECT COALESCE(MAX(seq), 0) FROM messages",
+			[],
+			|row| row.get(0),
+		)?;
+		let mut message_seqs = HashMap::with_capacity(bundle.messages.len());
+		let mut source_messages: Vec<&SessionBundleMessage> = bundle.messages.iter().collect();
+		source_messages.sort_by_key(|message| (message.seq, message.id.as_str()));
+		for (offset, message) in source_messages.iter().enumerate() {
+			let seq = message_base
+				.checked_add(1 + offset as i64)
+				.ok_or_else(|| StoreError::Validation("message seq overflow".into()))?;
+			message_seqs.insert(message.id.as_str(), seq);
+		}
+		for message in order_session_bundle_messages(&bundle.messages)? {
+			let seq = message_seqs
+				.get(message.id.as_str())
+				.copied()
+				.ok_or_else(|| StoreError::Validation("message seq allocation missing".into()))?;
+			transaction.execute(
+				"INSERT INTO messages \
+				 (seq, id, session_id, branch_id, parent_message_id, payload_json, created_at_ms) \
+				 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+				params![
+					seq,
+					message.id,
+					message.session_id,
+					message.branch_id,
+					message.parent_message_id,
+					encode_json(&message.payload)?,
+					message.created_at_ms,
+				],
+			)?;
+		}
+		let execution_base: i64 = transaction.query_row(
+			"SELECT COALESCE(MAX(seq), 0) FROM executions",
+			[],
+			|row| row.get(0),
+		)?;
+		let mut source_executions: Vec<&SessionBundleExecution> = bundle.executions.iter().collect();
+		source_executions.sort_by_key(|execution| (execution.seq, execution.execution_id.as_str()));
+		for (offset, execution) in source_executions.iter().enumerate() {
+			let seq = execution_base
+				.checked_add(1 + offset as i64)
+				.ok_or_else(|| StoreError::Validation("execution seq overflow".into()))?;
+			let outcome_json = execution.outcome.as_ref().map(encode_json).transpose()?;
+			transaction.execute(
+				"INSERT INTO executions \
+				 (seq, execution_id, session_id, branch_id, provider_call_id, tool_name, intent_json, created_at_ms, outcome_json, outcome_at_ms) \
+				 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+				params![
+					seq,
+					execution.execution_id,
+					execution.session_id,
+					execution.branch_id,
+					execution.provider_call_id,
+					execution.tool_name,
+					encode_json(&execution.intent)?,
+					execution.created_at_ms,
+					outcome_json,
+					execution.outcome_at_ms,
+				],
+			)?;
+		}
+		for delivery in &bundle.deliveries {
+			transaction.execute(
+				"INSERT INTO deliveries \
+				 (delivery_id, worker_id, session_id, origin_branch_id, payload_json, created_at_ms, delivered_at_ms, processed_at_ms, message_id) \
+				 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+				params![
+					delivery.delivery_id,
+					delivery.worker_id,
+					delivery.session_id,
+					delivery.origin_branch_id,
+					encode_json(&delivery.payload)?,
+					delivery.created_at_ms,
+					delivery.delivered_at_ms,
+					delivery.processed_at_ms,
+					delivery.message_id,
+				],
+			)?;
+		}
+		for completion in &bundle.worker_completions {
+			transaction.execute(
+				"INSERT INTO worker_completions \
+				 (worker_id, session_id, origin_branch_id, delivery_id, completion_json, completed_at_ms) \
+				 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+				params![
+					completion.worker_id,
+					completion.session_id,
+					completion.origin_branch_id,
+					completion.delivery_id,
+					encode_json(&completion.completion)?,
+					completion.completed_at_ms,
+				],
+			)?;
+		}
+		for artifact in &bundle.artifacts {
+			transaction.execute(
+				"INSERT INTO artifacts \
+				 (artifact_id, session_id, branch_id, execution_id, location, metadata_json, created_at_ms) \
+				 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+				params![
+					artifact.artifact_id,
+					artifact.session_id,
+					artifact.branch_id,
+					artifact.execution_id,
+					artifact.location,
+					encode_json(&artifact.metadata)?,
+					artifact.created_at_ms,
+				],
+			)?;
+		}
+		for provenance in &bundle.fork_provenance {
+			transaction.execute(
+				"INSERT INTO fork_provenance \
+				 (message_id, session_id, source_execution_id, provider_call_id, outcome_resolved) \
+				 VALUES (?1, ?2, ?3, ?4, ?5)",
+				params![
+					provenance.message_id,
+					provenance.session_id,
+					provenance.source_execution_id,
+					provenance.provider_call_id,
+					i64::from(provenance.outcome_resolved),
+				],
+			)?;
+		}
+		for admission in &bundle.task_admissions {
+			transaction.execute(
+				"INSERT INTO task_admissions \
+				 (task_id, parent_session_id, parent_branch_id, worker_id, producer_generation, state, spec_json, created_at_ms, updated_at_ms) \
+				 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+				params![
+					admission.task_id,
+					admission.parent_session_id,
+					admission.parent_branch_id,
+					admission.worker_id,
+					admission.producer_generation,
+					admission.state,
+					encode_json(&admission.spec)?,
+					admission.created_at_ms,
+					admission.updated_at_ms,
+				],
+			)?;
+		}
+		for draft in &bundle.stream_drafts {
+			transaction.execute(
+				"INSERT INTO stream_drafts (branch_id, session_id, payload_json, updated_at_ms) \
+				 VALUES (?1, ?2, ?3, ?4)",
+				params![
+					draft.branch_id,
+					draft.session_id,
+					encode_json(&draft.payload)?,
+					draft.updated_at_ms,
+				],
+			)?;
+		}
+		transaction.commit()?;
+		Ok(ImportBundleReport {
+			session_id: bundle.session.id,
+			detached,
+			detached_parent_session_id,
+			branches: bundle.branches.len(),
+			messages: bundle.messages.len(),
+			executions: bundle.executions.len(),
+			deliveries: bundle.deliveries.len(),
+			worker_completions: bundle.worker_completions.len(),
+			artifacts: bundle.artifacts.len(),
+			fork_provenance: bundle.fork_provenance.len(),
+			task_admissions: bundle.task_admissions.len(),
+			stream_drafts: bundle.stream_drafts.len(),
+		})
+	}
+
+	/// D74 read-only session inspector. Returns metadata, counts, artifact
+	/// existence, and token estimates only; no message bodies are included.
+	pub fn inspect_session(&self, session_id: &str) -> StoreResult<SessionInspectorReport> {
+		validate_id("session id", session_id)?;
+		let transaction = self.connection.unchecked_transaction()?;
+		let has_producer_generation =
+			session_table_has_column(&transaction, "sessions", "producer_generation")?;
+		let session_sql = if has_producer_generation {
+			"SELECT id, parent_session_id, active_branch_id, payload_json, created_at_ms, updated_at_ms, producer_generation \
+			 FROM sessions WHERE id = ?1"
+		} else {
+			"SELECT id, parent_session_id, active_branch_id, payload_json, created_at_ms, updated_at_ms, NULL \
+			 FROM sessions WHERE id = ?1"
+		};
+		let row = transaction
+			.query_row(session_sql, params![session_id], |row| {
+				Ok((
+					row.get::<_, String>(0)?,
+					row.get::<_, Option<String>>(1)?,
+					row.get::<_, Option<String>>(2)?,
+					row.get::<_, String>(3)?,
+					row.get::<_, i64>(4)?,
+					row.get::<_, i64>(5)?,
+					row.get::<_, Option<i64>>(6)?,
+				))
+			})
+			.optional()?;
+		let Some((
+			id,
+			parent_session_id,
+			active_branch_id,
+			payload_json,
+			created_at_ms,
+			updated_at_ms,
+			producer_generation,
+		)) = row
+		else {
+			return Err(StoreError::NotFound(format!("session {session_id} not found")));
+		};
+		let payload: Value = decode_json(&payload_json)?;
+		let branches = count_session_rows(&transaction, "branches", "session_id", session_id)?;
+		let messages = count_session_rows(&transaction, "messages", "session_id", session_id)?;
+		let executions = count_session_rows(&transaction, "executions", "session_id", session_id)?;
+		let unresolved_executions = count_rows(
+			&transaction,
+			"SELECT COUNT(*) FROM executions WHERE session_id = ?1 AND outcome_json IS NULL",
+			session_id,
+		)?;
+		let deliveries = count_session_rows(&transaction, "deliveries", "session_id", session_id)?;
+		let pending_deliveries = count_rows(
+			&transaction,
+			"SELECT COUNT(*) FROM deliveries WHERE session_id = ?1 AND delivered_at_ms IS NULL",
+			session_id,
+		)?;
+		let worker_completions =
+			count_session_rows(&transaction, "worker_completions", "session_id", session_id)?;
+		let fork_provenance = if table_exists_conn(&transaction, "fork_provenance")? {
+			count_session_rows(&transaction, "fork_provenance", "session_id", session_id)?
+		} else {
+			0
+		};
+		let task_admissions = if table_exists_conn(&transaction, "task_admissions")? {
+			count_session_rows(&transaction, "task_admissions", "parent_session_id", session_id)?
+		} else {
+			0
+		};
+		let stream_drafts = if table_exists_conn(&transaction, "stream_drafts")? {
+			count_session_rows(&transaction, "stream_drafts", "session_id", session_id)?
+		} else {
+			0
+		};
+		let mut artifact_summaries = Vec::new();
+		let mut missing_artifacts_on_disk = 0usize;
+		{
+			let mut statement = transaction.prepare(
+				"SELECT artifact_id, location FROM artifacts WHERE session_id = ?1 ORDER BY created_at_ms, artifact_id",
+			)?;
+			let mut rows = statement.query(params![session_id])?;
+			while let Some(row) = rows.next()? {
+				let mut artifact_id: String = row.get(0)?;
+				let mut location: String = row.get(1)?;
+				let exists_on_disk = artifact_exists_on_disk(&location);
+				if !exists_on_disk {
+					missing_artifacts_on_disk += 1;
+				}
+				redact_bundle_string(&mut artifact_id);
+				redact_bundle_string(&mut location);
+				artifact_summaries.push(ArtifactSummary {
+					artifact_id,
+					location,
+					exists_on_disk,
+				});
+			}
+		}
+		let artifacts = artifact_summaries.len();
+		let branch_messages = match active_branch_id.as_deref() {
+			Some(branch_id) => self.branch_messages(branch_id)?,
+			None => Vec::new(),
+		};
+		let active_branch_messages = branch_messages.len();
+		let (context_estimate, provider_usage) =
+			estimate_branch_context(&branch_messages, &payload);
+		transaction.commit()?;
+		let cwd = payload
+			.get("cwd")
+			.and_then(Value::as_str)
+			.map(redact_free_text);
+		let title = payload
+			.get("title")
+			.and_then(Value::as_str)
+			.map(redact_free_text);
+		Ok(SessionInspectorReport {
+			id: redact_free_text(&id),
+			parent_session_id: parent_session_id.as_deref().map(redact_free_text),
+			active_branch_id: active_branch_id.as_deref().map(redact_free_text),
+			producer_generation,
+			created_at_ms,
+			updated_at_ms,
+			cwd,
+			title,
+			branches,
+			messages,
+			active_branch_messages,
+			executions,
+			unresolved_executions,
+			deliveries,
+			pending_deliveries,
+			worker_completions,
+			artifacts,
+			missing_artifacts_on_disk,
+			fork_provenance,
+			task_admissions,
+			stream_drafts,
+			artifact_summaries,
+			context_estimate,
+			provider_usage,
+		})
+	}
+
+	/// Read-only database-wide inspector: schema version, per-table totals, and
+	/// redacted session summaries. No message bodies are returned.
+	pub fn inspect_database(&self) -> StoreResult<DatabaseInspectorReport> {
+		let transaction = self.connection.unchecked_transaction()?;
+		let schema_version: Option<i64> = transaction
+			.query_row("SELECT version FROM schema_version WHERE id = 1", [], |row| row.get(0))
+			.optional()?;
+		let schema_version = schema_version.ok_or_else(|| {
+			StoreError::Schema("session database has no schema_version row".to_string())
+		})?;
+		let mut table_counts = BTreeMap::new();
+		for table in [
+			"schema_version",
+			"sessions",
+			"branches",
+			"messages",
+			"executions",
+			"deliveries",
+			"worker_completions",
+			"artifacts",
+			"fork_provenance",
+			"task_admissions",
+			"stream_drafts",
+		] {
+			let count: i64 = transaction.query_row(
+				&format!("SELECT COUNT(*) FROM {table}"),
+				[],
+				|row| row.get(0),
+			)?;
+			table_counts.insert(table.to_string(), count);
+		}
+		let mut sessions = Vec::new();
+		{
+			let mut statement = transaction.prepare(
+				"SELECT s.id, s.parent_session_id, s.active_branch_id, s.payload_json, s.created_at_ms, s.updated_at_ms, \
+				        (SELECT COUNT(*) FROM branches b WHERE b.session_id = s.id), \
+				        (SELECT COUNT(*) FROM messages m WHERE m.session_id = s.id) \
+				 FROM sessions s ORDER BY s.created_at_ms, s.id",
+			)?;
+			let mut rows = statement.query([])?;
+			while let Some(row) = rows.next()? {
+				let id: String = row.get(0)?;
+				let parent_session_id: Option<String> = row.get(1)?;
+				let active_branch_id: Option<String> = row.get(2)?;
+				let payload: Value = decode_json(&row.get::<_, String>(3)?)?;
+				let title = payload
+					.get("title")
+					.and_then(Value::as_str)
+					.map(redact_free_text);
+				sessions.push(DatabaseSessionSummary {
+					id: redact_free_text(&id),
+					parent_session_id: parent_session_id.as_deref().map(redact_free_text),
+					active_branch_id: active_branch_id.as_deref().map(redact_free_text),
+					title,
+					created_at_ms: row.get(4)?,
+					updated_at_ms: row.get(5)?,
+					branches: row.get(6)?,
+					messages: row.get(7)?,
+				});
+			}
+		}
+		transaction.commit()?;
+		Ok(DatabaseInspectorReport {
+			schema_version,
+			table_counts,
+			sessions,
+		})
 	}
 
 	/// One deferred read transaction: session header, active branch leaf, every
@@ -11701,5 +13610,34 @@ mod tests {
 		assert!(!sess_dump.contains(secret), "secret must not appear in cleartext in sessions");
 
 		let _ = std::fs::remove_dir_all(dir);
+	}
+
+	#[test]
+	fn bundle_branch_order_is_parent_first_and_rejects_cycles() {
+		fn branch(id: &str, parent: Option<&str>) -> SessionBundleBranch {
+			SessionBundleBranch {
+				id: id.to_string(),
+				session_id: "s_order".to_string(),
+				parent_branch_id: parent.map(str::to_string),
+				parent_message_id: None,
+				leaf_message_id: None,
+				payload: json!({}),
+				created_at_ms: 0,
+			}
+		}
+		let child = branch("child", Some("root"));
+		let root = branch("root", None);
+		let ordered = order_session_bundle_branches(&[child.clone(), root.clone()])
+			.expect("parent-first order");
+		assert_eq!(
+			ordered.iter().map(|branch| branch.id.as_str()).collect::<Vec<_>>(),
+			vec!["root", "child"]
+		);
+		let error = order_session_bundle_branches(&[
+			branch("a", Some("b")),
+			branch("b", Some("a")),
+		])
+		.expect_err("cycle must fail");
+		assert!(matches!(error, StoreError::Validation(_)));
 	}
 }

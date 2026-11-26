@@ -12,7 +12,10 @@ use aragent::{
 	agent::{self, AgentRunner, ExtraTool, RunRequest},
 	agents,
 	approve::{ApprovalMode, Approvals},
-	args::{Cli, Command, normalize_continue_session_args, parse_cli, refused_verb_message},
+	args::{
+		Cli, Command, ExportFormat, ImportFormat, normalize_continue_session_args, parse_cli,
+		refused_verb_message,
+	},
 	autolearn::{self, LocalLearnTool, ManageSkillTool, MemoryBackend},
 	catalog::Catalog,
 	completions,
@@ -39,6 +42,7 @@ use aragent::{
 		SessionOptions, SessionStore, TurnBuilder, TurnRecord,
 	},
 	session_checkpoint::CheckpointHost,
+	session_store::{SessionBundle, SqliteStore},
 	skill_protocol::SkillUrlHandler,
 	skills::{self, LoadOptions, SkillSnapshot},
 	tool_commands, worktree_cmd,
@@ -85,6 +89,71 @@ fn base_dir(cli: &Cli) -> Result<PathBuf> {
 		Some(cwd) => Ok(dirs::absolute(&std::env::current_dir()?, cwd)),
 		None => Ok(std::env::current_dir()?),
 	}
+}
+
+/// Best-effort credential registration for commands that render or inspect
+/// stored content before the normal run path loads config/auth. Missing or
+/// malformed config/auth must never fail export or inspect.
+fn register_startup_credentials(config: Option<&Config>, cli_api_key: Option<&str>) {
+	let agent_db = dirs::agent_dir().join("agent.db");
+	register_startup_credentials_at(config, cli_api_key, &agent_db);
+}
+
+fn register_startup_credentials_at(
+	config: Option<&Config>,
+	cli_api_key: Option<&str>,
+	agent_db: &Path,
+) {
+	if let Some(key) = cli_api_key.filter(|key| !key.is_empty()) {
+		aragent::auth::known_secrets::register(key);
+	}
+	if let Some(config) = config {
+		for provider in config.providers.keys() {
+			let _ = config.resolve_api_key(provider);
+		}
+		if let Some(key) = config.memory_embeddings_api_key.as_deref().filter(|key| !key.is_empty())
+		{
+			aragent::auth::known_secrets::register(key);
+		}
+	}
+	// Register every declared environment key first. This must not depend on
+	// `agent.db` opening successfully: `peek_api_key` stops at the selected
+	// stored credential and an unreadable database must not hide env secrets.
+	for entry in aragent::auth::registry::PROVIDERS {
+		if let Some(vars) = aragent::auth::AuthBackend::env_var_names(entry.id) {
+			for var in vars {
+				if let Ok(value) = std::env::var(var) {
+					let value = value.trim();
+					if !value.is_empty() {
+						aragent::auth::known_secrets::register(value);
+					}
+				}
+			}
+		}
+	}
+	// `peek_api_key` also reads declared environment variables. Use an
+	// in-memory store when no database exists so provider keys are still
+	// registered without creating an unrelated `agent.db`.
+	let auth = if agent_db.is_file() {
+		aragent::auth::AuthBackend::open_at(agent_db)
+	} else {
+		aragent::auth::AuthBackend::in_memory()
+	};
+	if let Ok(auth) = auth {
+		for entry in aragent::auth::registry::PROVIDERS {
+			let _ = auth.peek_api_key(entry.id);
+			// Keep the selected env key registered even if it is the first of
+			// several declared variables.
+			if let Some(env_key) = auth.env_api_key(entry.id) {
+				aragent::auth::known_secrets::register(&env_key);
+			}
+		}
+	}
+}
+
+fn register_startup_credentials_for(cli: &Cli, base: &Path) {
+	let config = Config::load_run(&cli.config, Some(base)).ok();
+	register_startup_credentials(config.as_ref(), cli.api_key.as_deref());
 }
 
 /// Map a handler's explicit exit code to the CLI result: zero succeeds, any
@@ -220,10 +289,18 @@ fn run() -> std::result::Result<(), CliError> {
 			Some(cwd) => dirs::absolute(&std::env::current_dir()?, cwd),
 			None => std::env::current_dir()?,
 		};
+		register_startup_credentials_for(&cli, &base);
 		let output = cli.prompt.first().map(PathBuf::from);
-		let path =
-			run_export_command(Some(session), output.as_deref(), &base, cli.session_dir.as_deref())?;
-		println!("Exported to: {path}");
+		let path = run_export_command(
+			Some(session),
+			output.as_deref(),
+			ExportFormat::Html,
+			&base,
+			cli.session_dir.as_deref(),
+		)?;
+		if let Some(path) = path {
+			println!("Exported to: {}", path.display());
+		}
 		return Ok(());
 	}
 	// `agents`, `models`, read/grep, and completion commands run before the agent
@@ -474,18 +551,74 @@ fn run() -> std::result::Result<(), CliError> {
 			)?;
 			return Ok(());
 		},
-		Some(Command::Export { session, output }) => {
+		Some(Command::Export { session, output, format }) => {
 			let base = match &cli.cwd {
 				Some(cwd) => dirs::absolute(&std::env::current_dir()?, cwd),
 				None => std::env::current_dir()?,
 			};
+			register_startup_credentials_for(&cli, &base);
 			let path = run_export_command(
 				session.as_deref(),
 				output.as_deref(),
+				*format,
 				&base,
 				cli.session_dir.as_deref(),
 			)?;
-			println!("Exported to: {path}");
+			if let Some(path) = path {
+				println!("Exported to: {}", path.display());
+			}
+			return Ok(());
+		},
+		Some(Command::Import { path, from, session_dir, cwd, detach_parent, json }) => {
+			let base = match &cli.cwd {
+				Some(cwd) => dirs::absolute(&std::env::current_dir()?, cwd),
+				None => std::env::current_dir()?,
+			};
+			let target_dir = match session_dir {
+				Some(dir) => dirs::absolute(&base, dir),
+				None => session::compute_default_session_dir(&base, None),
+			};
+			let record_cwd = match cwd {
+				Some(dir) => dirs::absolute(&base, dir),
+				None => base.clone(),
+			};
+			let report = run_import_command(
+				path,
+				*from,
+				&target_dir,
+				&record_cwd,
+				*detach_parent,
+			)?;
+			if *json {
+				println!(
+					"{}",
+					serde_json::to_string_pretty(&report)
+						.map_err(|err| CliError::fail(err.to_string()))?
+				);
+			} else {
+				let path = report.get("path").and_then(|v| v.as_str()).unwrap_or_default();
+				let id = report.get("session_id").and_then(|v| v.as_str()).unwrap_or_default();
+				println!("Imported {id} to {path}");
+			}
+			return Ok(());
+		},
+		Some(Command::Inspect { session, db, context, json }) => {
+			let base = match &cli.cwd {
+				Some(cwd) => dirs::absolute(&std::env::current_dir()?, cwd),
+				None => std::env::current_dir()?,
+			};
+			register_startup_credentials_for(&cli, &base);
+			let stdout = io::stdout();
+			let mut out = io::BufWriter::new(stdout.lock());
+			run_inspect_command(
+				session.as_deref(),
+				*db,
+				*context,
+				*json,
+				&base,
+				cli.session_dir.as_deref(),
+				&mut out,
+			)?;
 			return Ok(());
 		},
 		Some(Command::Stats { session }) => {
@@ -493,6 +626,7 @@ fn run() -> std::result::Result<(), CliError> {
 				Some(cwd) => dirs::absolute(&std::env::current_dir()?, cwd),
 				None => std::env::current_dir()?,
 			};
+			register_startup_credentials_for(&cli, &base);
 			let stdout = io::stdout();
 			let mut out = io::BufWriter::new(stdout.lock());
 			run_stats_command(session.as_deref(), &base, cli.session_dir.as_deref(), &mut out)?;
@@ -503,6 +637,7 @@ fn run() -> std::result::Result<(), CliError> {
 				Some(cwd) => dirs::absolute(&std::env::current_dir()?, cwd),
 				None => std::env::current_dir()?,
 			};
+			register_startup_credentials_for(&cli, &base);
 			run_render_command(
 				session.as_deref(),
 				output.as_deref(),
@@ -516,6 +651,7 @@ fn run() -> std::result::Result<(), CliError> {
 				Some(cwd) => dirs::absolute(&std::env::current_dir()?, cwd),
 				None => std::env::current_dir()?,
 			};
+			register_startup_credentials_for(&cli, &base);
 			run_cleanse_command(session.as_deref(), *confirm, &base, cli.session_dir.as_deref())?;
 			return Ok(());
 		},
@@ -4068,17 +4204,18 @@ fn run_search_command(
 	Ok(())
 }
 
-/// Headless `arag export`: open session via `SessionStore`, render HTML, write file.
+/// Headless `arag export`: render HTML/Markdown or serialize a JSON bundle.
 fn run_export_command(
 	session: Option<&str>,
 	output: Option<&Path>,
+	format: ExportFormat,
 	cwd: &Path,
 	session_dir: Option<&Path>,
-) -> std::result::Result<String, CliError> {
+) -> std::result::Result<Option<PathBuf>, CliError> {
 	let Some(session) = session.map(str::trim).filter(|s| !s.is_empty()) else {
 		return Err(CliError::usage(
-			"Usage: arag export <session.jsonl|id> [--output <path>]\n\
-			 Exports a session log to standalone HTML without starting a live session.",
+			"Usage: arag export <session.jsonl|id> [--format html|json|md] [--output <path|->]\n\
+			 Exports a session without starting a live session.",
 		));
 	};
 	let session_path =
@@ -4124,12 +4261,36 @@ fn run_export_command(
 		.file_stem()
 		.and_then(|s| s.to_str())
 		.map(str::to_string);
+	if format == ExportFormat::Json {
+		let (Some(dir), Some(id)) = (dir.as_deref(), id.as_deref()) else {
+			return Err(CliError::fail(format!(
+				"cannot derive a durable session id from {}",
+				session_path.display()
+			)));
+		};
+		let db_path = aragent::durable_session::database_path(dir);
+		if !aragent::durable_session::session_exists(&db_path, id).unwrap_or(false) {
+			return Err(CliError::fail(format!(
+				"Session \"{session}\" is not in {}.\n\
+				 JSON export requires a durable SQLite session; use --format html|md for JSONL logs.",
+				db_path.display()
+			)));
+		}
+		let store = SqliteStore::open_read_only(db_path.as_path())
+			.map_err(|err| CliError::fail(format!("cannot open {}: {err}", db_path.display())))?;
+		let bundle: SessionBundle = store
+			.export_session_bundle(id)
+			.map_err(|err| CliError::fail(format!("cannot export session {id}: {err}")))?;
+		let json = serde_json::to_string_pretty(&bundle)
+			.map_err(|err| CliError::fail(format!("cannot serialize session bundle: {err}")))?;
+		return write_export_output(output, &session_path, "json", &json, cwd);
+	}
 	let store = SessionStore::open_snapshot(&SessionOptions {
 		enabled: true,
 		cwd: cwd.to_path_buf(),
 		model: None,
 		provider: None,
-		dir,
+		dir: dir.clone(),
 		id,
 		continue_latest: false,
 		parent_session: None,
@@ -4145,6 +4306,30 @@ fn run_export_command(
 			session_path.display()
 		)));
 	}
+	let content = match format {
+		ExportFormat::Html => render_session_html(&store),
+		ExportFormat::Md => render_session_markdown(&store),
+		ExportFormat::Json => unreachable!("handled above"),
+	};
+	write_export_output(output, &session_path, format.extension(), &content, cwd)
+}
+
+/// Write exported text to a file, or to stdout when the path is `-`.
+fn write_export_output(
+	output: Option<&Path>,
+	session_path: &Path,
+	extension: &str,
+	content: &str,
+	cwd: &Path,
+) -> std::result::Result<Option<PathBuf>, CliError> {
+	if output.is_some_and(|path| path == Path::new("-")) {
+		let mut stdout = io::stdout();
+		stdout
+			.write_all(content.as_bytes())
+			.and_then(|()| stdout.flush())
+			.map_err(|err| CliError::fail(format!("cannot write stdout: {err}")))?;
+		return Ok(None);
+	}
 	let out_path = match output {
 		Some(path) => {
 			if path.is_absolute() {
@@ -4153,18 +4338,366 @@ fn run_export_command(
 				dirs::absolute(cwd, path)
 			}
 		},
-		None => session_path.with_extension("html"),
+		None => session_path.with_extension(extension),
 	};
-	let html = render_session_html(&store);
 	if let Some(parent) = out_path.parent() {
 		if !parent.as_os_str().is_empty() {
 			std::fs::create_dir_all(parent)
 				.map_err(|err| CliError::fail(format!("cannot create {}: {err}", parent.display())))?;
 		}
 	}
-	std::fs::write(&out_path, html)
+	std::fs::write(&out_path, content)
 		.map_err(|err| CliError::fail(format!("cannot write {}: {err}", out_path.display())))?;
-	Ok(out_path.display().to_string())
+	Ok(Some(out_path))
+}
+
+/// Non-interactive `arag import`: bundle, JSONL, Claude, or Codex.
+fn run_import_command(
+	path: &Path,
+	from: ImportFormat,
+	target_dir: &Path,
+	record_cwd: &Path,
+	detach_parent: bool,
+) -> std::result::Result<serde_json::Value, CliError> {
+	let source_path = if path.is_absolute() {
+		path.to_path_buf()
+	} else {
+		dirs::absolute(record_cwd, path)
+	};
+	let format = match from {
+		ImportFormat::Auto => sniff_import_format(&source_path)?,
+		other => other,
+	};
+	match format {
+		ImportFormat::Bundle => {
+			let content = std::fs::read_to_string(&source_path).map_err(|err| {
+				CliError::fail(format!("cannot read {}: {err}", source_path.display()))
+			})?;
+			let bundle: SessionBundle = serde_json::from_str(&content).map_err(|err| {
+				CliError::fail(format!("invalid session bundle {}: {err}", source_path.display()))
+			})?;
+			std::fs::create_dir_all(target_dir).map_err(|err| {
+				CliError::fail(format!("cannot create {}: {err}", target_dir.display()))
+			})?;
+			let db_path = aragent::durable_session::database_path(target_dir);
+			let store = SqliteStore::open(db_path.as_path())
+				.map_err(|err| CliError::fail(format!("cannot open {}: {err}", db_path.display())))?;
+			let report = store.import_session_bundle(&bundle, detach_parent).map_err(|err| {
+				CliError::fail(format!("cannot import session bundle: {err}"))
+			})?;
+			let session_id = report.session_id.clone();
+			let path = aragent::durable_session::session_path(target_dir, &session_id);
+			Ok(serde_json::json!({
+				"format": "bundle",
+				"session_id": session_id,
+				"path": path.display().to_string(),
+				"detached": report.detached,
+				"detached_parent_session_id": report.detached_parent_session_id,
+				"branches": report.branches,
+				"messages": report.messages,
+				"executions": report.executions,
+				"deliveries": report.deliveries,
+				"worker_completions": report.worker_completions,
+				"artifacts": report.artifacts,
+				"fork_provenance": report.fork_provenance,
+				"task_admissions": report.task_admissions,
+				"stream_drafts": report.stream_drafts,
+			}))
+		},
+		ImportFormat::V1 => {
+			let imported = session::import_legacy_v1(&source_path, target_dir, Some(record_cwd))
+				.map_err(CliError::fail)?;
+			Ok(import_path_report("v1", &imported))
+		},
+		ImportFormat::V3 => {
+			let imported =
+				session::import_v3_session(&source_path, target_dir).map_err(CliError::fail)?;
+			Ok(import_path_report("v3", &imported))
+		},
+		ImportFormat::Claude | ImportFormat::Codex => {
+			run_foreign_import(format, path, target_dir, record_cwd)
+		},
+		ImportFormat::Auto => unreachable!("auto is resolved above"),
+	}
+}
+
+fn import_path_report(format: &str, imported: &Path) -> serde_json::Value {
+	let session_id = imported
+		.file_stem()
+		.and_then(|stem| stem.to_str())
+		.unwrap_or_default();
+	serde_json::json!({
+		"format": format,
+		"session_id": session_id,
+		"path": imported.display().to_string(),
+		"detached": false,
+	})
+}
+
+/// Sniff a bundle or JSONL header; never treats arbitrary JSON as a session.
+fn sniff_import_format(path: &Path) -> std::result::Result<ImportFormat, CliError> {
+	let content = std::fs::read_to_string(path)
+		.map_err(|err| CliError::fail(format!("cannot read {}: {err}", path.display())))?;
+	if let Ok(value) = serde_json::from_str::<serde_json::Value>(&content) {
+		if value.get("format").and_then(|v| v.as_str()) == Some("aragent.session.v1") {
+			return Ok(ImportFormat::Bundle);
+		}
+	}
+	let header = content
+		.lines()
+		.take(2)
+		.filter(|line| !line.trim().is_empty())
+		.filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+		.find(|value| {
+			matches!(
+				value.get("type").and_then(|v| v.as_str()),
+				Some("header" | "session")
+			)
+		})
+		.ok_or_else(|| {
+			CliError::fail(format!(
+				"cannot sniff import format for {}: expected aragent.session.v1, v3, or v1 header",
+				path.display()
+			))
+		})?;
+	let kind = header.get("type").and_then(|v| v.as_str()).unwrap_or_default();
+	let version = header.get("version").and_then(|v| v.as_u64());
+	match (kind, version) {
+		("header", Some(1)) => Ok(ImportFormat::V1),
+		("session", Some(3)) => Ok(ImportFormat::V3),
+		_ => Err(CliError::fail(format!(
+			"cannot sniff import format for {}: expected aragent.session.v1, v3, or v1 header",
+			path.display()
+		))),
+	}
+}
+
+fn run_foreign_import(
+	format: ImportFormat,
+	path: &Path,
+	target_dir: &Path,
+	record_cwd: &Path,
+) -> std::result::Result<serde_json::Value, CliError> {
+	let source = match format {
+		ImportFormat::Claude => ForeignSessionSource::Claude,
+		ImportFormat::Codex => ForeignSessionSource::Codex,
+		_ => unreachable!("only foreign formats reach here"),
+	};
+	let store = foreign_session::create_foreign_session_store(source, None);
+	let wanted = path.to_string_lossy();
+	let infos = store
+		.list()
+		.map_err(|err| CliError::fail(format!("failed to list {} sessions: {err}", source.name())))?;
+	let info = infos
+		.iter()
+		.find(|info| {
+			info.id == wanted.as_ref()
+				|| info.path.as_path() == path
+				|| info.path.file_name().and_then(|name| name.to_str()) == Some(wanted.as_ref())
+		})
+		.or_else(|| infos.iter().find(|info| info.id == wanted.as_ref()))
+		.ok_or_else(|| {
+			CliError::fail(format!(
+				"{} session \"{}\" not found",
+				source.name(),
+				path.display()
+			))
+		})?;
+	let loaded = store
+		.load(info)
+		.map_err(|err| CliError::fail(format!("failed to import {} session: {err}", source.name())))?;
+	let target_cwd = if loaded.cwd.as_os_str().is_empty() || !loaded.cwd.exists() {
+		record_cwd.to_path_buf()
+	} else {
+		loaded.cwd.clone()
+	};
+	std::fs::create_dir_all(target_dir).map_err(|err| {
+		CliError::fail(format!("cannot create {}: {err}", target_dir.display()))
+	})?;
+	let mut imported = SessionStore::open(&SessionOptions {
+		enabled: true,
+		cwd: target_cwd,
+		model: None,
+		provider: None,
+		dir: Some(target_dir.to_path_buf()),
+		id: None,
+		continue_latest: false,
+		parent_session: None,
+		no_title: false,
+	});
+	if !imported.enabled() {
+		let reason = imported
+			.corrupt_reason()
+			.or_else(|| imported.occupied())
+			.unwrap_or("persistence disabled");
+		return Err(CliError::fail(format!(
+			"cannot create target session in {}: {reason}",
+			target_dir.display()
+		)));
+	}
+	let provenance: session::SessionEntry = serde_json::from_value(loaded.provenance_entry(info))
+		.map_err(|err| CliError::fail(format!("cannot parse provenance entry: {err}")))?;
+	imported
+		.append_entry(provenance)
+		.map_err(|err| CliError::fail(format!("cannot append provenance entry: {err}")))?;
+	for entry_val in &loaded.entries {
+		let entry: session::SessionEntry = serde_json::from_value(entry_val.clone())
+			.map_err(|err| CliError::fail(format!("cannot parse imported entry: {err}")))?;
+		imported
+			.append_entry(entry)
+			.map_err(|err| CliError::fail(format!("cannot append imported entry: {err}")))?;
+	}
+	let id = imported.id().to_string();
+	let imported_path = imported.file().map(Path::to_path_buf);
+	Ok(serde_json::json!({
+		"format": if format == ImportFormat::Claude { "claude" } else { "codex" },
+		"session_id": id,
+		"path": imported_path.map(|p| p.display().to_string()).unwrap_or_default(),
+		"detached": false,
+		"messages": loaded.messages().len(),
+	}))
+}
+
+/// Resolve a session argument to `(database_path, session_id)`.
+fn resolve_durable_inspect(
+	session: Option<&str>,
+	cwd: &Path,
+	session_dir: Option<&Path>,
+) -> std::result::Result<(PathBuf, String), CliError> {
+	let dir = session_dir
+		.map(|dir| dirs::absolute(cwd, dir))
+		.unwrap_or_else(|| session::compute_default_session_dir(cwd, None));
+	let db_path = aragent::durable_session::database_path(&dir);
+	match session.map(str::trim).filter(|s| !s.is_empty()) {
+		Some(arg) => {
+			let candidate = dirs::absolute(cwd, Path::new(arg));
+			let path_id = candidate
+				.file_stem()
+				.and_then(|stem| stem.to_str())
+				.map(str::to_string);
+			if let Some(id) = path_id.clone() {
+				let parent_db = candidate
+					.parent()
+					.map(aragent::durable_session::database_path)
+					.unwrap_or_else(|| db_path.clone());
+				if aragent::durable_session::session_exists(&parent_db, &id).unwrap_or(false) {
+					return Ok((parent_db, id));
+				}
+			}
+			if aragent::durable_session::session_exists(&db_path, arg).unwrap_or(false) {
+				return Ok((db_path, arg.to_string()));
+			}
+			if let Ok(Some(path)) =
+				session::resolve_resumable_session(arg, cwd, session_dir, true)
+			{
+				if let (Some(parent), Some(id)) = (
+					path.parent(),
+					path.file_stem().and_then(|stem| stem.to_str()),
+				) {
+					let parent_db = aragent::durable_session::database_path(parent);
+					if aragent::durable_session::session_exists(&parent_db, id).unwrap_or(false) {
+						return Ok((parent_db, id.to_string()));
+					}
+				}
+			}
+			Err(CliError::fail(format!(
+				"session \"{arg}\" not found in a durable session database"
+			)))
+		},
+		None => {
+			let latest = aragent::durable_session::list_session_summaries(&dir)
+				.map_err(|err| CliError::fail(format!("cannot read {}: {err}", dir.display())))?
+				.into_iter()
+				.next()
+				.ok_or_else(|| CliError::fail(format!("no sessions in {}", dir.display())))?;
+			Ok((db_path, latest.id))
+		},
+	}
+}
+
+fn run_inspect_command(
+	session: Option<&str>,
+	db: bool,
+	context: bool,
+	json: bool,
+	cwd: &Path,
+	session_dir: Option<&Path>,
+	out: &mut impl Write,
+) -> std::result::Result<(), CliError> {
+	let dir = session_dir
+		.map(|dir| dirs::absolute(cwd, dir))
+		.unwrap_or_else(|| session::compute_default_session_dir(cwd, None));
+	let db_path = aragent::durable_session::database_path(&dir);
+	if db {
+		if !db_path.is_file() {
+			return Err(CliError::fail(format!(
+				"session database not found: {}",
+				db_path.display()
+			)));
+		}
+		let store = SqliteStore::open_read_only(db_path.as_path())
+			.map_err(|err| CliError::fail(format!("cannot open {}: {err}", db_path.display())))?;
+		let report = store
+			.inspect_database()
+			.map_err(|err| CliError::fail(format!("cannot inspect database: {err}")))?;
+		if json {
+			writeln!(out, "{}", serde_json::to_string_pretty(&report).map_err(|err| CliError::fail(err.to_string()))?)
+				.map_err(|err| CliError::fail(err.to_string()))?;
+			return Ok(());
+		}
+		writeln!(out, "Database: {}", db_path.display())
+			.map_err(|err| CliError::fail(err.to_string()))?;
+		writeln!(out, "Schema:   v{}", report.schema_version)
+			.map_err(|err| CliError::fail(err.to_string()))?;
+		writeln!(out, "Sessions: {}", report.sessions.len())
+			.map_err(|err| CliError::fail(err.to_string()))?;
+		for (table, count) in &report.table_counts {
+			writeln!(out, "  {table:<20} {count}")
+				.map_err(|err| CliError::fail(err.to_string()))?;
+		}
+		return Ok(());
+	}
+	let (db_path, id) = resolve_durable_inspect(session, cwd, session_dir)?;
+	let store = SqliteStore::open_read_only(db_path.as_path())
+		.map_err(|err| CliError::fail(format!("cannot open {}: {err}", db_path.display())))?;
+	let report = store
+		.inspect_session(&id)
+		.map_err(|err| CliError::fail(format!("cannot inspect session {id}: {err}")))?;
+	if json {
+		writeln!(out, "{}", serde_json::to_string_pretty(&report).map_err(|err| CliError::fail(err.to_string()))?)
+			.map_err(|err| CliError::fail(err.to_string()))?;
+		return Ok(());
+	}
+	writeln!(out, "Session: {}", report.id).map_err(|err| CliError::fail(err.to_string()))?;
+	if let Some(title) = &report.title {
+		writeln!(out, "Title:   {title}").map_err(|err| CliError::fail(err.to_string()))?;
+	}
+	if let Some(cwd) = &report.cwd {
+		writeln!(out, "Cwd:     {cwd}").map_err(|err| CliError::fail(err.to_string()))?;
+	}
+	writeln!(out, "Branches: {}  Messages: {}  Active branch: {}",
+		report.branches, report.messages, report.active_branch_messages)
+		.map_err(|err| CliError::fail(err.to_string()))?;
+	writeln!(out, "Executions: {} (unresolved {})  Deliveries: {} (pending {})",
+		report.executions, report.unresolved_executions,
+		report.deliveries, report.pending_deliveries)
+		.map_err(|err| CliError::fail(err.to_string()))?;
+	writeln!(out, "Artifacts: {} (missing on disk {})  Drafts: {}",
+		report.artifacts, report.missing_artifacts_on_disk, report.stream_drafts)
+		.map_err(|err| CliError::fail(err.to_string()))?;
+	if context {
+		let estimate = &report.context_estimate;
+		writeln!(out, "Context estimate: {} tokens (system {}, user {}, assistant {}, tools {}, thinking {})",
+			estimate.total, estimate.system_prompt, estimate.user,
+			estimate.assistant, estimate.tool_calls_and_results, estimate.thinking)
+			.map_err(|err| CliError::fail(err.to_string()))?;
+	}
+	if let Some(usage) = &report.provider_usage {
+		writeln!(out, "Provider usage: input {} output {} cache read {} cache write {} total {}",
+			usage.input, usage.output, usage.cache_read, usage.cache_write, usage.total_tokens)
+			.map_err(|err| CliError::fail(err.to_string()))?;
+	}
+	Ok(())
 }
 
 fn html_escape_text(text: &str) -> String {
@@ -4184,8 +4717,9 @@ fn render_session_html(store: &SessionStore) -> String {
 	};
 	let mut body = String::new();
 	for entry in entries {
-		let role = entry.message.role.as_str();
-		let text = entry.message.content.text();
+		let role = aragent::auth::error::redact_free_text(&entry.message.role);
+		let role = html_escape_text(&role);
+		let text = aragent::auth::error::redact_free_text(&entry.message.content.text());
 		body.push_str(&format!(
 			"<article class=\"{role}\"><h2>{role}</h2><pre>{}</pre></article>\n",
 			html_escape_text(&text)
@@ -4195,7 +4729,7 @@ fn render_session_html(store: &SessionStore) -> String {
 		.header()
 		.and_then(|header| header.title.as_deref())
 		.unwrap_or("Aragent session");
-	let title = html_escape_text(title);
+	let title = html_escape_text(&aragent::auth::error::redact_free_text(title));
 	format!(
 		"<!doctype html>\n<html><head><meta charset=\"utf-8\"><title>{title}</title>\
 		 <style>body{{font-family:system-ui,sans-serif;max-width:52rem;margin:2rem auto;padding:0 1rem;}}\
@@ -4203,6 +4737,27 @@ fn render_session_html(store: &SessionStore) -> String {
 		 .user h2{{color:#0b6}}.assistant h2{{color:#06c}}</style></head><body>\
 		 <h1>{title}</h1>\n{body}</body></html>\n"
 	)
+}
+
+/// Minimal Markdown transcript over `SessionStore`.
+fn render_session_markdown(store: &SessionStore) -> String {
+	let entries: Vec<&MessageEntry> = if store.has_branch_context() {
+		store.branch_messages()
+	} else {
+		store.messages().iter().collect()
+	};
+	let title = store
+		.header()
+		.and_then(|header| header.title.as_deref())
+		.unwrap_or("Aragent session");
+	let title = aragent::auth::error::redact_free_text(title);
+	let mut out = format!("# {title}\n\n");
+	for entry in entries {
+		let role = aragent::auth::error::redact_free_text(&entry.message.role);
+		let text = aragent::auth::error::redact_free_text(&entry.message.content.text());
+		out.push_str(&format!("## {role}\n\n{text}\n\n"));
+	}
+	out
 }
 
 /// Resolve a session path/id (or most recent) into an open `SessionStore`.
@@ -4663,6 +5218,300 @@ mod tests {
 			.output()
 			.expect("git rev-parse");
 		assert!(!head.status.success(), "nothing may be committed on a clean tree");
+		let _ = std::fs::remove_dir_all(&dir);
+	}
+
+	#[test]
+	fn cli_export_import_inspect_json_round_trip() {
+		use aragent::session_store::{NewMessage, NewSession};
+
+		let dir = std::env::temp_dir().join(format!(
+			"aragent-cli-session-{}-{}",
+			std::process::id(),
+			line!()
+		));
+		let _ = std::fs::remove_dir_all(&dir);
+		std::fs::create_dir_all(&dir).expect("create cli temp dir");
+		let id = "cli-session-1";
+		let secret = "sk-cli-session-secret-2b4e6f8a";
+		aragent::auth::known_secrets::register(secret);
+		let mut store =
+			SqliteStore::open(dir.join("sessions.db")).expect("open cli source database");
+		store
+			.create_session(NewSession {
+				id: id.to_string(),
+				parent_session_id: None,
+				payload: serde_json::json!({
+					"kind": "session",
+					"title": format!("CLI {secret}"),
+					"cwd": "/tmp/cli",
+				}),
+				initial_branch_id: "cli-branch".to_string(),
+				initial_branch_payload: serde_json::json!({"kind": "branch"}),
+			})
+			.expect("create cli session");
+		store
+			.append_message(NewMessage {
+				id: "cli-message-1".to_string(),
+				session_id: id.to_string(),
+				branch_id: "cli-branch".to_string(),
+				parent_message_id: None,
+				payload: serde_json::json!({
+					"type": "message",
+					"id": "cli-message-1",
+					"parentId": null,
+					"timestamp": "2026-01-01T00:00:00Z",
+					"message": {
+						"role": format!("user-{secret}"),
+						"content": [{"type": "text", "text": format!("body {secret}")}],
+					},
+				}),
+			})
+			.expect("append cli message");
+
+		let export_path = dir.join("bundle.json");
+		let pseudo_path = dir.join(format!("{id}.jsonl"));
+		let session_arg = pseudo_path.to_string_lossy().into_owned();
+		let written = run_export_command(
+			Some(&session_arg),
+			Some(&export_path),
+			ExportFormat::Json,
+			&dir,
+			Some(&dir),
+		)
+		.expect("cli json export")
+		.expect("cli json export writes a file");
+		assert_eq!(written, export_path);
+		let document = std::fs::read_to_string(&export_path).expect("read cli bundle");
+		assert!(document.contains(aragent::session_store::SESSION_BUNDLE_FORMAT));
+		assert!(!document.contains(secret), "CLI JSON export leaked a secret");
+
+		let target = dir.join("target");
+		let imported = run_import_command(
+			&export_path,
+			ImportFormat::Bundle,
+			&target,
+			&dir,
+			false,
+		)
+		.expect("cli bundle import");
+		assert_eq!(imported["session_id"], id);
+
+		let mut inspect = Vec::new();
+		run_inspect_command(Some(id), false, true, true, &target, Some(&target), &mut inspect)
+			.expect("cli session inspect");
+		let report: serde_json::Value =
+			serde_json::from_slice(&inspect).expect("parse cli inspect json");
+		assert_eq!(report["id"].as_str(), Some(id));
+		assert_eq!(report["messages"].as_u64(), Some(1));
+		assert_eq!(report["context_estimate"]["total"].as_u64().is_some(), true);
+		assert!(
+			!String::from_utf8_lossy(&inspect).contains(secret),
+			"CLI inspect leaked a secret"
+		);
+
+		let mut database = Vec::new();
+		run_inspect_command(None, true, false, true, &target, Some(&target), &mut database)
+			.expect("cli database inspect");
+		let report: serde_json::Value =
+			serde_json::from_slice(&database).expect("parse cli database json");
+		assert_eq!(report["schema_version"].as_i64(), Some(aragent::session_store::SCHEMA_VERSION));
+		assert_eq!(report["sessions"].as_array().map(Vec::len), Some(1));
+		let _ = std::fs::remove_dir_all(&dir);
+	}
+	#[test]
+	fn cli_export_redacts_config_credentials_in_markdown_and_html() {
+		use aragent::session_store::{NewMessage, NewSession};
+
+		let dir = std::env::temp_dir().join(format!(
+			"aragent-cli-redact-{}-{}",
+			std::process::id(),
+			line!()
+		));
+		let _ = std::fs::remove_dir_all(&dir);
+		std::fs::create_dir_all(&dir).expect("create redact temp dir");
+		let secret = "sk-config-markdown-secret-71c9d3";
+		let config_path = dir.join("config.yml");
+		std::fs::write(
+			&config_path,
+			format!("providers:\n  testprovider:\n    apiKey: {secret}\n"),
+		)
+		.expect("write config");
+		let config = Config::load_run(&[config_path], Some(&dir)).expect("load test config");
+		register_startup_credentials(Some(&config), None);
+
+		let id = "cli-md-session";
+		let mut store =
+			SqliteStore::open(dir.join("sessions.db")).expect("open redact source database");
+		store
+			.create_session(NewSession {
+				id: id.to_string(),
+				parent_session_id: None,
+				payload: serde_json::json!({
+					"type": "session",
+					"version": 3,
+					"id": id,
+					"timestamp": "2026-01-01T00:00:00Z",
+					"cwd": "/tmp/cli-md",
+					"title": format!("title {secret}"),
+				}),
+				initial_branch_id: "cli-md-branch".to_string(),
+				initial_branch_payload: serde_json::json!({"kind": "branch"}),
+			})
+			.expect("create redact session");
+		store
+			.append_message(NewMessage {
+				id: "cli-md-message".to_string(),
+				session_id: id.to_string(),
+				branch_id: "cli-md-branch".to_string(),
+				parent_message_id: None,
+				payload: serde_json::json!({
+					"type": "message",
+					"id": "cli-md-message",
+					"parentId": null,
+					"timestamp": "2026-01-01T00:00:00Z",
+					"message": {
+						"role": format!("user-{secret}"),
+						"content": [{"type": "text", "text": format!("body {secret}")}],
+					},
+				}),
+			})
+			.expect("append redact message");
+
+		let pseudo_path = dir.join(format!("{id}.jsonl"));
+		let session_arg = pseudo_path.to_string_lossy().into_owned();
+		for format in [ExportFormat::Md, ExportFormat::Html] {
+			let out_path = dir.join(format!("out.{}", format.extension()));
+			run_export_command(
+				Some(&session_arg),
+				Some(&out_path),
+				format,
+				&dir,
+				Some(&dir),
+			)
+			.expect("redacted export")
+			.expect("redacted export writes a file");
+			let document = std::fs::read_to_string(&out_path).expect("read redacted export");
+			assert!(
+				!document.contains(secret),
+				"{format:?} export leaked a configured credential"
+			);
+			assert!(document.contains("[REDACTED]"), "{format:?} export was not redacted");
+		}
+
+		let mut inspect = Vec::new();
+		run_inspect_command(Some(id), false, true, true, &dir, Some(&dir), &mut inspect)
+			.expect("redacted inspect");
+		assert!(!String::from_utf8_lossy(&inspect).contains(secret));
+		let _ = std::fs::remove_dir_all(&dir);
+	}
+	#[test]
+	fn startup_credentials_register_env_key_without_agent_db() {
+		let dir = std::env::temp_dir().join(format!(
+			"aragent-cli-env-cred-{}-{}",
+			std::process::id(),
+			line!()
+		));
+		let _ = std::fs::remove_dir_all(&dir);
+		std::fs::create_dir_all(&dir).expect("create env temp dir");
+		let agent_db = dir.join("agent.db");
+		assert!(!agent_db.exists(), "test requires an absent agent.db");
+		let secret = "kagi-env-secret-4d8f2a";
+		// SAFETY: unique declared env key; no other test reads KAGI_API_KEY.
+		unsafe { std::env::set_var("KAGI_API_KEY", secret) };
+		register_startup_credentials_at(None, None, &agent_db);
+		// SAFETY: as above.
+		unsafe { std::env::remove_var("KAGI_API_KEY") };
+		let redacted = aragent::auth::error::redact_free_text(&format!("token={secret}"));
+		assert!(!redacted.contains(secret), "env credential was not registered");
+		assert!(redacted.contains("[REDACTED]"));
+		assert!(!agent_db.exists(), "credential registration must not create agent.db");
+		let _ = std::fs::remove_dir_all(&dir);
+	}
+	#[test]
+	fn startup_credentials_register_env_key_with_stored_login() {
+		use aragent::auth::store::{Credential, CredentialStore};
+
+		let dir = std::env::temp_dir().join(format!(
+			"aragent-cli-env-stored-{}-{}",
+			std::process::id(),
+			line!()
+		));
+		let _ = std::fs::remove_dir_all(&dir);
+		std::fs::create_dir_all(&dir).expect("create env-stored temp dir");
+		let agent_db = dir.join("agent.db");
+		let stored_secret = "perplexity-stored-secret-5c7a1e";
+		let env_secret = "perplexity-env-secret-8b2d4f";
+		let store = CredentialStore::open(&agent_db).expect("open credential store");
+		store
+			.upsert(
+				"perplexity",
+				&Credential::ApiKey { key: stored_secret.to_string(), source_login: true },
+			)
+			.expect("store login credential");
+		// SAFETY: unique declared env key; no other test reads PERPLEXITY_API_KEY.
+		unsafe { std::env::set_var("PERPLEXITY_API_KEY", env_secret) };
+		register_startup_credentials_at(None, None, &agent_db);
+		// SAFETY: as above.
+		unsafe { std::env::remove_var("PERPLEXITY_API_KEY") };
+		for secret in [stored_secret, env_secret] {
+			let redacted = aragent::auth::error::redact_free_text(&format!("value={secret}"));
+			assert!(!redacted.contains(secret), "credential {secret} was not registered");
+			assert!(redacted.contains("[REDACTED]"));
+		}
+		let _ = std::fs::remove_dir_all(&dir);
+	}
+	#[test]
+	fn startup_credentials_register_every_anthropic_env_var() {
+		let dir = std::env::temp_dir().join(format!(
+			"aragent-cli-anthropic-env-{}-{}",
+			std::process::id(),
+			line!()
+		));
+		let _ = std::fs::remove_dir_all(&dir);
+		std::fs::create_dir_all(&dir).expect("create anthropic temp dir");
+		let agent_db = dir.join("agent.db");
+		let oauth_secret = "anthropic-oauth-secret-3f7a9c";
+		let api_secret = "anthropic-api-secret-6d1b2e";
+		// SAFETY: unique test-only values for declared Anthropic env vars.
+		unsafe {
+			std::env::set_var("ANTHROPIC_OAUTH_TOKEN", oauth_secret);
+			std::env::set_var("ANTHROPIC_API_KEY", api_secret);
+		}
+		register_startup_credentials_at(None, None, &agent_db);
+		// SAFETY: as above.
+		unsafe {
+			std::env::remove_var("ANTHROPIC_OAUTH_TOKEN");
+			std::env::remove_var("ANTHROPIC_API_KEY");
+		}
+		for secret in [oauth_secret, api_secret] {
+			let redacted = aragent::auth::error::redact_free_text(&format!("value={secret}"));
+			assert!(!redacted.contains(secret), "env var {secret} was not registered");
+			assert!(redacted.contains("[REDACTED]"));
+		}
+		let _ = std::fs::remove_dir_all(&dir);
+	}
+
+	#[test]
+	fn startup_credentials_register_env_key_with_corrupt_agent_db() {
+		let dir = std::env::temp_dir().join(format!(
+			"aragent-cli-corrupt-db-{}-{}",
+			std::process::id(),
+			line!()
+		));
+		let _ = std::fs::remove_dir_all(&dir);
+		std::fs::create_dir_all(&dir).expect("create corrupt temp dir");
+		let agent_db = dir.join("agent.db");
+		std::fs::write(&agent_db, b"not a sqlite database").expect("write corrupt agent.db");
+		let secret = "llama-cpp-env-secret-9a4c2f";
+		// SAFETY: unique declared env key; no other test reads LLAMA_CPP_API_KEY.
+		unsafe { std::env::set_var("LLAMA_CPP_API_KEY", secret) };
+		register_startup_credentials_at(None, None, &agent_db);
+		// SAFETY: as above.
+		unsafe { std::env::remove_var("LLAMA_CPP_API_KEY") };
+		let redacted = aragent::auth::error::redact_free_text(&format!("value={secret}"));
+		assert!(!redacted.contains(secret), "env credential hidden by corrupt agent.db");
+		assert!(redacted.contains("[REDACTED]"));
 		let _ = std::fs::remove_dir_all(&dir);
 	}
 }

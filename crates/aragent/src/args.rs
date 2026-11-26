@@ -6,7 +6,7 @@
 use std::path::PathBuf;
 use std::time::Duration;
 
-use clap::{Args, CommandFactory, FromArgMatches, Parser, Subcommand};
+use clap::{Args, CommandFactory, FromArgMatches, Parser, Subcommand, ValueEnum};
 
 use crate::approve::ApprovalMode;
 use crate::output::OutputMode;
@@ -997,6 +997,38 @@ fn flag_value_kind(arg: &clap::Arg) -> FlagValueKind {
 	}
 }
 
+/// Output format for `arag export`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum ExportFormat {
+	Html,
+	Json,
+	Md,
+}
+
+impl ExportFormat {
+	#[must_use]
+	pub fn extension(self) -> &'static str {
+		match self {
+			Self::Html => "html",
+			Self::Json => "json",
+			Self::Md => "md",
+		}
+	}
+}
+
+/// Source format for `arag import`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum ImportFormat {
+	Auto,
+	Bundle,
+	#[value(name = "v1")]
+	V1,
+	#[value(name = "v3")]
+	V3,
+	Claude,
+	Codex,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Subcommand)]
 pub enum Command {
 	/// Serve the Agent Client Protocol over stdio.
@@ -1209,17 +1241,61 @@ pub enum Command {
 		limit:   Option<u32>,
 	},
 
-	/// Export a session JSONL file to standalone HTML and exit.
+	/// Export a session as HTML, JSON bundle, or Markdown.
 	///
-	/// Usage: `arag export <session> [--output <path>]`. Reads the session via
-	/// `SessionStore` (no live RPC session required).
+	/// Usage: `arag export <session> [--format html|json|md] [--output <path|->]`.
 	Export {
 		/// Session file path or id (same selectors as `--resume`).
 		#[arg(value_name = "SESSION")]
 		session: Option<String>,
-		/// Output HTML path (default: `<session>.html` beside the log).
+		/// Output path; `-` writes JSON/Markdown to stdout.
 		#[arg(short = 'o', long = "output", value_name = "PATH")]
 		output:  Option<PathBuf>,
+		/// Output format (default `html`).
+		#[arg(long, value_enum, default_value = "html")]
+		format:  ExportFormat,
+	},
+
+	/// Import a session from a bundle, JSONL log, Claude, or Codex.
+	///
+	/// Usage: `arag import <PATH> [--from auto|bundle|v1|v3|claude|codex]`.
+	Import {
+		/// Source path (bundle/JSONL file, or foreign session id).
+		#[arg(value_name = "PATH")]
+		path:          PathBuf,
+		/// Source format; `auto` sniffs bundles and JSONL headers.
+		#[arg(long, value_enum, default_value = "auto")]
+		from:          ImportFormat,
+		/// Target session directory (default: the cwd session dir).
+		#[arg(long, value_name = "DIR")]
+		session_dir:   Option<PathBuf>,
+		/// Working directory recorded on imported sessions.
+		#[arg(long, value_name = "PATH")]
+		cwd:           Option<PathBuf>,
+		/// Import a child session even when its parent is absent locally.
+		#[arg(long)]
+		detach_parent: bool,
+		/// Print a machine-readable JSON report.
+		#[arg(long)]
+		json:          bool,
+	},
+
+	/// Inspect one session or the whole session database.
+	///
+	/// Usage: `arag inspect [SESSION] [--db] [--context] [--json]`.
+	Inspect {
+		/// Session id or path (default: most recent session).
+		#[arg(value_name = "SESSION")]
+		session: Option<String>,
+		/// Report on the whole database instead of one session.
+		#[arg(long)]
+		db:      bool,
+		/// Include the active-branch context token estimate.
+		#[arg(long)]
+		context: bool,
+		/// Print a machine-readable JSON report.
+		#[arg(long)]
+		json:    bool,
 	},
 
 	/// Show session statistics (token usage, tool calls, duration) and exit.
@@ -1964,11 +2040,80 @@ mod tests {
 			Some(Command::Export {
 				session: Some("session.jsonl".to_string()),
 				output:  Some(PathBuf::from("out.html")),
+				format:  ExportFormat::Html,
 			})
 		);
 		assert_eq!(
 			parse(&["arag", "export"]).command,
-			Some(Command::Export { session: None, output: None })
+			Some(Command::Export {
+				session: None,
+				output:  None,
+				format:  ExportFormat::Html,
+			})
+		);
+	}
+
+	#[test]
+	fn import_and_inspect_subcommands_parse() {
+		assert_eq!(
+			parse(&[
+				"arag", "import", "x.json", "--from", "bundle", "--session-dir", "s",
+				"--cwd", "/w", "--detach-parent", "--json",
+			])
+			.command,
+			Some(Command::Import {
+				path:          PathBuf::from("x.json"),
+				from:          ImportFormat::Bundle,
+				session_dir:   Some(PathBuf::from("s")),
+				cwd:           Some(PathBuf::from("/w")),
+				detach_parent: true,
+				json:          true,
+			})
+		);
+		assert_eq!(
+			parse(&["arag", "import", "log.jsonl"]).command,
+			Some(Command::Import {
+				path:          PathBuf::from("log.jsonl"),
+				from:          ImportFormat::Auto,
+				session_dir:   None,
+				cwd:           None,
+				detach_parent: false,
+				json:          false,
+			})
+		);
+		assert_eq!(
+			parse(&["arag", "export", "s", "--format", "json", "-o", "-"]).command,
+			Some(Command::Export {
+				session: Some("s".to_string()),
+				output:  Some(PathBuf::from("-")),
+				format:  ExportFormat::Json,
+			})
+		);
+		assert_eq!(
+			parse(&["arag", "export", "s", "--format", "md"]).command,
+			Some(Command::Export {
+				session: Some("s".to_string()),
+				output:  None,
+				format:  ExportFormat::Md,
+			})
+		);
+		assert_eq!(
+			parse(&["arag", "inspect", "--db", "--json"]).command,
+			Some(Command::Inspect {
+				session: None,
+				db:      true,
+				context: false,
+				json:    true,
+			})
+		);
+		assert_eq!(
+			parse(&["arag", "inspect", "abc", "--context"]).command,
+			Some(Command::Inspect {
+				session: Some("abc".to_string()),
+				db:      false,
+				context: true,
+				json:    false,
+			})
 		);
 	}
 
