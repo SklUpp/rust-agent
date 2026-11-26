@@ -7,7 +7,10 @@ use tokio_util::sync::CancellationToken;
 use crate::{
 	compaction::{CompactionReport, Compactor},
 	delivery::BackgroundResultSink,
-	durable::{DURABILITY_ADMISSION_FAILURE_CODE, DURABILITY_FAILURE_CODE},
+	durable::{
+		DURABILITY_ADMISSION_FAILURE_CODE, DURABILITY_FAILURE_CODE,
+		DURABILITY_UNKNOWN_OUTCOME_CODE, DurableError,
+	},
 	mailbox::{Mailbox, format_incoming},
 	provider::{ModelProvider, ProviderError, StreamAssembler, ToolChoice},
 	state::{
@@ -57,6 +60,15 @@ pub const INTERRUPTED_TOOL_RESULT: &str = "[Tool execution interrupted by user]"
 /// fallout: the loop fails the result closed, wire-only views drop the images.
 pub fn tool_image_parts_of(result: &ToolResult) -> Result<Vec<ContentPart>, String> {
 	image_parts_from_details(result.details.as_ref())
+}
+
+/// Durability detail marker carried by a tool result, if any.
+fn durability_code(result: &ToolResult) -> Option<&str> {
+	result
+		.details
+		.as_ref()
+		.and_then(|details| details.get("code"))
+		.and_then(serde_json::Value::as_str)
 }
 
 /// Validate a `details.images` payload into content parts.
@@ -347,8 +359,31 @@ pub enum AgentError {
 	Provider(#[from] ProviderError),
 	#[error("Durable session write failed: {0}")]
 	Durable(String),
+	/// A durable write may have committed although its outcome was never
+	/// observed (cancelled await, writer stopped before replying). The run
+	/// stops; the write must never be retried automatically.
+	#[error("Durable session write outcome unknown: {0}")]
+	DurableUnknownOutcome(String),
 	#[error("Internal error: {0}")]
 	Internal(String),
+}
+
+impl AgentError {
+	/// True when a durable write may have committed but its outcome is unknown.
+	#[must_use]
+	pub fn is_durable_unknown_outcome(&self) -> bool {
+		matches!(self, Self::DurableUnknownOutcome(_))
+	}
+}
+
+impl From<DurableError> for AgentError {
+	fn from(error: DurableError) -> Self {
+		if error.is_unknown_outcome() {
+			Self::DurableUnknownOutcome(error.to_string())
+		} else {
+			Self::Durable(error.to_string())
+		}
+	}
 }
 
 /// Control event to steer or interrupt a running dialog.
@@ -1032,7 +1067,7 @@ impl AgentLoop {
 					durable
 						.consume_peer_delivery(delivery_id, &user)
 						.await
-						.map_err(|error| AgentError::Durable(error.to_string()))?;
+						.map_err(AgentError::from)?;
 				}
 				state.messages.push(user);
 			}
@@ -1054,7 +1089,7 @@ impl AgentLoop {
 			durable
 				.consume_peer_delivery(delivery_id, &message)
 				.await
-				.map_err(|error| AgentError::Durable(error.to_string()))?;
+				.map_err(AgentError::from)?;
 		}
 		state.messages.push(message);
 		Ok(())
@@ -1069,7 +1104,7 @@ impl AgentLoop {
 		durable
 			.persist_messages(messages)
 			.await
-			.map_err(|error| AgentError::Durable(error.to_string()))
+			.map_err(AgentError::from)
 	}
 
 	/// Mark delivery rows as present in the persisted conversation.
@@ -1086,7 +1121,7 @@ impl AgentLoop {
 		durable
 			.mark_deliveries_delivered(delivery_ids)
 			.await
-			.map_err(|error| AgentError::Durable(error.to_string()))
+			.map_err(AgentError::from)
 	}
 
 	/// Mark deliveries the provider request actually consumed. Only called after
@@ -1104,7 +1139,7 @@ impl AgentLoop {
 		durable
 			.mark_deliveries_processed(delivery_ids)
 			.await
-			.map_err(|error| AgentError::Durable(error.to_string()))
+			.map_err(AgentError::from)
 	}
 
 	/// Tell the owner that a checkpoint/branch rewrite replaced the live
@@ -1117,7 +1152,7 @@ impl AgentLoop {
 		durable
 			.resync_messages(messages)
 			.await
-			.map_err(|error| AgentError::Durable(error.to_string()))
+			.map_err(AgentError::from)
 	}
 
 	async fn compact_conversation(
@@ -1131,7 +1166,7 @@ impl AgentLoop {
 		durable
 			.compacted(messages, report)
 			.await
-			.map_err(|error| AgentError::Durable(error.to_string()))
+			.map_err(AgentError::from)
 	}
 
 	/// Amend the active turn's assistant record with its terminal status in durable storage.
@@ -1146,7 +1181,7 @@ impl AgentLoop {
 		durable
 			.finish_turn(stop_reason, error_message)
 			.await
-			.map_err(|error| AgentError::Durable(error.to_string()))
+			.map_err(AgentError::from)
 	}
 
 	fn begin_turn_ack(
@@ -1345,7 +1380,7 @@ impl AgentLoop {
 				let recovered = durable
 					.accept_pending_worker_deliveries()
 					.await
-					.map_err(|error| AgentError::Durable(error.to_string()))?;
+					.map_err(AgentError::from)?;
 				for delivery in recovered {
 					if let Some(sink) = &self.background_results {
 						sink.acknowledge_delivery(&delivery.delivery_id);
@@ -1378,7 +1413,7 @@ impl AgentLoop {
 				let replayed = durable
 					.accept_pending_peer_deliveries(peer_replay_cutoff_ms)
 					.await
-					.map_err(|error| AgentError::Durable(error.to_string()))?;
+					.map_err(AgentError::from)?;
 				for delivery in replayed {
 					state.messages.push(delivery.message);
 				}
@@ -1389,7 +1424,7 @@ impl AgentLoop {
 				durable
 					.unconfirmed_delivery_ids(&state.messages)
 					.await
-					.map_err(|error| AgentError::Durable(error.to_string()))?
+					.map_err(AgentError::from)?
 			} else {
 				Vec::new()
 			};
@@ -1513,7 +1548,7 @@ impl AgentLoop {
 							durable
 								.consume_peer_delivery(delivery_id, &message)
 								.await
-								.map_err(|error| AgentError::Durable(error.to_string()))?;
+								.map_err(AgentError::from)?;
 						}
 						state.messages.push(message);
 					}
@@ -1552,7 +1587,7 @@ impl AgentLoop {
 							durable
 								.consume_peer_delivery(delivery_id, &message)
 								.await
-								.map_err(|error| AgentError::Durable(error.to_string()))?;
+								.map_err(AgentError::from)?;
 						}
 						state.messages.push(message);
 					}
@@ -1998,14 +2033,25 @@ impl AgentLoop {
 				}
 			}
 
-			let durability_failure = outcome.results.iter().find_map(|result| {
-				result
-					.details
-					.as_ref()
-					.and_then(|details| details.get("code"))
-					.and_then(serde_json::Value::as_str)
-					.filter(|code| *code == DURABILITY_FAILURE_CODE || *code == DURABILITY_ADMISSION_FAILURE_CODE)
-					.map(|_| result.content.clone())
+			// A batch may carry several durability failures: an unknown outcome
+			// outranks a clean admission/finish failure in any call order, because
+			// the write may have committed.
+			let durability_unknown = outcome.results.iter().find_map(|result| {
+				let code = durability_code(result)?;
+				(code == DURABILITY_UNKNOWN_OUTCOME_CODE)
+					.then(|| (code.to_string(), result.content.clone()))
+			});
+			let durability_failure = durability_unknown.or_else(|| {
+				outcome.results.iter().find_map(|result| {
+					let code = durability_code(result)?;
+					if code == DURABILITY_FAILURE_CODE
+						|| code == DURABILITY_ADMISSION_FAILURE_CODE
+					{
+						Some((code.to_string(), result.content.clone()))
+					} else {
+						None
+					}
+				})
 			});
 
 			let tool_names: std::collections::HashMap<&str, &str> = assistant
@@ -2014,16 +2060,14 @@ impl AgentLoop {
 				.map(|c| (c.id.as_str(), c.name.as_str()))
 				.collect();
 			for result in &outcome.results {
-				let is_unknown_outcome = result
-					.details
-					.as_ref()
-					.and_then(|details| details.get("code"))
-					.and_then(serde_json::Value::as_str)
-					== Some(DURABILITY_FAILURE_CODE);
-				if is_unknown_outcome {
-					// Post-effect unknown: finish_execution failed after the effect
-					// may have run. Never store a synthetic toolResult; the unresolved
-					// intent in the store must remain unmasked.
+				let code = durability_code(result);
+				if code == Some(DURABILITY_FAILURE_CODE)
+					|| code == Some(DURABILITY_UNKNOWN_OUTCOME_CODE)
+				{
+					// Post-effect or unknown-outcome durability failure: the effect
+					// may have run, or the write may have committed unseen. Never
+					// store a synthetic toolResult; the unresolved intent in the
+					// store must remain unmasked.
 					continue;
 				}
 				let name = tool_names.get(result.tool_call_id.as_str()).copied().unwrap_or("tool");
@@ -2044,12 +2088,24 @@ impl AgentLoop {
 				}
 			}
 
-			if let Some(error) = durability_failure {
+			if let Some((code, error)) = durability_failure {
 				// Stop before another model request or next tool effect.
 				// For admission failure, the safe not-started toolResult was pushed
 				// and is persisted here so resume does not see a dangling call.
-				// For unknown outcome, only completed tools were pushed.
-				let _ = self.persist_conversation(&state.messages).await;
+				// For a failure or unknown outcome, only completed tools were pushed.
+				let unknown = code == DURABILITY_UNKNOWN_OUTCOME_CODE;
+				if let Err(AgentError::DurableUnknownOutcome(persist_error)) =
+					self.persist_conversation(&state.messages).await
+				{
+					// The final conversation flush may itself have committed unseen;
+					// never downgrade that to the clean tool failure.
+					return Err(AgentError::DurableUnknownOutcome(format!(
+						"{error}; conversation write outcome unknown: {persist_error}"
+					)));
+				}
+				if unknown {
+					return Err(AgentError::DurableUnknownOutcome(error));
+				}
 				return Err(AgentError::Durable(error));
 			}
 			// A tool may cancel the turn itself (interactive `ask` cancel/abort).
@@ -2286,7 +2342,7 @@ impl AgentLoop {
 			let partial = Self::terminal_message(provider, Message::assistant(text), &attempt);
 			let status = TurnStatus::Error(err.to_string());
 			return Some(Err(NextAssistantError::Failed {
-				error: AgentError::Durable(err.to_string()),
+				error: AgentError::from(err),
 				terminal: Some((partial, status)),
 			}));
 		}
@@ -2644,6 +2700,19 @@ mod live_cut_tests {
 			name: name.to_string(),
 			arguments: serde_json::json!({}),
 		}
+	}
+
+	#[test]
+	fn unknown_durable_outcome_keeps_its_agent_error_marker() {
+		let error =
+			AgentError::from(DurableError::unknown_outcome("writer stopped before replying"));
+		assert!(matches!(error, AgentError::DurableUnknownOutcome(_)), "{error}");
+		assert!(error.is_durable_unknown_outcome(), "{error}");
+		assert!(error.to_string().contains("outcome unknown"), "{error}");
+
+		let clean = AgentError::from(DurableError::new("session store busy"));
+		assert!(matches!(clean, AgentError::Durable(_)), "{clean}");
+		assert!(!clean.is_durable_unknown_outcome(), "{clean}");
 	}
 
 	#[test]

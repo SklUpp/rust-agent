@@ -2,8 +2,10 @@
 //!
 //! One synchronous [`SqliteStore`] lives on a dedicated thread; every caller —
 //! including the async agent loop — sends a job and awaits its result. SQLite
-//! work therefore never runs on a Tokio worker, and every write either commits
-//! or returns its error to the caller.
+//! work therefore never runs on a Tokio worker, and every observed write either
+//! commits or returns its error to the caller. A write whose await is cancelled
+//! after enqueue may still commit: [`WriteTracker`] reports that unknown outcome
+//! and the job is never retried.
 //!
 //! [`DurableSession`] implements [`pi_agent::DurableBoundary`] for the live
 //! loop and exposes the small synchronous surface [`crate::session::SessionStore`]
@@ -290,6 +292,63 @@ fn try_lock_exclusive(_file: &File) -> io::Result<()> {
 /// closure, so sending or awaiting the reply can never reorder a write.
 type Job = Box<dyn FnOnce(&mut SqliteStore) + Send>;
 
+/// Observable terminal state of one enqueued writer job.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WriteOutcome {
+	/// The writer thread ran the job and it returned `Ok`.
+	Committed,
+	/// The writer thread ran the job and it returned `Err`.
+	Failed,
+	/// No result was observed: the awaiting caller was cancelled or timed out,
+	/// or the writer stopped before replying. The job may still commit.
+	Unknown,
+}
+
+/// Handle that observes one enqueued job independently of its await.
+///
+/// Starts pending (no outcome). Dropping a cancelled
+/// [`DurableWriter::call_async_tracked`] future marks it
+/// [`WriteOutcome::Unknown`]; if the writer thread applies the job later the
+/// state advances to `Committed`/`Failed`. The job is never retried.
+#[derive(Debug, Clone, Default)]
+pub struct WriteTracker {
+	state: Arc<Mutex<Option<WriteOutcome>>>,
+}
+
+impl WriteTracker {
+	/// Terminal state, or `None` while the job has not been settled (including a
+	/// job that `send` rejected, so it never ran).
+	#[must_use]
+	pub fn outcome(&self) -> Option<WriteOutcome> {
+		*lock(&self.state)
+	}
+
+	fn settle(&self, outcome: WriteOutcome) {
+		*lock(&self.state) = Some(outcome);
+	}
+
+	fn settle_if_pending(&self, outcome: WriteOutcome) {
+		let mut state = lock(&self.state);
+		if state.is_none() {
+			*state = Some(outcome);
+		}
+	}
+}
+
+/// Marks a cancelled in-flight call whose outcome is not yet known.
+struct CancelGuard {
+	tracker: WriteTracker,
+	armed: bool,
+}
+
+impl Drop for CancelGuard {
+	fn drop(&mut self) {
+		if self.armed {
+			self.tracker.settle_if_pending(WriteOutcome::Unknown);
+		}
+	}
+}
+
 /// Handle to the dedicated SQLite writer thread.
 ///
 /// The root session lease lives here so every child/completion Arc keeps
@@ -380,10 +439,11 @@ impl DurableWriter {
 			let _ = reply.send(());
 		}))?;
 		receiver.recv().map_err(|_| {
-			StoreError::Io(std::io::Error::new(
-				std::io::ErrorKind::BrokenPipe,
-				"session store writer stopped before replying",
-			))
+			// Enqueued but never reported: queued writes may or may not have
+			// been applied.
+			StoreError::UnknownOutcome(
+				"session store writer stopped before reporting the barrier".to_string(),
+			)
 		})
 	}
 
@@ -398,28 +458,64 @@ impl DurableWriter {
 			let _ = reply.send(operation(store));
 		}))?;
 		receiver.recv().map_err(|_| {
-			StoreError::Io(std::io::Error::new(
-				std::io::ErrorKind::BrokenPipe,
-				"session store writer stopped before replying",
-			))
+			// Enqueued but never reported: the write may have committed.
+			StoreError::UnknownOutcome(
+				"session store writer stopped before reporting the write outcome".to_string(),
+			)
 		})?
 	}
 
 	/// Async call for the agent loop. No Tokio worker blocks on SQLite.
+	///
+	/// Once the job is enqueued, cancelling this future (timeout, `select!`,
+	/// drop) does not cancel the write: it may still commit. Use
+	/// [`Self::call_async_tracked`] to observe that unknown outcome. A job that
+	/// fails inside `send` was never enqueued and definitely did not run.
 	pub async fn call_async<T: Send + 'static>(
 		&self,
 		operation: impl FnOnce(&mut SqliteStore) -> StoreResult<T> + Send + 'static,
 	) -> StoreResult<T> {
+		self
+			.call_async_tracked(WriteTracker::default(), operation)
+			.await
+	}
+
+	/// Cancellation-aware [`Self::call_async`].
+	///
+	/// Once the job is enqueued, dropping this future marks `tracker`
+	/// [`WriteOutcome::Unknown`]; the job is never retried. When the writer
+	/// thread does apply it, the tracker records `Committed`/`Failed`, so a
+	/// caller that cancelled can learn after the fact whether the write landed.
+	/// A writer that stops before replying yields
+	/// [`StoreError::UnknownOutcome`], never a clean failure.
+	pub async fn call_async_tracked<T: Send + 'static>(
+		&self,
+		tracker: WriteTracker,
+		operation: impl FnOnce(&mut SqliteStore) -> StoreResult<T> + Send + 'static,
+	) -> StoreResult<T> {
 		let (reply, receiver) = tokio::sync::oneshot::channel();
+		let job_tracker = tracker.clone();
 		self.send(Box::new(move |store| {
-			let _ = reply.send(operation(store));
+			let result = operation(store);
+			job_tracker.settle(if result.is_ok() {
+				WriteOutcome::Committed
+			} else {
+				WriteOutcome::Failed
+			});
+			let _ = reply.send(result);
 		}))?;
-		receiver.await.map_err(|_| {
-			StoreError::Io(std::io::Error::new(
-				std::io::ErrorKind::BrokenPipe,
-				"session store writer stopped before replying",
-			))
-		})?
+		let mut guard = CancelGuard { tracker, armed: true };
+		let received = receiver.await;
+		guard.armed = false;
+		match received {
+			Ok(result) => result,
+			Err(_) => {
+				guard.tracker.settle_if_pending(WriteOutcome::Unknown);
+				Err(StoreError::UnknownOutcome(
+					"session store writer stopped before reporting the write outcome".to_string(),
+				))
+			},
+		}
 	}
 }
 
@@ -435,6 +531,16 @@ impl Drop for DurableWriter {
 			let _ = join.join();
 		}
 		// `root_lease` drops after join: exclusivity covers queued jobs.
+	}
+}
+
+impl From<StoreError> for DurableError {
+	fn from(error: StoreError) -> Self {
+		if error.is_unknown_outcome() {
+			DurableError::unknown_outcome(error.to_string())
+		} else {
+			DurableError::new(error.to_string())
+		}
 	}
 }
 
@@ -985,14 +1091,14 @@ impl DurableSession {
 		let parts = self
 			.call_async_owned(move |store| load_parts(store, &session_id))
 			.await
-			.map_err(|error| DurableError::new(error.to_string()))?;
+			.map_err(DurableError::from)?;
 		{
 			let mut cursor = lock(&self.cursor);
 			cursor.branch = parts.branch_id;
 			cursor.leaf = parts.leaf;
 		}
 		let seed = seed_entries(&parts.branch_messages, parts.projection.as_ref(), &parts.messages)
-			.map_err(|error| DurableError::new(error.to_string()))?;
+			.map_err(DurableError::from)?;
 		let Some((boundary, matched)) = align_seed(messages, digests, &seed) else {
 			return Err(DurableError::new(if messages.len() < previous {
 				"conversation shrank without a compaction mapping"
@@ -1047,7 +1153,7 @@ impl DurableSession {
 				store.update_session_payload(&session_id, payload)
 			})
 			.await
-			.map_err(|error| DurableError::new(error.to_string()))
+			.map_err(DurableError::from)
 	}
 
 	/// Set or replace the selected projection synchronously.
@@ -1416,7 +1522,7 @@ impl DurableSession {
 		let record = self
 			.call_async_owned(move |store| store.delivery(&lookup_id))
 			.await
-			.map_err(|error| DurableError::new(error.to_string()))?
+			.map_err(DurableError::from)?
 			.ok_or_else(|| {
 				DurableError::new(format!("peer delivery {delivery_id} does not exist"))
 			})?;
@@ -1455,7 +1561,7 @@ impl DurableSession {
 				)
 			})
 			.await
-			.map_err(|error| DurableError::new(error.to_string()))?;
+			.map_err(DurableError::from)?;
 		lock(&self.cursor).leaf = Some(message_id.clone());
 		let digest = self.incoming_digest(message);
 		lock(&self.preconsumed)
@@ -1566,7 +1672,7 @@ impl DurableBoundary for DurableSession {
 				Ok(())
 			})
 			.await
-			.map_err(|error| DurableError::new(error.to_string()))?;
+			.map_err(DurableError::from)?;
 		if !appended_kept.is_empty() {
 			let projection = {
 				let mut current = lock(&self.projection);
@@ -1662,7 +1768,7 @@ impl DurableBoundary for DurableSession {
 		let parts = self
 			.call_async_owned(move |store| load_parts(store, &session_id))
 			.await
-			.map_err(|error| DurableError::new(error.to_string()))?;
+			.map_err(DurableError::from)?;
 		{
 			let mut cursor = lock(&self.cursor);
 			cursor.branch = parts.branch_id;
@@ -1674,7 +1780,7 @@ impl DurableBoundary for DurableSession {
 		lock(&self.preconsumed).clear();
 		let ids = self
 			.align_ids(messages, &parts.branch_messages)
-			.map_err(|error| DurableError::new(error.to_string()))?;
+			.map_err(DurableError::from)?;
 		*lock(&self.tracked) = messages
 			.iter()
 			.map(|message| self.incoming_digest(message))
@@ -1706,7 +1812,7 @@ impl DurableBoundary for DurableSession {
 				})
 			})
 			.await
-			.map_err(|error| DurableError::new(error.to_string()))
+			.map_err(DurableError::from)
 	}
 
 	async fn finish_execution(
@@ -1763,7 +1869,7 @@ impl DurableBoundary for DurableSession {
 				Ok(())
 			})
 			.await
-			.map_err(|error| DurableError::new(error.to_string()))
+			.map_err(DurableError::from)
 	}
 
 	async fn finish_turn(
@@ -1787,7 +1893,7 @@ impl DurableBoundary for DurableSession {
 				)
 			})
 			.await
-			.map_err(|error| DurableError::new(error.to_string()))?;
+			.map_err(DurableError::from)?;
 		*lock(&self.last_assistant_id) = Some(target_id);
 		Ok(())
 	}
@@ -1809,7 +1915,7 @@ impl DurableBoundary for DurableSession {
 				store.save_stream_draft(&session_id, &branch_id, &text, &attempt)
 			})
 			.await
-			.map_err(|error| DurableError::new(error.to_string()))
+			.map_err(DurableError::from)
 	}
 
 	async fn clear_partial_assistant(&self) -> Result<(), DurableError> {
@@ -1818,7 +1924,7 @@ impl DurableBoundary for DurableSession {
 		self
 			.call_async_owned(move |store| store.clear_stream_draft(&session_id, &branch_id))
 			.await
-			.map_err(|error| DurableError::new(error.to_string()))
+			.map_err(DurableError::from)
 	}
 
 	fn child_durability_factory(&self) -> Option<Arc<dyn ChildDurabilityFactory>> {
@@ -1838,7 +1944,7 @@ impl DurableBoundary for DurableSession {
 				Ok(())
 			})
 			.await
-			.map_err(|error| DurableError::new(error.to_string()))
+			.map_err(DurableError::from)
 	}
 
 	async fn mark_deliveries_processed(&self, delivery_ids: &[String]) -> Result<(), DurableError> {
@@ -1855,7 +1961,7 @@ impl DurableBoundary for DurableSession {
 				Ok(())
 			})
 			.await
-			.map_err(|error| DurableError::new(error.to_string()))
+			.map_err(DurableError::from)
 	}
 
 	async fn accept_pending_worker_deliveries(
@@ -1879,7 +1985,7 @@ impl DurableBoundary for DurableSession {
 				}
 			})
 			.await
-			.map_err(|error| DurableError::new(error.to_string()))?;
+			.map_err(DurableError::from)?;
 
 		if pending_items.is_empty() {
 			return Ok(Vec::new());
@@ -1964,7 +2070,7 @@ impl DurableBoundary for DurableSession {
 					)
 				})
 				.await
-				.map_err(|error| DurableError::new(error.to_string()))?;
+				.map_err(DurableError::from)?;
 
 			let digest = self.incoming_digest(&msg);
 			let proj_to_save = {
@@ -2031,7 +2137,7 @@ impl DurableBoundary for DurableSession {
 					.collect())
 			})
 			.await
-			.map_err(|error| DurableError::new(error.to_string()))?;
+			.map_err(DurableError::from)?;
 
 		Ok(unconfirmed)
 	}
@@ -2052,7 +2158,7 @@ impl DurableBoundary for DurableSession {
 		let pending = self
 			.call_async_owned(move |store| store.pending_peer_deliveries(&session_id))
 			.await
-			.map_err(|error| DurableError::new(error.to_string()))?;
+			.map_err(DurableError::from)?;
 		let mut delivered = Vec::with_capacity(pending.len());
 		for record in pending {
 			if record.created_at_ms >= cutoff_ms {
@@ -2089,7 +2195,7 @@ impl DurableBoundary for DurableSession {
 				store.withdraw_pending_delivery(&delivery_id).map(|_| ())
 			})
 			.await
-			.map_err(|error| DurableError::new(error.to_string()))
+			.map_err(DurableError::from)
 	}
 }
 
@@ -2154,7 +2260,7 @@ impl StoreChildDurabilityFactory {
 		let child_id = worker_id.to_string();
 		let (child, loaded) =
 			run_blocking(move || DurableSession::open_with_writer(writer, &child_id, header))
-				.map_err(|error| DurableError::new(error.to_string()))?;
+				.map_err(DurableError::from)?;
 		let identity = WorkerIdentity {
 			worker_id: worker_id.to_string(),
 			session_id: self.session_id.clone(),
@@ -2200,14 +2306,14 @@ impl StoreChildDurabilityFactory {
 				spec,
 			})
 		})
-		.map_err(|error| DurableError::new(error.to_string()))
+		.map_err(DurableError::from)
 	}
 
 	fn start_task(&self, worker_id: &str) -> Result<(), DurableError> {
 		let task_id = self.admission_id(worker_id);
 		match writer_call(&self.writer, move |store| store.mark_task_admission_started(&task_id)) {
 			Ok(()) | Err(StoreError::Conflict(_)) | Err(StoreError::NotFound(_)) => Ok(()),
-			Err(error) => Err(DurableError::new(error.to_string())),
+			Err(error) => Err(DurableError::from(error)),
 		}
 	}
 
@@ -2216,7 +2322,7 @@ impl StoreChildDurabilityFactory {
 		let state = state.to_string();
 		match writer_call(&self.writer, move |store| store.finish_task_admission(&task_id, &state)) {
 			Ok(()) | Err(StoreError::Conflict(_)) | Err(StoreError::NotFound(_)) => Ok(()),
-			Err(error) => Err(DurableError::new(error.to_string())),
+			Err(error) => Err(DurableError::from(error)),
 		}
 	}
 }
@@ -2272,7 +2378,7 @@ impl ChildDurabilityFactory for StoreChildDurabilityFactory {
 			.as_ref()
 			.map(replay_loaded_session)
 			.transpose()
-			.map_err(|e| DurableError::new(e.to_string()))?;
+			.map_err(DurableError::from)?;
 		Ok((Self::handle(child, identity), replay))
 	}
 
@@ -2308,8 +2414,8 @@ impl ChildDurabilityFactory for StoreChildDurabilityFactory {
 			Ok(true) => {},
 			Ok(false) => child
 				.import_messages(messages)
-				.map_err(|error| DurableError::new(error.to_string()))?,
-			Err(error) => return Err(DurableError::new(error.to_string())),
+				.map_err(DurableError::from)?,
+			Err(error) => return Err(DurableError::from(error)),
 		}
 		Ok(Self::handle(child, identity))
 	}
@@ -2377,7 +2483,7 @@ impl ChildDurabilityFactory for StoreChildDurabilityFactory {
 			);
 			Ok(Some(restored))
 		})
-		.map_err(|error| DurableError::new(error.to_string()))?;
+		.map_err(DurableError::from)?;
 		Ok(messages)
 	}
 
@@ -2397,7 +2503,7 @@ impl ChildDurabilityFactory for StoreChildDurabilityFactory {
 		}
 		let writer = Arc::clone(&self.writer);
 		run_blocking(move || writer.barrier())
-			.map_err(|error| DurableError::new(error.to_string()))?;
+			.map_err(DurableError::from)?;
 		self.load_child_messages(worker_id)
 	}
 
@@ -2437,7 +2543,7 @@ impl ChildDurabilityFactory for StoreChildDurabilityFactory {
 			}
 			Ok(())
 		})
-		.map_err(|error| DurableError::new(error.to_string()))
+		.map_err(DurableError::from)
 	}
 
 	fn enqueue_peer_delivery(
@@ -2459,7 +2565,7 @@ impl ChildDurabilityFactory for StoreChildDurabilityFactory {
 				StoreError::Corrupt(format!("target session {branch_session} has no active branch"))
 			})
 		})
-		.map_err(|error| DurableError::new(error.to_string()))?;
+		.map_err(DurableError::from)?;
 		let delivery_id = format!("peer-{}", output::session_id());
 		let payload = serde_json::json!({
 			"kind": "peer-message",
@@ -2476,7 +2582,7 @@ impl ChildDurabilityFactory for StoreChildDurabilityFactory {
 			payload,
 		};
 		writer_call(&self.writer, move |store| store.enqueue_delivery(record))
-			.map_err(|error| DurableError::new(error.to_string()))?;
+			.map_err(DurableError::from)?;
 		Ok(delivery_id)
 	}
 
@@ -2487,7 +2593,7 @@ impl ChildDurabilityFactory for StoreChildDurabilityFactory {
 			store.mark_delivery_delivered(&delivery_id, now)?;
 			store.mark_delivery_processed(&delivery_id, now)
 		})
-		.map_err(|error| DurableError::new(error.to_string()))
+		.map_err(DurableError::from)
 	}
 
 	fn withdraw_peer_delivery(&self, delivery_id: &str) -> Result<(), DurableError> {
@@ -2495,7 +2601,7 @@ impl ChildDurabilityFactory for StoreChildDurabilityFactory {
 		writer_call(&self.writer, move |store| {
 			store.withdraw_pending_delivery(&delivery_id).map(|_| ())
 		})
-		.map_err(|error| DurableError::new(error.to_string()))
+		.map_err(DurableError::from)
 	}
 }
 
@@ -2527,7 +2633,7 @@ impl WorkerCompletionSink for StoreWorkerCompletion {
 			delivery,
 		};
 		writer_call(&writer, move |store| store.complete_worker(record))
-			.map_err(|error| DurableError::new(error.to_string()))
+			.map_err(DurableError::from)
 	}
 }
 
@@ -3519,6 +3625,167 @@ mod tests {
 				"attempt {attempt} must not append or duplicate rows"
 			);
 		}
+		let _ = std::fs::remove_dir_all(dir);
+	}
+
+	#[tokio::test]
+	async fn cancelled_async_write_reports_unknown_outcome_and_is_never_retried() {
+		let (dir, path) = temp_db("cancel-unknown-outcome");
+		let root = Arc::new(
+			DurableSession::create(&path, header("root", None)).expect("create root session"),
+		);
+		let branch_id = root.active_branch();
+
+		// Occupy the writer thread so the queued write cannot run before the
+		// caller drops its future.
+		let (blocked_tx, blocked_rx) = std::sync::mpsc::channel();
+		let (release_tx, release_rx) = std::sync::mpsc::channel();
+		let writer = Arc::clone(&root.writer);
+		let blocker = std::thread::spawn(move || {
+			writer.call(move |_store: &mut SqliteStore| -> StoreResult<()> {
+				blocked_tx.send(()).expect("signal writer blocked");
+				release_rx.recv().expect("wait for release");
+				Ok(())
+			})
+		});
+		blocked_rx
+			.recv_timeout(std::time::Duration::from_secs(2))
+			.expect("writer thread is blocked");
+
+		let runs = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+		let job_runs = Arc::clone(&runs);
+		let session_id = root.session_id.clone();
+		let write_branch = branch_id.clone();
+		let operation = move |store: &mut SqliteStore| {
+			job_runs.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+			store.append_message(NewMessage {
+				id: "msg-cancelled".to_string(),
+				session_id,
+				branch_id: write_branch,
+				parent_message_id: None,
+				payload: serde_json::json!({ "type": "message", "id": "msg-cancelled" }),
+			})
+		};
+		let tracker = WriteTracker::default();
+		let observed = tracker.clone();
+		let caller = Arc::clone(&root.writer);
+		let call = caller.call_async_tracked(tracker, operation);
+		let timed_out = tokio::time::timeout(std::time::Duration::from_millis(50), call)
+			.await;
+		assert!(timed_out.is_err(), "a blocked write must be cancelled by the timeout");
+		assert_eq!(
+			observed.outcome(),
+			Some(WriteOutcome::Unknown),
+			"a cancelled in-flight write is an unknown outcome"
+		);
+		assert_eq!(
+			runs.load(std::sync::atomic::Ordering::SeqCst),
+			0,
+			"the job must not have run before the writer was released"
+		);
+
+		release_tx.send(()).expect("release writer");
+		blocker.join().expect("blocker thread");
+		root.writer.barrier().expect("drain writer");
+		assert_eq!(
+			observed.outcome(),
+			Some(WriteOutcome::Committed),
+			"the cancelled job still runs once and reports its real outcome"
+		);
+		assert_eq!(
+			runs.load(std::sync::atomic::Ordering::SeqCst),
+			1,
+			"the cancelled write runs exactly once; never retried"
+		);
+
+		let store = SqliteStore::open(&path).expect("verify store");
+		let messages = store.branch_messages(&branch_id).expect("branch messages");
+		assert_eq!(messages.len(), 1, "exactly one row, no duplicate retry");
+		assert_eq!(messages[0].id, "msg-cancelled");
+
+		// Boundary callers keep the unknown-outcome classification.
+		let boundary = DurableError::from(StoreError::UnknownOutcome("cancelled".to_string()));
+		assert!(boundary.is_unknown_outcome());
+
+		let _ = std::fs::remove_dir_all(dir);
+	}
+
+	#[tokio::test]
+	async fn writer_death_after_enqueue_reports_unknown_outcome_not_clean_failure() {
+		let (dir, path) = temp_db("writer-panic-outcome");
+		let root = Arc::new(
+			DurableSession::create(&path, header("root", None)).expect("create root session"),
+		);
+		let tracker = WriteTracker::default();
+		let observed = tracker.clone();
+		let panic_job = |_store: &mut SqliteStore| -> StoreResult<()> {
+			panic!("writer job panicked after dequeue")
+		};
+		let writer = Arc::clone(&root.writer);
+		let result = writer.call_async_tracked(tracker, panic_job).await;
+		let error = result.expect_err("a lost reply after enqueue must not look like success");
+		assert!(error.is_unknown_outcome(), "unexpected error: {error}");
+		assert_eq!(observed.outcome(), Some(WriteOutcome::Unknown));
+
+		// Wait for the panicking writer thread to fully exit: only then is the
+		// next send guaranteed to fail before enqueue instead of racing a
+		// half-unwound writer.
+		let join = lock(&writer.join).take().expect("writer join handle");
+		assert!(join.join().is_err(), "the panicking job must unwind the writer");
+
+		// A failure inside `send` never enqueued: it stays a clean failure.
+		let noop = |_store: &mut SqliteStore| -> StoreResult<()> { Ok(()) };
+		let result = writer.call_async(noop).await;
+		let next = result.expect_err("the panicked writer thread is gone");
+		assert!(
+			!next.is_unknown_outcome(),
+			"pre-enqueue failure must not be classified as an unknown outcome: {next}"
+		);
+
+		let _ = std::fs::remove_dir_all(dir);
+	}
+
+	#[tokio::test]
+	async fn boundary_write_with_lost_reply_is_unknown_outcome() {
+		let (dir, path) = temp_db("boundary-unknown-outcome");
+		let mut session = DurableSession::create(&path, header("root", None)).expect("create");
+		let lease = session.writer.root_lease();
+		let (sender, receiver) = mpsc::channel::<Job>();
+		let join = std::thread::spawn(move || {
+			while let Ok(job) = receiver.recv() {
+				// Dequeue without running: the reply sender is dropped, so the
+				// awaiting boundary cannot know whether the write committed.
+				drop(job);
+			}
+		});
+		session.writer = Arc::new(DurableWriter {
+			sender: Mutex::new(Some(sender)),
+			join: Mutex::new(Some(join)),
+			root_lease: lease,
+			db_path: path.clone(),
+		});
+
+		let call = ToolCall {
+			id: "call-unknown".to_string(),
+			name: "effect".to_string(),
+			arguments: serde_json::json!({}),
+		};
+		let error = session.begin_execution(&call).await.expect_err("lost reply");
+		assert!(
+			error.is_unknown_outcome(),
+			"begin_execution must keep the unknown-outcome flag: {error}"
+		);
+
+		let error = session
+			.persist_messages(&[Message::user("hello")])
+			.await
+			.expect_err("lost reply");
+		assert!(
+			error.is_unknown_outcome(),
+			"persist_messages must keep the unknown-outcome flag: {error}"
+		);
+
+		drop(session);
 		let _ = std::fs::remove_dir_all(dir);
 	}
 }

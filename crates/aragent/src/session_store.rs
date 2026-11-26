@@ -246,6 +246,16 @@ const SCHEMA_V3_MIGRATION_DDL: &str = "
 pub enum StoreError {
 	/// SQLite rejected the operation.
 	Sqlite(rusqlite::Error),
+	/// Another connection holds the SQLite write lock (`SQLITE_BUSY`,
+	/// `SQLITE_BUSY_SNAPSHOT`) or a conflicting lock (`SQLITE_LOCKED`). The
+	/// operation did not commit; a caller may retry the whole operation later.
+	/// The store itself never retries.
+	Busy(rusqlite::Error),
+	/// A write was enqueued but its outcome was never observed: the awaiting
+	/// caller was cancelled or timed out, or the writer stopped before
+	/// reporting. It may have committed; callers must never retry it
+	/// automatically.
+	UnknownOutcome(String),
 	/// A stored or supplied JSON payload could not be encoded/decoded.
 	Json(serde_json::Error),
 	/// Filesystem failure while creating the database parent directory.
@@ -266,6 +276,8 @@ impl std::fmt::Display for StoreError {
 	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
 		match self {
 			Self::Sqlite(err) => write!(f, "session store: {err}"),
+			Self::Busy(err) => write!(f, "session store busy: {err}"),
+			Self::UnknownOutcome(err) => write!(f, "session store outcome unknown: {err}"),
 			Self::Json(err) => write!(f, "session store: invalid JSON payload: {err}"),
 			Self::Io(err) => write!(f, "session store: {err}"),
 			Self::Validation(err) => write!(f, "session store: {err}"),
@@ -281,9 +293,11 @@ impl std::error::Error for StoreError {
 	fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
 		match self {
 			Self::Sqlite(err) => Some(err),
+			Self::Busy(err) => Some(err),
 			Self::Json(err) => Some(err),
 			Self::Io(err) => Some(err),
-			Self::Validation(_)
+			Self::UnknownOutcome(_)
+			| Self::Validation(_)
 			| Self::Conflict(_)
 			| Self::NotFound(_)
 			| Self::Corrupt(_)
@@ -292,9 +306,39 @@ impl std::error::Error for StoreError {
 	}
 }
 
+impl StoreError {
+	/// True when SQLite refused the write because another connection holds the
+	/// lock. Contention is retryable by the caller; the store never retries.
+	#[must_use]
+	pub fn is_busy(&self) -> bool {
+		matches!(self, Self::Busy(_))
+	}
+
+	/// True when a write was enqueued but its outcome was never observed. It
+	/// may have committed; never retry it automatically.
+	#[must_use]
+	pub fn is_unknown_outcome(&self) -> bool {
+		matches!(self, Self::UnknownOutcome(_))
+	}
+}
+
 impl From<rusqlite::Error> for StoreError {
 	fn from(err: rusqlite::Error) -> Self {
-		Self::Sqlite(err)
+		// `SQLITE_BUSY_SNAPSHOT` shares the primary `SQLITE_BUSY` code, so both
+		// are classified here. Contention is not corruption: the operation did
+		// not commit and the caller may retry it later.
+		let busy = match &err {
+			rusqlite::Error::SqliteFailure(inner, _) => matches!(
+				inner.code,
+				rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked
+			),
+			_ => false,
+		};
+		if busy {
+			Self::Busy(err)
+		} else {
+			Self::Sqlite(err)
+		}
 	}
 }
 
@@ -1459,7 +1503,9 @@ impl SqliteStore {
 
 	/// Create the schema or verify the recorded version, in one transaction.
 	fn initialize(&mut self) -> StoreResult<()> {
-		let transaction = self.connection.transaction()?;
+		let transaction = self
+			.connection
+			.transaction_with_behavior(TransactionBehavior::Immediate)?;
 		transaction.execute_batch(SCHEMA_VERSION_DDL)?;
 		let recorded: Option<i64> = transaction
 			.query_row("SELECT version FROM schema_version WHERE id = 1", [], |row| row.get(0))
@@ -1577,7 +1623,9 @@ impl SqliteStore {
 		crate::auth::error::redact_session_payload(&mut session.payload);
 		crate::auth::error::redact_json_strings(&mut session.initial_branch_payload);
 		let now = now_ms();
-		let transaction = self.connection.transaction()?;
+		let transaction = self
+			.connection
+			.transaction_with_behavior(TransactionBehavior::Immediate)?;
 		let exists: bool = transaction.query_row(
 			"SELECT EXISTS(SELECT 1 FROM sessions WHERE id = ?1)",
 			params![session.id],
@@ -1647,7 +1695,9 @@ impl SqliteStore {
 		validate_id("branch id", &branch.id)?;
 		validate_id("branch session id", &branch.session_id)?;
 		let now = now_ms();
-		let transaction = self.connection.transaction()?;
+		let transaction = self
+			.connection
+			.transaction_with_behavior(TransactionBehavior::Immediate)?;
 		require_session(&transaction, &branch.session_id)?;
 		let exists: bool = transaction.query_row(
 			"SELECT EXISTS(SELECT 1 FROM branches WHERE id = ?1)",
@@ -1784,7 +1834,9 @@ impl SqliteStore {
 	pub fn set_active_branch(&mut self, session_id: &str, branch_id: &str) -> StoreResult<()> {
 		validate_id("session id", session_id)?;
 		validate_id("branch id", branch_id)?;
-		let transaction = self.connection.transaction()?;
+		let transaction = self
+			.connection
+			.transaction_with_behavior(TransactionBehavior::Immediate)?;
 		let branch_session: Option<String> = transaction
 			.query_row("SELECT session_id FROM branches WHERE id = ?1", params![branch_id], |row| {
 				row.get(0)
@@ -1966,7 +2018,9 @@ impl SqliteStore {
 	/// session's active branch does not change.
 	pub fn append_message(&mut self, message: NewMessage) -> StoreResult<()> {
 		let now = now_ms();
-		let transaction = self.connection.transaction()?;
+		let transaction = self
+			.connection
+			.transaction_with_behavior(TransactionBehavior::Immediate)?;
 		append_message_tx(&transaction, &message, now)?;
 		transaction.commit()?;
 		Ok(())
@@ -1976,7 +2030,9 @@ impl SqliteStore {
 	/// and every leaf update in the batch.
 	pub fn append_messages(&mut self, messages: &[NewMessage]) -> StoreResult<()> {
 		let now = now_ms();
-		let transaction = self.connection.transaction()?;
+		let transaction = self
+			.connection
+			.transaction_with_behavior(TransactionBehavior::Immediate)?;
 		for message in messages {
 			append_message_tx(&transaction, message, now)?;
 		}
@@ -2075,7 +2131,9 @@ impl SqliteStore {
 		let mut intent_payload = intent.payload;
 		crate::auth::error::redact_json_strings(&mut intent_payload);
 		let now = now_ms();
-		let transaction = self.connection.transaction()?;
+		let transaction = self
+			.connection
+			.transaction_with_behavior(TransactionBehavior::Immediate)?;
 		let branch_session: Option<String> = transaction
 			.query_row(
 				"SELECT session_id FROM branches WHERE id = ?1",
@@ -2918,7 +2976,9 @@ impl SqliteStore {
 		let completion_json = encode_json(&completion.completion)?;
 		let delivery_json = encode_json(&completion.delivery)?;
 		let now = now_ms();
-		let transaction = self.connection.transaction()?;
+		let transaction = self
+			.connection
+			.transaction_with_behavior(TransactionBehavior::Immediate)?;
 
 		let origin_session: Option<String> = transaction
 			.query_row(
@@ -3339,7 +3399,9 @@ impl SqliteStore {
 		let raw_payload = delivery.payload.clone();
 		crate::auth::error::redact_json_strings(&mut delivery.payload);
 		let payload_json = encode_json(&delivery.payload)?;
-		let transaction = self.connection.transaction()?;
+		let transaction = self
+			.connection
+			.transaction_with_behavior(TransactionBehavior::Immediate)?;
 		let origin_session: Option<String> = transaction
 			.query_row(
 				"SELECT session_id FROM branches WHERE id = ?1",
@@ -3731,7 +3793,9 @@ impl SqliteStore {
 	/// is idempotent; processed state is not implied.
 	pub fn mark_delivery_delivered(&mut self, delivery_id: &str, at_ms: i64) -> StoreResult<()> {
 		validate_id("delivery id", delivery_id)?;
-		let transaction = self.connection.transaction()?;
+		let transaction = self
+			.connection
+			.transaction_with_behavior(TransactionBehavior::Immediate)?;
 		let state: Option<(Option<i64>, Option<i64>)> = transaction
 			.query_row(
 				"SELECT delivered_at_ms, processed_at_ms FROM deliveries WHERE delivery_id = ?1",
@@ -3761,7 +3825,9 @@ impl SqliteStore {
 	/// recorded. Repeating the same mark is idempotent.
 	pub fn mark_delivery_processed(&mut self, delivery_id: &str, at_ms: i64) -> StoreResult<()> {
 		validate_id("delivery id", delivery_id)?;
-		let transaction = self.connection.transaction()?;
+		let transaction = self
+			.connection
+			.transaction_with_behavior(TransactionBehavior::Immediate)?;
 		let state: Option<(Option<i64>, Option<i64>)> = transaction
 			.query_row(
 				"SELECT delivered_at_ms, processed_at_ms FROM deliveries WHERE delivery_id = ?1",
@@ -3803,7 +3869,9 @@ impl SqliteStore {
 		crate::auth::error::redact_json_strings(&mut artifact.metadata);
 		let metadata_json = encode_json(&artifact.metadata)?;
 		let now = now_ms();
-		let transaction = self.connection.transaction()?;
+		let transaction = self
+			.connection
+			.transaction_with_behavior(TransactionBehavior::Immediate)?;
 		require_session(&transaction, &artifact.session_id)?;
 		if let Some(branch_id) = &artifact.branch_id {
 			let branch_session: Option<String> = transaction
@@ -10417,6 +10485,132 @@ mod tests {
 			session.payload.get("durableProjection").is_none(),
 			"projection must remain None, not resurrected by stale snapshot"
 		);
+
+		let _ = std::fs::remove_dir_all(dir);
+	}
+
+	#[test]
+	fn contended_immediate_write_reports_busy_before_touching_rows() {
+		let (dir, path) = temp_db("busy-classification");
+		let mut owner = SqliteStore::open(&path).expect("open owner");
+		owner
+			.create_session(NewSession {
+				id: "s_busy".to_string(),
+				parent_session_id: None,
+				payload: json!({ "cwd": "/tmp/project" }),
+				initial_branch_id: "b1".to_string(),
+				initial_branch_payload: json!({ "kind": "root" }),
+			})
+			.expect("create session");
+
+		let mut contender = SqliteStore::open(&path).expect("open contender");
+		contender
+			.connection
+			.busy_timeout(std::time::Duration::from_millis(10))
+			.expect("short busy timeout");
+
+		let held = owner
+			.connection
+			.transaction_with_behavior(TransactionBehavior::Immediate)
+			.expect("owner holds the write lock");
+
+		// `append_message` used to begin DEFERRED, discovering contention only on
+		// the INSERT. BEGIN IMMEDIATE must report Busy before any read/write.
+		let error = contender
+			.append_message(NewMessage {
+				id: "m_busy".to_string(),
+				session_id: "s_busy".to_string(),
+				branch_id: "b1".to_string(),
+				parent_message_id: None,
+				payload: json!({ "type": "message", "id": "m_busy" }),
+			})
+			.expect_err("contended append must fail, not hang or succeed");
+		assert!(error.is_busy(), "unexpected error: {error}");
+		assert!(matches!(error, StoreError::Busy(_)), "unexpected error: {error}");
+
+		// BEGIN IMMEDIATE runs before any validation/read: a would-be NotFound is
+		// masked by contention. A DEFERRED transaction would read first and
+		// report NotFound instead of Busy.
+		let masked = contender
+			.create_branch(NewBranch {
+				id: "b_masked".to_string(),
+				session_id: "s_missing".to_string(),
+				parent_branch_id: None,
+				parent_message_id: None,
+				payload: json!({}),
+			})
+			.expect_err("contended branch create must report Busy");
+		assert!(masked.is_busy(), "unexpected error: {masked}");
+
+		drop(held);
+		contender
+			.append_message(NewMessage {
+				id: "m_after".to_string(),
+				session_id: "s_busy".to_string(),
+				branch_id: "b1".to_string(),
+				parent_message_id: None,
+				payload: json!({ "type": "message", "id": "m_after" }),
+			})
+			.expect("write after lock release must succeed");
+		assert_eq!(
+			contender.branch_messages("b1").expect("messages").len(),
+			1,
+			"the contended write must have written nothing"
+		);
+
+		let _ = std::fs::remove_dir_all(dir);
+	}
+
+	#[test]
+	fn two_independent_writers_serialize_without_loss_or_duplicates() {
+		let (dir, path) = temp_db("two-writer");
+		let mut setup = SqliteStore::open(&path).expect("open setup");
+		setup
+			.create_session(NewSession {
+				id: "s_two".to_string(),
+				parent_session_id: None,
+				payload: json!({ "cwd": "/tmp/project" }),
+				initial_branch_id: "b1".to_string(),
+				initial_branch_payload: json!({ "kind": "root" }),
+			})
+			.expect("create session");
+		drop(setup);
+
+		const PER_WRITER: usize = 20;
+		let store_a = SqliteStore::open(&path).expect("open writer a");
+		let store_b = SqliteStore::open(&path).expect("open writer b");
+		let gate = std::sync::Arc::new(std::sync::Barrier::new(2));
+		let writers: Vec<_> = [("a", store_a), ("b", store_b)]
+			.into_iter()
+			.map(|(tag, mut store)| {
+				let gate = std::sync::Arc::clone(&gate);
+				std::thread::spawn(move || {
+					gate.wait();
+					for index in 0..PER_WRITER {
+						store
+							.enqueue_delivery(NewDelivery {
+								delivery_id: format!("d-{tag}-{index}"),
+								worker_id: format!("worker-{tag}"),
+								session_id: "s_two".to_string(),
+								origin_branch_id: "b1".to_string(),
+								payload: json!({ "tag": tag, "index": index }),
+							})
+							.expect("contended enqueue must wait and commit, never lose the row");
+					}
+				})
+			})
+			.collect();
+		for writer in writers {
+			writer.join().expect("writer thread");
+		}
+
+		let store = SqliteStore::open(&path).expect("verify store");
+		let pending = store.pending_deliveries("s_two").expect("pending deliveries");
+		assert_eq!(pending.len(), PER_WRITER * 2, "no lost or duplicated deliveries");
+		let unique: HashSet<&str> =
+			pending.iter().map(|row| row.delivery_id.as_str()).collect();
+		assert_eq!(unique.len(), pending.len(), "delivery ids must stay unique");
+		assert!(unique.contains("d-a-0") && unique.contains("d-b-19"));
 
 		let _ = std::fs::remove_dir_all(dir);
 	}

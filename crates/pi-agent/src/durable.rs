@@ -37,33 +37,57 @@ pub const DURABILITY_FAILURE_CODE: &str = "durability_failure";
 /// A safe error tool result is recorded so reopen/resume does not leave a dangling call.
 pub const DURABILITY_ADMISSION_FAILURE_CODE: &str = "durability_admission_failure";
 
+/// Detail marker for a durability write whose outcome is unknown: the write may
+/// have committed even though no terminal status was observed. The loop stops
+/// without recording a synthetic tool result and never retries the write.
+pub const DURABILITY_UNKNOWN_OUTCOME_CODE: &str = "durability_unknown_outcome";
+
 /// Durable write failure. The message is the storage error, never a generic
 /// "persistence disabled" substitute.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
-#[error("{0}")]
-pub struct DurableError(String);
+#[error("{message}")]
+pub struct DurableError {
+	message: String,
+	/// A write may have committed although its outcome was never observed
+	/// (cancelled/timed-out await, or a writer that stopped before replying).
+	/// Callers must not retry such a write automatically.
+	unknown_outcome: bool,
+}
 
 impl DurableError {
 	#[must_use]
 	pub fn new(message: impl Into<String>) -> Self {
-		Self(message.into())
+		Self { message: message.into(), unknown_outcome: false }
+	}
+
+	/// A write whose outcome is unknowable: it may have committed. Never retry
+	/// it automatically; surface it as an unresolved durable effect instead.
+	#[must_use]
+	pub fn unknown_outcome(message: impl Into<String>) -> Self {
+		Self { message: message.into(), unknown_outcome: true }
 	}
 
 	#[must_use]
 	pub fn message(&self) -> &str {
-		&self.0
+		&self.message
+	}
+
+	/// True when the write may have committed and its outcome is unknown.
+	#[must_use]
+	pub fn is_unknown_outcome(&self) -> bool {
+		self.unknown_outcome
 	}
 }
 
 impl From<String> for DurableError {
 	fn from(value: String) -> Self {
-		Self(value)
+		Self::new(value)
 	}
 }
 
 impl From<&str> for DurableError {
 	fn from(value: &str) -> Self {
-		Self(value.to_string())
+		Self::new(value)
 	}
 }
 

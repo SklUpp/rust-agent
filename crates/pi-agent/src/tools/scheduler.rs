@@ -4,7 +4,8 @@ use futures::future::join_all;
 
 use super::registry::{ToolRegistry, excluded_tool_reason};
 use crate::durable::{
-	DURABILITY_ADMISSION_FAILURE_CODE, DURABILITY_FAILURE_CODE, DurableBoundary,
+	DURABILITY_ADMISSION_FAILURE_CODE, DURABILITY_FAILURE_CODE, DURABILITY_UNKNOWN_OUTCOME_CODE,
+	DurableBoundary, DurableError,
 };
 use crate::tool::ToolError;
 use crate::state::{AgentContext, ToolApprover, ToolCall, ToolResult};
@@ -199,14 +200,15 @@ impl ToolScheduler {
 			Some(durable) => match durable.begin_execution(call).await {
 				Ok(id) => Some(id),
 				Err(error) => {
-					// Admission failed: the effect must not start. The durable
-					// intent row is the only evidence; there is nothing to replay.
-					return durable_admission_failure_result(
-						&call.id,
-						format!(
-							"tool not started: durable intent write failed: {error}"
-						),
-					);
+					// Admission failed: the effect must not start. An unknown write
+					// outcome may still have recorded the intent, so the message must
+					// not claim the intent write cleanly failed.
+					let message = if error.is_unknown_outcome() {
+						format!("durable intent write outcome unknown: {error}")
+					} else {
+						format!("tool not started: durable intent write failed: {error}")
+					};
+					return durable_admission_failure_result(&call.id, &error, message);
 				},
 			},
 			None => None,
@@ -227,6 +229,7 @@ impl ToolScheduler {
 			{
 				return durable_failure_result(
 					&call.id,
+					&error,
 					format!("tool cancellation outcome could not be persisted: {error}"),
 				);
 			}
@@ -245,6 +248,7 @@ impl ToolScheduler {
 			// loop terminates without another model request and never retries.
 			return durable_failure_result(
 				&call.id,
+				&error,
 				format!("tool effect outcome could not be persisted: {error}"),
 			);
 		}
@@ -266,30 +270,52 @@ fn tool_error_result(tool_call_id: &str, err: ToolError) -> ToolResult {
 	}
 }
 
-/// Terminal result for a durability failure. The loop detects the marker and
-/// converts the batch into [`crate::AgentError::Durable`] before any further
-/// model request; `terminate` also stops a host that only reads results.
-fn durable_failure_result(tool_call_id: &str, message: String) -> ToolResult {
-	ToolResult {
-		tool_call_id: tool_call_id.to_string(),
-		content: message,
-		is_error: true,
-		terminate: true,
-		details: Some(serde_json::json!({
-			"code": DURABILITY_FAILURE_CODE,
-		})),
+/// Marker code for a durability write failure. An unknown outcome must never be
+/// reported as a clean failure: the write may have committed.
+fn durability_failure_code(error: &DurableError, clean: &'static str) -> &'static str {
+	if error.is_unknown_outcome() {
+		DURABILITY_UNKNOWN_OUTCOME_CODE
+	} else {
+		clean
 	}
 }
 
+/// Terminal result for a durability failure. The loop detects the marker and
+/// converts the batch into an [`crate::AgentError`] before any further model
+/// request; `terminate` also stops a host that only reads results.
+fn durable_failure_result(
+	tool_call_id: &str,
+	error: &DurableError,
+	message: String,
+) -> ToolResult {
+	durable_terminal_result(
+		tool_call_id,
+		message,
+		durability_failure_code(error, DURABILITY_FAILURE_CODE),
+	)
+}
+
 /// Terminal result for an admission durability failure where the effect was not started.
-fn durable_admission_failure_result(tool_call_id: &str, message: String) -> ToolResult {
+fn durable_admission_failure_result(
+	tool_call_id: &str,
+	error: &DurableError,
+	message: String,
+) -> ToolResult {
+	durable_terminal_result(
+		tool_call_id,
+		message,
+		durability_failure_code(error, DURABILITY_ADMISSION_FAILURE_CODE),
+	)
+}
+
+fn durable_terminal_result(tool_call_id: &str, message: String, code: &'static str) -> ToolResult {
 	ToolResult {
 		tool_call_id: tool_call_id.to_string(),
 		content: message,
 		is_error: true,
 		terminate: true,
 		details: Some(serde_json::json!({
-			"code": DURABILITY_ADMISSION_FAILURE_CODE,
+			"code": code,
 		})),
 	}
 }
@@ -306,6 +332,32 @@ mod tests {
 	use super::*;
 	use crate::CancellationToken;
 	use crate::tools::{BashTool, registry::ToolRegistry};
+
+	#[test]
+	fn unknown_outcome_never_uses_a_clean_failure_marker() {
+		let unknown = DurableError::unknown_outcome("writer stopped before replying");
+		let admission =
+			durable_admission_failure_result("call-1", &unknown, "lost".to_string());
+		assert_eq!(
+			admission.details.expect("details")["code"],
+			json!(DURABILITY_UNKNOWN_OUTCOME_CODE)
+		);
+		let effect = durable_failure_result("call-2", &unknown, "lost".to_string());
+		assert_eq!(
+			effect.details.expect("details")["code"],
+			json!(DURABILITY_UNKNOWN_OUTCOME_CODE)
+		);
+
+		let clean = DurableError::new("session store busy");
+		let admission =
+			durable_admission_failure_result("call-3", &clean, "failed".to_string());
+		assert_eq!(
+			admission.details.expect("details")["code"],
+			json!(DURABILITY_ADMISSION_FAILURE_CODE)
+		);
+		let effect = durable_failure_result("call-4", &clean, "failed".to_string());
+		assert_eq!(effect.details.expect("details")["code"], json!(DURABILITY_FAILURE_CODE));
+	}
 
 	struct PendingApprover {
 		started: tokio::sync::mpsc::Sender<()>,
