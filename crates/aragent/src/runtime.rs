@@ -1311,6 +1311,9 @@ impl SignalDispatcher {
 						// diagnostics writer and terminate still-open session
 						// traces explicitly before exiting.
 						crate::diagnostics::shutdown();
+						// This exit skips `main`'s drain; release the turn-scoped
+						// wake lock (bounded) so no unlock is lost.
+						crate::wake_lock::shutdown();
 						std::process::exit(130);
 					});
 					break;
@@ -1589,6 +1592,11 @@ impl AgentRunner for PiAgentRunner {
 		if deadline_expired(&timed_out, max_time, deadline_start) {
 			return Err(Error::new(crate::deadline::TIMEOUT_MESSAGE));
 		}
+		// Android only: keep the CPU awake while this root turn does provider or
+		// tool work. The guard rides the dialog task below, so finish, cancel,
+		// error, or a dropped future releases it; concurrent turns share one
+		// process-wide reference.
+		let wake_lock = crate::wake_lock::WakeLockGuard::acquire();
 
 		let (discovery_steering_tx, mut discovery_steering_rx) = tokio::sync::mpsc::channel(4);
 		let discovery_sig_reg = self.dispatcher.register(discovery_steering_tx);
@@ -2384,6 +2392,9 @@ impl AgentRunner for PiAgentRunner {
 		let end_user_message = user_message.clone();
 		let dialog_message = user_message;
 		let dialog_handle = self.runtime.spawn(async move {
+			// Turn-scoped Android wake lock: dropped when the dialog future
+			// completes, is aborted, or the stream/runner drops it.
+			let _wake_lock = wake_lock;
 			agent
 				.run_dialog_message(dialog_message, &mut state, Some(steering_rx), Some(pi_events_tx))
 				.await

@@ -127,10 +127,15 @@ impl From<std::io::Error> for CliError {
 }
 
 fn main() -> std::process::ExitCode {
+	// Crash diagnostics before anything else can panic. The recoverable-panic
+	// probe is wired once `pi-agent` re-exports the shell's panic scope; until
+	// then every panic is treated as fatal (recovered panics are still caught
+	// at their own boundary, this only controls the stderr dump).
+	aragent::crash_handler::install();
 	// reqwest is compiled with `rustls-no-provider`; pin ring as the process
 	// provider before any HTTP client is built.
 	pi_agent::ensure_crypto_provider();
-	match run() {
+	let exit = match run() {
 		Ok(()) => std::process::ExitCode::from(aragent::EXIT_SUCCESS),
 		Err(error) => {
 			if !error.message.is_empty() {
@@ -138,7 +143,11 @@ fn main() -> std::process::ExitCode {
 			}
 			std::process::ExitCode::from(error.code)
 		},
-	}
+	};
+	// Bounded drain: the final queued `termux-wake-unlock` must reach the
+	// helper before the process exits. No-op when no wake lock was taken.
+	aragent::wake_lock::shutdown();
+	exit
 }
 
 fn run() -> std::result::Result<(), CliError> {

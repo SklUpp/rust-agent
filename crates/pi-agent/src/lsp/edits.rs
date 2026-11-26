@@ -7,12 +7,16 @@
 //! later URI never leaves earlier files half-applied.
 
 use std::{
-	collections::HashMap,
+	collections::{HashMap, HashSet},
 	path::{Path, PathBuf},
 	sync::atomic::{AtomicU64, Ordering},
 };
 
 use tokio_util::sync::CancellationToken;
+
+use crate::workspace_writer::{WorkspaceLease, canonical_identity};
+#[cfg(unix)]
+use crate::workspace_writer::{LockError, WorkspaceWriter};
 
 use super::types::{
 	CreateFileOptions, DeleteFileOptions, Position, Range, RenameFileOptions, ResourceOperation,
@@ -573,21 +577,98 @@ async fn delete_resource(path: &Path, options: &DeleteFileOptions) -> Result<boo
 // =============================================================================
 
 /// Apply text edits to one file with an atomic replace.
+///
+/// The lease is taken before the read so no other writer can change the file
+/// between the version the edits were computed against and the replace.
 pub async fn apply_text_edits(file_path: &Path, edits: &[TextEdit]) -> Result<(), String> {
+	let _leases = acquire_leases(std::iter::once(file_path.to_path_buf()))?;
 	let content = tokio::fs::read_to_string(file_path)
 		.await
 		.map_err(|error| format!("{}: {error}", file_path.display()))?;
 	let updated = apply_text_edits_to_string(&content, edits)?;
-	write_text_atomic(file_path, &updated).await
+	write_text_atomic_unlocked(file_path, &updated).await
 }
 
-pub async fn write_text_atomic(path: &Path, content: &str) -> Result<(), String> {
+/// Write one file while holding the caller's workspace lease(s).
+async fn write_text_atomic_unlocked(path: &Path, content: &str) -> Result<(), String> {
 	// Shared with builtin edit/write tools: resolves a final symlink to its
 	// target, writes an unpublished temp file beside it, then renames. This
 	// preserves a symlinked destination instead of replacing the link.
 	crate::tools::write_atomic(path, content.as_bytes(), &CancellationToken::new())
 		.await
 		.map_err(|error| error.to_string())
+}
+
+pub async fn write_text_atomic(path: &Path, content: &str) -> Result<(), String> {
+	let _leases = acquire_leases(std::iter::once(path.to_path_buf()))?;
+	write_text_atomic_unlocked(path, content).await
+}
+
+/// Take one non-blocking lease per canonical target.
+///
+/// Canonical ids are sorted and deduped first, so a symlink alias or a path
+/// repeated across the batch cannot self-contend. Only Unix has `flock`
+/// leases; other platforms keep writing directly and must not require
+/// `HOME`/`.omp` just to reach the lock root.
+#[cfg(unix)]
+fn acquire_leases(
+	paths: impl IntoIterator<Item = PathBuf>,
+) -> Result<Vec<WorkspaceLease>, String> {
+	let mut targets: Vec<PathBuf> =
+		paths.into_iter().map(|path| canonical_identity(&path)).collect();
+	targets.sort();
+	targets.dedup();
+
+	let writer = WorkspaceWriter::new().map_err(|error| {
+		format!("Cannot open the workspace writer lease root: {error}")
+	})?;
+	let mut leases = Vec::with_capacity(targets.len());
+	for target in targets {
+		match writer.acquire(&target) {
+			Ok(lease) => leases.push(lease),
+			Err(error) => return Err(lease_error(&target, error)),
+		}
+	}
+	Ok(leases)
+}
+
+/// Only Unix has `flock` leases. Other platforms write directly and must not
+/// require `HOME`/`.omp` just to reach an unsupported lock root.
+#[cfg(not(unix))]
+fn acquire_leases(
+	_paths: impl IntoIterator<Item = PathBuf>,
+) -> Result<Vec<WorkspaceLease>, String> {
+	Ok(Vec::new())
+}
+
+#[cfg(unix)]
+fn lease_error(path: &Path, error: LockError) -> String {
+	match error {
+		LockError::Occupied { canonical } => format!(
+			"Another writer holds the workspace lease for {} ({}); no bytes were written. \
+			 Retry after it finishes.",
+			path.display(),
+			canonical.display()
+		),
+		LockError::Io(error) => {
+			format!("Failed to acquire the workspace lease for {}: {error}", path.display())
+		},
+	}
+}
+
+/// Restore every file this batch already wrote, newest write first (a file
+/// edited twice must return to its pre-batch bytes), appending restore
+/// failures to the error that aborts the batch.
+async fn rollback_written(written: &[(PathBuf, String)], mut error: String) -> String {
+	for (file_path, original) in written.iter().rev() {
+		if let Err(restore_error) = write_text_atomic_unlocked(file_path, original).await {
+			error.push_str(&format!(
+				"\nAdditionally, failed to restore {}: {restore_error}",
+				file_path.display()
+			));
+		}
+	}
+	error
 }
 
 // =============================================================================
@@ -601,26 +682,54 @@ pub struct RenameReferenceEdit {
 }
 
 /// Apply a rename's reference edits and then move `source` -> `dest` as one
-/// unit. If the move fails, every edited reference file is restored from its
-/// pre-edit snapshot before the original error is returned.
+/// unit.
+///
+/// All target leases are taken up front and held across backup reads, every
+/// reference rewrite, the move, and any rollback, so the whole batch is one
+/// workspace-writer critical section. If the move fails (or a later reference
+/// cannot be read/edited/written), only files already written are restored
+/// from their pre-edit snapshot; a restore failure is appended to the returned
+/// error instead of being dropped.
 pub async fn apply_edits_then_rename(
 	references: &[RenameReferenceEdit],
 	source: &Path,
 	dest: &Path,
 ) -> Result<(), String> {
-	let mut backups = Vec::new();
+	let mut paths = Vec::with_capacity(references.len() + 2);
+	paths.extend(references.iter().map(|reference| reference.file_path.clone()));
+	paths.push(source.to_path_buf());
+	paths.push(dest.to_path_buf());
+	let _leases = acquire_leases(paths)?;
+
+	let mut written_backups: Vec<(PathBuf, String)> = Vec::new();
+	// Two reference entries may name the same file (or two symlink aliases).
+	// Only the first pre-edit snapshot is the file's true pre-batch content, so
+	// later entries for the same canonical target must not replace it.
+	let mut backed_up_targets: HashSet<PathBuf> = HashSet::new();
 	for reference in references {
-		let original = tokio::fs::read_to_string(&reference.file_path)
-			.await
-			.map_err(|error| format!("{}: {error}", reference.file_path.display()))?;
-		backups.push((reference.file_path.clone(), original));
-		if let Err(error) = apply_text_edits(&reference.file_path, &reference.edits).await {
-			for (file_path, original) in backups {
-				let _ = write_text_atomic(&file_path, &original).await;
-			}
-			return Err(error);
+		let original = match tokio::fs::read_to_string(&reference.file_path).await {
+			Ok(original) => original,
+			Err(error) => {
+				return Err(rollback_written(
+					&written_backups,
+					format!("{}: {error}", reference.file_path.display()),
+				)
+				.await);
+			},
+		};
+		let updated = match apply_text_edits_to_string(&original, &reference.edits) {
+			Ok(updated) => updated,
+			Err(error) => return Err(rollback_written(&written_backups, error).await),
+		};
+		if let Err(error) = write_text_atomic_unlocked(&reference.file_path, &updated).await {
+			return Err(rollback_written(&written_backups, error).await);
+		}
+		let target = canonical_identity(&reference.file_path);
+		if backed_up_targets.insert(target) {
+			written_backups.push((reference.file_path.clone(), original));
 		}
 	}
+
 	let move_result = async {
 		if let Some(parent) = dest.parent() {
 			tokio::fs::create_dir_all(parent).await.map_err(|error| error.to_string())?;
@@ -629,10 +738,7 @@ pub async fn apply_edits_then_rename(
 	}
 	.await;
 	if let Err(error) = move_result {
-		for (file_path, original) in backups {
-			let _ = write_text_atomic(&file_path, &original).await;
-		}
-		return Err(error);
+		return Err(rollback_written(&written_backups, error).await);
 	}
 	Ok(())
 }
@@ -767,6 +873,46 @@ mod tests {
 		let result = apply_edits_then_rename(&reference_edits, &source, &dest).await;
 		assert!(result.is_err());
 		assert_eq!(std::fs::read_to_string(&reference).unwrap(), "old");
+		assert!(source.exists());
+		let _ = std::fs::remove_dir_all(dir);
+	}
+
+	#[tokio::test]
+	async fn duplicate_reference_targets_restore_true_original() {
+		let dir = test_dir("dup-rollback");
+		let reference = dir.join("ref.txt");
+		let source = dir.join("source.txt");
+		std::fs::write(&reference, "old").unwrap();
+		std::fs::write(&source, "body").unwrap();
+		let blocker = dir.join("blocker");
+		std::fs::write(&blocker, "file").unwrap();
+		let dest = blocker.join("nested").join("dest.txt");
+
+		let edit = |expected: &str, replacement: &str| TextEdit {
+			range: Range {
+				start: Position { line: 0, character: 0 },
+				end:   Position { line: 0, character: expected.len() as u32 },
+			},
+			new_text: replacement.into(),
+			insert_text_format: None,
+		};
+		let reference_edits = vec![
+			RenameReferenceEdit {
+				file_path: reference.clone(),
+				edits:     vec![edit("old", "new")],
+			},
+			RenameReferenceEdit {
+				file_path: reference.clone(),
+				edits:     vec![edit("new", "last")],
+			},
+		];
+		let result = apply_edits_then_rename(&reference_edits, &source, &dest).await;
+		assert!(result.is_err());
+		assert_eq!(
+			std::fs::read_to_string(&reference).unwrap(),
+			"old",
+			"a file edited twice must roll back to its pre-batch bytes"
+		);
 		assert!(source.exists());
 		let _ = std::fs::remove_dir_all(dir);
 	}

@@ -162,6 +162,88 @@ fn stale_raw_change_is_not_overwritten_even_with_the_same_tag() {
 	let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// Env gate for the cross-process helper branch of this test binary.
+#[cfg(unix)]
+const LEASE_CHILD_ENV: &str = "OMP_WRITER_LEASE_CHILD_ROOT";
+
+/// Process A: acquire the lease, announce it, hold until the parent releases
+/// us, then exit (dropping the lock with the process's fds).
+#[cfg(unix)]
+#[test]
+fn writer_lease_child_helper() {
+	use std::time::{Duration, Instant};
+
+	let Some(root) = std::env::var_os(LEASE_CHILD_ENV) else {
+		// Normal test-suite run: this is only a helper when spawned by
+		// `lease_is_exclusive_across_processes`.
+		return;
+	};
+	let root = PathBuf::from(root);
+	let writer = WorkspaceWriter::with_lock_dir(root.join("locks"));
+	let lease = writer.acquire(&root.join("note.txt")).expect("child lease");
+	std::fs::write(root.join("acquired"), "1").expect("child marker");
+	let deadline = Instant::now() + Duration::from_secs(10);
+	while !root.join("release").exists() && Instant::now() < deadline {
+		std::thread::sleep(Duration::from_millis(20));
+	}
+	drop(lease);
+}
+
+/// Real two-process proof: a second process holding the `flock` must make this
+/// process's acquire report [`LockError::Occupied`], and the kernel must hand
+/// the lease over once the holder exits.
+#[cfg(unix)]
+#[test]
+fn lease_is_exclusive_across_processes() {
+	use std::process::{Command, Stdio};
+	use std::time::{Duration, Instant};
+
+	let root = temp_dir("cross-process");
+	let target = root.join("note.txt");
+	std::fs::write(&target, "alpha\n").expect("seed");
+	let marker = root.join("acquired");
+	let release = root.join("release");
+
+	let exe = std::env::current_exe().expect("test binary");
+	let mut child = Command::new(exe)
+		.args(["writer_lease_child_helper", "--exact", "--nocapture"])
+		.env(LEASE_CHILD_ENV, &root)
+		.stdout(Stdio::null())
+		.stderr(Stdio::inherit())
+		.spawn()
+		.expect("spawn lease helper");
+
+	let deadline = Instant::now() + Duration::from_secs(10);
+	while !marker.exists() {
+		if Instant::now() >= deadline {
+			let _ = child.kill();
+			let _ = child.wait();
+			panic!("helper process never acquired the lease");
+		}
+		std::thread::sleep(Duration::from_millis(20));
+	}
+
+	let writer = WorkspaceWriter::with_lock_dir(root.join("locks"));
+	let contention = writer.acquire(&target);
+
+	// Let the helper exit before asserting so a failure cannot leave it behind.
+	std::fs::write(&release, "1").expect("release helper");
+	let status = child.wait().expect("helper exit");
+	assert!(status.success(), "helper process failed: {status}");
+
+	match contention {
+		Err(LockError::Occupied { canonical: blocked }) => {
+			assert_eq!(blocked, canonical(&target));
+		},
+		Err(other) => panic!("expected Occupied across processes, got {other:?}"),
+		Ok(_) => panic!("a second process must not share the holder's lease"),
+	}
+
+	writer.acquire(&target).expect("lease is free once the holder exits");
+
+	let _ = std::fs::remove_dir_all(&root);
+}
+
 #[test]
 fn unchanged_raw_version_is_replaced() {
 	let dir = temp_dir("replace");

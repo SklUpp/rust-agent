@@ -1,3 +1,4 @@
+#![cfg_attr(not(target_os = "android"), feature(alloc_error_hook))]
 //! Headless `arag` runtime: argument parsing, file-backed config, prompts,
 //! skills, model catalog and the agent-runner seam consumed by `pi-agent`.
 //!
@@ -26,6 +27,7 @@ pub mod catalog;
 pub mod completions;
 pub mod config;
 pub mod config_cmd;
+pub mod crash_handler;
 pub mod daemon_broker;
 pub mod deadline;
 pub mod diagnostics;
@@ -61,6 +63,7 @@ pub mod session_store;
 pub mod skill_protocol;
 pub mod skills;
 pub mod tool_commands;
+pub mod wake_lock;
 pub mod worktree_cmd;
 pub mod yaml;
 
