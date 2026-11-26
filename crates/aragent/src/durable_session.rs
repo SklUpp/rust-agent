@@ -632,8 +632,8 @@ impl DurableSession {
 		match existing {
 			Some(_) => {
 				// Record the epoch this ownership claims before mutating.
-				let id = id.clone();
-				writer.call(move |store| store.set_session_producer_generation(&id, generation))?;
+				let epoch_id = id.clone();
+				writer.call(move |store| store.set_session_producer_generation(&epoch_id, generation))?;
 				// Exclusive ownership is proven: recover trailing unresolved
 				// intents and close child admissions orphaned by the previous
 				// owner before loading. Failure is fatal to writer open.
