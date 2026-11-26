@@ -46,6 +46,15 @@
 - `research-2026-11-06-code-analysis.md`, `research-2026-11-06-memory-skills.md`, `research-2026-11-06-frontends.md`
 - `research-2026-11-06-packaging.md`, `research-2026-11-06-profiles-hooks.md`
 
+### Исследования 2026-11-27 (с независимым ревью)
+
+Синтез 7 треков и вердиктов ревью (`ResearchReviewPlatform`, `ResearchReviewCoreEcosystem`). Не являются нормативными требованиями.
+
+- `research-2026-11-27-omp-sync-and-tools.md` — выборочный перенос OMP/`omp-termux` → `arag` + оптимизация/унификация инструментов
+- `research-2026-11-27-fastproot-lkl-android.md` — `fastproot` + `lkl`, кросс-OS бэкенды и адаптация под Android (SDK 28, ядра, Bionic, пробы)
+- `research-2026-11-27-ecosystem-and-9router.md` — зрелые крейты, Android-профили и интеграция `9router`/`9routerx`/`CLIProxyAPI` (fork/upstream sync)
+- `research-2026-11-27-multiplatform-fallback.md` — мультиплатформенный remote offload, проброс окружения/слепка и деградирующий fallback
+
 ## Правила обновления
 
 - Статус среза меняется только в плане; решение — только в решениях.
