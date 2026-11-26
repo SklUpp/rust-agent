@@ -14,7 +14,9 @@ use std::{
 	path::{Path, PathBuf},
 };
 
-use pi_ast::map::{MAP_MAX_SYMBOLS_PER_FILE, MapOptions, map_code, map_supported_path};
+use pi_ast::map::{
+	MAP_MAX_SYMBOLS_PER_FILE, RankedFile, RepoMapBuilder, RepoMapOptions, repo_map_supported_path,
+};
 use pi_walker::{
 	DirectoryErrorMode, FollowLinks, WalkDetail, WalkFilter, WalkOrder, WalkRank, WalkRequest,
 };
@@ -22,7 +24,11 @@ use serde_json::json;
 use tokio_util::sync::CancellationToken;
 
 use super::read::{DEFAULT_MAX_BYTES, result_with_details, truncate_head};
-use crate::{state::{AgentContext, ToolResult}, tool::tool_result};
+use crate::{
+	state::{AgentContext, ToolResult},
+	tokenizer::Tokenizer,
+	tool::tool_result,
+};
 
 /// Files examined by one map call.
 const MAP_MAX_FILES: usize = 500;
@@ -30,54 +36,52 @@ const MAP_MAX_FILES: usize = 500;
 const MAP_MAX_FILE_BYTES: u64 = 512 * 1024;
 /// Declarations emitted by one map call across all files.
 const MAP_MAX_SYMBOLS: usize = 2000;
+/// Token budget for one rendered map (Aider's default repo-map size).
+const MAP_MAX_TOKENS: usize = 1024;
 
 #[derive(Clone, Copy)]
 struct MapLimits {
-	max_files:      usize,
+	max_files: usize,
 	max_file_bytes: u64,
-	max_symbols:    usize,
+	max_symbols: usize,
+	max_tokens: usize,
 }
 
 impl Default for MapLimits {
 	fn default() -> Self {
 		Self {
-			max_files:      MAP_MAX_FILES,
+			max_files: MAP_MAX_FILES,
 			max_file_bytes: MAP_MAX_FILE_BYTES,
-			max_symbols:    MAP_MAX_SYMBOLS,
+			max_symbols: MAP_MAX_SYMBOLS,
+			max_tokens: MAP_MAX_TOKENS,
 		}
 	}
 }
 
-struct FileMap {
-	relative: String,
-	parsed:   bool,
-	symbols:  Vec<pi_ast::map::MapSymbol>,
-}
-
 struct MapReport {
-	rendered:             String,
-	cancelled:            bool,
-	files:                usize,
-	symbols:              usize,
-	scanned:              usize,
-	skipped_unsupported:  usize,
-	skipped_large:        usize,
-	skipped_unreadable:   usize,
-	truncated:            bool,
+	rendered: String,
+	cancelled: bool,
+	files: usize,
+	symbols: usize,
+	scanned: usize,
+	skipped_unsupported: usize,
+	skipped_large: usize,
+	skipped_unreadable: usize,
+	truncated: bool,
 }
 
 impl MapReport {
 	fn cancelled() -> Self {
 		Self {
-			rendered:             String::new(),
-			cancelled:            true,
-			files:                0,
-			symbols:              0,
-			scanned:              0,
-			skipped_unsupported:  0,
-			skipped_large:        0,
-			skipped_unreadable:   0,
-			truncated:            false,
+			rendered: String::new(),
+			cancelled: true,
+			files: 0,
+			symbols: 0,
+			scanned: 0,
+			skipped_unsupported: 0,
+			skipped_large: 0,
+			skipped_unreadable: 0,
+			truncated: false,
 		}
 	}
 }
@@ -107,6 +111,9 @@ pub(super) async fn read_directory_map(target: &Path, ctx: &AgentContext) -> Too
 		"resolvedPath": target.display().to_string(),
 		"repoMap": {
 			"syntaxOnly": true,
+			"ranked": true,
+			"tokens": Tokenizer::count_text(&built.rendered),
+			"maxTokens": MAP_MAX_TOKENS,
 			"files": built.files,
 			"symbols": built.symbols,
 			"scannedFiles": built.scanned,
@@ -165,21 +172,24 @@ fn build_map(root: &Path, token: &CancellationToken, limits: MapLimits) -> io::R
 			Ok(())
 		}
 	};
-	let outcome = match request.collect_ranked_with_heartbeat(WalkRank::PathAsc, limits.max_files, heartbeat) {
-		Ok(outcome) => outcome,
-		Err(_) if token.is_cancelled() => return Ok(MapReport::cancelled()),
-		Err(err) => return Err(io::Error::other(err.to_string())),
-	};
+	let outcome =
+		match request.collect_ranked_with_heartbeat(WalkRank::PathAsc, limits.max_files, heartbeat) {
+			Ok(outcome) => outcome,
+			Err(_) if token.is_cancelled() => return Ok(MapReport::cancelled()),
+			Err(err) => return Err(io::Error::other(err.to_string())),
+		};
 
 	let scan_truncated = outcome.stats.limited_entries > 0;
-	let mut files: Vec<FileMap> = Vec::new();
+	let mut builder = RepoMapBuilder::new(RepoMapOptions {
+		max_symbols: limits.max_symbols,
+		per_file_symbols: MAP_MAX_SYMBOLS_PER_FILE,
+		chat_files: Vec::new(),
+		mentioned_idents: Vec::new(),
+	});
 	let mut scanned = 0usize;
-	let mut symbols = 0usize;
 	let mut skipped_unsupported = 0usize;
 	let mut skipped_large = 0usize;
 	let mut skipped_unreadable = 0usize;
-	let mut symbol_truncated = false;
-	let mut per_file_truncated = false;
 
 	for entry in outcome.entries {
 		if token.is_cancelled() {
@@ -187,7 +197,7 @@ fn build_map(root: &Path, token: &CancellationToken, limits: MapLimits) -> io::R
 		}
 		let absolute = entry.absolute_path(&normalized);
 		let relative = entry.path;
-		let Some(language) = map_supported_path(&absolute) else {
+		let Some(language) = repo_map_supported_path(&absolute) else {
 			skipped_unsupported += 1;
 			continue;
 		};
@@ -205,10 +215,6 @@ fn build_map(root: &Path, token: &CancellationToken, limits: MapLimits) -> io::R
 			skipped_large += 1;
 			continue;
 		}
-		if symbols >= limits.max_symbols {
-			symbol_truncated = true;
-			break;
-		}
 		let bytes = match fs::read(&absolute) {
 			Ok(bytes) => bytes,
 			Err(_) => {
@@ -222,34 +228,18 @@ fn build_map(root: &Path, token: &CancellationToken, limits: MapLimits) -> io::R
 		}
 		scanned += 1;
 		let code = String::from_utf8_lossy(&bytes).into_owned();
-		let remaining = limits.max_symbols - symbols;
-		let file_cap = remaining.min(MAP_MAX_SYMBOLS_PER_FILE).max(1);
-		let result = match map_code(MapOptions {
-			code,
-			lang: Some(language.canonical_name().to_string()),
-			path: None,
-			max_symbols: Some(file_cap),
-		}) {
-			Ok(result) => result,
-			Err(_) => {
-				skipped_unreadable += 1;
-				continue;
-			},
-		};
-		if result.truncated {
-			if file_cap == MAP_MAX_SYMBOLS_PER_FILE {
-				per_file_truncated = true;
-			} else {
-				symbol_truncated = true;
-			}
-		}
-		if result.symbols.is_empty() && result.parsed {
-			continue;
-		}
-		symbols += result.symbols.len();
-		files.push(FileMap { relative, parsed: result.parsed, symbols: result.symbols });
+		builder.add(&relative, &code, language);
 	}
 
+	let ranking = builder.finish();
+	let symbol_truncated = ranking.symbol_truncated;
+	let per_file_truncated = ranking.per_file_truncated;
+	let files: Vec<RankedFile> = ranking
+		.files
+		.into_iter()
+		.filter(|file| !file.symbols.is_empty() || !file.parsed)
+		.collect();
+	let symbols = files.iter().map(|file| file.symbols.len()).sum();
 	let (rendered, output_truncated) = render_map(
 		&files,
 		scanned,
@@ -281,7 +271,7 @@ fn build_map(root: &Path, token: &CancellationToken, limits: MapLimits) -> io::R
 	reason = "one rendering pass; grouping the counters into a struct would not clarify the call"
 )]
 fn render_map(
-	files: &[FileMap],
+	files: &[RankedFile],
 	scanned: usize,
 	symbols: usize,
 	skipped_unsupported: usize,
@@ -294,7 +284,7 @@ fn render_map(
 ) -> (String, bool) {
 	let mut out = String::new();
 	out.push_str(
-		"[map: syntax-only declarations from tree-sitter; bodies omitted; no semantic resolution]\n",
+		"[map: syntax-only declarations from tree-sitter tags; heuristic PageRank ranking; bodies omitted]\n",
 	);
 	out.push_str(&format!(
 		"[map: {} file(s), {} symbol(s); scanned {} supported file(s), skipped {} unsupported, {} oversized, {} unreadable]\n",
@@ -308,17 +298,51 @@ fn render_map(
 	if files.is_empty() {
 		out.push_str("(no supported declarations found)\n");
 	}
-	for file in files {
-		out.push_str(&file.relative);
+	let mut tokens = Tokenizer::count_text(&out);
+	let mut token_truncated = false;
+	let mut byte_truncated = false;
+	let mut emitted_file = false;
+	let mut trimmable_starts: Vec<usize> = Vec::new();
+	'files: for file in files {
+		let mut header = String::new();
+		header.push_str(&file.path);
 		if !file.parsed {
-			out.push_str(" [parse errors: map may be incomplete]");
+			header.push_str(" [parse errors: map may be incomplete]");
 		}
-		out.push('\n');
+		header.push('\n');
+		let header_tokens = Tokenizer::count_text(&header);
+		// The first ranked file is always named: an empty map is worse than a
+		// header that eats most of a tight budget.
+		if emitted_file && tokens + header_tokens > limits.max_tokens {
+			token_truncated = true;
+			break;
+		}
+		if (out.len() + header.len()) as u64 > DEFAULT_MAX_BYTES {
+			byte_truncated = true;
+			break;
+		}
+		trimmable_starts.push(out.len());
+		out.push_str(&header);
+		tokens += header_tokens;
+		emitted_file = true;
 		for symbol in &file.symbols {
-			out.push_str(&format!("  {}: {} {}\n", symbol.line, symbol.kind, symbol.name));
+			let line = format!("  {}: {} {}\n", symbol.line, symbol.kind, symbol.name);
+			let line_tokens = Tokenizer::count_text(&line);
+			if tokens + line_tokens > limits.max_tokens {
+				token_truncated = true;
+				break 'files;
+			}
+			if (out.len() + line.len()) as u64 > DEFAULT_MAX_BYTES {
+				byte_truncated = true;
+				break 'files;
+			}
+			trimmable_starts.push(out.len());
+			out.push_str(&line);
+			tokens += line_tokens;
 		}
 	}
-	if scan_truncated || symbol_truncated || per_file_truncated {
+	let mut notice = String::new();
+	loop {
 		let mut reasons = Vec::new();
 		if scan_truncated {
 			reasons.push(format!("file scan limited to {}", limits.max_files));
@@ -332,7 +356,33 @@ fn render_map(
 		if skipped_large > 0 {
 			reasons.push(format!("{} oversized file(s) skipped", skipped_large));
 		}
-		out.push_str(&format!("[map truncated: {}]\n", reasons.join("; ")));
+		if token_truncated {
+			reasons.push(format!("token budget {} reached", limits.max_tokens));
+		}
+		if byte_truncated {
+			reasons.push("byte budget reached".to_string());
+		}
+		notice = if reasons.is_empty() {
+			String::new()
+		} else {
+			format!("[map truncated: {}]\n", reasons.join("; "))
+		};
+		// The notice counts: drop emitted lines until the whole rendered map
+		// (global header + file/symbol lines + notice) fits the token budget.
+		// Oversized output remains possible only when the minimum header plus
+		// notice alone exceeds the caller's budget.
+		let total = Tokenizer::count_text(&out) + Tokenizer::count_text(&notice);
+		if total <= limits.max_tokens {
+			break;
+		}
+		let Some(start) = trimmable_starts.pop() else {
+			break;
+		};
+		out.truncate(start);
+		token_truncated = true;
+	}
+	if !notice.is_empty() {
+		out.push_str(&notice);
 	}
 	let output_truncated = out.len() as u64 > DEFAULT_MAX_BYTES;
 	if output_truncated {
@@ -340,7 +390,7 @@ fn render_map(
 		cut.content.push_str("\n[map output truncated at 50 KiB]\n");
 		(cut.content, true)
 	} else {
-		(out, false)
+		(out, token_truncated || byte_truncated)
 	}
 }
 
@@ -366,10 +416,8 @@ mod tests {
 				.duration_since(UNIX_EPOCH)
 				.map(|duration| duration.as_nanos())
 				.unwrap_or_default();
-			let path = std::env::temp_dir().join(format!(
-				"omp-repo-map-{label}-{}-{nanos}",
-				std::process::id()
-			));
+			let path = std::env::temp_dir()
+				.join(format!("omp-repo-map-{label}-{}-{nanos}", std::process::id()));
 			fs::create_dir_all(&path).expect("create temp dir");
 			Self(path)
 		}
@@ -427,7 +475,11 @@ mod tests {
 			.await
 			.expect("read executes");
 		assert!(result.is_error, "{}", result.content);
-		assert!(result.content.contains("only") && result.content.contains("director"), "{}", result.content);
+		assert!(
+			result.content.contains("only") && result.content.contains("director"),
+			"{}",
+			result.content
+		);
 	}
 
 	#[tokio::test]
@@ -476,12 +528,14 @@ mod tests {
 			code.push_str(&format!("fn f{index}() {{}}\n"));
 		}
 		dir.write("big.rs", &code);
-		let report = build_map(&dir.0, &CancellationToken::new(), MapLimits::default())
-			.expect("map builds");
+		let report =
+			build_map(&dir.0, &CancellationToken::new(), MapLimits::default()).expect("map builds");
 		assert_eq!(report.symbols, MAP_MAX_SYMBOLS_PER_FILE);
 		assert!(report.truncated);
 		assert!(
-			report.rendered.contains(&format!("per-file symbol limit {MAP_MAX_SYMBOLS_PER_FILE}")),
+			report
+				.rendered
+				.contains(&format!("per-file symbol limit {MAP_MAX_SYMBOLS_PER_FILE}")),
 			"{}",
 			report.rendered
 		);
@@ -491,39 +545,96 @@ mod tests {
 	fn parse_error_files_are_reported_even_without_symbols() {
 		let dir = TempDir::new("parse-error");
 		dir.write("broken.rs", "@@@ not rust\n");
-		let report = build_map(&dir.0, &CancellationToken::new(), MapLimits::default())
-			.expect("map builds");
+		let report =
+			build_map(&dir.0, &CancellationToken::new(), MapLimits::default()).expect("map builds");
 		assert!(report.rendered.contains("broken.rs [parse errors"), "{}", report.rendered);
 	}
 
 	#[test]
-	fn byte_truncated_render_is_reported() {
-		use pi_ast::map::MapSymbol;
+	fn tight_token_budget_keeps_partial_top_file() {
+		use pi_ast::map::RankedSymbol;
 
-		let symbols: Vec<MapSymbol> = (0..3000)
-			.map(|index| MapSymbol {
+		let symbols: Vec<RankedSymbol> = (0..200)
+			.map(|index| RankedSymbol {
 				kind: "fn".to_string(),
-				name: format!("symbol_{index:04}_{}", "x".repeat(30)),
+				name: format!("sym_{index}"),
 				line: index as u32 + 1,
+				refs: 0,
 			})
 			.collect();
-		let files = [FileMap { relative: "big.rs".to_string(), parsed: true, symbols }];
+		let files = [RankedFile {
+			path: "top.rs".to_string(),
+			parsed: true,
+			score: 1.0,
+			used_tags: true,
+			symbols,
+		}];
+		let limits = MapLimits { max_tokens: 160, ..MapLimits::default() };
+		let (rendered, truncated) = render_map(&files, 1, 200, 0, 0, 0, false, false, false, limits);
+		assert!(truncated);
+		assert!(Tokenizer::count_text(&rendered) <= 160, "{rendered}");
+		assert!(rendered.contains("top.rs"), "{rendered}");
+		assert!(rendered.contains("sym_0"), "{rendered}");
+		assert!(!rendered.contains("sym_150"), "{rendered}");
+		assert!(
+			rendered
+				.lines()
+				.filter(|line| line.starts_with("  "))
+				.count() < 200,
+			"{rendered}"
+		);
+	}
+
+	#[test]
+	fn oversized_file_header_is_trimmed_to_budget() {
+		let long_path = format!("{}file.rs", "nested/".repeat(300));
+		let files = [RankedFile {
+			path: long_path,
+			parsed: true,
+			score: 1.0,
+			used_tags: false,
+			symbols: Vec::new(),
+		}];
+		let limits = MapLimits { max_tokens: 160, ..MapLimits::default() };
+		let (rendered, truncated) = render_map(&files, 1, 0, 0, 0, 0, false, false, false, limits);
+		assert!(truncated);
+		assert!(Tokenizer::count_text(&rendered) <= 160, "{rendered}");
+		assert!(!rendered.contains("nested/"), "{rendered}");
+	}
+
+	#[test]
+	fn token_budget_truncated_render_is_reported() {
+		use pi_ast::map::RankedSymbol;
+
+		let symbols: Vec<RankedSymbol> = (0..3000)
+			.map(|index| RankedSymbol {
+				kind: "function".to_string(),
+				name: format!("symbol_{index:04}_{}", "x".repeat(30)),
+				line: index as u32 + 1,
+				refs: 0,
+			})
+			.collect();
+		let files = [RankedFile {
+			path: "big.rs".to_string(),
+			parsed: true,
+			score: 1.0,
+			used_tags: true,
+			symbols,
+		}];
 		let (rendered, truncated) =
 			render_map(&files, 1, 3000, 0, 0, 0, false, false, false, MapLimits::default());
 		assert!(truncated);
-		assert!(rendered.contains("[map output truncated at 50 KiB]"), "{rendered}");
+		assert!(Tokenizer::count_text(&rendered) <= 1024, "{rendered}");
+		assert!(rendered.contains("token budget 1024 reached"), "{rendered}");
 	}
 
 	#[tokio::test]
-	async fn output_byte_truncation_sets_details_flag() {
+	async fn output_token_truncation_sets_details_flag() {
 		let dir = TempDir::new("byte-details");
 		for file in 0..5 {
 			let mut code = String::new();
 			for index in 0..200 {
-				code.push_str(&format!(
-					"fn symbol_{file}_{index}_{}() {{}}\n",
-					"x".repeat(40)
-				));
+				code.push_str(&format!("fn symbol_{file}_{index}_{}() {{}}\n", "x".repeat(40)));
 			}
 			dir.write(&format!("f{file}.rs"), &code);
 		}
@@ -531,7 +642,7 @@ mod tests {
 		assert!(!result.is_error, "{}", result.content);
 		let details = result.details.expect("details");
 		assert_eq!(details["repoMap"]["truncated"], json!(true), "{details}");
-		assert!(result.content.contains("[map output truncated at 50 KiB]"), "{}", result.content);
+		assert!(result.content.contains("token budget 1024 reached"), "{}", result.content);
 	}
 
 	#[cfg(unix)]

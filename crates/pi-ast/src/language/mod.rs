@@ -328,21 +328,48 @@ pub enum SupportLang {
 }
 
 static SORTED_ALIASES: LazyLock<Box<[&'static str]>> = LazyLock::new(|| {
-	let mut aliases = LANG_ALIASES.keys().copied().collect::<Box<[_]>>();
+	let mut aliases = LANG_ALIASES
+		.iter()
+		.filter(|(_, lang)| lang.is_available())
+		.map(|(alias, _)| *alias)
+		.collect::<Box<[_]>>();
 	aliases.sort_unstable();
 	aliases
 });
 
+#[cfg(feature = "full-grammars")]
+const ALL_LANGS: &[SupportLang] = {
+	use SupportLang::*;
+	&[
+		Astro, Bash, C, Cmake, Cpp, CSharp, Dart, Clojure, Css, Diff, Dockerfile, EmacsLisp, Elixir,
+		Erlang, Fortran, Go, Graphql, Haskell, Hcl, Html, Ini, Java, JavaScript, Json, Just, Julia,
+		Kotlin, Lua, Make, Markdown, Nix, ObjC, Ocaml, Odin, Php, Powershell, Proto, Python, R,
+		Regex, Ruby, Rust, Scala, Solidity, Sql, Starlark, Svelte, Swift, Toml, Tlaplus, Tsx,
+		TypeScript, Verilog, Vue, Xml, Yaml, Zig,
+	]
+};
+
+/// The slim build links only the twelve core grammars (plus TSX, which the
+/// TypeScript grammar crate provides).
+#[cfg(not(feature = "full-grammars"))]
+const ALL_LANGS: &[SupportLang] = {
+	use SupportLang::*;
+	&[Bash, C, Cpp, Go, JavaScript, Json, Markdown, Python, Rust, Toml, Tsx, TypeScript, Yaml]
+};
+
 impl SupportLang {
+	/// Languages whose grammar is linked in this build.
 	pub const fn all_langs() -> &'static [Self] {
-		use SupportLang::*;
-		&[
-			Astro, Bash, C, Cmake, Cpp, CSharp, Dart, Clojure, Css, Diff, Dockerfile, EmacsLisp,
-			Elixir, Erlang, Fortran, Go, Graphql, Haskell, Hcl, Html, Ini, Java, JavaScript, Json,
-			Just, Julia, Kotlin, Lua, Make, Markdown, Nix, ObjC, Ocaml, Odin, Php, Powershell, Proto,
-			Python, R, Regex, Ruby, Rust, Scala, Solidity, Sql, Starlark, Svelte, Swift, Toml,
-			Tlaplus, Tsx, TypeScript, Verilog, Vue, Xml, Yaml, Zig,
-		]
+		ALL_LANGS
+	}
+
+	/// Whether this language's tree-sitter grammar is compiled in.
+	///
+	/// Every variant is always present so downstream `SupportLang::X`
+	/// references keep compiling in a slim build; parsing a compiled-out
+	/// variant panics.
+	pub fn is_available(self) -> bool {
+		ALL_LANGS.contains(&self)
 	}
 
 	/// The canonical lowercase name used as a stable key in alias maps,
@@ -411,7 +438,10 @@ impl SupportLang {
 
 	pub fn from_alias(value: &str) -> Option<Self> {
 		let lowered = value.trim().to_ascii_lowercase();
-		LANG_ALIASES.get(lowered.as_str()).copied()
+		LANG_ALIASES
+			.get(lowered.as_str())
+			.copied()
+			.filter(|lang| lang.is_available())
 	}
 
 	pub fn from_path(path: &Path) -> Option<Self> {
@@ -610,17 +640,22 @@ const fn extensions(lang: SupportLang) -> &'static [&'static str] {
 	}
 }
 
+/// Return `lang` only when its grammar is linked in this build.
+fn available(lang: SupportLang) -> Option<SupportLang> {
+	lang.is_available().then_some(lang)
+}
+
 /// Guess language from file extension.
 fn from_extension(path: &Path) -> Option<SupportLang> {
 	let name = path.file_name()?.to_str()?;
 	if name == "Makefile" || name == "makefile" || name == "GNUmakefile" {
-		return Some(SupportLang::Make);
+		return available(SupportLang::Make);
 	}
 	if name == "Justfile" || name == "justfile" {
-		return Some(SupportLang::Just);
+		return available(SupportLang::Just);
 	}
 	if name == "CMakeLists.txt" {
-		return Some(SupportLang::Cmake);
+		return available(SupportLang::Cmake);
 	}
 	if name == "Dockerfile"
 		|| name == "dockerfile"
@@ -629,10 +664,10 @@ fn from_extension(path: &Path) -> Option<SupportLang> {
 		|| name == "Containerfile"
 		|| name == "containerfile"
 	{
-		return Some(SupportLang::Dockerfile);
+		return available(SupportLang::Dockerfile);
 	}
 	if name == ".emacs" {
-		return Some(SupportLang::EmacsLisp);
+		return available(SupportLang::EmacsLisp);
 	}
 
 	// Extensionless shell rc/profile files. `Path::extension` returns `None`

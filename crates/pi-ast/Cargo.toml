@@ -9,6 +9,76 @@ repository.workspace = true
 [lints]
 workspace = true
 
+[features]
+# The twelve core grammars every build links.
+core-grammars = [
+	"dep:tree-sitter-bash",
+	"dep:tree-sitter-c",
+	"dep:tree-sitter-cpp",
+	"dep:tree-sitter-go",
+	"dep:tree-sitter-javascript",
+	"dep:tree-sitter-json",
+	"dep:tree-sitter-md",
+	"dep:tree-sitter-python",
+	"dep:tree-sitter-rust",
+	"dep:tree-sitter-toml-ng",
+	"dep:tree-sitter-typescript",
+	"dep:tree-sitter-yaml",
+]
+# Every remaining grammar. `default` keeps it on so every `SupportLang`
+# variant parses; a slim build drops it:
+# `pi-ast = { path = "...", default-features = false, features = ["core-grammars"] }`.
+# Compiled-out variants still exist and still compile downstream match arms,
+# but parsing one panics (see `SupportLang::is_available`).
+full-grammars = [
+	"core-grammars",
+	"dep:tree-sitter-astro",
+	"dep:tree-sitter-clojure",
+	"dep:tree-sitter-cmake",
+	"dep:tree-sitter-c-sharp",
+	"dep:tree-sitter-css",
+	"dep:tree-sitter-dart",
+	"dep:tree-sitter-diff",
+	"dep:tree-sitter-dockerfile",
+	"dep:tree-sitter-elisp",
+	"dep:tree-sitter-elixir",
+	"dep:tree-sitter-erlang",
+	"dep:tree-sitter-fortran",
+	"dep:tree-sitter-graphql",
+	"dep:tree-sitter-haskell",
+	"dep:tree-sitter-hcl",
+	"dep:tree-sitter-html",
+	"dep:tree-sitter-ini",
+	"dep:tree-sitter-java",
+	"dep:tree-sitter-julia",
+	"dep:tree-sitter-just",
+	"dep:tree-sitter-kotlin",
+	"dep:tree-sitter-lua",
+	"dep:tree-sitter-make",
+	"dep:tree-sitter-nix",
+	"dep:tree-sitter-objc",
+	"dep:tree-sitter-ocaml",
+	"dep:tree-sitter-odin",
+	"dep:tree-sitter-php",
+	"dep:tree-sitter-powershell",
+	"dep:tree-sitter-proto",
+	"dep:tree-sitter-r",
+	"dep:tree-sitter-regex",
+	"dep:tree-sitter-ruby",
+	"dep:tree-sitter-scala",
+	"dep:tree-sitter-solidity",
+	"dep:tree-sitter-sql",
+	"dep:tree-sitter-starlark",
+	"dep:tree-sitter-svelte",
+	"dep:tree-sitter-swift",
+	"dep:tree-sitter-tlaplus",
+	"dep:tree-sitter-verilog",
+	"dep:tree-sitter-vue",
+	"dep:tree-sitter-xml",
+	"dep:tree-sitter-zig",
+]
+default = ["core-grammars", "full-grammars"]
+
 [dependencies]
 anyhow.workspace = true
 ast-grep-core.workspace = true
@@ -17,61 +87,61 @@ ignore.workspace = true
 phf.workspace = true
 serde.workspace = true
 tree-sitter.workspace = true
-tree-sitter-astro.workspace = true
-tree-sitter-bash.workspace = true
-tree-sitter-c.workspace = true
-tree-sitter-clojure.workspace = true
-tree-sitter-cmake.workspace = true
-tree-sitter-c-sharp.workspace = true
-tree-sitter-cpp.workspace = true
-tree-sitter-dart.workspace = true
-tree-sitter-css.workspace = true
-tree-sitter-diff.workspace = true
-tree-sitter-dockerfile.workspace = true
-tree-sitter-elixir.workspace = true
-tree-sitter-elisp.workspace = true
-tree-sitter-erlang.workspace = true
-tree-sitter-fortran.workspace = true
-tree-sitter-go.workspace = true
-tree-sitter-graphql.workspace = true
-tree-sitter-haskell.workspace = true
-tree-sitter-hcl.workspace = true
-tree-sitter-html.workspace = true
-tree-sitter-ini.workspace = true
-tree-sitter-java.workspace = true
-tree-sitter-javascript.workspace = true
-tree-sitter-json.workspace = true
-tree-sitter-just.workspace = true
-tree-sitter-julia.workspace = true
-tree-sitter-kotlin.workspace = true
-tree-sitter-lua.workspace = true
-tree-sitter-make.workspace = true
-tree-sitter-md.workspace = true
-tree-sitter-nix.workspace = true
-tree-sitter-objc.workspace = true
-tree-sitter-ocaml.workspace = true
-tree-sitter-odin.workspace = true
-tree-sitter-php.workspace = true
-tree-sitter-powershell.workspace = true
-tree-sitter-proto.workspace = true
-tree-sitter-python.workspace = true
-tree-sitter-r.workspace = true
-tree-sitter-regex.workspace = true
-tree-sitter-ruby.workspace = true
-tree-sitter-rust.workspace = true
-tree-sitter-scala.workspace = true
-tree-sitter-solidity.workspace = true
-tree-sitter-sql.workspace = true
-tree-sitter-starlark.workspace = true
-tree-sitter-svelte.workspace = true
-tree-sitter-swift.workspace = true
-tree-sitter-toml-ng.workspace = true
+tree-sitter-astro = { workspace = true, optional = true }
+tree-sitter-bash = { workspace = true, optional = true }
+tree-sitter-c = { workspace = true, optional = true }
+tree-sitter-clojure = { workspace = true, optional = true }
+tree-sitter-cmake = { workspace = true, optional = true }
+tree-sitter-c-sharp = { workspace = true, optional = true }
+tree-sitter-cpp = { workspace = true, optional = true }
+tree-sitter-dart = { workspace = true, optional = true }
+tree-sitter-css = { workspace = true, optional = true }
+tree-sitter-diff = { workspace = true, optional = true }
+tree-sitter-dockerfile = { workspace = true, optional = true }
+tree-sitter-elixir = { workspace = true, optional = true }
+tree-sitter-elisp = { workspace = true, optional = true }
+tree-sitter-erlang = { workspace = true, optional = true }
+tree-sitter-fortran = { workspace = true, optional = true }
+tree-sitter-go = { workspace = true, optional = true }
+tree-sitter-graphql = { workspace = true, optional = true }
+tree-sitter-haskell = { workspace = true, optional = true }
+tree-sitter-hcl = { workspace = true, optional = true }
+tree-sitter-html = { workspace = true, optional = true }
+tree-sitter-ini = { workspace = true, optional = true }
+tree-sitter-java = { workspace = true, optional = true }
+tree-sitter-javascript = { workspace = true, optional = true }
+tree-sitter-json = { workspace = true, optional = true }
+tree-sitter-just = { workspace = true, optional = true }
+tree-sitter-julia = { workspace = true, optional = true }
+tree-sitter-kotlin = { workspace = true, optional = true }
+tree-sitter-lua = { workspace = true, optional = true }
+tree-sitter-make = { workspace = true, optional = true }
+tree-sitter-md = { workspace = true, optional = true }
+tree-sitter-nix = { workspace = true, optional = true }
+tree-sitter-objc = { workspace = true, optional = true }
+tree-sitter-ocaml = { workspace = true, optional = true }
+tree-sitter-odin = { workspace = true, optional = true }
+tree-sitter-php = { workspace = true, optional = true }
+tree-sitter-powershell = { workspace = true, optional = true }
+tree-sitter-proto = { workspace = true, optional = true }
+tree-sitter-python = { workspace = true, optional = true }
+tree-sitter-r = { workspace = true, optional = true }
+tree-sitter-regex = { workspace = true, optional = true }
+tree-sitter-ruby = { workspace = true, optional = true }
+tree-sitter-rust = { workspace = true, optional = true }
+tree-sitter-scala = { workspace = true, optional = true }
+tree-sitter-solidity = { workspace = true, optional = true }
+tree-sitter-sql = { workspace = true, optional = true }
+tree-sitter-starlark = { workspace = true, optional = true }
+tree-sitter-svelte = { workspace = true, optional = true }
+tree-sitter-swift = { workspace = true, optional = true }
+tree-sitter-toml-ng = { workspace = true, optional = true }
 tree-sitter-tags.workspace = true
-tree-sitter-tlaplus.workspace = true
-tree-sitter-typescript.workspace = true
-tree-sitter-verilog.workspace = true
-tree-sitter-vue.workspace = true
-tree-sitter-xml.workspace = true
-tree-sitter-yaml.workspace = true
-tree-sitter-zig.workspace = true
+tree-sitter-tlaplus = { workspace = true, optional = true }
+tree-sitter-typescript = { workspace = true, optional = true }
+tree-sitter-verilog = { workspace = true, optional = true }
+tree-sitter-vue = { workspace = true, optional = true }
+tree-sitter-xml = { workspace = true, optional = true }
+tree-sitter-yaml = { workspace = true, optional = true }
+tree-sitter-zig = { workspace = true, optional = true }
 xxhash-rust.workspace = true

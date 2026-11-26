@@ -21,6 +21,7 @@ pub mod task_persisted_revive;
 pub mod tokenizer;
 pub mod tool;
 pub mod tools;
+pub mod utok;
 pub mod workspace_writer;
 pub mod tls;
 

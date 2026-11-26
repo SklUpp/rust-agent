@@ -36,7 +36,7 @@ pub struct BlockRange {
 	/// 1-indexed inclusive first line of the resolved block.
 	pub start_line: u32,
 	/// 1-indexed inclusive last line of the resolved block.
-	pub end_line:   u32,
+	pub end_line: u32,
 }
 
 /// Count of leading space/tab bytes on `row` (0-indexed), i.e. the byte column
@@ -117,10 +117,7 @@ pub fn block_range_at(options: BlockRangeOptions) -> Result<Option<BlockRange>> 
 	if node.has_error() {
 		return Ok(None);
 	}
-	Ok(Some(BlockRange {
-		start_line: node_start_line(node),
-		end_line:   node_content_end_line(node),
-	}))
+	Ok(Some(BlockRange { start_line: node_start_line(node), end_line: node_content_end_line(node) }))
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -128,17 +125,17 @@ pub struct LineRange {
 	/// 1-indexed inclusive first visible line.
 	pub start_line: u32,
 	/// 1-indexed inclusive last visible line.
-	pub end_line:   u32,
+	pub end_line: u32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EnclosingBoundaryOptions {
 	/// Source code to inspect.
-	pub code:   String,
+	pub code: String,
 	/// Language alias (e.g. "rust", "typescript") used before path inference.
-	pub lang:   Option<String>,
+	pub lang: Option<String>,
 	/// File path used to infer language by extension when `lang` is omitted.
-	pub path:   Option<String>,
+	pub path: Option<String>,
 	/// 1-indexed inclusive visible line ranges (the lines actually shown).
 	pub ranges: Vec<LineRange>,
 }
@@ -279,9 +276,9 @@ pub struct NodeSpan {
 	/// 1-indexed inclusive first line of the node.
 	pub start_line: u32,
 	/// 1-indexed inclusive last content line of the node.
-	pub end_line:   u32,
+	pub end_line: u32,
 	/// Tree-sitter grammar node kind (e.g. `attribute_item`, `function_item`).
-	pub kind:       String,
+	pub kind: String,
 }
 
 /// Named-node chain containing `options.line`, innermost-first, excluding the
@@ -331,8 +328,8 @@ pub fn node_chain_at(options: BlockRangeOptions) -> Result<Option<Vec<NodeSpan>>
 		if current.is_named() && !current.is_error() && !current.is_missing() {
 			chain.push(NodeSpan {
 				start_line: node_start_line(current),
-				end_line:   node_content_end_line(current),
-				kind:       current.kind().to_string(),
+				end_line: node_content_end_line(current),
+				kind: current.kind().to_string(),
 			});
 		}
 		node = current.parent();
@@ -544,6 +541,7 @@ mod tests {
 		assert_eq!(resolve(code, "r.rs", 2), Some(BlockRange { start_line: 2, end_line: 4 }));
 	}
 
+	#[cfg(feature = "full-grammars")]
 	#[test]
 	fn resolves_swift_computed_property_after_blank_line() {
 		// Regression: a block whose opening line is preceded by a blank line
@@ -563,6 +561,7 @@ mod tests {
 		);
 	}
 
+	#[cfg(feature = "full-grammars")]
 	#[test]
 	fn resolves_swift_top_level_decl_after_blank_line() {
 		// Same zero-width-separator regression one level up: a top-level
@@ -572,17 +571,20 @@ mod tests {
 		assert_eq!(resolve(code, "g.swift", 3), Some(BlockRange { start_line: 3, end_line: 5 }));
 	}
 
+	#[cfg(feature = "full-grammars")]
 	#[test]
 	fn resolves_emacs_lisp_defun_block() {
 		let code = "(defun greet (name)\n  \"Doc.\"\n  (message \"Hello %s\" name))\n";
 		assert_eq!(resolve(code, "init.el", 1), Some(BlockRange { start_line: 1, end_line: 3 }));
 	}
+	#[cfg(feature = "full-grammars")]
 	#[test]
 	fn resolves_emacs_lisp_dot_emacs_block() {
 		let code = "(defun greet (name)\n  \"Doc.\"\n  (message \"Hello %s\" name))\n";
 		assert_eq!(resolve(code, ".emacs", 1), Some(BlockRange { start_line: 1, end_line: 3 }));
 	}
 
+	#[cfg(feature = "full-grammars")]
 	#[test]
 	fn resolves_emacs_lisp_macro_style_list_block() {
 		let code = "(ert-deftest ogent-zen-test ()\n  \"Doc.\"\n  (should t))\n";
@@ -592,12 +594,14 @@ mod tests {
 		);
 	}
 
+	#[cfg(feature = "full-grammars")]
 	#[test]
 	fn emacs_lisp_closing_paren_resolves_to_nothing() {
 		let code = "(defun greet (name)\n  \"Doc.\"\n  (message \"Hello %s\" name)\n)\n";
 		assert_eq!(resolve(code, "init.el", 4), None);
 	}
 
+	#[cfg(feature = "full-grammars")]
 	#[test]
 	fn emacs_lisp_visible_opener_surfaces_closer() {
 		let code = "(defun greet (name)\n  \"Doc.\"\n  (let ((message (format \"Hello %s\" \
@@ -605,6 +609,7 @@ mod tests {
 		assert_eq!(boundaries(code, "init.el", &[(1, 1)]), Some(vec![5]));
 	}
 
+	#[cfg(feature = "full-grammars")]
 	#[test]
 	fn emacs_lisp_top_level_macro_forms_resolve_as_single_sexprs() {
 		let cases = [
@@ -637,6 +642,7 @@ mod tests {
 		}
 	}
 
+	#[cfg(feature = "full-grammars")]
 	#[test]
 	fn resolves_emacs_lisp_explicit_language_block() {
 		let result = block_range_at(BlockRangeOptions {
@@ -651,9 +657,9 @@ mod tests {
 
 	fn boundaries(code: &str, path: &str, ranges: &[(u32, u32)]) -> Option<Vec<u32>> {
 		enclosing_block_boundaries(EnclosingBoundaryOptions {
-			code:   code.to_string(),
-			lang:   None,
-			path:   Some(path.to_string()),
+			code: code.to_string(),
+			lang: None,
+			path: Some(path.to_string()),
 			ranges: ranges
 				.iter()
 				.map(|&(start_line, end_line)| LineRange { start_line, end_line })

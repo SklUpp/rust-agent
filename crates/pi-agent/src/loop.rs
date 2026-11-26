@@ -8,8 +8,8 @@ use crate::{
 	compaction::{CompactionReport, Compactor},
 	delivery::BackgroundResultSink,
 	durable::{
-		DURABILITY_ADMISSION_FAILURE_CODE, DURABILITY_FAILURE_CODE,
-		DURABILITY_UNKNOWN_OUTCOME_CODE, DurableError,
+		DURABILITY_ADMISSION_FAILURE_CODE, DURABILITY_FAILURE_CODE, DURABILITY_UNKNOWN_OUTCOME_CODE,
+		DurableError,
 	},
 	mailbox::{Mailbox, format_incoming},
 	provider::{ModelProvider, ProviderError, StreamAssembler, ToolChoice},
@@ -32,7 +32,10 @@ fn assistant_status(message: &Message, tool_use: bool) -> TurnStatus {
 	match message.stop_reason {
 		Some(StopReason::Length) => TurnStatus::Length,
 		Some(StopReason::Error) => TurnStatus::Error(
-			message.error_message.clone().unwrap_or_else(|| "provider error".to_string()),
+			message
+				.error_message
+				.clone()
+				.unwrap_or_else(|| "provider error".to_string()),
 		),
 		Some(StopReason::Aborted) => TurnStatus::Aborted,
 		Some(StopReason::ToolUse) => TurnStatus::ToolUse,
@@ -117,8 +120,7 @@ fn tool_image_parts(
 			Ok(_) => {},
 			Err(error) => {
 				result.is_error = true;
-				result.content =
-					format!("{}\n\n[image payload rejected: {error}]", result.content);
+				result.content = format!("{}\n\n[image payload rejected: {error}]", result.content);
 			},
 		}
 	}
@@ -250,8 +252,10 @@ impl TurnAck {
 	/// Register the turn about to end and return the decision receiver.
 	pub fn begin(&self, request: TurnAckRequest) -> oneshot::Receiver<TurnAckDecision> {
 		let (reply, rx) = oneshot::channel();
-		*self.pending.lock().unwrap_or_else(|poison| poison.into_inner()) =
-			Some(PendingTurnAck { request, reply });
+		*self
+			.pending
+			.lock()
+			.unwrap_or_else(|poison| poison.into_inner()) = Some(PendingTurnAck { request, reply });
 		rx
 	}
 
@@ -276,7 +280,13 @@ impl TurnAck {
 
 	/// Drop a pending reply so the loop stops waiting (cancellation/error path).
 	pub fn cancel(&self) {
-		drop(self.pending.lock().unwrap_or_else(|poison| poison.into_inner()).take());
+		drop(
+			self
+				.pending
+				.lock()
+				.unwrap_or_else(|poison| poison.into_inner())
+				.take(),
+		);
 	}
 }
 
@@ -340,7 +350,9 @@ pub enum AgentEvent {
 /// Announce one accepted steering message to the host event stream.
 async fn announce_user_steer(events: &Option<mpsc::Sender<AgentEvent>>, parts: &[ContentPart]) {
 	if let Some(sink) = events {
-		let _ = sink.send(AgentEvent::UserSteer { parts: parts.to_vec() }).await;
+		let _ = sink
+			.send(AgentEvent::UserSteer { parts: parts.to_vec() })
+			.await;
 	}
 }
 
@@ -433,7 +445,9 @@ impl Steering {
 				}
 			},
 			SteeringEvent::InjectMessage { parts, delivery_id } => {
-				self.injections.push(SteeringInjection { parts, delivery_id });
+				self
+					.injections
+					.push(SteeringInjection { parts, delivery_id });
 			},
 		}
 	}
@@ -503,7 +517,7 @@ impl SoftRequirementState {
 /// `hub wait` can tell whether its counterpart still exists.
 struct PresenceGuard {
 	mailbox: Arc<Mailbox>,
-	agent:   String,
+	agent: String,
 }
 
 impl PresenceGuard {
@@ -555,7 +569,10 @@ pub fn tool_batch_end(messages: &[Message], tool_call_id: &str) -> Option<usize>
 		.rposition(|message| message.tool_call_id.as_deref() == Some(tool_call_id))?;
 	let assistant_position = messages[..result_position].iter().rposition(|message| {
 		message.role == Role::Assistant
-			&& message.tool_calls.iter().any(|call| call.id == tool_call_id)
+			&& message
+				.tool_calls
+				.iter()
+				.any(|call| call.id == tool_call_id)
 	})?;
 	let call_ids: std::collections::HashSet<&str> = messages[assistant_position]
 		.tool_calls
@@ -681,8 +698,12 @@ fn apply_turn_boundary(
 fn synthetic_tool_result(call: &ToolCall, reason: &str, error_message: Option<&str>) -> ToolResult {
 	let text = match reason {
 		"aborted" => "Tool execution was aborted",
-		"length" => "Tool call was not executed because the assistant hit its output token limit (stop_reason: length) before the arguments could complete; the recorded arguments are truncated and unsafe to run. Do NOT retry by re-emitting the same large payload — split the work into several smaller tool calls (e.g. for `write`/`edit`, write the first chunk then append the rest with subsequent `edit` insert ops, or break the file into multiple `write` targets)",
-		"error" => "Tool call was not executed because the provider stream ended with an error before the tool could run",
+		"length" => {
+			"Tool call was not executed because the assistant hit its output token limit (stop_reason: length) before the arguments could complete; the recorded arguments are truncated and unsafe to run. Do NOT retry by re-emitting the same large payload — split the work into several smaller tool calls (e.g. for `write`/`edit`, write the first chunk then append the rest with subsequent `edit` insert ops, or break the file into multiple `write` targets)"
+		},
+		"error" => {
+			"Tool call was not executed because the provider stream ended with an error before the tool could run"
+		},
 		_ => "Tool call was not executed because the assistant ended its turn",
 	};
 	let content = match error_message {
@@ -863,8 +884,7 @@ pub struct AgentLoop {
 ///
 /// The return value is durability: `false` means accepted messages are not yet
 /// on disk, so the loop must not compact (an unwritten turn would be lost).
-pub type TurnObserver =
-	Arc<dyn Fn(&[Message], Option<CompactionReport>) -> bool + Send + Sync>;
+pub type TurnObserver = Arc<dyn Fn(&[Message], Option<CompactionReport>) -> bool + Send + Sync>;
 
 impl AgentLoop {
 	pub fn new(
@@ -1122,10 +1142,7 @@ impl AgentLoop {
 	}
 
 	/// Mark delivery rows as present in the persisted conversation.
-	async fn mark_deliveries_delivered(
-		&self,
-		delivery_ids: &[String],
-	) -> Result<(), AgentError> {
+	async fn mark_deliveries_delivered(&self, delivery_ids: &[String]) -> Result<(), AgentError> {
 		if delivery_ids.is_empty() {
 			return Ok(());
 		}
@@ -1140,10 +1157,7 @@ impl AgentLoop {
 
 	/// Mark deliveries the provider request actually consumed. Only called after
 	/// a response, never on inbox take.
-	async fn mark_deliveries_processed(
-		&self,
-		delivery_ids: &[String],
-	) -> Result<(), AgentError> {
+	async fn mark_deliveries_processed(&self, delivery_ids: &[String]) -> Result<(), AgentError> {
 		if delivery_ids.is_empty() {
 			return Ok(());
 		}
@@ -1279,7 +1293,9 @@ impl AgentLoop {
 		steering_rx: Option<mpsc::Receiver<SteeringEvent>>,
 		events: Option<mpsc::Sender<AgentEvent>>,
 	) -> Result<Vec<TurnResult>, AgentError> {
-		self.run_dialog_message(Message::user(user_input), state, steering_rx, events).await
+		self
+			.run_dialog_message(Message::user(user_input), state, steering_rx, events)
+			.await
 	}
 
 	/// Run turns with a pre-constructed user message (supporting text and image parts).
@@ -1420,8 +1436,9 @@ impl AgentLoop {
 
 			// Results that settled while the previous assistant turn ran land
 			// before this one, exactly once (ephemeral background results and peer-mail).
-			let ephemeral_and_peer_ids =
-				self.inject_boundary_messages(state, events.as_ref()).await?;
+			let ephemeral_and_peer_ids = self
+				.inject_boundary_messages(state, events.as_ref())
+				.await?;
 
 			// Peer mail accepted by the host but never appended before a crash:
 			// each row is consumed atomically and appended here, in order. Mail
@@ -1491,8 +1508,13 @@ impl AgentLoop {
 				.as_ref()
 				.is_none_or(|observer| observer(&state.messages, None));
 			if durable {
-				let (compacted, report) =
-					Compactor::compact_report(&state.messages, context_limit, MIN_RECENT_MESSAGES);
+				let model = self.provider.model().unwrap_or("");
+				let (compacted, report) = Compactor::compact_report_for_model(
+					model,
+					&state.messages,
+					context_limit,
+					MIN_RECENT_MESSAGES,
+				);
 				state.messages = compacted;
 				// The rewrite is destructive even though its input is durable: the
 				// owner must remap its write cursor to the new index space, never
@@ -1517,17 +1539,18 @@ impl AgentLoop {
 			let mut tool_choice = match (&soft_req, soft.force_next) {
 				(Some(requirement), true) => {
 					soft.force_next = false;
-					self.policy.as_ref().map_or(
-						ToolChoice::Tool { name: requirement.tool_name.clone() },
-						|policy| policy.choice(requirement),
-					)
+					self
+						.policy
+						.as_ref()
+						.map_or(ToolChoice::Tool { name: requirement.tool_name.clone() }, |policy| {
+							policy.choice(requirement)
+						})
 				},
 				_ => ToolChoice::Auto,
 			};
 			if continuation_pending {
 				continuation_pending = false;
-				if let (Some(policy), Some(requirement)) = (self.policy.as_ref(), soft_req.as_ref())
-				{
+				if let (Some(policy), Some(requirement)) = (self.policy.as_ref(), soft_req.as_ref()) {
 					// One-shot upstream `required`: consuming it also spends the
 					// policy's escalation budget so an ignored reply yields.
 					tool_choice = policy.choice(requirement);
@@ -1641,7 +1664,9 @@ impl AgentLoop {
 			};
 			// The provider accepted this request and returned a response; only now
 			// are its delivery rows consumed by the model.
-			self.mark_deliveries_processed(&request_delivery_ids).await?;
+			self
+				.mark_deliveries_processed(&request_delivery_ids)
+				.await?;
 			if let Some(guard) = &self.assistant_guard {
 				guard.guard(&mut assistant, &state.messages);
 			}
@@ -1667,10 +1692,8 @@ impl AgentLoop {
 			});
 
 			if let Some(events_sink) = events.as_ref() {
-				let status = assistant_status(
-					&assistant,
-					!assistant.tool_calls.is_empty() || soft_non_compliant,
-				);
+				let status =
+					assistant_status(&assistant, !assistant.tool_calls.is_empty() || soft_non_compliant);
 				let _ = events_sink
 					.send(AgentEvent::MessageEnd { message: assistant.clone(), status })
 					.await;
@@ -1728,21 +1751,18 @@ impl AgentLoop {
 				return Ok(turn_results);
 			}
 
-			if soft_non_compliant
-				&& let Some(requirement) = &soft_req
-			{
+			if soft_non_compliant && let Some(requirement) = &soft_req {
 				let limit = self
 					.policy
 					.as_ref()
-					.map_or(MAX_SOFT_TOOL_ESCALATIONS, |policy| {
-						policy.escalation_limit(requirement)
-					});
+					.map_or(MAX_SOFT_TOOL_ESCALATIONS, |policy| policy.escalation_limit(requirement));
 				let exhausted = soft.escalations >= limit;
 				let yield_to_user = exhausted
 					&& assistant.tool_calls.is_empty()
-					&& self.policy.as_ref().is_some_and(|policy| {
-						policy.exhaustion(requirement) == Exhaustion::EndTurn
-					});
+					&& self
+						.policy
+						.as_ref()
+						.is_some_and(|policy| policy.exhaustion(requirement) == Exhaustion::EndTurn);
 				if yield_to_user {
 					// The policy asks for a normal hand-back instead of an abort.
 					// Dropping the head lets the end-turn path below run unchanged.
@@ -1775,103 +1795,101 @@ impl AgentLoop {
 						)));
 					}
 					let notice = format!(
-					"Not executed: call the `{}` tool to resolve the pending action before using other tools.",
-					requirement.tool_name
-				);
-				let mut results = Vec::with_capacity(assistant.tool_calls.len());
-				for call in &assistant.tool_calls {
+						"Not executed: call the `{}` tool to resolve the pending action before using other tools.",
+						requirement.tool_name
+					);
+					let mut results = Vec::with_capacity(assistant.tool_calls.len());
+					for call in &assistant.tool_calls {
+						if let Some(events_sink) = events.as_ref() {
+							let _ = events_sink
+								.send(AgentEvent::ToolStart {
+									id: call.id.clone(),
+									name: call.name.clone(),
+									arguments: call.arguments.clone(),
+								})
+								.await;
+							let _ = events_sink
+								.send(AgentEvent::ToolEnd {
+									id: call.id.clone(),
+									name: call.name.clone(),
+									result: notice.clone(),
+									is_error: true,
+									images: Vec::new(),
+									details: None,
+								})
+								.await;
+						}
+						let result = ToolResult {
+							tool_call_id: call.id.clone(),
+							content: notice.clone(),
+							is_error: true,
+							terminate: false,
+							details: None,
+						};
+						state.messages.push(Message::tool_with_status(
+							&result.tool_call_id,
+							&call.name,
+							&result.content,
+							true,
+						));
+						results.push(result);
+					}
+					soft.force_next = true;
+					soft.escalations += 1;
+					// The ack must exist before `TurnEnd` is published: the consumer
+					// takes it while handling that event and the loop would wait
+					// forever on a registration that came later. The boundary already
+					// counts the injections journaled below, in this same block.
+					let ack_rx =
+						self.begin_turn_ack(turn_start, state.messages.len() + pending_injections.len());
 					if let Some(events_sink) = events.as_ref() {
 						let _ = events_sink
-							.send(AgentEvent::ToolStart {
-								id: call.id.clone(),
-								name: call.name.clone(),
-								arguments: call.arguments.clone(),
-							})
-							.await;
-						let _ = events_sink
-							.send(AgentEvent::ToolEnd {
-								id: call.id.clone(),
-								name: call.name.clone(),
-								result: notice.clone(),
-								is_error: true,
-								images: Vec::new(),
-								details: None,
+							.send(AgentEvent::TurnEnd {
+								message: assistant.clone(),
+								tool_results: results.clone(),
+								status: assistant_status(&assistant, true),
 							})
 							.await;
 					}
-					let result = ToolResult {
-						tool_call_id: call.id.clone(),
-						content: notice.clone(),
-						is_error: true,
-						terminate: false,
-						details: None,
-					};
-					state.messages.push(Message::tool_with_status(
-						&result.tool_call_id,
-						&call.name,
-						&result.content,
-						true,
-					));
-					results.push(result);
-				}
-				soft.force_next = true;
-				soft.escalations += 1;
-				// The ack must exist before `TurnEnd` is published: the consumer
-				// takes it while handling that event and the loop would wait
-				// forever on a registration that came later. The boundary already
-				// counts the injections journaled below, in this same block.
-				let ack_rx = self.begin_turn_ack(
-					turn_start,
-					state.messages.len() + pending_injections.len(),
-				);
-				if let Some(events_sink) = events.as_ref() {
-					let _ = events_sink
-						.send(AgentEvent::TurnEnd {
-							message: assistant.clone(),
-							tool_results: results.clone(),
-							status: assistant_status(&assistant, true),
-						})
-						.await;
-				}
-				// After `TurnEnd`, for the same reason as the end-turn path: the
-				// assistant/tool tail is journaled first, the injected user chains
-				// behind it.
-				self.persist_conversation(&state.messages).await?;
-				for injection in pending_injections {
-					announce_user_steer(&events, &injection.parts).await;
-					self.accept_injection(state, injection).await?;
-				}
-				let decision = self.await_turn_ack(ack_rx, &cancellation_token).await;
-				let TurnAckDecision {
-					rewrite,
-					warning,
-					continue_turn: _,
-					guidance,
-					scrub_custom_type,
-					provider,
-					context_limit: replacement_context_limit,
-					tool_selection: replacement_tools,
-				} = decision;
-				if self.apply_turn_rewrite(&mut state.messages, rewrite, warning) {
-					self.resync_conversation(&state.messages).await?;
-				}
-				self.apply_turn_tools(replacement_tools);
-				if apply_turn_boundary(
-					&mut state.messages,
-					&mut active_provider,
-					&mut context_limit,
-					guidance,
-					scrub_custom_type,
-					provider,
-					replacement_context_limit,
-				) {
-					self.resync_conversation(&state.messages).await?;
-				}
-				turn_results.push(TurnResult {
-					message: assistant,
-					tool_results: results,
-					is_completed: false,
-				});
+					// After `TurnEnd`, for the same reason as the end-turn path: the
+					// assistant/tool tail is journaled first, the injected user chains
+					// behind it.
+					self.persist_conversation(&state.messages).await?;
+					for injection in pending_injections {
+						announce_user_steer(&events, &injection.parts).await;
+						self.accept_injection(state, injection).await?;
+					}
+					let decision = self.await_turn_ack(ack_rx, &cancellation_token).await;
+					let TurnAckDecision {
+						rewrite,
+						warning,
+						continue_turn: _,
+						guidance,
+						scrub_custom_type,
+						provider,
+						context_limit: replacement_context_limit,
+						tool_selection: replacement_tools,
+					} = decision;
+					if self.apply_turn_rewrite(&mut state.messages, rewrite, warning) {
+						self.resync_conversation(&state.messages).await?;
+					}
+					self.apply_turn_tools(replacement_tools);
+					if apply_turn_boundary(
+						&mut state.messages,
+						&mut active_provider,
+						&mut context_limit,
+						guidance,
+						scrub_custom_type,
+						provider,
+						replacement_context_limit,
+					) {
+						self.resync_conversation(&state.messages).await?;
+					}
+					turn_results.push(TurnResult {
+						message: assistant,
+						tool_results: results,
+						is_completed: false,
+					});
 					continue;
 				}
 			}
@@ -1879,9 +1897,7 @@ impl AgentLoop {
 			// A `length` truncation cannot be replayed: the trailing tool_use
 			// arguments may be incomplete. Pair each call with a synthetic
 			// skipped result and re-sample, exactly like TS `agent-loop.ts`.
-			if assistant.stop_reason == Some(StopReason::Length)
-				&& !assistant.tool_calls.is_empty()
-			{
+			if assistant.stop_reason == Some(StopReason::Length) && !assistant.tool_calls.is_empty() {
 				let results = pair_skipped_tool_calls(
 					&assistant,
 					"length",
@@ -1959,10 +1975,8 @@ impl AgentLoop {
 				// Register the ack before publishing `TurnEnd` (the consumer takes
 				// it there), and count the injections this block journals next so
 				// the boundary is final when the host sees it.
-				let ack_rx = self.begin_turn_ack(
-					turn_start,
-					state.messages.len() + pending_injections.len(),
-				);
+				let ack_rx =
+					self.begin_turn_ack(turn_start, state.messages.len() + pending_injections.len());
 				// The assistant entry reaches the journal through `TurnEnd`, so it
 				// is emitted before the injected users: an accepted steering message
 				// must chain after the message it interrupted, not before it.
@@ -1983,8 +1997,7 @@ impl AgentLoop {
 				let decision = self.await_turn_ack(ack_rx, &cancellation_token).await;
 				// A turn-end rewrite replaces the live conversation; inject the
 				// Stop feedback after it so the continuation actually sees it.
-				let stop_feedback =
-					stop_feedback.filter(|_| !cancellation_token.is_cancelled());
+				let stop_feedback = stop_feedback.filter(|_| !cancellation_token.is_cancelled());
 				let TurnAckDecision {
 					rewrite,
 					warning,
@@ -2088,9 +2101,7 @@ impl AgentLoop {
 			let durability_failure = durability_unknown.or_else(|| {
 				outcome.results.iter().find_map(|result| {
 					let code = durability_code(result)?;
-					if code == DURABILITY_FAILURE_CODE
-						|| code == DURABILITY_ADMISSION_FAILURE_CODE
-					{
+					if code == DURABILITY_FAILURE_CODE || code == DURABILITY_ADMISSION_FAILURE_CODE {
 						Some((code.to_string(), result.content.clone()))
 					} else {
 						None
@@ -2114,7 +2125,10 @@ impl AgentLoop {
 					// store must remain unmasked.
 					continue;
 				}
-				let name = tool_names.get(result.tool_call_id.as_str()).copied().unwrap_or("tool");
+				let name = tool_names
+					.get(result.tool_call_id.as_str())
+					.copied()
+					.unwrap_or("tool");
 				match image_parts.get(&result.tool_call_id) {
 					Some(parts) => state.messages.push(Message::tool_with_status_and_parts(
 						&result.tool_call_id,
@@ -2163,7 +2177,8 @@ impl AgentLoop {
 					.stop_reason
 					.map(StopReason::as_str)
 					.unwrap_or("aborted");
-				self.finish_turn(stop_reason, assistant.error_message.as_deref())
+				self
+					.finish_turn(stop_reason, assistant.error_message.as_deref())
 					.await?;
 			}
 			let status = if cancelled {
@@ -2175,8 +2190,7 @@ impl AgentLoop {
 			// Ack first (the consumer takes it on `TurnEnd`), with the boundary
 			// already counting the injections journaled right after it.
 			let injection_count = pending_injections.len() + outcome.injections.len();
-			let ack_rx =
-				self.begin_turn_ack(turn_start, state.messages.len() + injection_count);
+			let ack_rx = self.begin_turn_ack(turn_start, state.messages.len() + injection_count);
 			// Injected messages land after the tool responses and after the turn
 			// tail is journaled, so the history stays valid and the accepted user
 			// chains behind the messages it interrupted.
@@ -2240,8 +2254,6 @@ impl AgentLoop {
 			if should_terminate {
 				return Ok(turn_results);
 			}
-
-
 		}
 
 		Err(AgentError::MaxTurnsExceeded(self.config.max_turns))
@@ -2311,7 +2323,10 @@ impl AgentLoop {
 		// A cancelled batch never produced these results; the synthetic row is
 		// the durable record of the cancellation, so it carries the supervisor's
 		// reason (`max time exceeded`) instead of the generic user label.
-		let interrupt_text = outcome.interrupt_reason.as_deref().unwrap_or(INTERRUPTED_TOOL_RESULT);
+		let interrupt_text = outcome
+			.interrupt_reason
+			.as_deref()
+			.unwrap_or(INTERRUPTED_TOOL_RESULT);
 		for call in calls {
 			match outcome
 				.results
@@ -2417,10 +2432,15 @@ impl AgentLoop {
 		let attempt = format!(
 			"{}-{}",
 			self.stream_boot_nanos,
-			self.stream_attempts.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+			self
+				.stream_attempts
+				.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
 		);
 		if cancellation_token.is_cancelled() {
-			return Err(NextAssistantError::interrupted(interrupted_message(Message::assistant(""), None), None));
+			return Err(NextAssistantError::interrupted(
+				interrupted_message(Message::assistant(""), None),
+				None,
+			));
 		}
 		let Some(events) = events else {
 			let complete_fut = provider.complete(messages, schemas, tool_choice);
@@ -2455,13 +2475,13 @@ impl AgentLoop {
 							},
 							res = &mut complete_fut => return Ok(Self::terminal_message(provider, res?, &attempt)),
 						}
-					}
+					},
 					None => {
 						tokio::select! {
 							_ = cancellation_token.cancelled() => return Err(NextAssistantError::interrupted(interrupted_message(Message::assistant(""), None), None)),
 							res = &mut complete_fut => return Ok(Self::terminal_message(provider, res?, &attempt)),
 						}
-					}
+					},
 				}
 			}
 		};
@@ -2499,7 +2519,7 @@ impl AgentLoop {
 						},
 						res = &mut stream_fut => break res?,
 					}
-				}
+				},
 				None => {
 					tokio::select! {
 						_ = cancellation_token.cancelled() => {
@@ -2508,7 +2528,7 @@ impl AgentLoop {
 						},
 						res = &mut stream_fut => break res?,
 					}
-				}
+				},
 			}
 		};
 
@@ -2533,62 +2553,62 @@ impl AgentLoop {
 			let next_chunk = match steering_rx.as_deref_mut() {
 				Some(rx) if rx_open => {
 					tokio::select! {
-						biased;
-						_ = cancellation_token.cancelled() => {
-							// Cancellation still preserves the fragment: flush
-							// the latest text, then report the interrupt. A
-							// failed flush fails the turn closed with the
-							// flush error instead of silently losing text.
-							memory_snapshot = assembler.finish_partial().content;
-							if let Some(outcome) = self.flush_stream_draft_text(&memory_snapshot, &attempt, provider).await {
-								return outcome;
-							}
-							let partial = interrupted_message(Self::terminal_message(provider, assembler.finish_partial(), &attempt), None);
-							return Err(NextAssistantError::interrupted(partial, None));
-						},
-						event = rx.recv() => match event {
-							Some(event @ (SteeringEvent::Interrupt | SteeringEvent::InterruptWithReason(_))) => {
-								cancellation_token.cancel();
-								let reason = match event {
-									SteeringEvent::InterruptWithReason(reason) => Some(reason),
-									_ => None,
-								};
+							biased;
+							_ = cancellation_token.cancelled() => {
+								// Cancellation still preserves the fragment: flush
+								// the latest text, then report the interrupt. A
+								// failed flush fails the turn closed with the
+								// flush error instead of silently losing text.
 								memory_snapshot = assembler.finish_partial().content;
 								if let Some(outcome) = self.flush_stream_draft_text(&memory_snapshot, &attempt, provider).await {
 									return outcome;
 								}
-								let partial = interrupted_message(
-									Self::terminal_message(provider, assembler.finish_partial(), &attempt),
-									reason.clone(),
-								);
-								return Err(NextAssistantError::interrupted(partial, reason));
-							}
-							Some(SteeringEvent::InjectMessage { parts, delivery_id }) => {
-								injections.push(SteeringInjection { parts, delivery_id });
+								let partial = interrupted_message(Self::terminal_message(provider, assembler.finish_partial(), &attempt), None);
+								return Err(NextAssistantError::interrupted(partial, None));
+							},
+							event = rx.recv() => match event {
+								Some(event @ (SteeringEvent::Interrupt | SteeringEvent::InterruptWithReason(_))) => {
+									cancellation_token.cancel();
+									let reason = match event {
+										SteeringEvent::InterruptWithReason(reason) => Some(reason),
+										_ => None,
+									};
+									memory_snapshot = assembler.finish_partial().content;
+									if let Some(outcome) = self.flush_stream_draft_text(&memory_snapshot, &attempt, provider).await {
+										return outcome;
+									}
+									let partial = interrupted_message(
+										Self::terminal_message(provider, assembler.finish_partial(), &attempt),
+										reason.clone(),
+									);
+									return Err(NextAssistantError::interrupted(partial, reason));
+								}
+								Some(SteeringEvent::InjectMessage { parts, delivery_id }) => {
+									injections.push(SteeringInjection { parts, delivery_id });
+									continue;
+								}
+								None => {
+									rx_open = false;
+									continue;
+								}
+							},
+							chunk = stream.next() => chunk,
+							_ = &mut idle_flush => {
+								// Stalled stream: refresh the memory snapshot, flush
+								// it as the disk draft, and re-arm the deadline.
+								// A failed flush fails the turn closed.
+								memory_snapshot = assembler.finish_partial().content;
+								chunks_since_snapshot = 0;
+								if let Some(outcome) = self.flush_stream_draft_text(&memory_snapshot, &attempt, provider).await {
+									return outcome;
+								}
+								chunks_since_flush = 0;
+								let deadline = tokio::time::Instant::now() + partial_cfg.flush_interval();
+								idle_flush.as_mut().reset(deadline);
 								continue;
-							}
-							None => {
-								rx_open = false;
-								continue;
-							}
-						},
-						chunk = stream.next() => chunk,
-						_ = &mut idle_flush => {
-							// Stalled stream: refresh the memory snapshot, flush
-							// it as the disk draft, and re-arm the deadline.
-							// A failed flush fails the turn closed.
-							memory_snapshot = assembler.finish_partial().content;
-							chunks_since_snapshot = 0;
-							if let Some(outcome) = self.flush_stream_draft_text(&memory_snapshot, &attempt, provider).await {
-								return outcome;
-							}
-							chunks_since_flush = 0;
-							let deadline = tokio::time::Instant::now() + partial_cfg.flush_interval();
-							idle_flush.as_mut().reset(deadline);
-							continue;
-						},
-				}
-				}
+							},
+					}
+				},
 				_ => {
 					tokio::select! {
 						_ = cancellation_token.cancelled() => {
@@ -2612,7 +2632,7 @@ impl AgentLoop {
 							continue;
 						},
 					}
-				}
+				},
 			};
 
 			let Some(chunk) = next_chunk else {
@@ -2625,7 +2645,10 @@ impl AgentLoop {
 					// ends this stream, so the draft must reflect it. A failed
 					// flush fails the turn closed with the flush error.
 					memory_snapshot = assembler.finish_partial().content;
-					if let Some(outcome) = self.flush_stream_draft_text(&memory_snapshot, &attempt, provider).await {
+					if let Some(outcome) = self
+						.flush_stream_draft_text(&memory_snapshot, &attempt, provider)
+						.await
+					{
 						return outcome;
 					}
 					let partial = Self::terminal_message(provider, assembler.finish_partial(), &attempt);
@@ -2634,7 +2657,7 @@ impl AgentLoop {
 						error: err.into(),
 						terminal: Some((partial, status)),
 					});
-				}
+				},
 			};
 			// TS `openai-completions.ts:1160-1192` handles a chunk's reasoning
 			// before its content, so reasoning-first here keeps block order and
@@ -2656,7 +2679,10 @@ impl AgentLoop {
 			done = chunk.is_done;
 			if let Err(err) = assembler.push(&chunk) {
 				memory_snapshot = assembler.finish_partial().content;
-				if let Some(outcome) = self.flush_stream_draft_text(&memory_snapshot, &attempt, provider).await {
+				if let Some(outcome) = self
+					.flush_stream_draft_text(&memory_snapshot, &attempt, provider)
+					.await
+				{
 					return outcome;
 				}
 				let partial = Self::terminal_message(provider, assembler.finish_partial(), &attempt);
@@ -2673,30 +2699,33 @@ impl AgentLoop {
 				memory_snapshot = assembler.finish_partial().content;
 				chunks_since_snapshot = 0;
 			}
-		// Disk tier: flush the branch-scoped draft when the chunk knob
-		// fires. The snapshot is refreshed first when dirty, so the disk
-		// draft is always latest — independent of the memory cadence (a
-		// wide `memory_snapshot_chunks` with `persist_every_chunks = 1`
-		// still persists every chunk). The stall timer resets only when
-		// text was actually written; an empty no-op leaves the deadline
-		// alone so a stalled stream cannot postpone recovery forever. A
-		// failed flush fails the turn closed: silent durability loss is
-		// worse than an error.
-		chunks_since_flush += 1;
-		if chunks_since_flush >= partial_cfg.persist_every_chunks {
-			if chunks_since_snapshot > 0 {
-				memory_snapshot = assembler.finish_partial().content;
-				chunks_since_snapshot = 0;
-			}
-			if !memory_snapshot.is_empty() {
-				if let Some(outcome) = self.flush_stream_draft_text(&memory_snapshot, &attempt, provider).await {
-					return outcome;
+			// Disk tier: flush the branch-scoped draft when the chunk knob
+			// fires. The snapshot is refreshed first when dirty, so the disk
+			// draft is always latest — independent of the memory cadence (a
+			// wide `memory_snapshot_chunks` with `persist_every_chunks = 1`
+			// still persists every chunk). The stall timer resets only when
+			// text was actually written; an empty no-op leaves the deadline
+			// alone so a stalled stream cannot postpone recovery forever. A
+			// failed flush fails the turn closed: silent durability loss is
+			// worse than an error.
+			chunks_since_flush += 1;
+			if chunks_since_flush >= partial_cfg.persist_every_chunks {
+				if chunks_since_snapshot > 0 {
+					memory_snapshot = assembler.finish_partial().content;
+					chunks_since_snapshot = 0;
 				}
-				chunks_since_flush = 0;
-				let deadline = tokio::time::Instant::now() + partial_cfg.flush_interval();
-				idle_flush.as_mut().reset(deadline);
+				if !memory_snapshot.is_empty() {
+					if let Some(outcome) = self
+						.flush_stream_draft_text(&memory_snapshot, &attempt, provider)
+						.await
+					{
+						return outcome;
+					}
+					chunks_since_flush = 0;
+					let deadline = tokio::time::Instant::now() + partial_cfg.flush_interval();
+					idle_flush.as_mut().reset(deadline);
+				}
 			}
-		}
 			if done {
 				break;
 			}
@@ -2704,7 +2733,10 @@ impl AgentLoop {
 
 		if !done {
 			memory_snapshot = assembler.finish_partial().content;
-			if let Some(outcome) = self.flush_stream_draft_text(&memory_snapshot, &attempt, provider).await {
+			if let Some(outcome) = self
+				.flush_stream_draft_text(&memory_snapshot, &attempt, provider)
+				.await
+			{
 				return outcome;
 			}
 			let partial = Self::terminal_message(provider, assembler.finish_partial(), &attempt);
@@ -2719,7 +2751,10 @@ impl AgentLoop {
 		let message = match assembler.finish() {
 			Ok(message) => Self::terminal_message(provider, message, &attempt),
 			Err(err) => {
-				if let Some(outcome) = self.flush_stream_draft_text(&partial.content, &attempt, provider).await {
+				if let Some(outcome) = self
+					.flush_stream_draft_text(&partial.content, &attempt, provider)
+					.await
+				{
 					return outcome;
 				}
 				let status = TurnStatus::Error(err.to_string());
@@ -2727,7 +2762,7 @@ impl AgentLoop {
 					error: err.into(),
 					terminal: Some((partial, status)),
 				});
-			}
+			},
 		};
 		Ok(message)
 	}
@@ -2739,17 +2774,12 @@ mod live_cut_tests {
 	use crate::state::ToolCall;
 
 	fn call(id: &str, name: &str) -> ToolCall {
-		ToolCall {
-			id: id.to_string(),
-			name: name.to_string(),
-			arguments: serde_json::json!({}),
-		}
+		ToolCall { id: id.to_string(), name: name.to_string(), arguments: serde_json::json!({}) }
 	}
 
 	#[test]
 	fn unknown_durable_outcome_keeps_its_agent_error_marker() {
-		let error =
-			AgentError::from(DurableError::unknown_outcome("writer stopped before replying"));
+		let error = AgentError::from(DurableError::unknown_outcome("writer stopped before replying"));
 		assert!(matches!(error, AgentError::DurableUnknownOutcome(_)), "{error}");
 		assert!(error.is_durable_unknown_outcome(), "{error}");
 		assert!(error.to_string().contains("outcome unknown"), "{error}");
@@ -2836,10 +2866,7 @@ mod live_cut_tests {
 		let mut messages = vec![
 			Message::system("sys"),
 			Message::user("investigate"),
-			Message::assistant_with_tools(
-				"",
-				vec![call("cp", "checkpoint"), call("read", "read")],
-			),
+			Message::assistant_with_tools("", vec![call("cp", "checkpoint"), call("read", "read")]),
 			Message::tool_with_status("cp", "checkpoint", "Checkpoint: map it", false),
 			Message::tool_with_status("read", "read", "sibling contents", false),
 			Message::assistant("secret exploration"),
@@ -2880,7 +2907,8 @@ mod live_cut_tests {
 			Message::assistant("secret exploration"),
 		];
 		assert!(
-			live.iter()
+			live
+				.iter()
 				.all(|message| message.tool_call_id.as_deref() != Some("cp"))
 		);
 		let decision = TurnAckDecision {
@@ -3008,7 +3036,11 @@ mod steering_parts_tests {
 		assert!(!steering.interrupted, "an injected message is not an interrupt");
 		assert_eq!(steering.injections.len(), 1);
 		assert_eq!(steering.injections[0].parts, parts);
-		let injected = steering.injections.into_iter().next().expect("one injection");
+		let injected = steering
+			.injections
+			.into_iter()
+			.next()
+			.expect("one injection");
 		let message = Message::user_with_parts(injected.parts);
 		assert_eq!(message.parts, parts);
 		assert!(message.has_image(), "steering image must survive into the chat");

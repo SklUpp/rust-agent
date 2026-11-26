@@ -28,6 +28,7 @@ rmcp = { version = "=3.9.0", default-features = false, features = ["client", "tr
 pi-iso = { workspace = true }
 pi-vcs.workspace = true
 ruzstd.workspace = true
+xutf.workspace = true
 pi-ast = { workspace = true }
 portable-pty = { workspace = true }
 xxhash-rust = { workspace = true }
@@ -39,8 +40,13 @@ rusqlite = { version = "0.33.0", features = ["bundled", "hooks"] }
 [features]
 default = []
 test-support = ["rmcp/test-support"]
+# Embed the non-default utok vocabularies (cl100k_base, qwen3, deepseek3,
+# kimi_k2, glm5; ~3.4 MB compressed). Default builds embed o200k_base and the
+# two Claude ctok blobs only.
+utok-all-families = []
 
 [dev-dependencies]
+fancy-regex = "0.17" # utok scanner differential oracle
 tokio = { workspace = true, features = ["full"] }
 futures = { workspace = true }
 async-trait = { workspace = true }

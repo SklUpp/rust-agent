@@ -27,12 +27,12 @@ pub struct Compactor;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CompactionReport {
 	/// Conversation length before the rewrite.
-	pub old_len:    usize,
+	pub old_len: usize,
 	/// Old index of the first retained conversation message (after the leading
 	/// system messages and the pruned prefix).
-	pub kept_from:  usize,
+	pub kept_from: usize,
 	/// Index of that first retained message in the compacted conversation.
-	pub kept_at:    usize,
+	pub kept_at: usize,
 }
 
 impl CompactionReport {
@@ -62,17 +62,59 @@ impl Compactor {
 		Self::compact_report(messages, token_budget, min_recent).0
 	}
 
+	/// [`Self::compact`] with token counts from `model`'s family.
+	pub fn compact_for_model(
+		model: &str,
+		messages: &[Message],
+		token_budget: usize,
+		min_recent: usize,
+	) -> Vec<Message> {
+		Self::compact_report_for_model(model, messages, token_budget, min_recent).0
+	}
+
 	/// [`Self::compact`] plus the index mapping it applied, when it pruned.
 	pub fn compact_report(
 		messages: &[Message],
 		token_budget: usize,
 		min_recent: usize,
 	) -> (Vec<Message>, Option<CompactionReport>) {
+		Self::compact_report_with(
+			messages,
+			token_budget,
+			min_recent,
+			|msg| Tokenizer::count_message(msg),
+			|messages| Tokenizer::count_messages(messages),
+		)
+	}
+
+	/// [`Self::compact_report`] with token counts from `model`'s family.
+	pub fn compact_report_for_model(
+		model: &str,
+		messages: &[Message],
+		token_budget: usize,
+		min_recent: usize,
+	) -> (Vec<Message>, Option<CompactionReport>) {
+		Self::compact_report_with(
+			messages,
+			token_budget,
+			min_recent,
+			|msg| Tokenizer::count_message_for_model(model, msg),
+			|messages| Tokenizer::count_messages_for_model(model, messages),
+		)
+	}
+
+	fn compact_report_with(
+		messages: &[Message],
+		token_budget: usize,
+		min_recent: usize,
+		count_message: impl Fn(&Message) -> usize,
+		count_messages: impl Fn(&[Message]) -> usize,
+	) -> (Vec<Message>, Option<CompactionReport>) {
 		if messages.is_empty() {
 			return (Vec::new(), None);
 		}
 
-		let total_tokens = Tokenizer::count_messages(messages);
+		let total_tokens = count_messages(messages);
 		if total_tokens <= token_budget {
 			return (messages.to_vec(), None);
 		}
@@ -91,7 +133,7 @@ impl Compactor {
 			}
 		}
 
-		let system_tokens = Tokenizer::count_messages(&system_messages);
+		let system_tokens = count_messages(&system_messages);
 		let remaining_budget = token_budget.saturating_sub(system_tokens);
 
 		if conversation.is_empty() {
@@ -104,7 +146,7 @@ impl Compactor {
 
 		// Walk backwards from newest to oldest
 		for (idx, msg) in conversation.iter().rev().enumerate() {
-			let msg_tokens = Tokenizer::count_message(msg);
+			let msg_tokens = count_message(msg);
 			if idx < min_recent || (current_tokens + msg_tokens <= remaining_budget) {
 				current_tokens += msg_tokens;
 				kept_reverse.push(msg.clone());
@@ -142,9 +184,9 @@ impl Compactor {
 			return (result, None);
 		}
 		let report = CompactionReport {
-			old_len:   messages.len(),
+			old_len: messages.len(),
 			kept_from: leading + pruned_count,
-			kept_at:   leading + 1,
+			kept_at: leading + 1,
 		};
 		(result, Some(report))
 	}

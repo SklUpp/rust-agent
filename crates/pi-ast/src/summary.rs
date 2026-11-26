@@ -14,15 +14,15 @@ const DEFAULT_MIN_COMMENT_LINES: u32 = 6;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SummaryOptions {
 	/// Source code to summarize.
-	pub code:               String,
+	pub code: String,
 	/// Language alias (e.g. "rust", "typescript") used before path inference.
-	pub lang:               Option<String>,
+	pub lang: Option<String>,
 	/// File path used to infer language by extension when `lang` is omitted.
-	pub path:               Option<String>,
+	pub path: Option<String>,
 	/// Minimum total node lines before eliding a body/literal node.
-	pub min_body_lines:     Option<u32>,
+	pub min_body_lines: Option<u32>,
 	/// Minimum total comment lines before eliding a multiline block comment.
-	pub min_comment_lines:  Option<u32>,
+	pub min_comment_lines: Option<u32>,
 	/// Target visible-line count for BFS unfold. Starting from every elidable
 	/// span folded, this progressively reveals outer-then-inner spans until
 	/// the visible line count meets the target. `None` or `0` disables BFS
@@ -39,33 +39,33 @@ pub struct SummaryOptions {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SummarySegment {
 	/// "kept" or "elided".
-	pub kind:       String,
+	pub kind: String,
 	/// 1-based inclusive start line.
 	pub start_line: u32,
 	/// 1-based inclusive end line.
-	pub end_line:   u32,
+	pub end_line: u32,
 	/// Verbatim text for kept segments; absent for elided segments.
-	pub text:       Option<String>,
+	pub text: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SummaryResult {
 	/// Canonical language name when parsing succeeded.
-	pub language:    Option<String>,
+	pub language: Option<String>,
 	/// True when tree-sitter parsed the source without syntax errors.
-	pub parsed:      bool,
+	pub parsed: bool,
 	/// True when at least one elision span was emitted.
-	pub elided:      bool,
+	pub elided: bool,
 	/// Total source lines.
 	pub total_lines: u32,
 	/// Kept/elided segments in source order.
-	pub segments:    Vec<SummarySegment>,
+	pub segments: Vec<SummarySegment>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct LineSpan {
 	start: u32,
-	end:   u32,
+	end: u32,
 }
 
 impl LineSpan {
@@ -80,7 +80,7 @@ impl LineSpan {
 /// within its parent's.
 #[derive(Debug)]
 struct SpanNode {
-	span:     LineSpan,
+	span: LineSpan,
 	children: Vec<usize>,
 }
 
@@ -222,10 +222,10 @@ fn unparsed_result(source: String, total_lines: u32) -> SummaryResult {
 		Vec::new()
 	} else {
 		vec![SummarySegment {
-			kind:       "kept".to_string(),
+			kind: "kept".to_string(),
 			start_line: 1,
-			end_line:   total_lines,
-			text:       Some(source),
+			end_line: total_lines,
+			text: Some(source),
 		}]
 	};
 	SummaryResult { language: None, parsed: false, elided: false, total_lines, segments }
@@ -890,11 +890,11 @@ mod tests {
 
 	fn summarize(code: &str, path: &str) -> SummaryResult {
 		summarize_code(SummaryOptions {
-			code:               code.to_string(),
-			lang:               None,
-			path:               Some(path.to_string()),
-			min_body_lines:     None,
-			min_comment_lines:  None,
+			code: code.to_string(),
+			lang: None,
+			path: Some(path.to_string()),
+			min_body_lines: None,
+			min_comment_lines: None,
 			unfold_until_lines: None,
 			unfold_limit_lines: None,
 		})
@@ -952,12 +952,11 @@ mod tests {
 
 	#[test]
 	fn summarizes_python_function_body() {
-		let result =
-			summarize(
-				"class Greeter:\n    def greet(self, name: str) -> str:\n        clean = \
+		let result = summarize(
+			"class Greeter:\n    def greet(self, name: str) -> str:\n        clean = \
 				 name.strip()\n        label = clean or 'world'\n        return f'hello {label}'\n",
-				"fixture.py",
-			);
+			"fixture.py",
+		);
 
 		assert!(result.parsed);
 		assert!(result.elided);
@@ -978,6 +977,7 @@ mod tests {
 		);
 	}
 
+	#[cfg(feature = "full-grammars")]
 	#[test]
 	fn summarizes_fortran_program() {
 		let result = summarize("program hello\n  print *, 'hi'\nend program hello\n", "fixture.f90");
@@ -987,6 +987,7 @@ mod tests {
 		assert!(!result.segments.is_empty());
 	}
 
+	#[cfg(feature = "full-grammars")]
 	#[test]
 	fn summarizes_emacs_lisp_defun_body() {
 		let code = "(defun greet (name)\n  \"Doc.\"\n  (let ((message (format \"Hello %s\" \
@@ -999,6 +1000,7 @@ mod tests {
 		assert_eq!(segment_kinds(&result), vec!["kept", "elided", "kept"]);
 	}
 
+	#[cfg(feature = "full-grammars")]
 	#[test]
 	fn summarizes_emacs_lisp_special_form() {
 		let code =
@@ -1018,11 +1020,11 @@ mod tests {
 		assert!(!default_result.elided);
 
 		let override_result = summarize_code(SummaryOptions {
-			code:               code.to_string(),
-			lang:               Some("typescript".to_string()),
-			path:               None,
-			min_body_lines:     Some(3),
-			min_comment_lines:  None,
+			code: code.to_string(),
+			lang: Some("typescript".to_string()),
+			path: None,
+			min_body_lines: Some(3),
+			min_comment_lines: None,
 			unfold_until_lines: None,
 			unfold_limit_lines: None,
 		})
@@ -1097,6 +1099,7 @@ mod tests {
 		assert_eq!(result.segments[2].text.as_deref(), Some("}"));
 	}
 
+	#[cfg(feature = "full-grammars")]
 	#[test]
 	fn summarizes_java_class_body() {
 		let result = summarize(
@@ -1215,11 +1218,11 @@ mod tests {
 
 	fn summarize_with_unfold(code: &str, path: &str, until: u32, limit: u32) -> SummaryResult {
 		summarize_code(SummaryOptions {
-			code:               code.to_string(),
-			lang:               None,
-			path:               Some(path.to_string()),
-			min_body_lines:     None,
-			min_comment_lines:  None,
+			code: code.to_string(),
+			lang: None,
+			path: Some(path.to_string()),
+			min_body_lines: None,
+			min_comment_lines: None,
 			unfold_until_lines: Some(until),
 			unfold_limit_lines: Some(limit),
 		})
@@ -1318,6 +1321,7 @@ mod tests {
 		);
 	}
 
+	#[cfg(feature = "full-grammars")]
 	#[test]
 	fn bfs_unfold_skips_unfoldable_leaf_and_continues_to_siblings() {
 		// Repro for the "useless HTML summary" report: a big <style> raw-text
