@@ -1040,8 +1040,8 @@ pub async fn prepare_context(cwd: PathBuf) -> Result<WorktreeBaseline, String> {
 fn prepare_context_blocking(cwd: &Path) -> Result<WorktreeBaseline, String> {
 	let cwd = canonical_dir(cwd)?;
 	let root_probe = match vcs_repo(&cwd) {
-		Some(repo) => Ok(repo.root().to_path_buf()),
-		None => git_text(&cwd, &["rev-parse", "--show-toplevel"]).map(PathBuf::from),
+		Some(repo) if repo.head().is_ok() => Ok(repo.root().to_path_buf()),
+		_ => git_text(&cwd, &["rev-parse", "--show-toplevel"]).map(PathBuf::from),
 	};
 	let root = match root_probe {
 		Ok(root) => canonical_dir(&root)?,
