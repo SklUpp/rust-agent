@@ -13627,7 +13627,8 @@ mod tests {
 		}
 		let child = branch("child", Some("root"));
 		let root = branch("root", None);
-		let ordered = order_session_bundle_branches(&[child.clone(), root.clone()])
+		let branches = [child, root];
+		let ordered = order_session_bundle_branches(&branches)
 			.expect("parent-first order");
 		assert_eq!(
 			ordered.iter().map(|branch| branch.id.as_str()).collect::<Vec<_>>(),
