@@ -1296,7 +1296,9 @@ impl MemoryStore {
 
 	/// [`Self::consolidate`] with an injected clock, for deterministic tests.
 	pub fn consolidate_at(&self, now: i64) -> MemoryResult<ConsolidationReport> {
-		let report = crate::local_memory::with_path_lock(&self.path, || {
+		let report = crate::local_memory::with_path_lock(
+			&self.path,
+			|| -> MemoryResult<ConsolidationReport> {
 			let mut guard = self.lock();
 			let transaction = guard.transaction_with_behavior(TransactionBehavior::Immediate)?;
 			let mut report = ConsolidationReport::default();
