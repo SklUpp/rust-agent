@@ -329,7 +329,7 @@ pub enum SupportLang {
 
 static SORTED_ALIASES: LazyLock<Box<[&'static str]>> = LazyLock::new(|| {
 	let mut aliases = LANG_ALIASES
-		.iter()
+		.entries()
 		.filter(|(_, lang)| lang.is_available())
 		.map(|(alias, _)| *alias)
 		.collect::<Box<[_]>>();
