@@ -1147,7 +1147,7 @@ fn order_session_bundle_branches(
 				inserted.insert(branch.id.as_str());
 				ordered.push(*branch);
 			}
-			ready
+			!ready
 		});
 		if remaining.len() == before {
 			return Err(StoreError::Validation(
@@ -1176,7 +1176,7 @@ fn order_session_bundle_messages(
 				inserted.insert(message.id.as_str());
 				ordered.push(*message);
 			}
-			ready
+			!ready
 		});
 		if remaining.len() == before {
 			return Err(StoreError::Validation(
