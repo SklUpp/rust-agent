@@ -469,6 +469,7 @@ pub const LSP_READONLY_ACTIONS: &[&str] = &[
 	"symbols",
 	"status",
 	"capabilities",
+	"matrix",
 ];
 
 pub const LSP_ACTIONS: &[&str] = &[
@@ -486,6 +487,7 @@ pub const LSP_ACTIONS: &[&str] = &[
 	"status",
 	"reload",
 	"capabilities",
+	"matrix",
 	"request",
 ];
 

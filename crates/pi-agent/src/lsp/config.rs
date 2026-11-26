@@ -48,7 +48,10 @@ const LOCAL_BIN_PATHS: &[(&[&str], &str)] = &[
 #[derive(Debug, Default)]
 struct NormalizedConfig {
 	servers: Map<String, Value>,
-	idle_timeout_ms: Option<u64>,
+	/// Outer `None`: `idleTimeoutMs` absent from this layer. Inner `None`:
+	/// explicit `0`/`null`, which disables idle-kill instead of inheriting the
+	/// embedded five-minute default.
+	idle_timeout_ms: Option<Option<u64>>,
 }
 
 // =============================================================================
@@ -63,23 +66,10 @@ struct NormalizedConfig {
 /// `lsp.json` > `.lsp.json` > `lsp.yaml` > `.lsp.yaml` > `lsp.yml` > `.lsp.yml`.
 #[must_use]
 pub fn load_config(cwd: &Path) -> LspConfig {
-	let defaults = parse_defaults();
-	let mut merged = defaults;
-	let mut idle_timeout_ms = None;
-	let mut has_overrides = false;
-
-	for source in config_sources(cwd).into_iter().rev() {
-		let Some(parsed) = read_config_file(&source) else {
-			continue;
-		};
-		if !parsed.servers.is_empty() {
-			has_overrides = true;
-			merge_servers(&mut merged, &parsed.servers);
-		}
-		if parsed.idle_timeout_ms.is_some() {
-			idle_timeout_ms = parsed.idle_timeout_ms;
-		}
-	}
+	let merged_config = merge_config(cwd);
+	let merged = merged_config.servers;
+	let idle_timeout_ms = merged_config.idle_timeout_ms;
+	let has_overrides = merged_config.has_overrides;
 
 	let mut servers = Vec::new();
 	for (name, raw) in &merged {
@@ -118,10 +108,92 @@ pub fn load_config(cwd: &Path) -> LspConfig {
 	LspConfig::new(servers, idle_timeout_ms)
 }
 
-fn parse_defaults() -> Map<String, Value> {
+struct MergedConfig {
+	servers: Map<String, Value>,
+	/// The embedded defaults set five minutes; an explicit `0`/`null` in any
+	/// higher-precedence layer resolves to `None` (idle-kill disabled).
+	idle_timeout_ms: Option<u64>,
+	has_overrides: bool,
+}
+
+fn merge_config(cwd: &Path) -> MergedConfig {
+	let defaults = parse_defaults();
+	let mut servers = defaults.servers;
+	let mut idle_timeout_ms = defaults.idle_timeout_ms.flatten();
+	let mut has_overrides = false;
+	for source in config_sources(cwd).into_iter().rev() {
+		let Some(parsed) = read_config_file(&source) else {
+			continue;
+		};
+		if !parsed.servers.is_empty() {
+			has_overrides = true;
+			merge_servers(&mut servers, &parsed.servers);
+		}
+		if let Some(setting) = parsed.idle_timeout_ms {
+			idle_timeout_ms = setting;
+		}
+	}
+	MergedConfig { servers, idle_timeout_ms, has_overrides }
+}
+
+/// Why a configured server cannot serve this workspace.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ServerState {
+	Disabled,
+	BinaryNotFound,
+}
+
+/// Configured, applicable server that [`load_config`] filters out. Used by
+/// capability reporting to explain missing LSP support instead of reporting a
+/// generic `not_configured`.
+#[derive(Debug, Clone)]
+pub struct UnavailableServer {
+	pub name: String,
+	pub command: String,
+	pub file_types: Vec<String>,
+	pub state: ServerState,
+}
+
+/// Servers configured for `cwd` but unavailable because they are disabled or
+/// their command cannot be resolved. Entries whose root markers do not match the
+/// workspace, invalid entries, and custom linters are omitted.
+#[must_use]
+pub fn unavailable_servers(cwd: &Path) -> Vec<UnavailableServer> {
+	let merged = merge_config(cwd);
+	let mut unavailable = Vec::new();
+	for (name, raw) in &merged.servers {
+		if matches!(name.as_str(), "biome" | "swiftlint") {
+			continue;
+		}
+		let Some(config) = normalize_server(raw) else {
+			continue;
+		};
+		if !has_root_markers(cwd, &config.root_markers) {
+			continue;
+		}
+		let disabled = merged.has_overrides && config.disabled.unwrap_or(false);
+		let state = if disabled {
+			ServerState::Disabled
+		} else if resolve_command(&config.command, cwd).is_none() {
+			ServerState::BinaryNotFound
+		} else {
+			continue;
+		};
+		unavailable.push(UnavailableServer {
+			name: name.clone(),
+			command: config.command,
+			file_types: config.file_types,
+			state,
+		});
+	}
+	unavailable.sort_by(|a, b| a.name.cmp(&b.name));
+	unavailable
+}
+
+fn parse_defaults() -> NormalizedConfig {
 	serde_json::from_str::<Value>(DEFAULTS_JSON)
 		.ok()
-		.and_then(|value| value.as_object().cloned())
+		.and_then(normalize_config)
 		.unwrap_or_default()
 }
 
@@ -306,10 +378,16 @@ fn read_config_file(path: &Path) -> Option<NormalizedConfig> {
 
 fn normalize_config(value: Value) -> Option<NormalizedConfig> {
 	let object = value.as_object()?;
-	let idle_timeout_ms = object
-		.get("idleTimeoutMs")
-		.and_then(Value::as_u64)
-		.filter(|value| *value > 0);
+	let idle_timeout_ms = match object.get("idleTimeoutMs") {
+		None => None,
+		Some(Value::Null) => Some(None),
+		Some(Value::Number(number)) => match number.as_u64() {
+			Some(0) => Some(None),
+			Some(millis) => Some(Some(millis)),
+			None => None,
+		},
+		Some(_) => None,
+	};
 	if let Some(raw_servers) = object.get("servers") {
 		let servers = raw_servers.as_object()?.clone();
 		return Some(NormalizedConfig { servers, idle_timeout_ms });
@@ -565,6 +643,37 @@ mod tests {
 	}
 
 	#[test]
+	fn embedded_defaults_enable_five_minute_idle_kill() {
+		let defaults = parse_defaults();
+		assert_eq!(defaults.idle_timeout_ms, Some(Some(300_000)));
+		assert!(defaults.servers.contains_key("rust-analyzer"));
+	}
+
+	#[test]
+	fn explicit_zero_idle_timeout_disables_idle_kill() {
+		let config = normalize_config(server(r#"{"idleTimeoutMs":0,"servers":{}}"#)).unwrap();
+		assert_eq!(config.idle_timeout_ms, Some(None));
+	}
+
+	#[test]
+	fn explicit_null_idle_timeout_disables_idle_kill() {
+		let config = normalize_config(server(r#"{"idleTimeoutMs":null,"servers":{}}"#)).unwrap();
+		assert_eq!(config.idle_timeout_ms, Some(None));
+	}
+
+	#[test]
+	fn positive_idle_timeout_overrides_each_layer() {
+		let config = normalize_config(server(r#"{"idleTimeoutMs":45000,"servers":{}}"#)).unwrap();
+		assert_eq!(config.idle_timeout_ms, Some(Some(45_000)));
+	}
+
+	#[test]
+	fn absent_idle_timeout_keeps_layer_unset() {
+		let config = normalize_config(server(r#"{"servers":{}}"#)).unwrap();
+		assert_eq!(config.idle_timeout_ms, None);
+	}
+
+	#[test]
 	fn invalid_override_keeps_previous_server() {
 		let mut base = Map::new();
 		base.insert(
@@ -598,5 +707,46 @@ mod tests {
 		assert!(!wildcard_match("*.cabal", "sub/pkg.cabal"));
 		assert!(!wildcard_match("sub?pkg.cabal", "sub/pkg.cabal"));
 		assert!(wildcard_match("*.sln", "App.sln"));
+	}
+
+	#[test]
+	fn idle_timeout_resolves_independently_per_workspace() {
+		let root = std::env::temp_dir().join(format!("omp-lsp-idle-{}", std::process::id()));
+		let fast = root.join("fast");
+		let off = root.join("off");
+		std::fs::create_dir_all(&fast).expect("fast workspace");
+		std::fs::create_dir_all(&off).expect("off workspace");
+		std::fs::write(
+			fast.join("lsp.json"),
+			r#"{"idleTimeoutMs":300000,"servers":{}}"#,
+		)
+		.expect("fast config");
+		std::fs::write(off.join("lsp.json"), r#"{"idleTimeoutMs":0,"servers":{}}"#)
+			.expect("off config");
+		assert_eq!(load_config(&fast).idle_timeout_ms, Some(300_000));
+		assert_eq!(load_config(&off).idle_timeout_ms, None);
+	}
+
+	#[test]
+	fn unavailable_servers_distinguish_disabled_from_missing_binary() {
+		let dir =
+			std::env::temp_dir().join(format!("omp-lsp-unavailable-{}", std::process::id()));
+		std::fs::create_dir_all(&dir).expect("workspace");
+		std::fs::write(
+			dir.join("lsp.json"),
+			r#"{"servers":{
+				"off-ruby":{"command":"sh","fileTypes":[".rb"],"rootMarkers":["."],"disabled":true},
+				"missing-java":{"command":"definitely-not-real-lsp-binary-xyz","fileTypes":[".java"],"rootMarkers":["."]}
+			}}"#,
+		)
+		.expect("lsp config");
+		let servers = unavailable_servers(&dir);
+		let off = servers.iter().find(|server| server.name == "off-ruby").expect("disabled server");
+		assert_eq!(off.state, ServerState::Disabled);
+		let missing = servers
+			.iter()
+			.find(|server| server.name == "missing-java")
+			.expect("unresolved server");
+		assert_eq!(missing.state, ServerState::BinaryNotFound);
 	}
 }

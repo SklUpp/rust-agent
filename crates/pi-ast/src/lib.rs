@@ -5,4 +5,4 @@ pub mod ops;
 pub mod parse_cache;
 pub mod summary;
 
-pub use language::SupportLang;
+pub use language::{LanguageCapability, SemanticOp, SupportLang, semantic_matrix};

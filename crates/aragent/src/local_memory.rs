@@ -353,6 +353,11 @@ pub fn save_learned_lesson_with_embedding(
 	// Exactly-once migration of the pre-store artifact. The file is only read;
 	// the store keeps the canonical rows.
 	store.import_learned_lessons(agent_dir, cwd)?;
+	// Deterministic maintenance on every production lesson write: expire
+	// TTL-inferred rows and mark near-duplicates before inserting, so a
+	// re-learned expired lesson starts from a fresh row. Best effort — dirty
+	// export markers make a failed export retryable.
+	let _ = store.consolidate();
 	let cwd_text = cwd.to_string_lossy();
 	let record = store.add(&AddInput {
 		scope:      Scope::Project,
@@ -741,6 +746,51 @@ mod tests {
 		assert_eq!(text.lines().nth(4), Some("- second"));
 		assert_eq!(text.lines().nth(5), Some("- first"));
 		assert_eq!(text.lines().nth(6), Some("- oldest lesson"));
+	}
+
+	#[test]
+	fn save_runs_consolidation_expiring_inferred_but_keeping_asserted() {
+		let dir = temp_dir();
+		let cwd = Path::new("/work/project");
+		let store = MemoryStore::open(&dir).expect("store");
+		let expired = store
+			.add(&AddInput {
+				scope:      Scope::Project,
+				cwd:        Some("/work/project"),
+				session_id: None,
+				body:       "expired inferred lesson",
+				context:    None,
+				origin:     Origin::Inferred,
+				actor:      Some("agent"),
+				source:     Some("learn"),
+				dedupe:     false,
+			})
+			.expect("inferred row");
+		store.set_ttl(&expired.id, Some(0)).expect("expire inferred");
+		let asserted = store
+			.add(&AddInput::asserted(
+				Scope::Project,
+				Some("/work/project"),
+				"keep asserted lesson",
+			))
+			.expect("asserted row");
+		// Even an asserted row with a TTL is a user commitment: cleanup must
+		// delete only `inferred` rows.
+		store.set_ttl(&asserted.id, Some(0)).expect("ttl asserted");
+		drop(store);
+
+		save_learned_lesson(&dir, cwd, &SaveInput { content: "fresh lesson", context: None }, None)
+			.expect("save");
+
+		let store = MemoryStore::open(&dir).expect("reopen");
+		assert!(store.get(&expired.id, Some("/work/project")).is_err());
+		assert_eq!(
+			store
+				.get(&asserted.id, Some("/work/project"))
+				.expect("asserted row survives maintenance")
+				.body,
+			"keep asserted lesson"
+		);
 	}
 
 	#[test]

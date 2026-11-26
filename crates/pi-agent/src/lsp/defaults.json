@@ -1,4 +1,5 @@
 {
+	"idleTimeoutMs": 300000,
 	"rust-analyzer": {
 		"command": "rust-analyzer",
 		"args": [],

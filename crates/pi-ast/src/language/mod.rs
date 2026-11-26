@@ -337,8 +337,9 @@ static SORTED_ALIASES: LazyLock<Box<[&'static str]>> = LazyLock::new(|| {
 	aliases
 });
 
-#[cfg(feature = "full-grammars")]
-const ALL_LANGS: &[SupportLang] = {
+/// Every variant, independent of which grammars this build links. The
+/// semantic matrix reports compiled-out languages with `ast_supported: false`.
+const EVERY_LANGS: &[SupportLang] = {
 	use SupportLang::*;
 	&[
 		Astro, Bash, C, Cmake, Cpp, CSharp, Dart, Clojure, Css, Diff, Dockerfile, EmacsLisp, Elixir,
@@ -351,11 +352,93 @@ const ALL_LANGS: &[SupportLang] = {
 
 /// The slim build links only the twelve core grammars (plus TSX, which the
 /// TypeScript grammar crate provides).
-#[cfg(not(feature = "full-grammars"))]
-const ALL_LANGS: &[SupportLang] = {
+const CORE_LANGS: &[SupportLang] = {
 	use SupportLang::*;
 	&[Bash, C, Cpp, Go, JavaScript, Json, Markdown, Python, Rust, Toml, Tsx, TypeScript, Yaml]
 };
+
+#[cfg(feature = "full-grammars")]
+const ALL_LANGS: &[SupportLang] = EVERY_LANGS;
+
+#[cfg(not(feature = "full-grammars"))]
+const ALL_LANGS: &[SupportLang] = CORE_LANGS;
+
+/// Semantic operation a backend may or may not provide for a language.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum SemanticOp {
+	ReadSymbols,
+	AstQuery,
+	AstReplace,
+	RepoMapTags,
+	LspDefinition,
+	LspReferences,
+	LspHover,
+	LspRename,
+	LspDiagnostics,
+	LspFormat,
+}
+
+impl SemanticOp {
+	/// Every operation in report order.
+	pub const ALL: [Self; 10] = [
+		Self::ReadSymbols,
+		Self::AstQuery,
+		Self::AstReplace,
+		Self::RepoMapTags,
+		Self::LspDefinition,
+		Self::LspReferences,
+		Self::LspHover,
+		Self::LspRename,
+		Self::LspDiagnostics,
+		Self::LspFormat,
+	];
+
+	/// Stable key used in capability reports and tool output.
+	pub const fn as_str(self) -> &'static str {
+		match self {
+			Self::ReadSymbols => "readSymbols",
+			Self::AstQuery => "astQuery",
+			Self::AstReplace => "astReplace",
+			Self::RepoMapTags => "repoMapTags",
+			Self::LspDefinition => "lspDefinition",
+			Self::LspReferences => "lspReferences",
+			Self::LspHover => "lspHover",
+			Self::LspRename => "lspRename",
+			Self::LspDiagnostics => "lspDiagnostics",
+			Self::LspFormat => "lspFormat",
+		}
+	}
+
+	/// True for operations served by an LSP backend.
+	pub const fn is_lsp(self) -> bool {
+		matches!(
+			self,
+			Self::LspDefinition
+				| Self::LspReferences
+				| Self::LspHover
+				| Self::LspRename
+				| Self::LspDiagnostics
+				| Self::LspFormat
+		)
+	}
+}
+
+/// Language × operation declaration without probing a live backend.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LanguageCapability {
+	pub language: SupportLang,
+	/// The grammar is compiled in and the AST backend can parse the language.
+	pub ast_supported: bool,
+	/// The grammar only exists under the `full-grammars` feature.
+	pub ast_full_grammar_only: bool,
+	/// A tree-sitter tag query is bundled for repo-map ranking.
+	pub repo_map_tags: bool,
+	/// Preferred server name from the LSP defaults, when one exists.
+	pub default_lsp_server: Option<&'static str>,
+	/// Operations this language can route to a backend, regardless of whether
+	/// the server binary is installed.
+	pub supported_ops: Vec<SemanticOp>,
+}
 
 impl SupportLang {
 	/// Languages whose grammar is linked in this build.
@@ -448,9 +531,106 @@ impl SupportLang {
 		from_extension(path)
 	}
 
+	/// Like [`Self::from_path`], but also resolves grammars compiled out of this
+	/// build (for capability reporting only; parsing one still panics).
+	pub fn from_path_unconditional(path: &Path) -> Option<Self> {
+		from_extension_any(path)
+	}
+
+	/// File extensions associated with this language.
+	pub const fn extensions(self) -> &'static [&'static str] {
+		crate::language::extensions(self)
+	}
+
 	pub fn sorted_aliases() -> &'static [&'static str] {
 		&SORTED_ALIASES
 	}
+
+	/// Declare what AST, repo-map, and LSP backends can do for this language.
+	///
+	/// The declaration is static: it never spawns a server or reads the
+	/// filesystem. Callers combine it with resolved server config/status.
+	pub fn capabilities(self) -> LanguageCapability {
+		let ast_supported = self.is_available();
+		let ast_full_grammar_only = !CORE_LANGS.contains(&self);
+		let repo_map_tags = ast_supported && crate::map::has_tag_query(self);
+		let default_lsp_server = default_lsp_server(self);
+		let mut supported_ops = Vec::with_capacity(SemanticOp::ALL.len());
+		for op in SemanticOp::ALL {
+			if op.is_lsp() {
+				if default_lsp_server.is_some() {
+					supported_ops.push(op);
+				}
+			} else if op == SemanticOp::RepoMapTags {
+				if repo_map_tags {
+					supported_ops.push(op);
+				}
+			} else if ast_supported {
+				supported_ops.push(op);
+			}
+		}
+		LanguageCapability {
+			language: self,
+			ast_supported,
+			ast_full_grammar_only,
+			repo_map_tags,
+			default_lsp_server,
+			supported_ops,
+		}
+	}
+}
+
+/// Static language → preferred LSP server name mapping (see `lsp/defaults.json`).
+fn default_lsp_server(language: SupportLang) -> Option<&'static str> {
+	use SupportLang::*;
+	Some(match language {
+		Astro => "astro",
+		Bash => "bashls",
+		C => "clangd",
+		Cpp | ObjC => "clangd",
+		CSharp => "omnisharp",
+		Css => "vscode-css-language-server",
+		Dart => "dartls",
+		Dockerfile => "dockerls",
+		Elixir => "elixirls",
+		Erlang => "erlangls",
+		Go => "gopls",
+		Graphql => "graphql",
+		Haskell => "hls",
+		Hcl => "terraformls",
+		Html => "vscode-html-language-server",
+		Java => "jdtls",
+		JavaScript | Tsx | TypeScript => "typescript-language-server",
+		Json => "vscode-json-language-server",
+		Kotlin => "kotlin-lsp",
+		Lua => "lua-language-server",
+		Markdown => "marksman",
+		Nix => "nixd",
+		Ocaml => "ocamllsp",
+		Odin => "ols",
+		Php => "intelephense",
+		Python => "pyright",
+		Ruby => "ruby-lsp",
+		Rust => "rust-analyzer",
+		Scala => "metals",
+		Svelte => "svelte",
+		Swift => "sourcekit-lsp",
+		Tlaplus => "tlaplus",
+		Vue => "vue-language-server",
+		Yaml => "yamlls",
+		Zig => "zls",
+		_ => return None,
+	})
+}
+
+/// Every known language with its declared semantic operations.
+///
+/// Includes grammars this build does not link (`ast_supported: false`), so a
+/// caller can report a structured "unsupported" result instead of guessing
+/// from a missing alias.
+#[must_use]
+pub fn semantic_matrix() -> Vec<LanguageCapability> {
+	EVERY_LANGS.iter().copied().map(SupportLang::capabilities).collect()
 }
 
 impl fmt::Display for SupportLang {
@@ -640,22 +820,29 @@ const fn extensions(lang: SupportLang) -> &'static [&'static str] {
 	}
 }
 
-/// Return `lang` only when its grammar is linked in this build.
-fn available(lang: SupportLang) -> Option<SupportLang> {
-	lang.is_available().then_some(lang)
+/// Guess language from file extension, restricted to linked grammars.
+fn from_extension(path: &Path) -> Option<SupportLang> {
+	from_extension_in(path, ALL_LANGS)
 }
 
-/// Guess language from file extension.
-fn from_extension(path: &Path) -> Option<SupportLang> {
+/// Guess language from file extension, including grammars compiled out of this
+/// build. Parsing a compiled-out variant panics; capability reporting only
+/// declares it.
+fn from_extension_any(path: &Path) -> Option<SupportLang> {
+	from_extension_in(path, EVERY_LANGS)
+}
+
+fn from_extension_in(path: &Path, langs: &[SupportLang]) -> Option<SupportLang> {
+	let pick = |lang| langs.contains(&lang).then_some(lang);
 	let name = path.file_name()?.to_str()?;
 	if name == "Makefile" || name == "makefile" || name == "GNUmakefile" {
-		return available(SupportLang::Make);
+		return pick(SupportLang::Make);
 	}
 	if name == "Justfile" || name == "justfile" {
-		return available(SupportLang::Just);
+		return pick(SupportLang::Just);
 	}
 	if name == "CMakeLists.txt" {
-		return available(SupportLang::Cmake);
+		return pick(SupportLang::Cmake);
 	}
 	if name == "Dockerfile"
 		|| name == "dockerfile"
@@ -664,10 +851,10 @@ fn from_extension(path: &Path) -> Option<SupportLang> {
 		|| name == "Containerfile"
 		|| name == "containerfile"
 	{
-		return available(SupportLang::Dockerfile);
+		return pick(SupportLang::Dockerfile);
 	}
 	if name == ".emacs" {
-		return available(SupportLang::EmacsLisp);
+		return pick(SupportLang::EmacsLisp);
 	}
 
 	// Extensionless shell rc/profile files. `Path::extension` returns `None`
@@ -696,10 +883,7 @@ fn from_extension(path: &Path) -> Option<SupportLang> {
 	}
 
 	let ext = path.extension()?.to_str()?;
-	SupportLang::all_langs()
-		.iter()
-		.copied()
-		.find(|&l| extensions(l).contains(&ext))
+	langs.iter().copied().find(|&lang| extensions(lang).contains(&ext))
 }
 
 static LANG_ALIASES: phf::Map<&'static str, SupportLang> = phf_map! {
@@ -861,3 +1045,44 @@ static LANG_ALIASES: phf::Map<&'static str, SupportLang> = phf_map! {
 "yml"            => SupportLang::Yaml,
 "zig"            => SupportLang::Zig,
 };
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+	use std::path::Path;
+
+	#[test]
+	fn unconditional_detection_resolves_full_grammar_languages() {
+		assert_eq!(
+			SupportLang::from_path_unconditional(Path::new("Main.java")),
+			Some(SupportLang::Java)
+		);
+		assert_eq!(
+			SupportLang::from_path_unconditional(Path::new("lib.rs")),
+			Some(SupportLang::Rust)
+		);
+		assert_eq!(SupportLang::from_path_unconditional(Path::new("notes.unknownext")), None);
+	}
+
+	#[test]
+	fn capabilities_expose_extensions_and_static_ops() {
+		let rust = SupportLang::Rust.capabilities();
+		assert_eq!(rust.language, SupportLang::Rust);
+		assert!(rust.ast_supported);
+		assert_eq!(rust.ast_full_grammar_only, false);
+		assert_eq!(rust.default_lsp_server, Some("rust-analyzer"));
+		assert!(rust.supported_ops.contains(&SemanticOp::LspDefinition));
+		assert!(SupportLang::Rust.extensions().contains(&"rs"));
+	}
+
+	#[cfg(not(feature = "full-grammars"))]
+	#[test]
+	fn slim_build_keeps_lsp_ops_for_compiled_out_language() {
+		let java = SupportLang::from_path_unconditional(Path::new("Main.java"))
+			.expect("full-grammar language must be recognized")
+			.capabilities();
+		assert!(!java.ast_supported);
+		assert!(java.ast_full_grammar_only);
+		assert!(java.supported_ops.contains(&SemanticOp::LspDefinition));
+	}
+}

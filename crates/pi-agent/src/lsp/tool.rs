@@ -5,7 +5,7 @@
 //! by the same formatter used by write-through (`formatContent` upstream).
 
 use std::{
-	path::Path,
+	path::{Path, PathBuf},
 	sync::{
 		Arc,
 		atomic::{AtomicBool, Ordering},
@@ -31,7 +31,7 @@ use super::{
 	},
 	config::{
 		get_lsp_server_for_file, get_lsp_servers, get_lsp_servers_for_file, get_servers_for_file,
-		is_method_not_found_error,
+		is_method_not_found_error, unavailable_servers, ServerState, UnavailableServer,
 	},
 	diagnostics::{
 		self, BATCH_DIAGNOSTICS_WAIT_TIMEOUT_MS, SINGLE_DIAGNOSTICS_WAIT_TIMEOUT_MS,
@@ -40,8 +40,8 @@ use super::{
 	linter,
 	lspmux,
 	types::{
-		CodeAction, CodeActionContext, CodeActionOrCommand, Diagnostic, DocumentSymbol, LspParams,
-		Position, Range, ServerConfig, SymbolInformation, TextEdit, WorkspaceEdit,
+		CodeAction, CodeActionContext, CodeActionOrCommand, Diagnostic, DocumentSymbol, LspConfig,
+		LspParams, Position, Range, ServerConfig, SymbolInformation, TextEdit, WorkspaceEdit,
 	},
 	utils::{
 		dedupe_workspace_symbols, file_to_uri, filter_workspace_symbols, format_code_action,
@@ -248,9 +248,9 @@ impl Tool for LspTool {
 					"enum": [
 						"diagnostics", "definition", "references", "hover", "symbols", "rename",
 						"rename_file", "code_actions", "format", "type_definition",
-						"implementation", "status", "reload", "capabilities", "request"
+						"implementation", "status", "reload", "capabilities", "matrix", "request"
 					],
-					"description": "LSP action. Use `*` as file for workspace-scoped diagnostics/symbols/reload."
+					"description": "LSP action. Use `*` as file for workspace-scoped diagnostics/symbols/reload; `matrix` reports language × operation support without starting a server."
 				},
 				"file": {
 					"type": "string",
@@ -358,6 +358,7 @@ impl Tool for LspTool {
 			"rename_file" => self.rename_file(&params, &cwd, &run, &action).await,
 			"format" => self.format(&params, &cwd, &run, &action).await,
 			"capabilities" => self.capabilities(&params, &cwd, &run, &action).await,
+			"matrix" => self.matrix(&params, &cwd, &action),
 			"request" => self.request(&params, &cwd, &run, &action).await,
 			"symbols" if params.file.as_deref() == Some("*") || params.file.is_none() => {
 				self.workspace_symbols(&params, &cwd, &run, &action).await
@@ -1379,6 +1380,154 @@ impl LspTool {
 		))
 	}
 
+	/// Static language × operation support, refined with the resolved LSP
+	/// config (configured / binary resolved / running) without spawning a server.
+	fn matrix(
+		&self,
+		params: &LspParams,
+		cwd: &Path,
+		action: &str,
+	) -> Result<ToolResult, ToolError> {
+		let selected = params.file.as_deref().filter(|file| *file != "*");
+		let selected_path = selected.map(|file| resolve_to_cwd(file, cwd));
+		let ast_lang = selected_path
+			.as_deref()
+			.and_then(pi_ast::SupportLang::from_path_unconditional);
+
+		let config = get_config(cwd);
+		let unavailable = unavailable_servers(cwd);
+		let active_names: Vec<String> = get_active_clients()
+			.into_iter()
+			.map(|status| status.name)
+			.collect();
+		let file_servers = selected_path
+			.as_deref()
+			.map(|target| get_lsp_servers_for_file(&config, target));
+
+		// A known path may carry no AST language (`.jsonc`, `.mli`, custom LSP
+		// `fileTypes`). Keep it when an LSP server applies; only truly unknown
+		// files get the unsupported result.
+		if let Some(target) = selected_path.as_deref()
+			&& ast_lang.is_none()
+		{
+			let available = file_servers.as_ref().and_then(|servers| servers.first().cloned());
+			let unavailable_entry = unavailable_for_path(&unavailable, target);
+			if available.is_none() && unavailable_entry.is_none() {
+				let file = selected.expect("selected path implies a file");
+				let reason = "unknown file extension";
+				let mut report = details(action, true, None, params);
+				report["file"] = json!(file);
+				report["supported"] = Value::Bool(false);
+				report["language"] = Value::Null;
+				report["reason"] = json!(reason);
+				return Ok(text_result(
+					format!("No semantic capabilities for {file}: {reason}"),
+					true,
+					report,
+				));
+			}
+			let info = resolve_server(available, unavailable_entry, &active_names, None);
+			let mut operations = serde_json::Map::new();
+			for op in pi_ast::SemanticOp::ALL {
+				let supported = op.is_lsp() && info.ready;
+				let reason = if supported {
+					None
+				} else if op.is_lsp() {
+					Some(info.state)
+				} else {
+					Some("no AST grammar")
+				};
+				let _ = operations.insert(op.as_str().to_string(), operation_entry(supported, reason));
+			}
+			let line = format!(
+				"{}: ast=no, repoMapTags=no, lsp={} ({})",
+				selected.expect("selected path implies a file"),
+				info.name.as_deref().unwrap_or("-"),
+				info.state,
+			);
+			let mut report = details(action, true, None, params);
+			report["file"] = json!(selected.expect("selected path implies a file"));
+			report["supported"] = Value::Bool(info.ready);
+			report["languages"] = json!([{
+				"language": Value::Null,
+				"astSupported": false,
+				"astFullGrammarOnly": false,
+				"repoMapTags": false,
+				"defaultLspServer": Value::Null,
+				"lspServer": lsp_server_json(&info),
+				"operations": operations,
+			}]);
+			return Ok(text_result(format!("Semantic matrix for {line}"), true, report));
+		}
+
+		let mut languages = Vec::new();
+		let mut lines = Vec::new();
+		for capability in pi_ast::semantic_matrix() {
+			if ast_lang.is_some_and(|language| language != capability.language) {
+				continue;
+			}
+			let available = match file_servers.as_ref() {
+				Some(servers) => servers.first().cloned(),
+				None => server_for_language(&config, capability.language),
+			};
+			let unavailable_entry = match selected_path.as_deref() {
+				Some(target) => unavailable_for_path(&unavailable, target),
+				None => unavailable_for_language(&unavailable, capability.language),
+			};
+			let info = resolve_server(
+				available,
+				unavailable_entry,
+				&active_names,
+				capability.default_lsp_server,
+			);
+
+			let mut operations = serde_json::Map::new();
+			for op in pi_ast::SemanticOp::ALL {
+				let supported = if op.is_lsp() {
+					info.ready
+				} else {
+					capability.supported_ops.contains(&op)
+				};
+				let reason = if supported {
+					None
+				} else if !capability.ast_supported && !op.is_lsp() {
+					Some("grammar not compiled in this build")
+				} else if op.is_lsp() {
+					Some(info.state)
+				} else {
+					Some("operation not provided")
+				};
+				let _ = operations.insert(op.as_str().to_string(), operation_entry(supported, reason));
+			}
+
+			let name = capability.language.canonical_name();
+			lines.push(format!(
+				"{name}: ast={}, repoMapTags={}, lsp={} ({})",
+				if capability.ast_supported { "yes" } else { "no" },
+				if capability.repo_map_tags { "yes" } else { "no" },
+				info.name.as_deref().unwrap_or("-"),
+				info.state,
+			));
+			languages.push(json!({
+				"language": name,
+				"astSupported": capability.ast_supported,
+				"astFullGrammarOnly": capability.ast_full_grammar_only,
+				"repoMapTags": capability.repo_map_tags,
+				"defaultLspServer": capability.default_lsp_server,
+				"lspServer": lsp_server_json(&info),
+				"operations": operations,
+			}));
+		}
+
+		let heading = match selected {
+			Some(file) => format!("Semantic matrix for {file}"),
+			None => format!("Semantic matrix ({} languages)", languages.len()),
+		};
+		let mut report = details(action, true, None, params);
+		report["languages"] = Value::Array(languages);
+		Ok(text_result(format!("{heading}\n{}", lines.join("\n")), true, report))
+	}
+
 	async fn capabilities(
 		&self,
 		params: &LspParams,
@@ -1873,6 +2022,135 @@ async fn execute_command(
 		.map(|_| ())
 }
 
+struct ResolvedServer {
+	name: Option<String>,
+	configured: bool,
+	command: Option<String>,
+	resolved: bool,
+	disabled: bool,
+	started: bool,
+	ready: bool,
+	state: &'static str,
+}
+
+fn resolve_server(
+	available: Option<(String, ServerConfig)>,
+	unavailable: Option<&UnavailableServer>,
+	active_names: &[String],
+	default_name: Option<&str>,
+) -> ResolvedServer {
+	let configured_name = available
+		.as_ref()
+		.map(|(name, _)| name.clone())
+		.or_else(|| unavailable.map(|entry| entry.name.clone()));
+	let configured = configured_name.is_some();
+	let name = configured_name.or_else(|| default_name.map(str::to_string));
+	let state = if available.is_some() {
+		"available"
+	} else if let Some(entry) = unavailable {
+		match entry.state {
+			ServerState::Disabled => "disabled",
+			ServerState::BinaryNotFound => "binary_not_found",
+		}
+	} else {
+		"not_configured"
+	};
+	let command = available
+		.as_ref()
+		.map(|(_, server)| server.command.clone())
+		.or_else(|| unavailable.map(|entry| entry.command.clone()));
+	let started = command
+		.as_ref()
+		.is_some_and(|command| active_names.iter().any(|name| name == command));
+	ResolvedServer {
+		name,
+		configured,
+		command,
+		resolved: available.is_some(),
+		disabled: available.is_none()
+			&& unavailable.is_some_and(|entry| entry.state == ServerState::Disabled),
+		started,
+		ready: available.is_some(),
+		state,
+	}
+}
+
+fn lsp_server_json(info: &ResolvedServer) -> Value {
+	json!({
+		"name": info.name,
+		"configured": info.configured,
+		"command": info.command,
+		"resolved": info.resolved,
+		"disabled": info.disabled,
+		"started": info.started,
+		"state": info.state,
+	})
+}
+
+fn operation_entry(supported: bool, reason: Option<&str>) -> Value {
+	let mut entry = json!({ "supported": supported });
+	if let Some(reason) = reason {
+		entry["reason"] = json!(reason);
+	}
+	entry
+}
+
+fn server_for_language(
+	config: &LspConfig,
+	language: pi_ast::SupportLang,
+) -> Option<(String, ServerConfig)> {
+	for &extension in language.extensions() {
+		let probe = PathBuf::from(format!("probe.{extension}"));
+		if let Some(found) = get_lsp_servers_for_file(config, &probe).into_iter().next() {
+			return Some(found);
+		}
+	}
+	None
+}
+
+fn unavailable_for_path<'a>(
+	servers: &'a [UnavailableServer],
+	path: &Path,
+) -> Option<&'a UnavailableServer> {
+	let extension = path
+		.extension()
+		.and_then(|value| value.to_str())
+		.map(|value| format!(".{}", value.to_ascii_lowercase()))
+		.unwrap_or_default();
+	let extension_no_dot = extension.trim_start_matches('.').to_string();
+	let file_name = path
+		.file_name()
+		.and_then(|value| value.to_str())
+		.map(str::to_ascii_lowercase)
+		.unwrap_or_default();
+	servers.iter().find(|server| {
+		server.file_types.iter().any(|file_type| {
+			let normalized = file_type.to_ascii_lowercase();
+			let normalized_no_dot = normalized.trim_start_matches('.');
+			normalized == extension
+				|| normalized == file_name
+				|| normalized_no_dot == extension_no_dot.as_str()
+				|| normalized_no_dot == file_name.as_str()
+		})
+	})
+}
+
+fn unavailable_for_language<'a>(
+	servers: &'a [UnavailableServer],
+	language: pi_ast::SupportLang,
+) -> Option<&'a UnavailableServer> {
+	let extensions = language.extensions();
+	servers.iter().find(|server| {
+		server.file_types.iter().any(|file_type| {
+			let extension = file_type.trim_start_matches('.');
+			extensions
+				.iter()
+				.copied()
+				.any(|candidate| candidate.eq_ignore_ascii_case(extension))
+		})
+	})
+}
+
 #[cfg(test)]
 mod readonly_action_tests {
 	use super::*;
@@ -1908,5 +2186,279 @@ mod readonly_action_tests {
 			Err(error) => error.to_string().contains("not permitted in this read-only session"),
 		};
 		assert!(!rejected, "write-capable tool must not apply the read-only gate");
+	}
+}
+
+#[cfg(test)]
+mod semantic_matrix_tests {
+	use super::*;
+	use crate::state::AgentContext;
+
+	#[tokio::test]
+	async fn matrix_declares_supported_language_operations() {
+		let tool = LspTool::with_shared(false);
+		let ctx = AgentContext::new(std::env::temp_dir());
+		let result = tool
+			.execute(&json!({"action": "matrix", "file": "main.rs"}), &ctx)
+			.await
+			.expect("matrix must not error");
+		assert!(!result.is_error);
+		let details = result.details.expect("structured details");
+		let languages = details["languages"].as_array().expect("languages array");
+		assert_eq!(languages.len(), 1, "file filter selects one language");
+		let row = &languages[0];
+		assert_eq!(row["language"], "rust");
+		assert_eq!(row["astSupported"], true);
+		assert_eq!(row["astFullGrammarOnly"], false);
+		assert_eq!(row["repoMapTags"], true);
+		assert_eq!(row["operations"]["readSymbols"]["supported"], true);
+		assert_eq!(row["operations"]["astQuery"]["supported"], true);
+		assert_eq!(row["operations"]["astReplace"]["supported"], true);
+		assert_eq!(row["operations"].as_object().expect("operations").len(), 10);
+	}
+
+	#[tokio::test]
+	async fn matrix_reports_unknown_extension_as_unsupported() {
+		let tool = LspTool::with_shared(false);
+		let ctx = AgentContext::new(std::env::temp_dir());
+		let result = tool
+			.execute(&json!({"action": "matrix", "file": "notes.unknownext"}), &ctx)
+			.await
+			.expect("unsupported input is an in-band result");
+		assert!(!result.is_error);
+		assert!(result.content.contains("No semantic capabilities"), "{}", result.content);
+		let details = result.details.expect("structured details");
+		assert_eq!(details["supported"], false);
+		assert_eq!(details["language"], Value::Null);
+		assert_eq!(details["file"], "notes.unknownext");
+	}
+
+	#[tokio::test]
+	async fn capabilities_reports_unknown_extension_without_starting_a_server() {
+		let tool = LspTool::with_shared(false);
+		let ctx = AgentContext::new(std::env::temp_dir());
+		let result = tool
+			.execute(&json!({"action": "capabilities", "file": "notes.unknownext"}), &ctx)
+			.await
+			.expect("unknown extension is an in-band result");
+		assert!(result.is_error);
+		assert!(result.content.contains("No language server found for this file"), "{}", result.content);
+		let details = result.details.expect("structured details");
+		assert_eq!(details["success"], false);
+	}
+
+	#[tokio::test]
+	async fn read_only_tool_allows_matrix() {
+		let tool = LspTool::with_shared_read_only(false, true);
+		let ctx = AgentContext::new(std::env::temp_dir());
+		let result = tool
+			.execute(&json!({"action": "matrix", "file": "main.rs"}), &ctx)
+			.await
+			.expect("matrix is read-only");
+		assert!(!result.content.contains("not permitted in this read-only session"));
+	}
+
+	fn project(config: &str) -> std::path::PathBuf {
+		static COUNTER: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+		let dir = std::env::temp_dir().join(format!(
+			"omp-lsp-matrix-{}-{}",
+			std::process::id(),
+			COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+		));
+		std::fs::create_dir_all(&dir).expect("temp project");
+		std::fs::write(dir.join("lsp.json"), config).expect("lsp config");
+		dir
+	}
+
+	#[test]
+	fn matrix_is_in_shared_action_lists() {
+		assert!(crate::lsp::LSP_READONLY_ACTIONS.contains(&"matrix"));
+		assert!(crate::lsp::types::LSP_ACTIONS.contains(&"matrix"));
+	}
+
+	#[tokio::test]
+	async fn matrix_uses_configured_alternative_server_and_unconditional_language() {
+		let command = std::env::current_exe()
+			.expect("test executable")
+			.to_string_lossy()
+			.to_string();
+		let config = json!({
+			"idleTimeoutMs": 0,
+			"servers": {
+				"custom-py": {
+					"command": command,
+					"fileTypes": [".py", ".java"],
+					"rootMarkers": ["."]
+				}
+			}
+		})
+		.to_string();
+		let dir = project(&config);
+		let tool = LspTool::with_shared(false);
+		let ctx = AgentContext::new(dir);
+
+		let python = tool
+			.execute(&json!({"action": "matrix", "file": "script.py"}), &ctx)
+			.await
+			.expect("python matrix");
+		let details = python.details.expect("details");
+		let row = &details["languages"][0];
+		assert_eq!(row["language"], "python");
+		assert_eq!(row["lspServer"]["name"], "custom-py");
+		assert_eq!(row["lspServer"]["state"], "available");
+		assert_eq!(row["operations"]["lspDefinition"]["supported"], true);
+
+		// Full-grammar-only language: recognized even when its grammar is not
+		// compiled in, and its configured LSP stays usable.
+		let java = tool
+			.execute(&json!({"action": "matrix", "file": "Main.java"}), &ctx)
+			.await
+			.expect("java matrix");
+		let details = java.details.expect("details");
+		let row = &details["languages"][0];
+		assert_eq!(row["language"], "java");
+		assert_eq!(row["lspServer"]["name"], "custom-py");
+		assert_eq!(row["operations"]["lspDefinition"]["supported"], true);
+		assert_eq!(
+			row["astSupported"].as_bool(),
+			Some(pi_ast::SupportLang::Java.is_available())
+		);
+	}
+
+	#[tokio::test]
+	async fn matrix_does_not_use_language_wide_server_for_specific_file() {
+		let dir = project(
+			r#"{"idleTimeoutMs":0,"servers":{
+				"off-py":{"command":"sh","fileTypes":[".py"],"rootMarkers":["."],"disabled":true}
+			}}"#,
+		);
+		let tool = LspTool::with_shared(false);
+		let ctx = AgentContext::new(dir);
+
+		// `script.pyi` does not match the disabled `.py` server's file types, so
+		// it must not inherit the language-wide `disabled` reason.
+		let stub = tool
+			.execute(&json!({"action": "matrix", "file": "script.pyi"}), &ctx)
+			.await
+			.expect("stub matrix");
+		let details = stub.details.expect("details");
+		let row = &details["languages"][0];
+		assert_eq!(row["language"], "python");
+		assert_eq!(row["lspServer"]["state"], "not_configured");
+		assert_eq!(row["lspServer"]["configured"], false);
+		assert_eq!(row["operations"]["lspDefinition"]["reason"], "not_configured");
+
+		let python = tool
+			.execute(&json!({"action": "matrix", "file": "script.py"}), &ctx)
+			.await
+			.expect("python matrix");
+		let details = python.details.expect("details");
+		let row = &details["languages"][0];
+		assert_eq!(row["lspServer"]["state"], "disabled");
+	}
+
+	#[tokio::test]
+	async fn matrix_reports_lsp_only_file_types_without_ast_language() {
+		let command = std::env::current_exe()
+			.expect("test executable")
+			.to_string_lossy()
+			.to_string();
+		let config = json!({
+			"idleTimeoutMs": 0,
+			"servers": {
+				"jsonc-lsp": {
+					"command": command,
+					"fileTypes": [".jsonc"],
+					"rootMarkers": ["."]
+				}
+			}
+		})
+		.to_string();
+		let dir = project(&config);
+		let tool = LspTool::with_shared(false);
+		let ctx = AgentContext::new(dir);
+
+		let result = tool
+			.execute(&json!({"action": "matrix", "file": "config.jsonc"}), &ctx)
+			.await
+			.expect("lsp-only matrix");
+		let details = result.details.expect("details");
+		assert_eq!(details["supported"], true);
+		let row = &details["languages"][0];
+		assert_eq!(row["language"], Value::Null);
+		assert_eq!(row["astSupported"], false);
+		assert_eq!(row["lspServer"]["name"], "jsonc-lsp");
+		assert_eq!(row["lspServer"]["state"], "available");
+		assert_eq!(row["operations"]["readSymbols"]["supported"], false);
+		assert_eq!(row["operations"]["readSymbols"]["reason"], "no AST grammar");
+		assert_eq!(row["operations"]["lspDefinition"]["supported"], true);
+	}
+
+	#[tokio::test]
+	async fn matrix_available_server_does_not_inherit_disabled_flag() {
+		let command = std::env::current_exe()
+			.expect("test executable")
+			.to_string_lossy()
+			.to_string();
+		let config = json!({
+			"idleTimeoutMs": 0,
+			"servers": {
+				"working-py": {
+					"command": command,
+					"fileTypes": [".py"],
+					"rootMarkers": ["."]
+				},
+				"alt-off-py": {
+					"command": "sh",
+					"fileTypes": [".py"],
+					"rootMarkers": ["."],
+					"disabled": true
+				}
+			}
+		})
+		.to_string();
+		let dir = project(&config);
+		let tool = LspTool::with_shared(false);
+		let ctx = AgentContext::new(dir);
+
+		let result = tool
+			.execute(&json!({"action": "matrix", "file": "script.py"}), &ctx)
+			.await
+			.expect("matrix");
+		let details = result.details.expect("details");
+		let row = &details["languages"][0];
+		assert_eq!(row["lspServer"]["name"], "working-py");
+		assert_eq!(row["lspServer"]["state"], "available");
+		assert_eq!(row["lspServer"]["disabled"], false);
+		assert_eq!(row["operations"]["lspDefinition"]["supported"], true);
+	}
+
+	#[tokio::test]
+	async fn matrix_explains_disabled_missing_and_unconfigured_servers() {
+		let dir = project(
+			r#"{"idleTimeoutMs":0,"servers":{
+				"off-ini":{"command":"sh","fileTypes":[".ini"],"rootMarkers":["."],"disabled":true},
+				"missing-diff":{"command":"definitely-not-real-lsp-binary-xyz","fileTypes":[".diff"],"rootMarkers":["."]}
+			}}"#,
+		);
+		let tool = LspTool::with_shared(false);
+		let ctx = AgentContext::new(dir);
+		for (file, language, state, configured) in [
+			("config.ini", "ini", "disabled", true),
+			("change.diff", "diff", "binary_not_found", true),
+			("Cargo.toml", "toml", "not_configured", false),
+		] {
+			let result = tool
+				.execute(&json!({"action": "matrix", "file": file}), &ctx)
+				.await
+				.expect("matrix");
+			let details = result.details.expect("details");
+			let row = &details["languages"][0];
+			assert_eq!(row["language"], language);
+			assert_eq!(row["lspServer"]["state"], state);
+			assert_eq!(row["lspServer"]["configured"], configured);
+			assert_eq!(row["operations"]["lspDefinition"]["supported"], false);
+			assert_eq!(row["operations"]["lspDefinition"]["reason"], state);
+		}
 	}
 }

@@ -2099,35 +2099,39 @@ pub async fn reload_server(
 // Config cache and idle shutdown
 // =============================================================================
 
-static IDLE_TIMEOUT_MS: AtomicU64 = AtomicU64::new(0);
 static IDLE_CHECKER_STARTED: AtomicBool = AtomicBool::new(false);
 
-pub fn set_idle_timeout(timeout_ms: Option<u64>) {
-	IDLE_TIMEOUT_MS.store(timeout_ms.unwrap_or(0), Ordering::Relaxed);
-	if timeout_ms.is_some_and(|value| value > 0)
-		&& tokio::runtime::Handle::try_current().is_ok()
-		&& !IDLE_CHECKER_STARTED.swap(true, Ordering::SeqCst)
+/// Start the process-wide idle checker once a workspace enables a timeout.
+/// Each tick resolves the timeout from the client's own workspace config, so
+/// one workspace's `0` never disables another workspace's idle-kill.
+fn ensure_idle_checker(timeout_ms: Option<u64>) {
+	if !timeout_ms.is_some_and(|value| value > 0)
+		|| tokio::runtime::Handle::try_current().is_err()
+		|| IDLE_CHECKER_STARTED.swap(true, Ordering::SeqCst)
 	{
-		tokio::spawn(async {
-			loop {
-				tokio::time::sleep(Duration::from_secs(60)).await;
-				let timeout = IDLE_TIMEOUT_MS.load(Ordering::Relaxed);
-				if timeout == 0 {
+		return;
+	}
+	tokio::spawn(async {
+		loop {
+			tokio::time::sleep(Duration::from_secs(60)).await;
+			let candidates: Vec<Arc<LspClient>> =
+				lock(&registry().links).values().map(|link| Arc::clone(&link.client)).collect();
+			for client in candidates {
+				if client.pending_count() > 0 {
 					continue;
 				}
-				let candidates: Vec<Arc<LspClient>> =
-					lock(&registry().links).values().map(|link| Arc::clone(&link.client)).collect();
-				for client in candidates {
-					if client.pending_count() > 0 {
-						continue;
-					}
-					if client.idle_for() > Duration::from_millis(timeout) {
-						let _ = shutdown_client_instance(&client).await;
-					}
+				let timeout = workspace_idle_timeout(&client.cwd);
+				if timeout > 0 && client.idle_for() > Duration::from_millis(timeout) {
+					let _ = shutdown_client_instance(&client).await;
 				}
 			}
-		});
-	}
+		}
+	});
+}
+
+/// Per-workspace idle-kill timeout; `0` disables it for that workspace only.
+fn workspace_idle_timeout(cwd: &Path) -> u64 {
+	get_config(cwd).idle_timeout_ms.unwrap_or(0)
 }
 
 static CONFIG_CACHE: LazyLock<Mutex<HashMap<String, Arc<LspConfig>>>> =
@@ -2142,12 +2146,12 @@ fn config_cache() -> &'static Mutex<HashMap<String, Arc<LspConfig>>> {
 pub fn get_config(cwd: &Path) -> Arc<LspConfig> {
 	let key = normalize_cwd(cwd);
 	if let Some(config) = lock(config_cache()).get(&key).cloned() {
-		set_idle_timeout(config.idle_timeout_ms);
+		ensure_idle_checker(config.idle_timeout_ms);
 		return config;
 	}
 	let config = Arc::new(load_config(cwd));
 	lock(config_cache()).insert(key, config.clone());
-	set_idle_timeout(config.idle_timeout_ms);
+	ensure_idle_checker(config.idle_timeout_ms);
 	config
 }
 
@@ -2171,4 +2175,27 @@ pub fn lsp_servers(config: &LspConfig) -> Vec<(String, ServerConfig)> {
 #[must_use]
 pub fn display_path(path: &Path, cwd: &Path) -> String {
 	format_path_relative_to_cwd(path, cwd)
+}
+
+#[cfg(test)]
+mod idle_timeout_tests {
+	use super::*;
+
+	#[test]
+	fn idle_timeout_is_read_per_workspace() {
+		let root = std::env::temp_dir().join(format!("omp-lsp-client-idle-{}", std::process::id()));
+		let fast = root.join("fast");
+		let off = root.join("off");
+		std::fs::create_dir_all(&fast).expect("fast workspace");
+		std::fs::create_dir_all(&off).expect("off workspace");
+		std::fs::write(
+			fast.join("lsp.json"),
+			r#"{"idleTimeoutMs":300000,"servers":{}}"#,
+		)
+		.expect("fast config");
+		std::fs::write(off.join("lsp.json"), r#"{"idleTimeoutMs":0,"servers":{}}"#)
+			.expect("off config");
+		assert_eq!(workspace_idle_timeout(&fast), 300_000);
+		assert_eq!(workspace_idle_timeout(&off), 0);
+	}
 }
