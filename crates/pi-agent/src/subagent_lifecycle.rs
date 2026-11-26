@@ -1098,20 +1098,6 @@ impl SubagentLifecycleManager {
 	}
 
 	async fn park_epoch(&self, id: &str, expected_epoch: Option<u64>) -> bool {
-		let mut state = lock(&self.state);
-		let Some((status, entry_epoch)) =
-			state.entries.get(id).map(|entry| (entry.status, entry.epoch))
-		else {
-			return false;
-		};
-		if status == LifecycleStatus::Tombstoned {
-			return false;
-		}
-		if let Some(expected) = expected_epoch
-			&& (entry_epoch != expected || status != LifecycleStatus::Idle)
-		{
-			return false;
-		}
 		let notify = lock(&self.exits)
 			.entry(id.to_string())
 			.or_insert_with(|| Arc::new(tokio::sync::Notify::new()))
@@ -1119,21 +1105,37 @@ impl SubagentLifecycleManager {
 		let notified = notify.notified();
 		tokio::pin!(notified);
 		notified.as_mut().enable();
-		let had_live = if let Some(live) = state.live.get(id) {
-			live.cancel.cancel();
-			// Keep the slot: the actor removes it in `finish_actor` (or the
-			// actor-exit guard on panic/abort) only after its effect and flush.
-			true
-		} else {
-			false
+		let had_live = {
+			let mut state = lock(&self.state);
+			let Some((status, entry_epoch)) =
+				state.entries.get(id).map(|entry| (entry.status, entry.epoch))
+			else {
+				return false;
+			};
+			if status == LifecycleStatus::Tombstoned {
+				return false;
+			}
+			if let Some(expected) = expected_epoch
+				&& (entry_epoch != expected || status != LifecycleStatus::Idle)
+			{
+				return false;
+			}
+			let had_live = if let Some(live) = state.live.get(id) {
+				live.cancel.cancel();
+				// Keep the slot: the actor removes it in `finish_actor` (or the
+				// actor-exit guard on panic/abort) only after its effect and flush.
+				true
+			} else {
+				false
+			};
+			state.history.remove(id);
+			if let Some(entry) = state.entries.get_mut(id) {
+				entry.epoch = entry.epoch.wrapping_add(1);
+				entry.status = LifecycleStatus::Parked;
+				entry.last_activity = now_ms();
+			}
+			had_live
 		};
-		state.history.remove(id);
-		if let Some(entry) = state.entries.get_mut(id) {
-			entry.epoch = entry.epoch.wrapping_add(1);
-			entry.status = LifecycleStatus::Parked;
-			entry.last_activity = now_ms();
-		}
-		drop(state);
 		if had_live {
 			notified.as_mut().await;
 		}

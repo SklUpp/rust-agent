@@ -1710,9 +1710,9 @@ impl AgentLoop {
 						)
 						.await;
 						self.persist_conversation(&state.messages).await?;
-						for parts in pending_injections {
-							announce_user_steer(&events, &parts).await;
-							state.messages.push(Message::user_with_parts(parts));
+						for injection in pending_injections {
+							announce_user_steer(&events, &injection.parts).await;
+							self.accept_injection(state, injection).await?;
 						}
 						self.persist_conversation(&state.messages).await?;
 						return Err(AgentError::Internal(format!(
