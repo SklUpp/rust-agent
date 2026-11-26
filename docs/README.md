@@ -32,6 +32,7 @@
 | `agent-execution-contract-proposal.md` | исполнение инструментов, admission и границы эффекта |
 | `agent-core-extraction-design.md` | извлечение Rust-ядра из донора |
 | `agent-loop-tool-implementation-map.md` | карта реализации agent loop и инструментов |
+| `modular-reuse-blueprint.md` | согласованная матрица модульного переиспользования, Cargo features и лицензий (2026-11-20) |
 
 ## Архив исследований
 
