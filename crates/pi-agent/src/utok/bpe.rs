@@ -437,7 +437,7 @@ mod merge_tests {
 		for (rank, token) in tokens.iter().enumerate() {
 			let rank = rank as u32;
 			table.max_token_len = table.max_token_len.max(token.len());
-			if let [a, b] = *token {
+			if let &[a, b] = *token {
 				table.pairs[usize::from(a) << 8 | usize::from(b)] = rank;
 			} else if let Some(key) = pack(token) {
 				table.short.insert(key, rank);
