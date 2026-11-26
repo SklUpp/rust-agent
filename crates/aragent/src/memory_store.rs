@@ -3174,7 +3174,13 @@ mod tests {
 		let path = MemoryStore::database_path(&dir);
 		let id = "0123456789abcdef0123456789abcdef";
 		let body = "preserved migration lesson";
-		let dedupe = record_dedupe_key(Scope::Project, Some("/work/one"), None, body, None);
+		let dedupe = record_dedupe_key(
+			Scope::Project,
+			Some("/work/one"),
+			None,
+			body,
+			Some("old context"),
+		);
 		{
 			let connection = Connection::open(&path).expect("raw v1 open");
 			connection

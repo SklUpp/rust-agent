@@ -919,7 +919,7 @@ mod tests {
 		let status = status();
 		assert_eq!(status.backend, "local");
 		assert!(status.active && status.writable && status.searchable);
-		assert!(status.message.contains("lexical recall"));
+		assert!(status.message.contains("FTS5/BM25 recall"));
 	}
 
 	#[test]
