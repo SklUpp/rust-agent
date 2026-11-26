@@ -24,7 +24,7 @@ use std::{
 
 use tokio::process::Command;
 
-use crate::{IsoError, IsoResult, command_failed};
+use crate::{IsoError, IsoResult, command_failed, file_content_hash};
 
 /// Captured changes between a `lower` baseline and a `merged` view.
 #[derive(Debug, Clone, Default)]
@@ -280,6 +280,17 @@ fn walk_diff_blocking(lower: &Path, merged: &Path) -> IsoResult<Diff> {
 				if metas_equal(l_meta, m_meta) {
 					continue;
 				}
+				// Metadata moved, but if both sides are regular files of the
+				// same size, verify content before reporting: a touch (or a
+				// copy that lost mtime precision) is not a change. This keeps
+				// `xxh3` in the fast path instead of rendering a full diff.
+				if l_meta.len() == m_meta.len()
+					&& l_meta.is_file()
+					&& m_meta.is_file()
+					&& file_content_hash(&lower.join(rel))? == file_content_hash(&merged.join(rel))?
+				{
+					continue;
+				}
 				files.push(plain_change(merged, rel, ChangeKind::Modified, Some(lower))?);
 			},
 		}
@@ -337,15 +348,14 @@ fn walk(root: &Path, dir: &Path, out: &mut BTreeMap<PathBuf, Metadata>) -> IsoRe
 		let file_type = entry
 			.file_type()
 			.map_err(|err| IsoError::other(format!("file_type {}: {err}", path.display())))?;
-		let meta = if file_type.is_symlink() {
-			std::fs::symlink_metadata(&path)
-				.map_err(|err| IsoError::other(format!("metadata {}: {err}", path.display())))?
-		} else {
-			entry
-				.metadata()
-				.map_err(|err| IsoError::other(format!("metadata {}: {err}", path.display())))?
-		};
 		if file_type.is_symlink() {
+			// Same predicate as rcopy and plain capture. Skipping here on both
+			// sides keeps an omitted link from becoming a deletion or addition.
+			if crate::symlink_escapes(root, &path) {
+				continue;
+			}
+			let meta = std::fs::symlink_metadata(&path)
+				.map_err(|err| IsoError::other(format!("metadata {}: {err}", path.display())))?;
 			let rel = path.strip_prefix(root).unwrap_or(&path).to_path_buf();
 			out.insert(rel, meta);
 			continue;
@@ -354,6 +364,14 @@ fn walk(root: &Path, dir: &Path, out: &mut BTreeMap<PathBuf, Metadata>) -> IsoRe
 			walk(root, &path, out)?;
 			continue;
 		}
+		// FIFOs, sockets, and devices: never open them (a FIFO can block
+		// forever) and never treat them as mergeable content.
+		if !file_type.is_file() {
+			continue;
+		}
+		let meta = entry
+			.metadata()
+			.map_err(|err| IsoError::other(format!("metadata {}: {err}", path.display())))?;
 		let rel = path.strip_prefix(root).unwrap_or(&path).to_path_buf();
 		out.insert(rel, meta);
 	}
@@ -376,6 +394,13 @@ fn plain_change(
 	if is_symlink(&full)
 		|| peer_root.is_some_and(|peer| is_symlink(&peer.join(rel)))
 	{
+		return Ok(FileChange { path: rel.to_path_buf(), op, diff: None });
+	}
+	// Special files never enter the index; guard direct callers too so a FIFO
+	// cannot block the diff thread.
+	let meta = std::fs::symlink_metadata(&full)
+		.map_err(|err| IsoError::other(format!("metadata {}: {err}", full.display())))?;
+	if !meta.is_file() {
 		return Ok(FileChange { path: rel.to_path_buf(), op, diff: None });
 	}
 	let primary = std::fs::read(&full)
@@ -446,4 +471,160 @@ fn looks_binary(bytes: &[u8]) -> bool {
 
 fn is_symlink(path: &Path) -> bool {
 	std::fs::symlink_metadata(path).is_ok_and(|meta| meta.file_type().is_symlink())
+}
+
+#[cfg(test)]
+mod tests {
+	use std::{
+		fs,
+		path::{Path, PathBuf},
+		sync::atomic::{AtomicU64, Ordering},
+		time::{Duration, SystemTime, UNIX_EPOCH},
+	};
+
+	use xxhash_rust::xxh3::xxh3_64;
+
+	use super::*;
+
+	struct TempDirGuard(PathBuf);
+
+	impl TempDirGuard {
+		fn new() -> Self {
+			static COUNTER: AtomicU64 = AtomicU64::new(0);
+			let nanos = SystemTime::now()
+				.duration_since(UNIX_EPOCH)
+				.expect("system time should be after epoch")
+				.as_nanos();
+			let dir = std::env::temp_dir().join(format!(
+				"pi-iso-diff-test-{}-{nanos}-{}",
+				std::process::id(),
+				COUNTER.fetch_add(1, Ordering::Relaxed)
+			));
+			fs::create_dir_all(&dir).expect("create temp test directory");
+			Self(dir)
+		}
+
+		fn path(&self) -> &Path {
+			&self.0
+		}
+	}
+
+	impl Drop for TempDirGuard {
+		fn drop(&mut self) {
+			let _ = fs::remove_dir_all(&self.0);
+		}
+	}
+
+	fn pair(root: &TempDirGuard) -> (PathBuf, PathBuf) {
+		let lower = root.path().join("lower");
+		let merged = root.path().join("merged");
+		fs::create_dir_all(&lower).expect("create lower");
+		fs::create_dir_all(&merged).expect("create merged");
+		(lower, merged)
+	}
+
+	fn set_mtime(path: &Path, secs: u64) {
+		let file = fs::OpenOptions::new()
+			.write(true)
+			.open(path)
+			.expect("open for mtime");
+		file
+			.set_modified(UNIX_EPOCH + Duration::from_secs(secs))
+			.expect("set mtime");
+	}
+
+	#[test]
+	fn plain_diff_skips_mtime_only_change() {
+		let root = TempDirGuard::new();
+		let (lower, merged) = pair(&root);
+		fs::write(lower.join("same.txt"), b"identical bytes\n").expect("write lower");
+		fs::write(merged.join("same.txt"), b"identical bytes\n").expect("write merged");
+		set_mtime(&lower.join("same.txt"), 10);
+		set_mtime(&merged.join("same.txt"), 20);
+
+		let diff = plain_diff_blocking(&lower, &merged).expect("plain diff");
+		assert!(diff.is_empty(), "content-identical file reported as changed: {:?}", diff.files);
+	}
+
+	#[test]
+	fn plain_diff_reports_same_size_content_change() {
+		let root = TempDirGuard::new();
+		let (lower, merged) = pair(&root);
+		fs::write(lower.join("same.txt"), b"left\n").expect("write lower");
+		fs::write(merged.join("same.txt"), b"rght\n").expect("write merged");
+		set_mtime(&lower.join("same.txt"), 10);
+		set_mtime(&merged.join("same.txt"), 20);
+
+		let diff = plain_diff_blocking(&lower, &merged).expect("plain diff");
+		assert_eq!(diff.files.len(), 1);
+		assert_eq!(diff.files[0].op, ChangeKind::Modified);
+		assert!(
+			diff.files[0]
+				.diff
+				.as_deref()
+				.is_some_and(|text| text.contains("-left"))
+		);
+	}
+
+	#[cfg(unix)]
+	#[test]
+	fn escaping_and_broken_symlinks_are_not_reported() {
+		use std::os::unix::fs::symlink;
+
+		let root = TempDirGuard::new();
+		let (lower, merged) = pair(&root);
+		let outside = root.path().join("outside.txt");
+		fs::write(&outside, b"secret").expect("write outside");
+		// Escaping link omitted from the merged tree would otherwise look like
+		// a child-side deletion of the parent link.
+		symlink(&outside, lower.join("escape")).expect("escape link");
+		// Broken/unresolvable links are excluded on both sides too.
+		symlink("missing-target", merged.join("broken")).expect("broken link");
+
+		let diff = plain_diff_blocking(&lower, &merged).expect("plain diff");
+		assert!(
+			diff.is_empty(),
+			"excluded links must not become added/removed files: {:?}",
+			diff.files
+		);
+	}
+
+	#[cfg(unix)]
+	#[test]
+	fn special_files_are_ignored_without_reading() {
+		use std::os::unix::net::UnixListener;
+
+		let root = TempDirGuard::new();
+		let (lower, merged) = pair(&root);
+		let _socket = UnixListener::bind(lower.join("agent.sock")).expect("bind socket");
+		let _merged_socket = UnixListener::bind(merged.join("agent.sock")).expect("bind socket");
+
+		// A FIFO without a writer would block on read; the walker must skip it.
+		let fifo = lower.join("pipe");
+		let fifo_ready = std::process::Command::new("mkfifo")
+			.arg(&fifo)
+			.status()
+			.is_ok_and(|status| status.success());
+
+		let diff = plain_diff_blocking(&lower, &merged).expect("plain diff");
+		assert!(
+			diff.is_empty(),
+			"sockets/fifos are not mergeable content (fifo created: {fifo_ready}): {:?}",
+			diff.files
+		);
+	}
+
+	#[test]
+	fn file_content_hash_matches_xxh3_64_small_and_streamed() {
+		let root = TempDirGuard::new();
+		let small = root.path().join("small.bin");
+		fs::write(&small, b"abc").expect("write small");
+		assert_eq!(file_content_hash(&small).unwrap(), xxh3_64(b"abc"));
+
+		// Above the one-shot cutoff, so the streaming hasher runs.
+		let big_bytes = vec![0xa5_u8; 70 * 1024];
+		let big = root.path().join("big.bin");
+		fs::write(&big, &big_bytes).expect("write big");
+		assert_eq!(file_content_hash(&big).unwrap(), xxh3_64(&big_bytes));
+	}
 }

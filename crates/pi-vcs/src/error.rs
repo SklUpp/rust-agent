@@ -93,6 +93,15 @@ pub enum Error {
 		message: String,
 	},
 
+	/// The in-process backend cannot perform this operation (for example a
+	/// reftable repository). No parent state was mutated, so callers may retry
+	/// through the git CLI.
+	#[error("unsupported in-process operation: {operation}")]
+	Unsupported {
+		/// Operation or backend feature that is unavailable in-process.
+		operation: String,
+	},
+
 	/// The operation was canceled via its interrupt flag.
 	#[error("operation canceled")]
 	Canceled,
@@ -118,6 +127,7 @@ impl Error {
 			Self::CliTimeout { .. } => "CliTimeout",
 			Self::Io(_) => "Io",
 			Self::Backend { .. } => "Backend",
+			Self::Unsupported { .. } => "Unsupported",
 			Self::Canceled => "Canceled",
 		}
 	}

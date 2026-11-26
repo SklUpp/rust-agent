@@ -38,6 +38,7 @@ mod windows_block_clone;
 mod zfs;
 
 pub use diff::{ChangeKind, Diff, FileChange, plain_diff_blocking};
+pub use rcopy::{DEFAULT_RCOPY_MAX_BYTES, RCOPY_MAX_BYTES_ENV};
 
 /// Stable identifier for which backend a build was compiled with.
 ///
@@ -220,6 +221,60 @@ pub(crate) fn command_failed(
 ) -> IsoError {
 	let stderr = String::from_utf8_lossy(stderr);
 	IsoError::other(format!("{what} (exit {code}): {}", stderr.trim()))
+}
+
+/// Whether `link` resolves outside `root`. Broken, looping, or otherwise
+/// unresolvable links count as escaping: containment cannot be proven.
+///
+/// Recursive copy, plain diff, and plain isolation capture all use this exact
+/// predicate. A link skipped by one side must be skipped by the other, or the
+/// omission would look like a child-side deletion during merge.
+pub fn symlink_escapes(root: &Path, link: &Path) -> bool {
+	// Canonicalize the root too: comparing a canonical target against a
+	// symlinked root path (for example /tmp -> /private/tmp) would otherwise
+	// misclassify every link as escaping.
+	let root = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
+	let Ok(target) = std::fs::canonicalize(link) else {
+		return true;
+	};
+	!target.starts_with(&root)
+}
+
+/// Files at or below this size are hashed in one shot; larger ones stream.
+const HASH_ONE_SHOT_MAX_BYTES: u64 = 64 * 1024;
+
+/// `xxh3` content digest of a regular file.
+///
+/// Used to verify that an rcopy landed byte-for-byte and to skip a plain
+/// diff entry whose mtime moved but whose bytes did not. Verification is
+/// intentionally cheap (non-cryptographic), not tamper-proof.
+pub(crate) fn file_content_hash(path: &Path) -> IsoResult<u64> {
+	use std::io::Read as _;
+
+	let mut file = std::fs::File::open(path)
+		.map_err(|err| IsoError::other(format!("open {} for hashing: {err}", path.display())))?;
+	let len = file
+		.metadata()
+		.map_err(|err| IsoError::other(format!("stat {} for hashing: {err}", path.display())))?
+		.len();
+	if len <= HASH_ONE_SHOT_MAX_BYTES {
+		let mut bytes = Vec::with_capacity(len as usize);
+		file
+			.read_to_end(&mut bytes)
+			.map_err(|err| IsoError::other(format!("read {} for hashing: {err}", path.display())))?;
+		return Ok(xxhash_rust::xxh3::xxh3_64(&bytes));
+	}
+	let mut hasher = xxhash_rust::xxh3::Xxh3::new();
+	let mut buf = vec![0_u8; 64 * 1024];
+	loop {
+		let read = file
+			.read(&mut buf)
+			.map_err(|err| IsoError::other(format!("read {} for hashing: {err}", path.display())))?;
+		if read == 0 {
+			return Ok(hasher.digest());
+		}
+		hasher.update(&buf[..read]);
+	}
 }
 
 /// Backend contract.

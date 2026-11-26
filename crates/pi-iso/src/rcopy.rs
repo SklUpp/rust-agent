@@ -7,7 +7,10 @@
 //! [`diff`](IsolationBackend::diff) on the `git diff` path.
 //!
 //! Otherwise we do a vanilla recursive copy, preserving file modes and
-//! mtimes so the default mtime-skipping diff path stays fast. There is no
+//! mtimes so the default mtime-skipping diff path stays fast. The copy is
+//! budgeted ([`DEFAULT_RCOPY_MAX_BYTES`], overridable through
+//! [`RCOPY_MAX_BYTES_ENV`]) and every file is byte-verified with `xxh3`.
+//! Symlinks resolving outside the source root are skipped. There is no
 //! file-system magic; the caller pays full filesystem-copy cost up front
 //! and an `rm -rf` on teardown.
 
@@ -15,7 +18,19 @@ use std::path::{Path, PathBuf};
 
 use async_trait::async_trait;
 
-use crate::{BackendKind, IsoError, IsoResult, IsolationBackend, ProbeResult, command_failed};
+use crate::{
+	BackendKind, IsoError, IsoResult, IsolationBackend, ProbeResult, command_failed,
+	file_content_hash, symlink_escapes,
+};
+
+/// Default ceiling on the number of regular-file bytes the non-git recursive
+/// fallback will copy. A larger workspace needs the copy budget raised
+/// explicitly instead of silently filling the disk.
+pub const DEFAULT_RCOPY_MAX_BYTES: u64 = 1024 * 1024 * 1024;
+
+/// Environment override for [`DEFAULT_RCOPY_MAX_BYTES`], parsed as a decimal
+/// byte count.
+pub const RCOPY_MAX_BYTES_ENV: &str = "PI_ISO_RCOPY_MAX_BYTES";
 
 pub struct RcopyBackend;
 
@@ -201,7 +216,7 @@ fn seed_dirty_state(lower: &Path, merged: &Path) -> IsoResult<()> {
 			std::fs::create_dir_all(parent)
 				.map_err(|err| IsoError::other(format!("create {}: {err}", parent.display())))?;
 		}
-		copy_path(&src, &dst)?;
+		copy_path(lower, &src, &dst)?;
 	}
 
 	Ok(())
@@ -301,25 +316,50 @@ fn git_apply_with_program(
 /// Copy a single path (regular file, symlink, or directory) from `src`
 /// to `dst`, preserving mode and mtime on supported platforms. Used by
 /// the untracked-files pass; directories are recursed via the existing
-/// [`copy_dir_contents`] helper.
-fn copy_path(src: &Path, dst: &Path) -> IsoResult<()> {
+/// [`copy_dir_contents`] helper. Symlinks that resolve outside `root` are
+/// skipped: copying them would hand the merged view a path out of the
+/// source tree.
+fn copy_path(root: &Path, src: &Path, dst: &Path) -> IsoResult<()> {
 	let meta = std::fs::symlink_metadata(src)
 		.map_err(|err| IsoError::other(format!("stat {}: {err}", src.display())))?;
-	if meta.file_type().is_symlink() {
+	let file_type = meta.file_type();
+	if file_type.is_symlink() {
+		if symlink_escapes(root, src) {
+			return Ok(());
+		}
 		copy_symlink(src, dst)
-	} else if meta.file_type().is_dir() {
+	} else if file_type.is_dir() {
 		std::fs::create_dir_all(dst)
 			.map_err(|err| IsoError::other(format!("create {}: {err}", dst.display())))?;
-		copy_dir_contents(src, dst)?;
+		copy_dir_contents(root, src, dst)?;
 		copy_dir_mtime(src, dst);
 		Ok(())
+	} else if file_type.is_file() {
+		copy_file_verified(src, dst)
 	} else {
-		std::fs::copy(src, dst).map_err(|err| {
-			IsoError::other(format!("copy {} -> {}: {err}", src.display(), dst.display()))
-		})?;
-		copy_file_mtime(src, dst);
+		// FIFOs, sockets, and devices have no copyable content; opening one
+		// could block forever.
 		Ok(())
 	}
+}
+
+/// Copy a regular file and verify the destination bytes with `xxh3`.
+fn copy_file_verified(src: &Path, dst: &Path) -> IsoResult<()> {
+	std::fs::copy(src, dst).map_err(|err| {
+		IsoError::other(format!("copy {} -> {}: {err}", src.display(), dst.display()))
+	})?;
+	copy_file_mtime(src, dst);
+	let want = file_content_hash(src)?;
+	let got = file_content_hash(dst)?;
+	if want != got {
+		let _ = std::fs::remove_file(dst);
+		return Err(IsoError::other(format!(
+			"copy verification failed for {} -> {} (xxh3 {want:016x} != {got:016x})",
+			src.display(),
+			dst.display()
+		)));
+	}
+	Ok(())
 }
 
 /// Recursive copy preserving file modes (unix) and mtimes on both unix
@@ -327,13 +367,77 @@ fn copy_path(src: &Path, dst: &Path) -> IsoResult<()> {
 /// because `copy` already preserves mtime on the macOS/Linux platforms we
 /// care about — but we still set it explicitly to keep behaviour
 /// consistent across hosts where the stdlib promise is weaker.
+///
+/// The tree is size-checked before the first byte is copied, so an
+/// unbounded workspace fails without filling the destination disk.
 fn recursive_copy(lower: &Path, merged: &Path) -> IsoResult<()> {
-	std::fs::create_dir_all(merged)
-		.map_err(|err| IsoError::other(format!("create {}: {err}", merged.display())))?;
-	copy_dir_contents(lower, merged)
+	recursive_copy_with_cap(lower, merged, rcopy_max_bytes()?)
 }
 
-fn copy_dir_contents(src: &Path, dst: &Path) -> IsoResult<()> {
+fn rcopy_max_bytes() -> IsoResult<u64> {
+	match std::env::var(RCOPY_MAX_BYTES_ENV) {
+		Ok(raw) => raw
+			.trim()
+			.parse::<u64>()
+			.map_err(|err| IsoError::other(format!("invalid {RCOPY_MAX_BYTES_ENV}={raw:?}: {err}"))),
+		Err(std::env::VarError::NotPresent) => Ok(DEFAULT_RCOPY_MAX_BYTES),
+		Err(err) => Err(IsoError::other(format!("read {RCOPY_MAX_BYTES_ENV}: {err}"))),
+	}
+}
+
+fn recursive_copy_with_cap(lower: &Path, merged: &Path, max_bytes: u64) -> IsoResult<()> {
+	// A canonical root lets `symlink_escapes` compare like with like.
+	let lower = std::fs::canonicalize(lower).unwrap_or_else(|_| lower.to_path_buf());
+	check_tree_budget(&lower, max_bytes)?;
+	std::fs::create_dir_all(merged)
+		.map_err(|err| IsoError::other(format!("create {}: {err}", merged.display())))?;
+	let result = copy_dir_contents(&lower, &lower, merged);
+	if result.is_err() {
+		let _ = std::fs::remove_dir_all(merged);
+	}
+	result
+}
+
+/// Sum regular-file sizes under `dir` and fail as soon as the copy budget
+/// is exceeded. Symlinks carry no copied bytes (and escaping ones are
+/// skipped), so they are ignored.
+fn check_tree_budget(root: &Path, max_bytes: u64) -> IsoResult<()> {
+	let mut total = 0_u64;
+	check_dir_budget(root, root, max_bytes, &mut total)
+}
+
+fn check_dir_budget(root: &Path, dir: &Path, max_bytes: u64, total: &mut u64) -> IsoResult<()> {
+	let entries = std::fs::read_dir(dir)
+		.map_err(|err| IsoError::other(format!("read_dir {}: {err}", dir.display())))?;
+	for entry in entries {
+		let entry =
+			entry.map_err(|err| IsoError::other(format!("dir entry in {}: {err}", dir.display())))?;
+		let file_type = entry
+			.file_type()
+			.map_err(|err| IsoError::other(format!("file_type {}: {err}", entry.path().display())))?;
+		if file_type.is_symlink() {
+			continue;
+		}
+		if file_type.is_dir() {
+			check_dir_budget(root, &entry.path(), max_bytes, total)?;
+		} else if file_type.is_file() {
+			let len = entry
+				.metadata()
+				.map_err(|err| IsoError::other(format!("metadata {}: {err}", entry.path().display())))?
+				.len();
+			*total = total.saturating_add(len);
+			if *total > max_bytes {
+				return Err(IsoError::other(format!(
+					"rcopy of {} exceeds the {max_bytes}-byte copy budget; raise {RCOPY_MAX_BYTES_ENV}",
+					root.display()
+				)));
+			}
+		}
+	}
+	Ok(())
+}
+
+fn copy_dir_contents(root: &Path, src: &Path, dst: &Path) -> IsoResult<()> {
 	let entries = std::fs::read_dir(src)
 		.map_err(|err| IsoError::other(format!("read_dir {}: {err}", src.display())))?;
 	for entry in entries {
@@ -345,17 +449,16 @@ fn copy_dir_contents(src: &Path, dst: &Path) -> IsoResult<()> {
 		let src_path = entry.path();
 		let dst_path = dst.join(entry.file_name());
 		if file_type.is_symlink() {
-			copy_symlink(&src_path, &dst_path)?;
+			if !symlink_escapes(root, &src_path) {
+				copy_symlink(&src_path, &dst_path)?;
+			}
 		} else if file_type.is_dir() {
 			std::fs::create_dir_all(&dst_path)
 				.map_err(|err| IsoError::other(format!("create {}: {err}", dst_path.display())))?;
-			copy_dir_contents(&src_path, &dst_path)?;
+			copy_dir_contents(root, &src_path, &dst_path)?;
 			copy_dir_mtime(&src_path, &dst_path);
-		} else {
-			std::fs::copy(&src_path, &dst_path).map_err(|err| {
-				IsoError::other(format!("copy {} -> {}: {err}", src_path.display(), dst_path.display()))
-			})?;
-			copy_file_mtime(&src_path, &dst_path);
+		} else if file_type.is_file() {
+			copy_file_verified(&src_path, &dst_path)?;
 		}
 	}
 	Ok(())
@@ -532,5 +635,64 @@ mod tests {
 			.expect_err("fake git apply should fail after consuming stdin");
 		let message = err.to_string();
 		assert!(message.starts_with("git apply (exit 42): simulated apply failure"));
+	}
+
+	fn plain_source(root: &TempDirGuard) -> PathBuf {
+		let source = root.path().join("src");
+		fs::create_dir_all(&source).expect("create source");
+		source
+	}
+
+	#[test]
+	fn recursive_copy_rejects_tree_over_budget_before_copying() {
+		let root = TempDirGuard::new();
+		let source = plain_source(&root);
+		fs::write(source.join("payload.bin"), vec![b'x'; 100]).expect("write payload");
+		let merged = root.path().join("merged");
+
+		let err =
+			recursive_copy_with_cap(&source, &merged, 50).expect_err("over-budget tree must fail");
+		assert!(err.to_string().contains("copy budget"), "{err}");
+		assert!(!merged.exists(), "failed preflight must not create the destination");
+	}
+
+	#[test]
+	fn recursive_copy_verifies_content_and_preserves_files() {
+		let root = TempDirGuard::new();
+		let source = plain_source(&root);
+		fs::write(source.join("payload.txt"), b"hello rcopy").expect("write payload");
+		fs::create_dir_all(source.join("nested")).expect("create nested");
+		fs::write(source.join("nested/deep.txt"), b"deep").expect("write deep");
+		let merged = root.path().join("merged");
+
+		recursive_copy_with_cap(&source, &merged, DEFAULT_RCOPY_MAX_BYTES)
+			.expect("within-budget tree must copy");
+		assert_eq!(fs::read(merged.join("payload.txt")).unwrap(), b"hello rcopy");
+		assert_eq!(fs::read(merged.join("nested/deep.txt")).unwrap(), b"deep");
+	}
+
+	#[cfg(unix)]
+	#[test]
+	fn recursive_copy_skips_symlinks_that_escape_the_source() {
+		let root = TempDirGuard::new();
+		let source = plain_source(&root);
+		let source = fs::canonicalize(&source).expect("canonical source");
+		let outside = root.path().join("outside.txt");
+		fs::write(&outside, b"secret").expect("write outside file");
+		fs::write(source.join("inside.txt"), b"inside").expect("write inside file");
+		std::os::unix::fs::symlink("inside.txt", source.join("inside-link"))
+			.expect("create inside symlink");
+		std::os::unix::fs::symlink(&outside, source.join("escape-link"))
+			.expect("create escape symlink");
+		let merged = root.path().join("merged");
+
+		recursive_copy_with_cap(&source, &merged, DEFAULT_RCOPY_MAX_BYTES)
+			.expect("copy with symlinks");
+
+		assert!(merged.join("inside-link").symlink_metadata().is_ok());
+		assert!(
+			merged.join("escape-link").symlink_metadata().is_err(),
+			"escaping symlink must not be recreated"
+		);
 	}
 }

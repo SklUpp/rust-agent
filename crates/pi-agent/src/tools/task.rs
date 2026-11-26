@@ -1336,6 +1336,7 @@ impl TaskTool {
 					succeeded,
 					&child_cancel,
 					Some(isolation_commit_provider),
+					Some(Arc::clone(&ctx.conflicts)),
 				),
 				&ctx.cancellation_token,
 				&child_cancel,
@@ -1568,6 +1569,7 @@ impl TaskTool {
 		let semaphore = self.semaphore.clone();
 		let plan = ctx.plan.clone();
 		let cwd = ctx.cwd.clone();
+		let conflicts = Arc::clone(&ctx.conflicts);
 		let task_id = child_id.clone();
 		let cancel = child_cancel.clone();
 		let mut lifecycle = SettlementGuard::new(
@@ -1624,6 +1626,7 @@ impl TaskTool {
 				plan,
 				Arc::clone(&background_salvage),
 				child_durable,
+				conflicts,
 			)
 			.await;
 			supervisor.unregister_active_child(&task_id);
@@ -2122,6 +2125,7 @@ async fn run_background_child(
 	plan: Option<Arc<dyn crate::state::PlanModeGuard>>,
 	salvage: Arc<Mutex<ChildSalvage>>,
 	child_durable: Option<ChildDurability>,
+	conflicts: Arc<crate::tools::conflict::ConflictHistory>,
 ) -> Result<BackgroundOutcome, AgentError> {
 	let child_model = child_ctx
 		.resolve_model(&item.agent, item.effort.as_deref())
@@ -2340,6 +2344,7 @@ async fn run_background_child(
 					succeeded,
 					&cancel_for_finalize,
 					Some(isolation_commit_provider),
+					Some(Arc::clone(&conflicts)),
 				)
 				.await,
 			)
@@ -5833,6 +5838,7 @@ mod tests {
 				None,
 				Arc::new(Mutex::new(ChildSalvage::default())),
 				None,
+				Arc::new(crate::tools::conflict::ConflictHistory::new()),
 			),
 		)
 		.await
@@ -5919,6 +5925,7 @@ mod tests {
 			None,
 			Arc::new(Mutex::new(ChildSalvage::default())),
 			None,
+			Arc::new(crate::tools::conflict::ConflictHistory::new()),
 		));
 		tokio::select! {
 			() = started.notified() => {}
@@ -5990,6 +5997,7 @@ mod tests {
 			None,
 			Arc::new(Mutex::new(ChildSalvage::default())),
 			None,
+			Arc::new(crate::tools::conflict::ConflictHistory::new()),
 		)
 		.await;
 
@@ -6067,6 +6075,7 @@ mod tests {
 			None,
 			Arc::new(Mutex::new(ChildSalvage::default())),
 			None,
+			Arc::new(crate::tools::conflict::ConflictHistory::new()),
 		)
 		.await;
 		match result {

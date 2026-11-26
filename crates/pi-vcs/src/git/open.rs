@@ -22,10 +22,9 @@ impl GitRepo {
 	/// every operation on them must use the CLI fallback instead.
 	pub(crate) fn gix(&self) -> Result<gix::Repository> {
 		if self.info().is_reftable {
-			return Err(Error::backend(
-				"git open",
-				"reftable repository cannot be opened in-process; use the CLI fallback",
-			));
+			return Err(Error::Unsupported {
+				operation: "open reftable repository in-process".to_string(),
+			});
 		}
 		if let Some(repo) = self.gix.get() {
 			return Ok(repo.to_thread_local());
@@ -45,10 +44,9 @@ impl GitRepo {
 	/// for a fresh open instead.
 	pub(crate) fn gix_fresh(&self) -> Result<gix::Repository> {
 		if self.info().is_reftable {
-			return Err(Error::backend(
-				"git open",
-				"reftable repository cannot be opened in-process; use the CLI fallback",
-			));
+			return Err(Error::Unsupported {
+				operation: "open reftable repository in-process".to_string(),
+			});
 		}
 		Ok(open_options()
 			.open(self.root())

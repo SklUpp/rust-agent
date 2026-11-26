@@ -159,6 +159,7 @@ async fn finish(
 		true,
 		cancel,
 		None,
+		None,
 	)
 	.await
 }
@@ -548,6 +549,100 @@ async fn plain_workspace_task_delta_is_applied_without_git() {
 	);
 	assert!(!parent.join(".git").exists(), "no Git repo is created");
 	assert!(!sandbox.handle().base_dir.exists(), "sandbox cleaned");
+}
+
+/// A child-created broken/excluded symlink cannot be applied, so the sandbox
+/// must survive for recovery instead of being cleaned up as a no-op.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn plain_excluded_child_symlink_retains_sandbox() {
+	let temp = TempDir::new("plain-excluded-retain");
+	let parent = temp.join("project");
+	plain_project(&parent);
+
+	let policy = policy(IsolationMergeMode::Patch);
+	let (baseline, sandbox) =
+		start_sandbox(&parent, &temp.join("wt"), policy, "task-plain-excluded").await;
+	std::os::unix::fs::symlink("missing-target", sandbox.merged_dir().join("broken.txt"))
+		.expect("child broken symlink");
+
+	let out = finish(
+		&sandbox,
+		&baseline,
+		policy,
+		"task-plain-excluded",
+		&temp.join("artifacts"),
+		&CancellationToken::new(),
+	)
+	.await;
+	assert!(out.cleanup_error.is_none(), "{out:?}");
+	let report = out.report.clone().expect("report");
+	assert_eq!(
+		report.changes_applied,
+		Some(false),
+		"excluded child symlink must leave the merge pending: {}",
+		out.summary
+	);
+	assert!(
+		out.summary.contains("Skipped `broken.txt`"),
+		"the excluded path is reported: {}",
+		out.summary
+	);
+	let retained = sandbox.handle().base_dir.display().to_string();
+	assert!(
+		out.summary.contains(&retained),
+		"the retained sandbox path is surfaced: {}",
+		out.summary
+	);
+	assert!(
+		sandbox.handle().base_dir.exists(),
+		"pending excluded child output must retain the sandbox"
+	);
+	assert!(
+		fs::symlink_metadata(parent.join("broken.txt")).is_err(),
+		"the excluded child symlink must not be written into the parent"
+	);
+}
+
+/// With `apply = false` the merge never runs, but excluded child nodes still
+/// exist only in the sandbox, so finalize must retain it.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn plain_excluded_child_symlink_retains_sandbox_when_apply_disabled() {
+	let temp = TempDir::new("plain-excluded-noapply");
+	let parent = temp.join("project");
+	plain_project(&parent);
+
+	let mut policy = policy(IsolationMergeMode::Patch);
+	policy.apply = false;
+	let (baseline, sandbox) =
+		start_sandbox(&parent, &temp.join("wt"), policy, "task-plain-noapply").await;
+	std::os::unix::fs::symlink("missing-target", sandbox.merged_dir().join("broken.txt"))
+		.expect("child broken symlink");
+
+	let out = finish(
+		&sandbox,
+		&baseline,
+		policy,
+		"task-plain-noapply",
+		&temp.join("artifacts"),
+		&CancellationToken::new(),
+	)
+	.await;
+	assert!(out.cleanup_error.is_none(), "{out:?}");
+	assert!(
+		out.summary.contains("sandbox was retained"),
+		"the retained sandbox is surfaced: {}",
+		out.summary
+	);
+	assert!(
+		sandbox.handle().base_dir.exists(),
+		"apply=false must retain the sandbox for an excluded child node"
+	);
+	assert!(
+		fs::symlink_metadata(parent.join("broken.txt")).is_err(),
+		"no child output is written when apply=false"
+	);
 }
 
 /// An external edit to the same file must not be overwritten: the merge
