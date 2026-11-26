@@ -182,6 +182,44 @@ pub trait DurableBoundary: Send + Sync + std::fmt::Debug {
 	) -> Result<Vec<String>, DurableError> {
 		Ok(Vec::new())
 	}
+
+	/// Atomically append one accepted peer message and mark its delivery row
+	/// delivered, in a single transaction. `message` is exactly the message the
+	/// loop will append to history, so the next `persist_messages` recognizes
+	/// the stored row instead of appending a second copy.
+	async fn consume_peer_delivery(
+		&self,
+		_delivery_id: &str,
+		_message: &Message,
+	) -> Result<(), DurableError> {
+		Ok(())
+	}
+
+	/// Replay peer deliveries accepted by the host before `cutoff_ms` but never
+	/// appended to the live conversation (process death between accept and
+	/// persist). Rows accepted during the current turn stay pending for their
+	/// in-memory queue and are not stolen by this drain.
+	async fn accept_pending_peer_deliveries(
+		&self,
+		_cutoff_ms: i64,
+	) -> Result<Vec<DeliveredPeerMessage>, DurableError> {
+		Ok(Vec::new())
+	}
+
+	/// Drop a still-pending delivery whose send failed before acceptance.
+	async fn withdraw_pending_delivery(&self, _delivery_id: &str) -> Result<(), DurableError> {
+		Ok(())
+	}
+}
+
+/// One replayed peer delivery. `message` is the exact user message the loop
+/// must append; the row is already marked delivered.
+#[derive(Debug, Clone)]
+pub struct DeliveredPeerMessage {
+	pub delivery_id: String,
+	pub from: String,
+	pub text: String,
+	pub message: Message,
 }
 
 /// Immutable worker identity captured at spawn. `worker_id` is the spawn-time
@@ -339,12 +377,27 @@ pub trait ChildDurabilityFactory: Send + Sync + std::fmt::Debug {
 
 	/// Persist one peer message into the target agent's durable scope as a
 	/// pending delivery. `target_session` is `None` for the root session.
+	/// `message_id` is the transport message id and `text` is the exact
+	/// model-facing line (`format_incoming`), so a replay renders identically.
 	fn enqueue_peer_delivery(
 		&self,
 		_target_session: Option<&str>,
 		_sender: &str,
+		_message_id: &str,
 		_text: &str,
 	) -> Result<String, DurableError> {
 		Err(DurableError::new("durable peer delivery is not implemented"))
+	}
+
+	/// Mark a peer delivery row delivered and processed synchronously. Used by
+	/// `hub wait`/`hub inbox`, where the message leaves the mailbox as a tool
+	/// result instead of entering the conversation.
+	fn mark_peer_delivery_consumed(&self, _delivery_id: &str) -> Result<(), DurableError> {
+		Ok(())
+	}
+
+	/// Withdraw a pending peer delivery whose send failed before acceptance.
+	fn withdraw_peer_delivery(&self, _delivery_id: &str) -> Result<(), DurableError> {
+		Ok(())
 	}
 }

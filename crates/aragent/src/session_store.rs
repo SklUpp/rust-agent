@@ -3611,6 +3611,17 @@ impl SqliteStore {
 		Ok(())
 	}
 
+	/// One delivery row by id, including delivered/processed state.
+	pub fn delivery(&self, delivery_id: &str) -> StoreResult<Option<DeliveryRecord>> {
+		validate_id("delivery id", delivery_id)?;
+		let mut records = self.query_deliveries(
+			"SELECT delivery_id, worker_id, session_id, origin_branch_id, payload_json, created_at_ms, delivered_at_ms, processed_at_ms, message_id \
+			 FROM deliveries WHERE delivery_id = ?1",
+			delivery_id,
+		)?;
+		Ok(records.pop())
+	}
+
 	/// Deliveries not yet durably offered to the target context.
 	pub fn pending_deliveries(&self, session_id: &str) -> StoreResult<Vec<DeliveryRecord>> {
 		self.query_deliveries(
@@ -3633,6 +3644,33 @@ impl SqliteStore {
 			 ORDER BY d.created_at_ms, d.delivery_id",
 			session_id,
 		)
+	}
+
+	/// Peer mail (`payload.kind == "peer-message"`) not yet durably offered to
+	/// the target context. Worker completions are excluded: they have their own
+	/// recovery path and payload contract.
+	pub fn pending_peer_deliveries(&self, session_id: &str) -> StoreResult<Vec<DeliveryRecord>> {
+		let records = self.query_deliveries(
+			"SELECT delivery_id, worker_id, session_id, origin_branch_id, payload_json, created_at_ms, delivered_at_ms, processed_at_ms, message_id \
+			 FROM deliveries WHERE session_id = ?1 AND delivered_at_ms IS NULL ORDER BY created_at_ms, delivery_id",
+			session_id,
+		)?;
+		Ok(records
+			.into_iter()
+			.filter(|record| record.payload.get("kind").and_then(Value::as_str) == Some("peer-message"))
+			.collect())
+	}
+
+	/// Remove a still-pending delivery. Used when the send that enqueued it
+	/// failed before any recipient could accept it, so a later resume does not
+	/// replay a message no one received. Delivered rows are never withdrawn.
+	pub fn withdraw_pending_delivery(&mut self, delivery_id: &str) -> StoreResult<bool> {
+		validate_id("delivery id", delivery_id)?;
+		let changes = self.connection.execute(
+			"DELETE FROM deliveries WHERE delivery_id = ?1 AND delivered_at_ms IS NULL",
+			params![delivery_id],
+		)?;
+		Ok(changes > 0)
 	}
 
 	/// Deliveries already offered to the target context but not confirmed

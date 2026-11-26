@@ -414,7 +414,7 @@ async fn index_lists_live_parked_tombstoned_and_disk_rows_without_advisors() {
 	manager
 		.adopt(&parked, Some(contract(&parked, &root.path)))
 		.expect("adopt");
-	manager.park(&parked);
+	manager.park(&parked).await;
 
 	let tombstoned = reserve(&supervisor, "tombstoned");
 	append(&supervisor, &tombstoned, &[Message::user("tombstone row")]);
@@ -487,7 +487,7 @@ async fn live_transcript_reads_appends_without_claiming_an_in_memory_session() {
 	manager
 		.adopt(&id, Some(contract(&id, &root.path)))
 		.expect("adopt live row");
-	assert!(manager.park(&id));
+	assert!(manager.park(&id).await);
 	let closed = read(&router, &root, &format!("history://{id}"))
 		.await
 		.expect("closed live read");
@@ -507,7 +507,7 @@ async fn parked_and_tombstoned_transcripts_stay_readable() {
 	manager
 		.adopt(&parked, Some(contract(&parked, &root.path)))
 		.expect("adopt");
-	manager.park(&parked);
+	manager.park(&parked).await;
 	let parked_read = read(&router, &root, &format!("history://{parked}"))
 		.await
 		.expect("parked read");
@@ -534,7 +534,7 @@ async fn parked_and_tombstoned_transcripts_stay_readable() {
 	);
 
 	// A parked/closed live session never removes the file reader.
-	manager.park(&tombstoned);
+	manager.park(&tombstoned).await;
 	let still_readable = read(&router, &root, &format!("history://{tombstoned}"))
 		.await
 		.expect("closed live read");
@@ -1075,7 +1075,7 @@ async fn revived_live_snapshot_precedes_flush_and_survives_idle_until_park() {
 	assert!(!raw.is_error, "{}", raw.content);
 	assert!(raw.content.contains("gated-answer"));
 
-	manager.park(&id);
+	manager.park(&id).await;
 	assert!(manager.live_messages(&id).is_none());
 	let parked = read(&router, &root, &format!("history://{id}"))
 		.await
@@ -1155,7 +1155,7 @@ async fn task_tool_live_snapshot_precedes_flush_then_hands_over_live() {
 	// A refinement accepted mid-turn: the loop appends it to the child's own
 	// state, so it must also reach the journal and any later revive.
 	supervisor
-		.inject_peer_message(&id, "keep plantdb.toml read-only".to_string())
+		.inject_peer_message(&id, "keep plantdb.toml read-only".to_string(), None)
 		.expect("steering accepted by the running child");
 
 	let live = read(&router, &root, &format!("history://{id}"))
@@ -1248,7 +1248,7 @@ async fn task_tool_live_snapshot_precedes_flush_then_hands_over_live() {
 	);
 
 	// Park drops the actor: the transcript file takes over from here.
-	manager.park(&id);
+	manager.park(&id).await;
 	let disk = read(&router, &root, &format!("history://{id}"))
 		.await
 		.expect("disk fallback read");

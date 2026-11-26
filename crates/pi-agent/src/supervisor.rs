@@ -1484,6 +1484,14 @@ impl Supervisor {
 		}
 	}
 
+	/// True when this child has a live durable scope cached by the supervisor.
+	/// A park keeps such a child's live slot until its actor exits, so a cached
+	/// revive can never race an unwinding owner.
+	#[must_use]
+	pub fn has_durable_child(&self, id: &str) -> bool {
+		self.state.lock().unwrap().durable_children.contains_key(id)
+	}
+
     /// Read durable child conversation without changing ownership. Used by history and legacy paths.
     pub fn load_child_messages(&self, worker_id: &str) -> Result<Option<Vec<Message>>, String> {
         let Some(factory) = self.child_durability_factory() else {
@@ -1536,25 +1544,44 @@ impl Supervisor {
     }
 
 	/// Persist one peer message into the target scope as a pending delivery.
-	/// Returns `None` when this supervisor has no durable factory.
-	pub fn offer_peer_delivery(
+	/// `target_session` is `None` for the root session. Returns `None` when this
+	/// supervisor has no durable factory.
+	pub fn enqueue_peer_delivery(
 		&self,
-		target: &str,
+		target_session: Option<&str>,
 		sender: &str,
+		message_id: &str,
 		text: &str,
 	) -> Result<Option<String>, String> {
 		let Some(factory) = self.child_durability_factory() else {
 			return Ok(None);
 		};
-		let target_session = if target == crate::mailbox::MAIN_AGENT_ID {
-			None
-		} else {
-			self.capture_result_key(target).or_else(|| Some(target.to_string()))
-		};
 		factory
-			.enqueue_peer_delivery(target_session.as_deref(), sender, text)
+			.enqueue_peer_delivery(target_session, sender, message_id, text)
 			.map(Some)
-			.map_err(|error| format!("peer delivery for {target}: {error}"))
+			.map_err(|error| format!("peer delivery: {error}"))
+	}
+
+	/// Mark a peer delivery consumed when the message leaves the mailbox as a
+	/// `hub wait`/`hub inbox` tool result. Best effort: the message was already
+	/// handed to the caller, so a failure is logged, never fatal.
+	pub fn mark_peer_delivery_consumed(&self, delivery_id: &str) {
+		let Some(factory) = self.child_durability_factory() else {
+			return;
+		};
+		if let Err(error) = factory.mark_peer_delivery_consumed(delivery_id) {
+			eprintln!("warning: cannot mark peer delivery {delivery_id} consumed: {error}");
+		}
+	}
+
+	/// Withdraw a pending delivery whose send failed before acceptance.
+	pub fn withdraw_peer_delivery(&self, delivery_id: &str) {
+		let Some(factory) = self.child_durability_factory() else {
+			return;
+		};
+		if let Err(error) = factory.withdraw_peer_delivery(delivery_id) {
+			eprintln!("warning: cannot withdraw peer delivery {delivery_id}: {error}");
+		}
 	}
 
 	/// Usage this child's completed provider requests already reported, summed.
@@ -1945,7 +1972,10 @@ impl Supervisor {
 
 	/// Drop the registration only when the finishing actor still owns the epoch.
 	pub fn unregister_lifecycle_actor(&self, id: &str, epoch: u64) {
-		let mut state = self.state.lock().unwrap();
+		let mut state = self
+			.state
+			.lock()
+			.unwrap_or_else(|poison| poison.into_inner());
 		if state
 			.lifecycle_actors
 			.get(id)
@@ -2050,7 +2080,10 @@ impl Supervisor {
 	/// replying must settle the waiter immediately rather than at the timeout.
 	pub fn note_agent_end(&self, id: &str) {
 		{
-			let mut state = self.state.lock().unwrap();
+			let mut state = self
+				.state
+				.lock()
+				.unwrap_or_else(|poison| poison.into_inner());
 			*state.agent_end_seq.entry(id.to_string()).or_default() += 1;
 		}
 		self.settle.notify_waiters();
@@ -2063,7 +2096,12 @@ impl Supervisor {
 	/// Hand a peer message to a live child. Only an actual `try_send` success
 	/// is reported as injected; anything else is an error the caller turns into
 	/// a failed receipt plus a buffered mailbox copy.
-	pub fn inject_peer_message(&self, id: &str, text: String) -> Result<(), String> {
+	pub fn inject_peer_message(
+		&self,
+		id: &str,
+		text: String,
+		delivery_id: Option<String>,
+	) -> Result<(), String> {
 		let state = self.state.lock().unwrap();
 		let Some(record) = state.records.get(id) else {
 			return Err(format!(
@@ -2078,9 +2116,10 @@ impl Supervisor {
 		match state.active.get(id) {
 			Some(active) => active
 				.steering_tx
-				.try_send(SteeringEvent::InjectMessage(vec![
-					crate::state::ContentPart::text(text),
-				]))
+				.try_send(SteeringEvent::InjectMessage {
+					parts: vec![crate::state::ContentPart::text(text)],
+					delivery_id,
+				})
 				.map_err(|_| format!("Agent \"{id}\" has no live session.")),
 			None => Err(format!("Agent \"{id}\" has no live session.")),
 		}

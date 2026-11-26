@@ -1374,7 +1374,7 @@ impl HubTool {
 			.map(str::to_string);
 
 		if let Some(message) = mailbox.take(&sender, from.as_deref()) {
-			return message_result(&sender, message);
+			return self.message_result(&sender, message);
 		}
 
 		let ids: Option<Vec<String>> = obj.get("ids").and_then(Value::as_array).map(|values| {
@@ -1437,7 +1437,7 @@ impl HubTool {
 			let timeout = explicit_timeout.unwrap_or(DEFAULT_IRC_TIMEOUT_MS);
 			let (buffered, waiter) = mailbox.take_or_register(&sender, from.as_deref());
 			if let Some(message) = buffered {
-				return message_result(&sender, message);
+				return self.message_result(&sender, message);
 			}
 			let Some(mut waiter) = waiter else {
 				return self.no_peer_wait_result(&sender);
@@ -1465,7 +1465,7 @@ impl HubTool {
 							},
 							message = &mut receive => {
 								if let Some(message) = message {
-									return message_result(&sender, message);
+									return self.message_result(&sender, message);
 								}
 								return self.message_timeout_result(&sender, from.as_deref(), timeout);
 							},
@@ -1483,7 +1483,7 @@ impl HubTool {
 							},
 							message = &mut receive => {
 								if let Some(message) = message {
-									return message_result(&sender, message);
+									return self.message_result(&sender, message);
 								}
 								return self.message_timeout_result(&sender, from.as_deref(), timeout);
 							},
@@ -1502,7 +1502,7 @@ impl HubTool {
 		let timeout = explicit_timeout.unwrap_or(DEFAULT_JOB_WAIT_MS);
 		let (buffered, waiter) = mailbox.take_or_register(&sender, from.as_deref());
 		if let Some(message) = buffered {
-			return message_result(&sender, message);
+			return self.message_result(&sender, message);
 		}
 		let Some(mut waiter) = waiter else {
 			return self.job_snapshot_result("wait", Vec::new());
@@ -1535,7 +1535,7 @@ impl HubTool {
 						},
 						message = &mut receive => {
 							if let Some(message) = message {
-								return message_result(&sender, message);
+								return self.message_result(&sender, message);
 							}
 							return self.job_snapshot_result("wait", current);
 						},
@@ -1552,7 +1552,7 @@ impl HubTool {
 						},
 						message = &mut receive => {
 							if let Some(message) = message {
-								return message_result(&sender, message);
+								return self.message_result(&sender, message);
 							}
 							return self.job_snapshot_result("wait", current);
 						},
@@ -1711,35 +1711,54 @@ impl HubTool {
 		let await_ends = self.supervisor.agent_end_seq(to);
 		let mut receipts = Vec::with_capacity(targets.len());
 		for target in &targets {
-			let delivery_id = match self
-				.supervisor
-				.offer_peer_delivery(target, &sender, message)
-			{
-				Ok(delivery_id) => delivery_id,
-				Err(error) => {
-					receipts.push(IrcDeliveryReceipt {
-						to: target.clone(),
-						outcome: "failed".to_string(),
-						error: Some(error),
-					});
-					continue;
+			let msg = IrcMessage::new(sender.clone(), target.clone(), message)
+				.with_reply_to(reply_to);
+			let text = format_incoming(&msg);
+			// Only durable targets spool mail; an ephemeral child in a durable
+			// root keeps the historical in-memory hand-off.
+			let delivery_id = match super::hub_park::durable_peer_target(&self.supervisor, target) {
+				None => None,
+				Some(target_session) => {
+					match self.supervisor.enqueue_peer_delivery(
+						target_session.as_deref(),
+						&sender,
+						&msg.id,
+						&text,
+					) {
+						Ok(delivery_id) => delivery_id,
+						Err(error) => {
+							receipts.push(IrcDeliveryReceipt {
+								to: target.clone(),
+								outcome: "failed".to_string(),
+								error: Some(error),
+							});
+							continue;
+						},
+					}
 				},
 			};
-			let msg = IrcMessage::new(sender.clone(), target.clone(), message)
-				.with_reply_to(reply_to)
-				.with_delivery_id(delivery_id);
+			let msg = msg.with_delivery_id(delivery_id.clone());
 			let known = self.supervisor.is_known_agent(target);
-			let receipt = if mailbox.deliver_to_waiter(&msg) {
+			let delivered_to_waiter = mailbox.deliver_to_waiter(&msg);
+			if delivered_to_waiter
+				&& let Some(delivery_id) = delivery_id.as_deref()
+			{
+				// The waiter owns the message from here; it is not conversation
+				// input, so a resume must not replay it into the model.
+				self.supervisor.mark_peer_delivery_consumed(delivery_id);
+			}
+			let receipt = if delivered_to_waiter {
 				IrcDeliveryReceipt {
 					to: target.clone(),
 					outcome: "injected".to_string(),
 					error: None,
 				}
 			} else {
-				match self
-					.supervisor
-					.inject_peer_message(target, format_incoming(&msg))
-				{
+				match self.supervisor.inject_peer_message(
+					target,
+					text.clone(),
+					delivery_id.clone(),
+				) {
 					Ok(()) => IrcDeliveryReceipt {
 						to: target.clone(),
 						outcome: "injected".to_string(),
@@ -1752,7 +1771,8 @@ impl HubTool {
 						if let Some(delegated) = super::hub_park::delegate_send(
 							&self.supervisor,
 							target,
-							format_incoming(&msg),
+							text,
+							delivery_id.clone(),
 						) {
 							match delegated {
 								Ok(outcome) => IrcDeliveryReceipt {
@@ -1793,6 +1813,12 @@ impl HubTool {
 					},
 				}
 			};
+			if receipt.outcome == "failed"
+				&& let Some(delivery_id) = delivery_id.as_deref()
+			{
+				// Nothing accepted it: do not replay an unread message later.
+				self.supervisor.withdraw_peer_delivery(delivery_id);
+			}
 			receipts.push(receipt);
 		}
 
@@ -1827,6 +1853,7 @@ impl HubTool {
 				.await?
 			{
 				ReplyWait::Reply(message) => {
+					self.consume_delivery(&message);
 					lines.push(String::new());
 					lines.push(format!("Reply from {}:", message.from));
 					lines.push(message.body.clone());
@@ -1953,6 +1980,23 @@ impl HubTool {
 		}
 	}
 
+	/// Mark a mailbox message's durable row consumed when it is returned as a
+	/// tool result (`wait`/`inbox`/awaited reply) rather than conversation input.
+	fn consume_delivery(&self, message: &IrcMessage) {
+		if let Some(delivery_id) = message.delivery_id.as_deref() {
+			self.supervisor.mark_peer_delivery_consumed(delivery_id);
+		}
+	}
+
+	fn message_result(
+		&self,
+		sender: &str,
+		message: IrcMessage,
+	) -> Result<ToolResult, ToolError> {
+		self.consume_delivery(&message);
+		message_result(sender, message)
+	}
+
 	fn execute_inbox(
 		&self,
 		obj: &serde_json::Map<String, Value>,
@@ -1960,6 +2004,14 @@ impl HubTool {
 		let sender = self.sender_id();
 		let peek = obj.get("peek").and_then(Value::as_bool).unwrap_or(false);
 		let messages = self.supervisor.mailbox().inbox(&sender, peek);
+		if !peek {
+			// These messages leave the mailbox as a tool result, not as
+			// conversation input: mark their durable rows consumed so a resume
+			// never replays them into the model.
+			for message in &messages {
+				self.consume_delivery(message);
+			}
+		}
 		let details = HubToolDetails {
 			op: "inbox".to_string(),
 			from: Some(sender),

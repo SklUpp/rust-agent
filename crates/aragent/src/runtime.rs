@@ -1368,7 +1368,10 @@ impl SignalDispatcher {
 	fn inject(&self, parts: Vec<pi_agent::ContentPart>) -> bool {
 		match self.steer_turn.lock() {
 			Ok(guard) => guard.as_ref().is_some_and(|tx| {
-				tx.try_send(SteeringEvent::InjectMessage(parts)).is_ok()
+				tx.try_send(SteeringEvent::InjectMessage {
+					parts,
+					delivery_id: None,
+				}).is_ok()
 			}),
 			Err(_) => false,
 		}
@@ -2311,9 +2314,10 @@ impl AgentRunner for PiAgentRunner {
 			let steer_sink: crate::advisor_runtime::SteerSink =
 				Arc::new(move |text: &str| {
 					steer_tx
-						.try_send(SteeringEvent::InjectMessage(vec![
-							pi_agent::ContentPart::text(text),
-						]))
+						.try_send(SteeringEvent::InjectMessage {
+							parts: vec![pi_agent::ContentPart::text(text)],
+							delivery_id: None,
+						})
 						.is_ok()
 				});
 			manager.configure_run(
@@ -2327,9 +2331,10 @@ impl AgentRunner for PiAgentRunner {
 				Some(steer_sink),
 			);
 			if let Some(aside) = manager.take_pending_aside_content() {
-				let _ = steering_tx.try_send(SteeringEvent::InjectMessage(vec![
-					pi_agent::ContentPart::text(aside),
-				]));
+				let _ = steering_tx.try_send(SteeringEvent::InjectMessage {
+					parts: vec![pi_agent::ContentPart::text(aside)],
+					delivery_id: None,
+				});
 			}
 		}
 		// The goal limit steer rides this run's own steering channel: replacing
@@ -2338,9 +2343,10 @@ impl AgentRunner for PiAgentRunner {
 			let steer_tx = steering_tx.clone();
 			goal.set_steer(Some(std::sync::Arc::new(move |text: &str| {
 				steer_tx
-					.try_send(SteeringEvent::InjectMessage(vec![
-						pi_agent::ContentPart::text(text),
-					]))
+					.try_send(SteeringEvent::InjectMessage {
+						parts: vec![pi_agent::ContentPart::text(text)],
+						delivery_id: None,
+					})
 					.is_ok()
 			})));
 		}
@@ -4128,9 +4134,10 @@ async fn run_advisor_call(
 			) {
 				crate::advisor_runtime::LoopGuardAction::None => {},
 				crate::advisor_runtime::LoopGuardAction::Redirect(text) => {
-					let _ = steer_tx.try_send(pi_agent::SteeringEvent::InjectMessage(
-						pi_agent::Message::user(text).parts,
-					));
+					let _ = steer_tx.try_send(pi_agent::SteeringEvent::InjectMessage {
+						parts: pi_agent::Message::user(text).parts,
+						delivery_id: None,
+					});
 				},
 				crate::advisor_runtime::LoopGuardAction::Abort => {
 					// The corrective was ignored: stop this advisor update.

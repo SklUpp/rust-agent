@@ -1215,7 +1215,10 @@ async fn interrupt_journals_injections_before_the_next_turn() {
 			_ = started.notified() => {},
 			res = &mut first => panic!("dialog ended before the provider request started: {res:?}"),
 		}
-		tx.send(SteeringEvent::InjectMessage(vec![ContentPart::text("please also note")]))
+		tx.send(SteeringEvent::InjectMessage {
+			parts: vec![ContentPart::text("please also note")],
+			delivery_id: None,
+		})
 			.await
 			.expect("accept injection");
 		tx
@@ -1284,7 +1287,10 @@ async fn drain_interrupt_survives_a_host_reload() {
 		.with_durable(Some(Arc::clone(&session) as Arc<dyn DurableBoundary>));
 	let mut state = AgentState::default();
 	let (tx, rx) = tokio::sync::mpsc::channel(4);
-	tx.send(SteeringEvent::InjectMessage(vec![ContentPart::text("steer note")]))
+	tx.send(SteeringEvent::InjectMessage {
+		parts: vec![ContentPart::text("steer note")],
+		delivery_id: None,
+	})
 		.await
 		.expect("queue injection");
 	tx
@@ -4011,6 +4017,74 @@ fn child_generation_validation_tracks_parent_lineage() {
 		"a future epoch must fail closed"
 	);
 	drop(factory);
+	drop(root);
+	let _ = std::fs::remove_dir_all(dir);
+}
+
+#[tokio::test]
+async fn peer_deliveries_replay_once_and_withdraw_unaccepted() {
+	let dir = temp_dir("peer-replay");
+	let path = dir.join("sessions.db");
+	let session_id = "peer-root";
+	let text = "[msg-1] peer-a: marker-peer-once";
+	let delivery_id;
+	{
+		let root = Arc::new(
+			DurableSession::create(&path, header(session_id, &dir)).expect("create root"),
+		);
+		let factory = root.child_durability_factory();
+		delivery_id = factory
+			.enqueue_peer_delivery(None, "peer-a", "msg-1", text)
+			.expect("enqueue peer delivery");
+		let rejected = factory
+			.enqueue_peer_delivery(None, "peer-a", "msg-2", "never accepted")
+			.expect("enqueue rejected delivery");
+		factory
+			.withdraw_peer_delivery(&rejected)
+			.expect("withdraw rejected delivery");
+	}
+
+	let (root, _loaded) =
+		DurableSession::open(&path, session_id, header(session_id, &dir)).expect("reopen root");
+	let replayed = root
+		.accept_pending_peer_deliveries(i64::MAX)
+		.await
+		.expect("replay pending peer deliveries");
+	assert_eq!(replayed.len(), 1, "the withdrawn row must not replay");
+	assert_eq!(replayed[0].delivery_id, delivery_id);
+	assert_eq!(replayed[0].from, "peer-a");
+	assert_eq!(replayed[0].text, text);
+	assert_eq!(replayed[0].message.content, text);
+
+	// Consuming is atomic: the next drain sees nothing and the row is delivered.
+	assert!(
+		root.accept_pending_peer_deliveries(i64::MAX)
+			.await
+			.expect("second drain")
+			.is_empty()
+	);
+	// The loop appends the returned message; the boundary must not append a
+	// second copy because the row already carries it.
+	root.persist_messages(&[replayed[0].message.clone()])
+		.await
+		.expect("persist replayed message");
+
+	let store = SqliteStore::open_read_only(&path).expect("read store");
+	let delivered = store
+		.delivery(&delivery_id)
+		.expect("read delivery")
+		.expect("delivery present");
+	assert!(delivered.delivered_at_ms.is_some(), "consume marks delivered");
+	let branch = store
+		.branch_messages(&delivered.origin_branch_id)
+		.expect("read branch");
+	assert_eq!(branch.len(), 1, "exactly one persisted copy");
+	assert!(
+		serde_json::to_string(&branch[0].payload)
+			.expect("payload json")
+			.contains("marker-peer-once")
+	);
+	drop(store);
 	drop(root);
 	let _ = std::fs::remove_dir_all(dir);
 }

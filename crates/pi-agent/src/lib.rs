@@ -27,7 +27,8 @@ pub use compaction::{CompactionReport, Compactor};
 pub use tls::{ensure_crypto_provider, http_client_builder, shared_rustls_config};
 pub use durable::{
 	ChildDurability, ChildDurabilityFactory, DURABILITY_ADMISSION_FAILURE_CODE,
-	DURABILITY_FAILURE_CODE, DeliveredWorkerResult, DurableBoundary, DurableError,
+	DURABILITY_FAILURE_CODE, DeliveredPeerMessage, DeliveredWorkerResult, DurableBoundary,
+	DurableError,
 	WorkerCompletionSink, WorkerIdentity,
 };
 pub use loop_module::{

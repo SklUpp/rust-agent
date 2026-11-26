@@ -74,12 +74,38 @@ pub fn delegate_send(
 	supervisor: &Arc<Supervisor>,
 	to: &str,
 	text: String,
+	delivery_id: Option<String>,
 ) -> Option<Result<DeliveryOutcome, String>> {
 	let manager = lookup(supervisor)?;
 	if !manager.knows(to) {
 		return None;
 	}
-	Some(manager.send(to, text))
+	Some(manager.send_with_delivery(to, text, delivery_id))
+}
+
+/// Resolve where a peer delivery for `target` must be spooled.
+///
+/// `None` means the target is not durable (or this supervisor has no durable
+/// factory), so the caller must not create a delivery row. `Some(None)` is the
+/// root session; `Some(Some(worker))` is a durable child's session.
+#[must_use]
+pub fn durable_peer_target(
+	supervisor: &Arc<Supervisor>,
+	target: &str,
+) -> Option<Option<String>> {
+	if supervisor.child_durability_factory().is_none() {
+		return None;
+	}
+	if target == crate::mailbox::MAIN_AGENT_ID {
+		return Some(None);
+	}
+	if let Some(worker) = lookup(supervisor).and_then(|manager| manager.durable_worker_id(target))
+	{
+		return Some(Some(worker));
+	}
+	supervisor
+		.has_durable_child(target)
+		.then(|| supervisor.capture_result_key(target).or_else(|| Some(target.to_string())))
 }
 
 /// One visible history entry: a manager row, a supervisor child, or a

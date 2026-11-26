@@ -83,7 +83,7 @@ pub trait FrameSink: Send + Sync {
 /// The native steering channel injects a message into the live conversation, so
 /// images travel with it instead of being rejected. The wiring is
 /// `RpcLaunch.steer` -> `PiAgentRunner::steer(Vec<pi_agent::ContentPart>)` ->
-/// `SignalDispatcher` -> `SteeringEvent::InjectMessage(Vec<ContentPart>)`; the
+/// `SignalDispatcher` -> `SteeringEvent::InjectMessage { parts, .. }`; the
 /// parts are rebuilt by the CLI entry point, which is the only place that may
 /// know both types.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]

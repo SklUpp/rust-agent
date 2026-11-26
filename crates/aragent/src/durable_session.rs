@@ -26,7 +26,8 @@ use std::{
 use async_trait::async_trait;
 use pi_agent::CompactionReport;
 use pi_agent::{
-	ChildDurability, ChildDurabilityFactory, DeliveredWorkerResult, DurableBoundary, DurableError,
+	ChildDurability, ChildDurabilityFactory, DeliveredPeerMessage, DeliveredWorkerResult,
+	DurableBoundary, DurableError,
 	WorkerCompletionSink, WorkerIdentity,
 	state::{Message, Role, StopReason, ToolCall, ToolResult},
 };
@@ -477,6 +478,10 @@ pub struct DurableSession {
 	/// write boundary (before any provider request) fails the turn.
 	resume_seed: Arc<Mutex<Option<StoreResult<Vec<(u64, Option<String>)>>>>>,
 	written_tool_ids: Arc<Mutex<HashMap<String, VecDeque<String>>>>,
+	/// Peer messages already appended by `consume_peer_delivery`, keyed by the
+	/// digest of the exact loop message. The next `persist_messages` skips the
+	/// append (the row exists) but still records its id in `tracked_ids`.
+	preconsumed: Arc<Mutex<HashMap<u64, VecDeque<String>>>>,
 	/// Selected compacted projection, mirrored in the session payload.
 	projection: Arc<Mutex<Option<StoredProjection>>>,
 	/// Last persisted assistant message id on the active branch, updated by
@@ -509,6 +514,7 @@ fn empty_session_fields(
 		cursor: Arc::new(Mutex::new(Cursor { branch, leaf })),
 		written_tools: Arc::new(Mutex::new(HashMap::new())),
 		written_tool_ids: Arc::new(Mutex::new(HashMap::new())),
+		preconsumed: Arc::new(Mutex::new(HashMap::new())),
 		tracked: Arc::new(Mutex::new(Vec::new())),
 		tracked_ids: Arc::new(Mutex::new(Vec::new())),
 		projection: Arc::new(Mutex::new(projection)),
@@ -774,6 +780,7 @@ impl DurableSession {
 		// Existing tool rows are part of the seed prefix, not pending outcomes.
 		lock(&self.written_tools).clear();
 		lock(&self.written_tool_ids).clear();
+		lock(&self.preconsumed).clear();
 		*lock(&self.projection) = parts.projection.clone();
 		if lock(&self.tracked).is_empty() {
 			let seed =
@@ -1396,6 +1403,75 @@ impl DurableSession {
 	}
 }
 
+impl DurableSession {
+	/// Atomically append one accepted peer message and mark its delivery row
+	/// delivered. The message id is deterministic from the delivery id and the
+	/// entry timestamp comes from the row, so a retried consume is idempotent.
+	async fn consume_peer_message(
+		&self,
+		delivery_id: &str,
+		message: &Message,
+	) -> Result<(), DurableError> {
+		let lookup_id = delivery_id.to_string();
+		let record = self
+			.call_async_owned(move |store| store.delivery(&lookup_id))
+			.await
+			.map_err(|error| DurableError::new(error.to_string()))?
+			.ok_or_else(|| {
+				DurableError::new(format!("peer delivery {delivery_id} does not exist"))
+			})?;
+		if record.session_id != self.session_id {
+			return Err(DurableError::new(format!(
+				"peer delivery {delivery_id} belongs to session {}, not {}",
+				record.session_id, self.session_id
+			)));
+		}
+		let message_id = format!("msg-peer-{delivery_id}");
+		let session_message = Self::project_message(message).ok_or_else(|| {
+			DurableError::new("peer delivery is not a persistable message")
+		})?;
+		let created_ms = u64::try_from(record.created_at_ms).unwrap_or(0);
+		let timestamp =
+			output::iso8601(UNIX_EPOCH + std::time::Duration::from_millis(created_ms));
+		let entry = MessageEntry::new(message_id.clone(), None, timestamp, session_message);
+		let payload =
+			serde_json::to_value(&entry).map_err(|error| DurableError::new(error.to_string()))?;
+		let write_id = delivery_id.to_string();
+		let session_id = self.session_id.clone();
+		let write_message_id = message_id.clone();
+		let at_ms = record.created_at_ms;
+		self
+			.call_async_owned(move |store| {
+				store.consume_delivery(
+					&write_id,
+					NewMessage {
+						id: write_message_id,
+						session_id,
+						branch_id: String::new(),
+						parent_message_id: None,
+						payload,
+					},
+					at_ms,
+				)
+			})
+			.await
+			.map_err(|error| DurableError::new(error.to_string()))?;
+		lock(&self.cursor).leaf = Some(message_id.clone());
+		let digest = self.incoming_digest(message);
+		lock(&self.preconsumed)
+			.entry(digest)
+			.or_default()
+			.push_back(message_id.clone());
+		let mut projection = lock(&self.projection);
+		if let Some(projection) = projection.as_mut()
+			&& !projection.kept.contains(&message_id)
+		{
+			projection.kept.push(message_id);
+		}
+		Ok(())
+	}
+}
+
 #[async_trait]
 impl DurableBoundary for DurableSession {
 	async fn persist_messages(&self, messages: &[Message]) -> Result<(), DurableError> {
@@ -1420,7 +1496,19 @@ impl DurableBoundary for DurableSession {
 			let mut entries = Vec::new();
 			let mut tail_ids: Vec<Option<String>> = Vec::new();
 			let mut parent = leaf;
-			for message in &messages[start..] {
+			for (offset, message) in messages[start..].iter().enumerate() {
+				// A peer delivery consumed earlier already appended this exact
+				// message in its own transaction. Record the stored id and digest
+				// in order without appending a second copy.
+				let digest = digests[start + offset];
+				let preconsumed_id = lock(&self.preconsumed)
+					.get_mut(&digest)
+					.and_then(|ids| ids.pop_front());
+				if let Some(id) = preconsumed_id {
+					parent = Some(id.clone());
+					tail_ids.push(Some(id));
+					continue;
+				}
 				if message.role == Role::Tool
 					&& message
 						.tool_call_id
@@ -1583,6 +1671,7 @@ impl DurableBoundary for DurableSession {
 		// Existing tool rows are part of the seed prefix, not pending outcomes.
 		lock(&self.written_tools).clear();
 		lock(&self.written_tool_ids).clear();
+		lock(&self.preconsumed).clear();
 		let ids = self
 			.align_ids(messages, &parts.branch_messages)
 			.map_err(|error| DurableError::new(error.to_string()))?;
@@ -1946,6 +2035,62 @@ impl DurableBoundary for DurableSession {
 
 		Ok(unconfirmed)
 	}
+
+	async fn consume_peer_delivery(
+		&self,
+		delivery_id: &str,
+		message: &Message,
+	) -> Result<(), DurableError> {
+		self.consume_peer_message(delivery_id, message).await
+	}
+
+	async fn accept_pending_peer_deliveries(
+		&self,
+		cutoff_ms: i64,
+	) -> Result<Vec<DeliveredPeerMessage>, DurableError> {
+		let session_id = self.session_id.clone();
+		let pending = self
+			.call_async_owned(move |store| store.pending_peer_deliveries(&session_id))
+			.await
+			.map_err(|error| DurableError::new(error.to_string()))?;
+		let mut delivered = Vec::with_capacity(pending.len());
+		for record in pending {
+			if record.created_at_ms >= cutoff_ms {
+				continue;
+			}
+			let from = record
+				.payload
+				.get("from")
+				.and_then(Value::as_str)
+				.unwrap_or_default()
+				.to_string();
+			let text = record
+				.payload
+				.get("text")
+				.and_then(Value::as_str)
+				.unwrap_or_default()
+				.to_string();
+			let message = Message::user(text.clone());
+			self.consume_peer_message(&record.delivery_id, &message).await?;
+			delivered.push(DeliveredPeerMessage {
+				delivery_id: record.delivery_id,
+				from,
+				text,
+				message,
+			});
+		}
+		Ok(delivered)
+	}
+
+	async fn withdraw_pending_delivery(&self, delivery_id: &str) -> Result<(), DurableError> {
+		let delivery_id = delivery_id.to_string();
+		self
+			.call_async_owned(move |store| {
+				store.withdraw_pending_delivery(&delivery_id).map(|_| ())
+			})
+			.await
+			.map_err(|error| DurableError::new(error.to_string()))
+	}
 }
 
 /// Host child-scope factory backed by the root session's writer thread.
@@ -2299,6 +2444,7 @@ impl ChildDurabilityFactory for StoreChildDurabilityFactory {
 		&self,
 		target_session: Option<&str>,
 		sender: &str,
+		message_id: &str,
 		text: &str,
 	) -> Result<String, DurableError> {
 		let session_id = target_session
@@ -2318,6 +2464,7 @@ impl ChildDurabilityFactory for StoreChildDurabilityFactory {
 		let payload = serde_json::json!({
 			"kind": "peer-message",
 			"from": sender,
+			"msgId": message_id,
 			"text": text,
 			"deliveryId": delivery_id,
 		});
@@ -2331,6 +2478,24 @@ impl ChildDurabilityFactory for StoreChildDurabilityFactory {
 		writer_call(&self.writer, move |store| store.enqueue_delivery(record))
 			.map_err(|error| DurableError::new(error.to_string()))?;
 		Ok(delivery_id)
+	}
+
+	fn mark_peer_delivery_consumed(&self, delivery_id: &str) -> Result<(), DurableError> {
+		let delivery_id = delivery_id.to_string();
+		let now = unix_ms();
+		writer_call(&self.writer, move |store| {
+			store.mark_delivery_delivered(&delivery_id, now)?;
+			store.mark_delivery_processed(&delivery_id, now)
+		})
+		.map_err(|error| DurableError::new(error.to_string()))
+	}
+
+	fn withdraw_peer_delivery(&self, delivery_id: &str) -> Result<(), DurableError> {
+		let delivery_id = delivery_id.to_string();
+		writer_call(&self.writer, move |store| {
+			store.withdraw_pending_delivery(&delivery_id).map(|_| ())
+		})
+		.map_err(|error| DurableError::new(error.to_string()))
 	}
 }
 

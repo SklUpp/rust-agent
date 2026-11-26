@@ -4361,7 +4361,10 @@ async fn steering_injection_preserves_text_and_image_parts() {
 	let image = ContentPart::image(image_b64, "image/png").expect("valid image part");
 	let parts = vec![ContentPart::text("look"), image];
 	steering_tx
-		.send(SteeringEvent::InjectMessage(parts.clone()))
+		.send(SteeringEvent::InjectMessage {
+			parts: parts.clone(),
+			delivery_id: None,
+		})
 		.await
 		.expect("queue steering");
 

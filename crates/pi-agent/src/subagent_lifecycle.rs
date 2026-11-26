@@ -83,6 +83,34 @@ pub const DEFAULT_AGENT_IDLE_TTL_MS: u64 = 420_000;
 /// How long teardown waits for a cancelled lifecycle actor before aborting it.
 const ACTOR_SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
 
+/// Deterministic-but-unique message ids for peer deliveries the manager creates
+/// itself (the hub path supplies its own transport id).
+static PEER_MESSAGE_SEQ: AtomicU64 = AtomicU64::new(1);
+
+/// Withdraws a pending delivery row unless the send is accepted. Declared after
+/// any manager-state guard at each use site, so the state lock is released
+/// before the supervisor hook runs.
+struct PendingDeliveryGuard {
+	supervisor:  Weak<Supervisor>,
+	delivery_id: Option<String>,
+}
+
+impl PendingDeliveryGuard {
+	fn disarm(&mut self) {
+		self.delivery_id = None;
+	}
+}
+
+impl Drop for PendingDeliveryGuard {
+	fn drop(&mut self) {
+		if let Some(delivery_id) = self.delivery_id.take()
+			&& let Some(supervisor) = self.supervisor.upgrade()
+		{
+			supervisor.withdraw_peer_delivery(&delivery_id);
+		}
+	}
+}
+
 fn now_ms() -> u64 {
 	SystemTime::now()
 		.duration_since(UNIX_EPOCH)
@@ -207,12 +235,27 @@ struct Entry {
 
 struct LiveSession {
 	/// Idle wake queue: each message starts its own turn on the owned state.
-	inbound:  mpsc::Sender<String>,
+	inbound:  mpsc::Sender<AcceptedMessage>,
 	/// Busy aside queue: a mid-turn message joins the running dialog at its
 	/// next step boundary (TS `deliverIrcMessage` non-interrupting aside).
 	steering: mpsc::Sender<crate::loop_module::SteeringEvent>,
 	cancel:   tokio_util::sync::CancellationToken,
 	epoch:    u64,
+}
+
+/// One accepted request with its durable peer delivery row, when the host
+/// persisted the send. The actor consumes the row atomically with the first
+/// history append of the turn.
+#[derive(Debug, Clone)]
+struct AcceptedMessage {
+	text:        String,
+	delivery_id: Option<String>,
+}
+
+/// One follow-up turn queued by the actor itself (a stranded aside).
+struct PendingTurn {
+	message:     Message,
+	delivery_id: Option<String>,
 }
 
 struct LifecycleState {
@@ -240,6 +283,10 @@ pub struct SubagentLifecycleManager {
 	/// Running actor tasks, so scope teardown can cancel and join them before
 	/// the session's provider/registry/tools are released.
 	actors:      Arc<ActorTracker>,
+	/// Per-id actor-exit notifications. `park` registers before cancelling and
+	/// waits for the actor to finish, so a cached durable child is never reused
+	/// while its previous owner is still unwinding.
+	exits:       Mutex<HashMap<String, Arc<tokio::sync::Notify>>>,
 }
 
 /// Counter plus abort handles for running lifecycle actors.
@@ -433,6 +480,7 @@ pub fn attach(
 			history:    HashMap::new(),
 		}),
 		gates: Mutex::new(HashMap::new()),
+		exits: Mutex::new(HashMap::new()),
 	});
 	if let Some(root) = manager.root.clone() {
 		manager.scan_persisted(&root);
@@ -470,6 +518,23 @@ impl SubagentLifecycleManager {
 	pub fn knows(&self, id: &str) -> bool {
 		let state = lock(&self.state);
 		state.entries.contains_key(id) || state.tombstones.contains(id)
+	}
+
+	/// Durable worker/session id for `id`, or `None` when the child is not
+	/// durable. Peer mail is only spooled for durable children.
+	#[must_use]
+	pub fn durable_worker_id(&self, id: &str) -> Option<String> {
+		let state = lock(&self.state);
+		let contract = state.entries.get(id)?.contract.as_ref()?;
+		if !contract.durable {
+			return None;
+		}
+		Some(
+			contract
+				.result_key
+				.clone()
+				.unwrap_or_else(|| id.to_string()),
+		)
 	}
 
 	/// Transcript path for `id`, including tombstoned ids (`history://`).
@@ -1023,24 +1088,62 @@ impl SubagentLifecycleManager {
 	}
 
 	/// Park an agent now (TTL expiry, explicit park, or shutdown).
-	pub fn park(&self, id: &str) -> bool {
+	///
+	/// The live slot is kept until the actor actually exits, and the returned
+	/// future resolves once that owner is gone (or immediately when no actor was
+	/// live). A revive therefore never reuses a scope while its previous owner
+	/// is still running a tool effect or flushing the final journal.
+	pub async fn park(&self, id: &str) -> bool {
+		self.park_epoch(id, None).await
+	}
+
+	async fn park_epoch(&self, id: &str, expected_epoch: Option<u64>) -> bool {
 		let mut state = lock(&self.state);
-		let Some(status) = state.entries.get(id).map(|entry| entry.status) else {
+		let Some((status, entry_epoch)) =
+			state.entries.get(id).map(|entry| (entry.status, entry.epoch))
+		else {
 			return false;
 		};
 		if status == LifecycleStatus::Tombstoned {
 			return false;
 		}
-		if let Some(live) = state.live.remove(id) {
-			live.cancel.cancel();
+		if let Some(expected) = expected_epoch
+			&& (entry_epoch != expected || status != LifecycleStatus::Idle)
+		{
+			return false;
 		}
+		let notify = lock(&self.exits)
+			.entry(id.to_string())
+			.or_insert_with(|| Arc::new(tokio::sync::Notify::new()))
+			.clone();
+		let notified = notify.notified();
+		tokio::pin!(notified);
+		notified.as_mut().enable();
+		let had_live = if let Some(live) = state.live.get(id) {
+			live.cancel.cancel();
+			// Keep the slot: the actor removes it in `finish_actor` (or the
+			// actor-exit guard on panic/abort) only after its effect and flush.
+			true
+		} else {
+			false
+		};
 		state.history.remove(id);
 		if let Some(entry) = state.entries.get_mut(id) {
 			entry.epoch = entry.epoch.wrapping_add(1);
 			entry.status = LifecycleStatus::Parked;
 			entry.last_activity = now_ms();
 		}
+		drop(state);
+		if had_live {
+			notified.as_mut().await;
+		}
 		true
+	}
+
+	fn notify_actor_exit(&self, id: &str) {
+		if let Some(notify) = lock(&self.exits).get(id).cloned() {
+			notify.notify_waiters();
+		}
 	}
 
 	/// Explicit user cancel of a live keep-alive session (`hub cancel`).
@@ -1177,6 +1280,18 @@ impl SubagentLifecycleManager {
 	/// cancelled (teardown), and a live slot whose actor token is already
 	/// cancelled (its actor is unwinding).
 	pub fn send(self: &Arc<Self>, id: &str, text: String) -> Result<DeliveryOutcome, String> {
+		self.send_with_delivery(id, text, None)
+	}
+
+	/// Deliver `text` together with its durable peer delivery row. The row is
+	/// created here when the caller did not already enqueue one, and withdrawn
+	/// if the send fails before any actor can accept it.
+	pub fn send_with_delivery(
+		self: &Arc<Self>,
+		id: &str,
+		text: String,
+		delivery_id: Option<String>,
+	) -> Result<DeliveryOutcome, String> {
 		if tokio::runtime::Handle::try_current().is_err() {
 			return Err("reviving an agent requires a tokio runtime".to_string());
 		}
@@ -1191,6 +1306,43 @@ impl SubagentLifecycleManager {
 				"Agent session is shutting down; \"{id}\" cannot accept new messages."
 			));
 		}
+		let mut created = PendingDeliveryGuard { supervisor: self.supervisor.clone(), delivery_id: None };
+		let delivery_id = match delivery_id {
+			Some(delivery_id) => Some(delivery_id),
+			None => {
+				let target = {
+					let state = lock(&self.state);
+					state.entries.get(id).and_then(|entry| {
+						entry.contract.as_ref().filter(|contract| contract.durable).map(|contract| {
+							(
+								contract.result_key.clone(),
+								entry.parent_id.clone().unwrap_or_else(|| {
+									crate::mailbox::MAIN_AGENT_ID.to_string()
+								}),
+							)
+						})
+					})
+				};
+				match (target, supervisor.as_ref()) {
+					(Some((Some(worker_id), sender)), Some(supervisor)) => {
+						let message_id = format!(
+							"msg-peer-{}-{}",
+							now_ms(),
+							PEER_MESSAGE_SEQ.fetch_add(1, Ordering::Relaxed)
+						);
+						let id = supervisor
+							.enqueue_peer_delivery(Some(&worker_id), &sender, &message_id, &text)
+							.map_err(|error| format!("cannot persist peer delivery: {error}"))?
+							.ok_or_else(|| {
+								"durable peer delivery is not configured".to_string()
+							})?;
+						created.delivery_id = Some(id.clone());
+						Some(id)
+					},
+					_ => None,
+				}
+			},
+		};
 		// One revive in flight per id (TS coalesces): a second send waits here and
 		// then finds the live slot the winner published, instead of starting a
 		// concurrent revive or failing with a message the peer never received.
@@ -1223,7 +1375,8 @@ impl SubagentLifecycleManager {
 		// into its queue would report success for work no one drains, and a
 		// revive started now could race the actor's closing journal flush.
 		if state.live.get(id).is_some_and(|live| live.cancel.is_cancelled()) {
-			state.live.remove(id);
+			// Keep the slot: a cached durable child must not be reopened while
+			// its previous actor is still unwinding. The actor removes it.
 			return Err(format!(
 				"Agent \"{id}\" is stopping; retry once its session is closed."
 			));
@@ -1239,7 +1392,10 @@ impl SubagentLifecycleManager {
 			// A coalesced send takes the request queue even while the winner's
 			// turn runs: it is answered by its own turn, not kept as context.
 			let delivery = if idle || coalesced {
-				match inbound.try_send(text.clone()) {
+				match inbound.try_send(AcceptedMessage {
+					text: text.clone(),
+					delivery_id: delivery_id.clone(),
+				}) {
 					Ok(()) => Some(DeliveryOutcome::Woken),
 					Err(mpsc::error::TrySendError::Full(_)) => {
 						return Err(format!("Agent \"{id}\" is busy; its session queue is full."));
@@ -1247,9 +1403,10 @@ impl SubagentLifecycleManager {
 					Err(mpsc::error::TrySendError::Closed(_)) => None,
 				}
 			} else {
-				match steering.try_send(crate::loop_module::SteeringEvent::InjectMessage(vec![
-					crate::state::ContentPart::text(text.clone()),
-				])) {
+				match steering.try_send(crate::loop_module::SteeringEvent::InjectMessage {
+					parts: vec![crate::state::ContentPart::text(text.clone())],
+					delivery_id: delivery_id.clone(),
+				}) {
 					Ok(()) => Some(DeliveryOutcome::Injected),
 					Err(mpsc::error::TrySendError::Full(_)) => {
 						return Err(format!("Agent \"{id}\" is busy; its aside queue is full."));
@@ -1264,6 +1421,7 @@ impl SubagentLifecycleManager {
 					entry.status = LifecycleStatus::Running;
 					entry.last_activity = now_ms();
 				}
+				created.disarm();
 				return Ok(outcome);
 			}
 			// The actor ended without recording it; drop the dead slot and fall
@@ -1368,7 +1526,7 @@ impl SubagentLifecycleManager {
 		)?;
 		let (inbound, receiver) = mpsc::channel(64);
 		inbound
-			.try_send(text)
+			.try_send(AcceptedMessage { text, delivery_id: delivery_id.clone() })
 			.map_err(|_| format!("Agent \"{id}\" session queue is unavailable."))?;
 		let (steering, steering_rx) = mpsc::channel(16);
 		// Derived from the supervisor's session token: `shutdown` cancels every
@@ -1426,6 +1584,7 @@ impl SubagentLifecycleManager {
 		// The actor receives the first message immediately; `Revived` is honest
 		// because a brand-new live session was built for it.
 		self.spawn_actor(id, revived, receiver, steering_rx, cancel, epoch);
+		created.disarm();
 		Ok(DeliveryOutcome::Revived)
 	}
 
@@ -1441,7 +1600,7 @@ impl SubagentLifecycleManager {
 		let id = id.to_string();
 		handle.spawn(async move {
 			tokio::time::sleep(Duration::from_millis(ttl)).await;
-			manager.expire_if_idle(&id, epoch);
+			manager.expire_if_idle(&id, epoch).await;
 		});
 	}
 
@@ -1453,7 +1612,7 @@ impl SubagentLifecycleManager {
 		self: &Arc<Self>,
 		id: String,
 		revived: RevivedChild,
-		receiver: mpsc::Receiver<String>,
+		receiver: mpsc::Receiver<AcceptedMessage>,
 		steering_rx: mpsc::Receiver<crate::loop_module::SteeringEvent>,
 		cancel: tokio_util::sync::CancellationToken,
 		epoch: u64,
@@ -1462,9 +1621,27 @@ impl SubagentLifecycleManager {
 		// Weak: an idle actor must not keep the manager (and its inbound sender)
 		// alive in a cycle after the owner drops it.
 		let manager = Arc::downgrade(self);
+		// Constructed before the spawn future's first poll, so an abort before
+		// the actor ever runs still releases the live slot and wakes park.
+		let exit_guard = ActorExitGuard {
+			manager: manager.clone(),
+			id:      id.clone(),
+			epoch,
+			armed:   true,
+		};
 		let handle = tokio::spawn(async move {
 			let _lease = lease;
-			run_actor(manager, id, revived, receiver, steering_rx, cancel, epoch).await;
+			run_actor(
+				manager,
+				id,
+				revived,
+				receiver,
+				steering_rx,
+				cancel,
+				epoch,
+				exit_guard,
+			)
+			.await;
 		});
 		self.actors.track(handle.abort_handle());
 	}
@@ -1499,23 +1676,8 @@ impl SubagentLifecycleManager {
 		}
 	}
 
-	fn expire_if_idle(&self, id: &str, epoch: u64) {
-		let mut state = lock(&self.state);
-		let eligible = state.entries.get(id).is_some_and(|entry| {
-			entry.epoch == epoch && entry.status == LifecycleStatus::Idle
-		});
-		if !eligible {
-			return;
-		}
-		if let Some(live) = state.live.remove(id) {
-			live.cancel.cancel();
-		}
-		state.history.remove(id);
-		if let Some(entry) = state.entries.get_mut(id) {
-			entry.epoch = entry.epoch.wrapping_add(1);
-			entry.status = LifecycleStatus::Parked;
-			entry.last_activity = now_ms();
-		}
+	async fn expire_if_idle(&self, id: &str, epoch: u64) {
+		self.park_epoch(id, Some(epoch)).await;
 	}
 
 	fn note_running(&self, id: &str, epoch: u64) {
@@ -1546,17 +1708,17 @@ impl SubagentLifecycleManager {
 		self: &Arc<Self>,
 		id: &str,
 		epoch: u64,
-		inbound: &mpsc::Receiver<String>,
+		inbound: &mpsc::Receiver<AcceptedMessage>,
 		steering: &mut mpsc::Receiver<crate::loop_module::SteeringEvent>,
-	) -> Vec<Vec<ContentPart>> {
+	) -> Vec<(Vec<ContentPart>, Option<String>)> {
 		let mut asides = Vec::new();
 		let mut valid = false;
 		let mut idle = false;
 		{
 			let mut state = lock(&self.state);
 			while let Ok(event) = steering.try_recv() {
-				if let crate::loop_module::SteeringEvent::InjectMessage(parts) = event {
-					asides.push(parts);
+				if let crate::loop_module::SteeringEvent::InjectMessage { parts, delivery_id } = event {
+					asides.push((parts, delivery_id));
 				}
 			}
 			// Queued under the same lock a sender uses, so `idle` really means
@@ -1670,6 +1832,42 @@ impl SubagentLifecycleManager {
 	}
 }
 
+/// Last-resort cleanup when an actor future is dropped before its normal tail
+/// runs (panic or `ActorTracker::abort_all`): the durable child's live slot
+/// and the park waiter would otherwise leak and park forever.
+struct ActorExitGuard {
+	manager: Weak<SubagentLifecycleManager>,
+	id:      String,
+	epoch:   u64,
+	armed:   bool,
+}
+
+impl ActorExitGuard {
+	/// Normal actor completion already released the slot and woke the waiter.
+	fn disarm(&mut self) {
+		self.armed = false;
+	}
+}
+
+impl Drop for ActorExitGuard {
+	fn drop(&mut self) {
+		if !self.armed {
+			return;
+		}
+		// Poison-tolerant throughout: a guard dropped during unwind must never
+		// panic again (a double panic aborts the process).
+		let Some(manager) = self.manager.upgrade() else {
+			return;
+		};
+		if let Some(supervisor) = manager.supervisor.upgrade() {
+			supervisor.unregister_lifecycle_actor(&self.id, self.epoch);
+			supervisor.clear_revived_output_prefix(&self.id);
+		}
+		manager.finish_actor(&self.id, self.epoch);
+		manager.notify_actor_exit(&self.id);
+	}
+}
+
 /// Serial worker behind one live session (revived or adopted).
 ///
 /// Messages queue here; each one runs a fresh dialog turn against the same
@@ -1681,10 +1879,11 @@ async fn run_actor(
 	manager: Weak<SubagentLifecycleManager>,
 	id: String,
 	revived: RevivedChild,
-	mut receiver: mpsc::Receiver<String>,
+	mut receiver: mpsc::Receiver<AcceptedMessage>,
 	mut steering_rx: mpsc::Receiver<crate::loop_module::SteeringEvent>,
 	cancel: tokio_util::sync::CancellationToken,
 	epoch: u64,
+	mut exit_guard: ActorExitGuard,
 ) {
 	let RevivedChild {
 		mut agent_loop,
@@ -1722,15 +1921,18 @@ async fn run_actor(
 		}));
 	}
 	// Asides that missed their last step boundary, resolved as wake turns.
-	let mut pending: VecDeque<Message> = VecDeque::new();
+	let mut pending: VecDeque<PendingTurn> = VecDeque::new();
 	// Buffered mail addressed to this agent is drained at the first turn
 	// boundary by the loop's peer inbox; it stays queued here until then.
 	loop {
-		let request = match pending.pop_front() {
-			Some(message) => message,
+		let PendingTurn { message: request, delivery_id } = match pending.pop_front() {
+			Some(turn) => turn,
 			None => tokio::select! {
 				maybe = receiver.recv() => match maybe {
-					Some(text) => Message::user(text),
+					Some(accepted) => PendingTurn {
+						message: Message::user(accepted.text),
+						delivery_id: accepted.delivery_id,
+					},
 					None => break,
 				},
 				// Teardown/hub-cancel must stop an *idle* actor too: without this
@@ -1775,6 +1977,18 @@ async fn run_actor(
 		// instead of inheriting the finished run's counter, which would make a
 		// child that hit its cap permanently unanswerable.
 		state.total_turns = 0;
+		// The receipt is already out; consume the durable row in the same
+		// transaction that appends the request, so a crash cannot replay it.
+		if let (Some(delivery_id), Some(boundary)) =
+			(delivery_id.as_deref(), agent_loop.durable_boundary())
+		{
+			if let Err(error) = boundary.consume_peer_delivery(delivery_id, &request).await {
+				eprintln!(
+					"warning: agent \"{id}\" peer delivery {delivery_id} was not consumed: {error}"
+				);
+				break;
+			}
+		}
 		let turn_result = agent_loop
 			.run_dialog_message_with_cancel(
 				request.clone(),
@@ -1856,23 +2070,27 @@ async fn run_actor(
 		// one critical section (see `settle_turn`). Resolved asides wake a real
 		// follow-up turn, matching TS `#resumeStrandedIrcAsides`; keeping them as
 		// context-only would silently break a busy send's `injected` promise.
-		for parts in manager.settle_turn(&id, epoch, &receiver, &mut steering_rx) {
-			pending.push_back(Message::user_with_parts(parts));
+		for (parts, delivery_id) in manager.settle_turn(&id, epoch, &receiver, &mut steering_rx) {
+			pending.push_back(PendingTurn {
+				message: Message::user_with_parts(parts),
+				delivery_id,
+			});
 		}
 	}
 	// A cancel can race the last accepted `send`, whose receipt already said
 	// `woken`/`injected`. Those messages sit in this actor's queues; the live
 	// slot is gone (so nothing new can be enqueued), and dropping them here
 	// would make the receipt a lie. Persist them in order instead: a later
-	// revive replays the instruction.
-	while let Some(message) = pending.pop_front() {
-		state.messages.push(message);
+	// revive replays the instruction. Durable peer rows are deliberately left
+	// pending so the resumed boundary consumes them exactly once.
+	while let Some(turn) = pending.pop_front() {
+		state.messages.push(turn.message);
 	}
-	while let Ok(text) = receiver.try_recv() {
-		state.messages.push(Message::user(text));
+	while let Ok(accepted) = receiver.try_recv() {
+		state.messages.push(Message::user(accepted.text));
 	}
 	while let Ok(event) = steering_rx.try_recv() {
-		if let crate::loop_module::SteeringEvent::InjectMessage(parts) = event {
+		if let crate::loop_module::SteeringEvent::InjectMessage { parts, .. } = event {
 			state.messages.push(Message::user_with_parts(parts));
 		}
 	}
@@ -1885,6 +2103,8 @@ async fn run_actor(
 			supervisor.clear_revived_output_prefix(&id);
 		}
 		manager.finish_actor(&id, epoch);
+		manager.notify_actor_exit(&id);
 	}
+	exit_guard.disarm();
 }
 

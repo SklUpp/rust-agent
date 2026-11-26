@@ -888,7 +888,7 @@ async fn completed_child_wakes_its_own_state_and_only_rebuilds_after_park() {
 	);
 
 	// Park drops the live actor; the next send is an honest cold revive.
-	manager.park(&id);
+	manager.park(&id).await;
 	assert!(!manager.is_live(&id));
 	assert_eq!(manager.status(&id), Some(LifecycleStatus::Parked));
 	let sent = hub
@@ -2151,7 +2151,7 @@ async fn gone_workspace_is_transcript_only_and_refuses_revive() {
 
 	let manager = attach(&supervisor, DEFAULT_AGENT_IDLE_TTL_MS, reviver_factory(provider));
 	manager.adopt(&id, Some(contract)).expect("adopt");
-	manager.park(&id);
+	manager.park(&id).await;
 	let outcome: Result<DeliveryOutcome, String> = manager.send(&id, "hello".to_string());
 	let error = outcome.expect_err("revive must refuse a gone workspace");
 	assert!(
@@ -2775,4 +2775,129 @@ async fn resumed_parked_child_does_not_collide_with_a_fresh_spawn() {
 		after_manager.transcript_path(&id).is_some(),
 		"history:// falls back to the transcript on disk"
 	);
+}
+
+/// Tool that blocks until the test releases it, so a parked actor provably has
+/// an effect in flight instead of racing a fixed sleep.
+struct SlowTool {
+	entered: Arc<Semaphore>,
+	release: Arc<Semaphore>,
+}
+
+#[async_trait]
+impl pi_agent::Tool for SlowTool {
+	fn name(&self) -> &str {
+		"slow"
+	}
+
+	fn description(&self) -> &str {
+		"blocks until the test releases it"
+	}
+
+	fn schema(&self) -> serde_json::Value {
+		json!({"type": "object", "properties": {}})
+	}
+
+	async fn execute(
+		&self,
+		_arguments: &serde_json::Value,
+		_ctx: &AgentContext,
+	) -> Result<ToolResult, pi_agent::ToolError> {
+		self.entered.add_permits(1);
+		self.release
+			.acquire()
+			.await
+			.expect("the test keeps the release semaphore open");
+		Ok(ToolResult {
+			tool_call_id: String::new(),
+			content: "slow-done".to_string(),
+			is_error: false,
+			terminate: false,
+			details: None,
+		})
+	}
+}
+
+#[tokio::test]
+async fn park_waits_for_in_flight_tool_before_a_revive_can_reuse_the_session() {
+	let root = home_session_root("park-quiescence");
+	let provider = ScriptProvider::new(vec![
+		Message::assistant_with_tools(
+			"",
+			vec![ToolCall {
+				id:        "call-slow".to_string(),
+				name:      "slow".to_string(),
+				arguments: json!({}),
+			}],
+		),
+		Message::assistant("after slow"),
+	]);
+	let entered = Arc::new(Semaphore::new(0));
+	let release = Arc::new(Semaphore::new(0));
+	let mut registry = ToolRegistry::new();
+	registry.register(Arc::new(SlowTool {
+		entered: entered.clone(),
+		release: release.clone(),
+	}));
+	let supervisor = Supervisor::new(
+		registry,
+		provider.clone(),
+		None,
+		DelegationLimits::default(),
+	);
+	supervisor.set_child_session_root(Some(root.clone()));
+	let (id, mut contract) = adoptable_child(&supervisor, &root);
+	contract.tools.push("slow".to_string());
+	let reviver: Arc<dyn PersistedChildReviverFactory> =
+		Arc::new(DefaultPersistedReviverFactory::new(
+			provider,
+			registry_with_builtins(),
+		));
+	let manager = attach(&supervisor, 120, reviver);
+	manager.adopt(&id, Some(contract)).expect("adopt");
+	let hub = HubTool::root(supervisor.clone());
+	let ctx = AgentContext::new(root.clone());
+
+	let sent = hub
+		.execute(&json!({ "op": "send", "to": id, "message": "sleepy" }), &ctx)
+		.await
+		.expect("hub send");
+	let receipt = hub_details(sent).receipts.expect("receipts").remove(0);
+	assert!(receipt.error.is_none(), "{:?}", receipt.error);
+
+	let transcript = transcript_path(&supervisor, &id).expect("transcript path");
+	// The permit proves `SlowTool::execute` itself is running (the journal entry
+	// alone precedes the effect and cannot establish that).
+	let _entered = tokio::time::timeout(Duration::from_secs(5), entered.acquire())
+		.await
+		.expect("the slow tool must start")
+		.expect("the test keeps the entered semaphore open");
+
+	let park_id = id.clone();
+	let parker = manager.clone();
+	let mut park = tokio::spawn(async move { parker.park(&park_id).await });
+	assert!(
+		tokio::time::timeout(Duration::from_millis(250), &mut park)
+			.await
+			.is_err(),
+		"park must not return while the tool effect is still in flight"
+	);
+	assert!(manager.is_live(&id), "the actor is still unwinding");
+
+	release.add_permits(1);
+	let parked = tokio::time::timeout(Duration::from_secs(5), park)
+		.await
+		.expect("park completes once the effect finishes")
+		.expect("the park task joins");
+	assert!(parked, "park reports the row as parked");
+	assert!(!manager.is_live(&id), "the parked actor has fully exited");
+
+	let journaled = load_transcript(&transcript).unwrap_or_default();
+	assert!(
+		journaled
+			.iter()
+			.any(|message| message.role == Role::Tool && message.content.contains("slow-done")),
+		"the effect result is durable before park returns"
+	);
+	let _ = std::fs::remove_dir_all(root);
 }

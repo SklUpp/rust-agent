@@ -360,14 +360,26 @@ pub enum SteeringEvent {
 	/// `errorMessage` instead of the generic user-interrupt label.
 	InterruptWithReason(String),
 	/// Exact user parts (text and images) injected as one user message, so a
-	/// steering image survives instead of being flattened to text.
-	InjectMessage(Vec<ContentPart>),
+	/// steering image survives instead of being flattened to text. A durable
+	/// peer message carries its delivery id so the boundary can consume the
+	/// row atomically with the history append.
+	InjectMessage {
+		parts: Vec<ContentPart>,
+		delivery_id: Option<String>,
+	},
+}
+
+/// One accepted steering injection with its optional durable delivery row.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SteeringInjection {
+	parts: Vec<ContentPart>,
+	delivery_id: Option<String>,
 }
 
 /// Events drained from the steering channel at one point in time.
 #[derive(Default)]
 struct Steering {
-	injections: Vec<Vec<ContentPart>>,
+	injections: Vec<SteeringInjection>,
 	interrupted: bool,
 	/// Supervisor-supplied reason for the interrupt (for example the
 	/// `--max-time` deadline). A later interrupt never replaces an earlier
@@ -385,7 +397,9 @@ impl Steering {
 					self.reason = Some(reason);
 				}
 			},
-			SteeringEvent::InjectMessage(message) => self.injections.push(message),
+			SteeringEvent::InjectMessage { parts, delivery_id } => {
+				self.injections.push(SteeringInjection { parts, delivery_id });
+			},
 		}
 	}
 
@@ -402,7 +416,7 @@ impl Steering {
 /// Outcome of one tool batch.
 struct BatchOutcome {
 	results: Vec<ToolResult>,
-	injections: Vec<Vec<ContentPart>>,
+	injections: Vec<SteeringInjection>,
 	interrupted: bool,
 	/// Supervisor-supplied interrupt reason, so the synthetic results of a
 	/// cancelled batch record the real cause instead of the user label.
@@ -934,6 +948,13 @@ impl AgentLoop {
 		self
 	}
 
+	/// The attached durability boundary, if this loop writes to a durable
+	/// session (used by the lifecycle actor to consume accepted peer mail).
+	#[must_use]
+	pub fn durable_boundary(&self) -> Option<&Arc<dyn crate::durable::DurableBoundary>> {
+		self.durable.as_ref()
+	}
+
 	/// Attach the per-turn ack channel used by the session owner for
 	/// persistence and checkpoint/rewind context replacement.
 	#[must_use]
@@ -977,7 +998,7 @@ impl AgentLoop {
 		&self,
 		state: &mut AgentState,
 		events: Option<&mpsc::Sender<AgentEvent>>,
-	) -> Vec<String> {
+	) -> Result<Vec<String>, AgentError> {
 		let mut delivery_ids = Vec::new();
 		if let Some(sink) = &self.background_results {
 			for delivery in sink.take_background_deliveries() {
@@ -1002,13 +1023,41 @@ impl AgentLoop {
 		}
 		if let Some((mailbox, agent_id)) = &self.peer_inbox {
 			for message in mailbox.inbox(agent_id, false) {
-				if let Some(delivery_id) = &message.delivery_id {
-					delivery_ids.push(delivery_id.clone());
+				let user = Message::user(format_incoming(&message));
+				if let (Some(delivery_id), Some(durable)) =
+					(message.delivery_id.as_deref(), &self.durable)
+				{
+					// The row and the history append commit together; a crash
+					// cannot leave a receipted message that replay repeats.
+					durable
+						.consume_peer_delivery(delivery_id, &user)
+						.await
+						.map_err(|error| AgentError::Durable(error.to_string()))?;
 				}
-				state.messages.push(Message::user(format_incoming(&message)));
+				state.messages.push(user);
 			}
 		}
-		delivery_ids
+		Ok(delivery_ids)
+	}
+
+	/// Append one accepted steering injection, consuming its durable peer row
+	/// atomically first. Callers persist the preceding history before this so
+	/// the consumed row chains after it instead of jumping ahead.
+	async fn accept_injection(
+		&self,
+		state: &mut AgentState,
+		injection: SteeringInjection,
+	) -> Result<(), AgentError> {
+		let message = Message::user_with_parts(injection.parts);
+		if let (Some(delivery_id), Some(durable)) = (injection.delivery_id.as_deref(), &self.durable)
+		{
+			durable
+				.consume_peer_delivery(delivery_id, &message)
+				.await
+				.map_err(|error| AgentError::Durable(error.to_string()))?;
+		}
+		state.messages.push(message);
+		Ok(())
 	}
 	/// Await host durability for the conversation. A failed write is terminal:
 	/// the caller must not issue the next model request or start another tool
@@ -1255,16 +1304,27 @@ impl AgentLoop {
 		let mut active_provider: Arc<dyn ModelProvider> = Arc::clone(&self.provider);
 		// Context budget follows a provider replacement for the rest of the dialog.
 		let mut context_limit = self.config.context_limit;
+		// Only peer rows accepted before this dialog started are replayed here.
+		// Rows accepted while it runs belong to the in-memory mailbox/steering
+		// queues and must not be consumed twice.
+		let peer_replay_cutoff_ms = std::time::SystemTime::now()
+			.duration_since(std::time::UNIX_EPOCH)
+			.map(|duration| duration.as_millis() as i64)
+			.unwrap_or_default();
 
 		while state.total_turns < self.config.max_turns {
 			if let Some(rx) = steering_rx.as_deref_mut() {
 				let steering = Steering::drain(rx);
 				// Accepted sends were already receipted: hand them to the state
 				// before an interrupt can end the dialog, or they would be lost
-				// while their `injected` receipt stands.
-				for parts in steering.injections {
-					announce_user_steer(&events, &parts).await;
-					state.messages.push(Message::user_with_parts(parts));
+				// while their `injected` receipt stands. The preceding history is
+				// durable first so an atomically consumed peer row chains after it.
+				if !steering.injections.is_empty() {
+					self.persist_conversation(&state.messages).await?;
+				}
+				for injection in steering.injections {
+					announce_user_steer(&events, &injection.parts).await;
+					self.accept_injection(state, injection).await?;
 				}
 				if steering.interrupted {
 					// Accepted sends were already receipted: make the injected
@@ -1308,7 +1368,21 @@ impl AgentLoop {
 			// Results that settled while the previous assistant turn ran land
 			// before this one, exactly once (ephemeral background results and peer-mail).
 			let ephemeral_and_peer_ids =
-				self.inject_boundary_messages(state, events.as_ref()).await;
+				self.inject_boundary_messages(state, events.as_ref()).await?;
+
+			// Peer mail accepted by the host but never appended before a crash:
+			// each row is consumed atomically and appended here, in order. Mail
+			// already drained from the live mailbox was consumed above, so it is
+			// not replayed twice.
+			if let Some(durable) = &self.durable {
+				let replayed = durable
+					.accept_pending_peer_deliveries(peer_replay_cutoff_ms)
+					.await
+					.map_err(|error| AgentError::Durable(error.to_string()))?;
+				for delivery in replayed {
+					state.messages.push(delivery.message);
+				}
+			}
 
 			// Unconfirmed delivery IDs (delivered-but-unprocessed on reopen) matching active messages
 			let unconfirmed_ids = if let Some(durable) = &self.durable {
@@ -1431,8 +1505,17 @@ impl AgentLoop {
 					// so no synthetic result can pair.
 					state.messages.push(partial.clone());
 					self.persist_conversation(&state.messages).await?;
-					for parts in &pending_injections {
-						state.messages.push(Message::user_with_parts(parts.clone()));
+					for injection in &pending_injections {
+						let message = Message::user_with_parts(injection.parts.clone());
+						if let (Some(delivery_id), Some(durable)) =
+							(injection.delivery_id.as_deref(), &self.durable)
+						{
+							durable
+								.consume_peer_delivery(delivery_id, &message)
+								.await
+								.map_err(|error| AgentError::Durable(error.to_string()))?;
+						}
+						state.messages.push(message);
 					}
 					self.persist_conversation(&state.messages).await?;
 					if let Some(sink) = events.as_ref() {
@@ -1443,8 +1526,8 @@ impl AgentLoop {
 							})
 							.await;
 					}
-					for parts in &pending_injections {
-						announce_user_steer(&events, parts).await;
+					for injection in &pending_injections {
+						announce_user_steer(&events, &injection.parts).await;
 					}
 					if let Some(sink) = events.as_ref() {
 						let _ = sink
@@ -1461,8 +1544,17 @@ impl AgentLoop {
 					// The hub receipted these sends as `injected`; a turn that dies
 					// mid-request must still journal them before it surfaces, or a
 					// host reload loses accepted steering.
-					for parts in &pending_injections {
-						state.messages.push(Message::user_with_parts(parts.clone()));
+					for injection in &pending_injections {
+						let message = Message::user_with_parts(injection.parts.clone());
+						if let (Some(delivery_id), Some(durable)) =
+							(injection.delivery_id.as_deref(), &self.durable)
+						{
+							durable
+								.consume_peer_delivery(delivery_id, &message)
+								.await
+								.map_err(|error| AgentError::Durable(error.to_string()))?;
+						}
+						state.messages.push(message);
 					}
 					self.persist_conversation(&state.messages).await?;
 					if let Some((partial, status)) = terminal {
@@ -1474,8 +1566,8 @@ impl AgentLoop {
 								})
 								.await;
 						}
-						for parts in &pending_injections {
-							announce_user_steer(&events, parts).await;
+						for injection in &pending_injections {
+							announce_user_steer(&events, &injection.parts).await;
 						}
 						if let Some(sink) = events.as_ref() {
 							let _ = sink
@@ -1487,8 +1579,8 @@ impl AgentLoop {
 								.await;
 						}
 					} else {
-						for parts in &pending_injections {
-							announce_user_steer(&events, parts).await;
+						for injection in &pending_injections {
+							announce_user_steer(&events, &injection.parts).await;
 						}
 					}
 					return Err(error);
@@ -1563,9 +1655,9 @@ impl AgentLoop {
 						})
 						.await;
 				}
-				for parts in pending_injections {
-					announce_user_steer(&events, &parts).await;
-					state.messages.push(Message::user_with_parts(parts));
+				for injection in pending_injections {
+					announce_user_steer(&events, &injection.parts).await;
+					self.accept_injection(state, injection).await?;
 				}
 				self.persist_conversation(&state.messages).await?;
 				let decision = self.await_turn_ack(ack_rx, &cancellation_token).await;
@@ -1691,9 +1783,10 @@ impl AgentLoop {
 				// After `TurnEnd`, for the same reason as the end-turn path: the
 				// assistant/tool tail is journaled first, the injected user chains
 				// behind it.
-				for parts in pending_injections {
-					announce_user_steer(&events, &parts).await;
-					state.messages.push(Message::user_with_parts(parts));
+				self.persist_conversation(&state.messages).await?;
+				for injection in pending_injections {
+					announce_user_steer(&events, &injection.parts).await;
+					self.accept_injection(state, injection).await?;
 				}
 				let decision = self.await_turn_ack(ack_rx, &cancellation_token).await;
 				let TurnAckDecision {
@@ -1758,9 +1851,9 @@ impl AgentLoop {
 						})
 						.await;
 				}
-				for parts in pending_injections {
-					announce_user_steer(&events, &parts).await;
-					state.messages.push(Message::user_with_parts(parts));
+				for injection in pending_injections {
+					announce_user_steer(&events, &injection.parts).await;
+					self.accept_injection(state, injection).await?;
 				}
 				let decision = self.await_turn_ack(ack_rx, &cancellation_token).await;
 				let TurnAckDecision {
@@ -1816,9 +1909,9 @@ impl AgentLoop {
 						})
 						.await;
 				}
-				for parts in pending_injections {
-					announce_user_steer(&events, &parts).await;
-					state.messages.push(Message::user_with_parts(parts));
+				for injection in pending_injections {
+					announce_user_steer(&events, &injection.parts).await;
+					self.accept_injection(state, injection).await?;
 				}
 				self.persist_conversation(&state.messages).await?;
 				let decision = self.await_turn_ack(ack_rx, &cancellation_token).await;
@@ -1987,9 +2080,9 @@ impl AgentLoop {
 			// Injected messages land after the tool responses and after the turn
 			// tail is journaled, so the history stays valid and the accepted user
 			// chains behind the messages it interrupted.
-			for parts in pending_injections.into_iter().chain(outcome.injections) {
-				announce_user_steer(&events, &parts).await;
-				state.messages.push(Message::user_with_parts(parts));
+			for injection in pending_injections.into_iter().chain(outcome.injections) {
+				announce_user_steer(&events, &injection.parts).await;
+				self.accept_injection(state, injection).await?;
 			}
 			// Accepted steering is a user message; make it durable before the
 			// owner is acked and before `TurnEnd` publishes, so a host reload at
@@ -2084,7 +2177,9 @@ impl AgentLoop {
 					tokio::select! {
 						biased;
 						event = rx.recv() => match event {
-							Some(SteeringEvent::InjectMessage(message)) => outcome.injections.push(message),
+							Some(SteeringEvent::InjectMessage { parts, delivery_id }) => {
+								outcome.injections.push(SteeringInjection { parts, delivery_id });
+							},
 							Some(SteeringEvent::Interrupt) => outcome.interrupted = true,
 							Some(SteeringEvent::InterruptWithReason(reason)) => {
 								outcome.interrupted = true;
@@ -2212,7 +2307,7 @@ impl AgentLoop {
 		events: Option<&mpsc::Sender<AgentEvent>>,
 		cancellation_token: &CancellationToken,
 		mut steering_rx: Option<&mut mpsc::Receiver<SteeringEvent>>,
-		injections: &mut Vec<Vec<ContentPart>>,
+		injections: &mut Vec<SteeringInjection>,
 	) -> Result<Message, NextAssistantError> {
 		// Stream attempt identity (`{boot_nanos}-{counter}`): flushes carry
 		// it so the store can tell this stream's draft from a recovered
@@ -2248,8 +2343,8 @@ impl AgentLoop {
 										reason,
 									));
 								}
-								Some(SteeringEvent::InjectMessage(msg)) => {
-									injections.push(msg);
+								Some(SteeringEvent::InjectMessage { parts, delivery_id }) => {
+									injections.push(SteeringInjection { parts, delivery_id });
 								}
 								None => {
 									tokio::select! {
@@ -2292,8 +2387,8 @@ impl AgentLoop {
 								let partial = interrupted_message(Message::assistant(""), reason.clone());
 								return Err(NextAssistantError::interrupted(partial, reason));
 							}
-							Some(SteeringEvent::InjectMessage(msg)) => {
-								injections.push(msg);
+							Some(SteeringEvent::InjectMessage { parts, delivery_id }) => {
+								injections.push(SteeringInjection { parts, delivery_id });
 							}
 							None => {
 								tokio::select! {
@@ -2368,8 +2463,8 @@ impl AgentLoop {
 								);
 								return Err(NextAssistantError::interrupted(partial, reason));
 							}
-							Some(SteeringEvent::InjectMessage(msg)) => {
-								injections.push(msg);
+							Some(SteeringEvent::InjectMessage { parts, delivery_id }) => {
+								injections.push(SteeringInjection { parts, delivery_id });
 								continue;
 							}
 							None => {
@@ -2794,13 +2889,14 @@ mod steering_parts_tests {
 			ContentPart::image("aW1n", "image/png").expect("valid image part"),
 		];
 		let (tx, mut rx) = mpsc::channel(4);
-		tx.try_send(SteeringEvent::InjectMessage(parts.clone()))
+		tx.try_send(SteeringEvent::InjectMessage { parts: parts.clone(), delivery_id: None })
 			.expect("steering channel must accept a message");
 		let steering = Steering::drain(&mut rx);
 		assert!(!steering.interrupted, "an injected message is not an interrupt");
-		assert_eq!(steering.injections, vec![parts.clone()]);
+		assert_eq!(steering.injections.len(), 1);
+		assert_eq!(steering.injections[0].parts, parts);
 		let injected = steering.injections.into_iter().next().expect("one injection");
-		let message = Message::user_with_parts(injected);
+		let message = Message::user_with_parts(injected.parts);
 		assert_eq!(message.parts, parts);
 		assert!(message.has_image(), "steering image must survive into the chat");
 	}

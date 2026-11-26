@@ -232,7 +232,10 @@ fn child_steer_sink(child: &ChildAdvisorContext<'_>) -> Option<crate::advisor_ru
 		let sender = sender.clone();
 		Arc::new(move |text: &str| {
 			sender
-				.try_send(pi_agent::SteeringEvent::InjectMessage(Message::user(text).parts))
+				.try_send(pi_agent::SteeringEvent::InjectMessage {
+					parts: Message::user(text).parts,
+					delivery_id: None,
+				})
 				.is_ok()
 		}) as crate::advisor_runtime::SteerSink
 	})
