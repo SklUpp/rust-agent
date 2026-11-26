@@ -3299,7 +3299,7 @@ mod tests {
 		 VALUES ('ffffffffffffffffffffffffffffffff', ?1, ?2, ?3, 'bad', 'inferred', 1, 1)";
 		assert!(guard.execute(insert, params!["session", "/work/one", "session-a"]).is_err());
 		assert!(guard.execute(insert, params!["project", "/work/one", "session-a"]).is_err());
-		assert!(guard.execute(insert, params!["session", None, ""]).is_err());
+		assert!(guard.execute(insert, params!["session", None::<&str>, ""]).is_err());
 		assert_eq!(project.id.len(), RECORD_ID_LEN);
 	}
 
