@@ -37,6 +37,7 @@ use crate::{
 		WriteAction, WriteManagedSkillInput, delete_managed_skill, sanitize_skill_name,
 		write_managed_skill,
 	},
+	memory_embeddings::{EmbeddingProvider, embed_best_effort},
 	skills::{LoadOptions, SkillSnapshot},
 };
 
