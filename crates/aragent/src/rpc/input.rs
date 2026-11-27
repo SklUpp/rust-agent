@@ -4,7 +4,7 @@
 //! One writer thread owns stdout so frames from the command loop and from
 //! background work (bash, turn pump) keep their order. The writer also applies
 //! protocol negotiation: a successful `negotiate_protocol` response flips the
-//! encoder to v2 for everything after it, exactly like upstream.
+//! encoder to the version it granted (v1 or v2) for everything after it.
 
 use std::{
 	io::{self, BufRead, Read, Write},
@@ -26,14 +26,25 @@ use serde_json::{Value, json};
 use super::{
 	frame::{FrameLines, RpcFrameDecoder, RpcFrameEncoder},
 	session::FrameSink,
-	types::{RpcControlFrame, RpcExtensionUiResponse, parse_control_frame},
+	types::{RpcControlFrame, RpcExtensionUiResponse, SUPPORTED_PROTOCOL_VERSIONS, parse_control_frame},
 };
 
-/// Successful negotiation response; the writer flips to protocol v2 afterwards.
-fn is_negotiation_success(frame: &Value) -> bool {
-	frame.get("type").and_then(Value::as_str) == Some("response")
-		&& frame.get("command").and_then(Value::as_str) == Some("negotiate_protocol")
-		&& frame.get("success").and_then(Value::as_bool) == Some(true)
+/// Negotiated version from a successful `negotiate_protocol` response; the
+/// writer flips its encoder to it once the response is written. `None` for any
+/// other frame or a version this build does not support.
+fn negotiated_protocol_version(frame: &Value) -> Option<u8> {
+	if frame.get("type").and_then(Value::as_str) != Some("response")
+		|| frame.get("command").and_then(Value::as_str) != Some("negotiate_protocol")
+		|| frame.get("success").and_then(Value::as_bool) != Some(true)
+	{
+		return None;
+	}
+	frame
+		.get("data")
+		.and_then(|data| data.get("protocolVersion"))
+		.and_then(Value::as_u64)
+		.and_then(|version| u8::try_from(version).ok())
+		.filter(|version| SUPPORTED_PROTOCOL_VERSIONS.contains(version))
 }
 
 /// Ordered, single-owner stdout writer for logical frames.
@@ -58,7 +69,7 @@ impl Output {
 			.spawn(move || {
 				let mut encoder = RpcFrameEncoder::new();
 				for frame in rx {
-					let negotiate = is_negotiation_success(&frame);
+					let negotiate = negotiated_protocol_version(&frame);
 					let lines: FrameLines = encoder.encode_frames(&frame);
 					for line in lines {
 						if let Err(err) = writer.write_all(line.as_bytes()).and_then(|()| writer.flush()) {
@@ -67,11 +78,11 @@ impl Output {
 							return;
 						}
 					}
-					if negotiate {
+					if let Some(version) = negotiate {
 						// Only reached when the response was written completely.
 						encoder
-							.set_protocol_version(2)
-							.expect("protocol v2 is supported");
+							.set_protocol_version(version)
+							.expect("negotiated protocol version is supported");
 					}
 				}
 			})
@@ -483,6 +494,90 @@ mod tests {
 		// Everything after negotiation is chunked, never an oversized line.
 		assert!(lines[2].contains(r#""type":"rpc_chunk""#));
 		assert!(lines.iter().all(|line| line.len() + 1 <= super::super::frame::MAX_RPC_FRAME_BYTES));
+	}
+
+	#[test]
+	fn negotiation_version_is_extracted_from_success_data() {
+		let response = |version: i64| {
+			serde_json::json!({
+				"type": "response",
+				"command": "negotiate_protocol",
+				"success": true,
+				"data": { "protocolVersion": version },
+			})
+		};
+		assert_eq!(negotiated_protocol_version(&response(1)), Some(1));
+		assert_eq!(negotiated_protocol_version(&response(2)), Some(2));
+		assert_eq!(negotiated_protocol_version(&response(3)), None);
+		assert_eq!(negotiated_protocol_version(&response(0)), None);
+		assert_eq!(
+			negotiated_protocol_version(&serde_json::json!({
+				"type": "response",
+				"command": "negotiate_protocol",
+				"success": false,
+				"data": { "protocolVersion": 2 },
+			})),
+			None
+		);
+		assert_eq!(
+			negotiated_protocol_version(&serde_json::json!({
+				"type": "response",
+				"command": "get_state",
+				"success": true,
+				"data": { "protocolVersion": 2 },
+			})),
+			None
+		);
+	}
+
+	#[test]
+	fn writer_granting_v1_or_an_unsupported_version_stays_on_v1() {
+		let sink = SharedWriter::default();
+		let output = Output::spawn(sink.clone());
+		output.send(serde_json::json!({ "type": "ready", "protocolVersion": 1 }));
+		output.send(serde_json::json!({
+			"id": "1",
+			"type": "response",
+			"command": "negotiate_protocol",
+			"success": true,
+			"data": { "protocolVersion": 1 },
+		}));
+		output.send(serde_json::json!({
+			"id": "2",
+			"type": "response",
+			"command": "negotiate_protocol",
+			"success": true,
+			"data": { "protocolVersion": 3 },
+		}));
+		let big = "x".repeat(super::super::frame::MAX_RPC_FRAME_BYTES + 10);
+		output.send(serde_json::json!({ "type": "notice", "message": big }));
+		assert_eq!(output.finish(), None);
+		let text = writer_contents(&sink);
+		let lines: Vec<&str> = text.lines().collect();
+		// v1 never switches to v2 chunking; oversized frames are capped instead.
+		assert!(!text.contains(r#""type":"rpc_chunk""#));
+		assert!(
+			lines
+				.iter()
+				.all(|line| line.len() + 1 <= super::super::frame::MAX_RPC_FRAME_BYTES)
+		);
+		let seen = |needle: &str| lines.iter().filter(|line| line.contains(needle)).count();
+		assert_eq!(
+			seen(r#""command":"negotiate_protocol""#),
+			2,
+			"both negotiation responses are written"
+		);
+		assert!(
+			lines.iter().any(|line| line.contains(r#""command":"negotiate_protocol""#)
+				&& line.contains(r#""success":true"#)
+				&& line.contains(r#""data":{"protocolVersion":1}"#)),
+			"the v1 grant is reported on the response"
+		);
+		assert_eq!(
+			seen(r#""type":"notice""#),
+			1,
+			"the oversized notice is shrunk and still written"
+		);
 	}
 
 	#[test]

@@ -5351,9 +5351,14 @@ fn build_registry_with_display(
 			},
 			"debug" => match session {
 				Some(session) => Arc::new(
-					DapTool::shared(session.dap_manager()).with_max_timeout(session.debug_timeout()),
+					DapTool::shared(session.dap_manager())
+						.with_max_timeout(session.debug_timeout())
+						.with_trust_check(Arc::new(crate::trust::workspace_is_trusted)),
 				),
-				None => Arc::new(DapTool::new()),
+				None => Arc::new(
+					DapTool::new()
+						.with_trust_check(Arc::new(crate::trust::workspace_is_trusted)),
+				),
 			},
 			// Eval needs a session-scoped runtime/host; `run_turn` mounts it into
 			// the final root/child registries instead.
@@ -5404,6 +5409,9 @@ fn format_mcp_infrastructure_error(server_name: &str, stage: &str, err: &McpErro
 				"request timed out".to_string()
 			}
 		},
+		McpError::Transport(_) if stage == "call" => {
+			"transport interrupted (execution uncertain; check remote state before retry)".to_string()
+		},
         McpError::AcceptedStreamError(_) => {
             "stream disconnected after call accepted (non-replayable, execution uncertain; check remote state before retry)".to_string()
         },
@@ -5443,6 +5451,28 @@ mod tests_mcp_infrastructure_error {
 		let res = format_mcp_infrastructure_error("my_server", "call", &err);
 		assert!(!res.contains("secret_db_password_12345"));
 		assert_eq!(res, "MCP tool error: server \"my_server\" JSON-RPC error -32603");
+	}
+
+	#[test]
+	fn test_transport_marks_uncertain_only_on_call() {
+		let err = McpError::Transport("connection reset".to_string());
+		let call_res = format_mcp_infrastructure_error("my_server", "call", &err);
+		assert_eq!(
+			call_res,
+			"MCP tool error: server \"my_server\" transport interrupted (execution uncertain; check remote state before retry)"
+		);
+
+		let list_res = format_mcp_infrastructure_error("my_server", "list", &err);
+		assert_eq!(
+			list_res,
+			"Failed to list tools from MCP server \"my_server\": execution failed"
+		);
+
+		let connect_res = format_mcp_infrastructure_error("my_server", "connect", &err);
+		assert_eq!(
+			connect_res,
+			"Failed to connect to MCP server \"my_server\": execution failed"
+		);
 	}
 
 	#[test]

@@ -38,8 +38,8 @@ use super::{
 	},
 	subagents::{self, SubagentRegistry},
 	types::{
-		InterruptMode, RpcCommand, RpcControlFrame, RpcResponse, StreamingBehavior,
-		SubagentSubscriptionLevel,
+		InterruptMode, RpcCommand, RpcControlFrame, RpcResponse, SUPPORTED_PROTOCOL_VERSIONS,
+		StreamingBehavior, SubagentSubscriptionLevel,
 	},
 };
 
@@ -49,9 +49,22 @@ use pi_agent::{
 
 fn now_ms() -> u64 {
 	SystemTime::now()
-		.duration_since(SystemTime::UNIX_EPOCH)
+		.duration_since(std::time::UNIX_EPOCH)
 		.unwrap_or_default()
 		.as_millis() as u64
+}
+
+/// Response data for `negotiate_protocol`, or the rejection message for a
+/// version this build cannot serve. The writer flips its encoder once the
+/// success response is written.
+fn negotiate_protocol_data(protocol_version: i64) -> std::result::Result<Value, String> {
+	u8::try_from(protocol_version)
+		.ok()
+		.filter(|version| SUPPORTED_PROTOCOL_VERSIONS.contains(version))
+		.map_or_else(
+			|| Err(format!("Unsupported protocol version: {protocol_version}")),
+			|version| Ok(json!({ "protocolVersion": version })),
+		)
 }
 
 /// TS `tool_execution_end` carries one result payload plus `isError`; it has no
@@ -968,13 +981,10 @@ impl RpcMode {
 
 		match command {
 			RpcCommand::NegotiateProtocol { protocol_version, .. } => {
-				if protocol_version != 2 {
-					return Some(err(format!(
-						"Unsupported protocol version: {protocol_version}"
-					)));
+				match negotiate_protocol_data(protocol_version) {
+					Ok(data) => Some(ok_data(data)),
+					Err(message) => Some(err(message)),
 				}
-				// The writer flips to v2 once this response is written.
-				Some(ok_data(json!({ "protocolVersion": 2 })))
 			},
 
 			RpcCommand::Prompt { message, images, streaming_behavior, .. } => {
@@ -2392,5 +2402,26 @@ mod run_control_tests {
 		assert!(!control.abandon_run(generation));
 		assert!(!control.stream());
 		assert!(control.begin_run().is_err());
+	}
+}
+
+#[cfg(test)]
+mod negotiate_protocol_tests {
+	use super::*;
+
+	#[test]
+	fn negotiation_accepts_every_supported_version() {
+		for version in SUPPORTED_PROTOCOL_VERSIONS {
+			let data = negotiate_protocol_data(i64::from(version)).expect("supported version");
+			assert_eq!(data, json!({ "protocolVersion": version }));
+		}
+	}
+
+	#[test]
+	fn negotiation_rejects_versions_outside_the_supported_set() {
+		for version in [0_i64, 3, -1] {
+			let error = negotiate_protocol_data(version).expect_err("unsupported version");
+			assert_eq!(error, format!("Unsupported protocol version: {version}"));
+		}
 	}
 }

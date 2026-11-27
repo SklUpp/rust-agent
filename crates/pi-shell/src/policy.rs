@@ -290,7 +290,29 @@ impl BashPolicy {
 		self.evaluate_at(command, 0)
 	}
 
+	/// Evaluate a command a host tool launches itself (`hub` `start`).
+	///
+	/// Interceptor rules that redirect to `hub` are skipped: the caller already
+	/// runs the process through `hub`, so `nohup`, trailing `&`, `vite` or
+	/// `npm run dev` are the intended invocation, not a bash workaround. Every
+	/// other interceptor (`read`/`grep`/`glob`/`edit`/`write`), `RAW_RULES`, the
+	/// AST checks and user `bash.patterns` still apply, including to nested
+	/// shells and substitutions.
+	#[must_use]
+	pub fn evaluate_for_hub(&self, command: &str) -> PolicyVerdict {
+		self.evaluate_at_with(command, 0, Some("hub"))
+	}
+
 	fn evaluate_at(&self, command: &str, depth: usize) -> PolicyVerdict {
+		self.evaluate_at_with(command, depth, None)
+	}
+
+	fn evaluate_at_with(
+		&self,
+		command: &str,
+		depth: usize,
+		exclude_tool: Option<&str>,
+	) -> PolicyVerdict {
 		let mut verdict = PolicyVerdict::allow();
 		if command.trim().is_empty() {
 			return verdict;
@@ -301,7 +323,7 @@ impl BashPolicy {
 			.as_ref()
 			.is_some_and(|interceptor| interceptor.enabled.unwrap_or(false))
 		{
-			self.apply_interceptor(command, &mut verdict);
+			self.apply_interceptor(command, exclude_tool, &mut verdict);
 		}
 		// Raw rules describe shell syntax (pipes, redirects, fork bombs), not
 		// quoted data: `echo "shutdown -h now"` must stay benign. Structured
@@ -334,10 +356,10 @@ impl BashPolicy {
 			);
 		}
 		for segment in &inspection.segments {
-			self.check_segment(segment, depth, &mut verdict);
+			self.check_segment(segment, depth, exclude_tool, &mut verdict);
 		}
 		for body in inspection.substitutions {
-			let nested = self.evaluate_at(&body, depth + 1);
+			let nested = self.evaluate_at_with(&body, depth + 1, exclude_tool);
 			if nested.decision != PolicyDecision::Allow {
 				verdict.raise(
 					nested.decision,
@@ -346,7 +368,7 @@ impl BashPolicy {
 			}
 		}
 		for script in inspection.scripts {
-			let nested = self.evaluate_at(&script, depth + 1);
+			let nested = self.evaluate_at_with(&script, depth + 1, exclude_tool);
 			if nested.decision != PolicyDecision::Allow {
 				verdict.raise(
 					nested.decision,
@@ -376,11 +398,19 @@ impl BashPolicy {
 		verdict
 	}
 
-	fn apply_interceptor(&self, command: &str, verdict: &mut PolicyVerdict) {
+	fn apply_interceptor(
+		&self,
+		command: &str,
+		exclude_tool: Option<&str>,
+		verdict: &mut PolicyVerdict,
+	) {
 		let Some(interceptor) = self.interceptor.as_ref() else {
 			return;
 		};
 		for rule in &interceptor.rules {
+			if exclude_tool == Some(rule.tool.as_str()) {
+				continue;
+			}
 			if !interceptor_rule_matches(rule, command) {
 				continue;
 			}
@@ -423,11 +453,17 @@ impl BashPolicy {
 		}
 	}
 
-	fn check_segment(&self, segment: &Segment, depth: usize, verdict: &mut PolicyVerdict) {
+	fn check_segment(
+		&self,
+		segment: &Segment,
+		depth: usize,
+		exclude_tool: Option<&str>,
+		verdict: &mut PolicyVerdict,
+	) {
 		let mut env_payloads = Vec::new();
 		let argv = unwrap_wrappers_collecting(&segment.argv, &mut env_payloads);
 		for payload in env_payloads {
-			let nested = self.evaluate_at(&payload, depth + 1);
+			let nested = self.evaluate_at_with(&payload, depth + 1, exclude_tool);
 			if nested.decision != PolicyDecision::Allow {
 				verdict.raise(
 					nested.decision,
@@ -447,7 +483,7 @@ impl BashPolicy {
 		if is_shell(basename(program))
 			&& let Some(body) = shell_c_body(argv)
 		{
-			let nested = self.evaluate_at(body, depth + 1);
+			let nested = self.evaluate_at_with(body, depth + 1, exclude_tool);
 			if nested.decision != PolicyDecision::Allow {
 				verdict.raise(
 					nested.decision,
