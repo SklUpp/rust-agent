@@ -30,6 +30,7 @@ use async_trait::async_trait;
 mod apfs;
 mod btrfs;
 mod diff;
+mod fsutil;
 mod linux_reflink;
 mod overlayfs;
 mod projfs;

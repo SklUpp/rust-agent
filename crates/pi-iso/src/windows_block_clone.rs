@@ -197,7 +197,7 @@ mod imp {
 			fs::{FileTypeExt, OpenOptionsExt},
 			io::AsRawHandle,
 		},
-		path::{Path, PathBuf},
+		path::Path,
 	};
 
 	use windows_sys::Win32::{
@@ -214,10 +214,10 @@ mod imp {
 		},
 	};
 
-	use crate::{IsoError, IsoResult};
+	use crate::{IsoError, IsoResult, fsutil};
 
 	pub fn start(lower: &Path, merged: &Path) -> IsoResult<()> {
-		let lower = canonical_existing_dir(lower)?;
+		let lower = fsutil::canonical_existing_dir(lower, "block-clone source")?;
 		require_refs(&lower, "block-clone source")?;
 		require_refs(&super::nearest_existing_ancestor(merged), "block-clone destination")?;
 		prepare_destination(merged)?;
@@ -233,24 +233,6 @@ mod imp {
 		remove_path(merged).map_err(|err| {
 			IsoError::other(format!("unable to remove block-cloned tree {}: {err}", merged.display()))
 		})
-	}
-
-	fn canonical_existing_dir(path: &Path) -> IsoResult<PathBuf> {
-		let resolved = if path.is_absolute() {
-			path.to_path_buf()
-		} else {
-			std::env::current_dir().map_or_else(|_| path.to_path_buf(), |cwd| cwd.join(path))
-		};
-		let meta = fs::metadata(&resolved).map_err(|err| {
-			IsoError::other(format!("invalid block-clone source {}: {err}", resolved.display()))
-		})?;
-		if !meta.is_dir() {
-			return Err(IsoError::other(format!(
-				"block-clone source {} is not a directory",
-				resolved.display()
-			)));
-		}
-		Ok(fs::canonicalize(&resolved).unwrap_or(resolved))
 	}
 
 	fn prepare_destination(merged: &Path) -> IsoResult<()> {

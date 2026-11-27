@@ -14,13 +14,13 @@
 //! file-system magic; the caller pays full filesystem-copy cost up front
 //! and an `rm -rf` on teardown.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use async_trait::async_trait;
 
 use crate::{
 	BackendKind, IsoError, IsoResult, IsolationBackend, ProbeResult, command_failed,
-	file_content_hash, symlink_escapes,
+	file_content_hash, fsutil,
 };
 
 /// Default ceiling on the number of regular-file bytes the non-git recursive
@@ -49,8 +49,8 @@ impl IsolationBackend for RcopyBackend {
 	}
 
 	fn start(&self, lower: &Path, merged: &Path) -> IsoResult<()> {
-		let lower = canonical_existing_dir(lower)?;
-		let merged = absolutize(merged);
+		let lower = fsutil::canonical_existing_dir(lower, "rcopy source")?;
+		let merged = fsutil::absolutize(merged)?;
 		prepare_destination(&merged)?;
 		if is_git_worktree(&lower) {
 			git_worktree_add(&lower, &merged)?;
@@ -81,32 +81,6 @@ impl IsolationBackend for RcopyBackend {
 	}
 }
 
-fn canonical_existing_dir(path: &Path) -> IsoResult<PathBuf> {
-	let resolved = if path.is_absolute() {
-		path.to_path_buf()
-	} else {
-		std::env::current_dir().map_or_else(|_| path.to_path_buf(), |cwd| cwd.join(path))
-	};
-	let meta = std::fs::metadata(&resolved).map_err(|err| {
-		IsoError::other(format!("invalid rcopy source {}: {err}", resolved.display()))
-	})?;
-	if !meta.is_dir() {
-		return Err(IsoError::other(format!(
-			"rcopy source {} is not a directory",
-			resolved.display()
-		)));
-	}
-	Ok(std::fs::canonicalize(&resolved).unwrap_or(resolved))
-}
-
-fn absolutize(path: &Path) -> PathBuf {
-	if path.is_absolute() {
-		path.to_path_buf()
-	} else {
-		std::env::current_dir().map_or_else(|_| path.to_path_buf(), |cwd| cwd.join(path))
-	}
-}
-
 fn prepare_destination(merged: &Path) -> IsoResult<()> {
 	if let Some(parent) = merged.parent() {
 		std::fs::create_dir_all(parent)
@@ -132,7 +106,29 @@ fn is_git_worktree(path: &Path) -> bool {
 	std::fs::symlink_metadata(path.join(".git")).is_ok()
 }
 
+/// Materialize a detached worktree of `lower` at `merged`.
+///
+/// Runs in-process through `pi-vcs`; the git CLI is reached only when the
+/// in-process backend cannot run at all ([`pi_vcs::Error::Unsupported`], e.g. a
+/// reftable repository). Real failures surface instead of being retried
+/// through a second code path.
 fn git_worktree_add(lower: &Path, merged: &Path) -> IsoResult<()> {
+	let repo = pi_vcs::detect(lower).map_err(|err| {
+		IsoError::other(format!("detect git repository at {}: {err}", lower.display()))
+	})?;
+	// The caller gated on `.git` existing, so `None` means pi-vcs could not
+	// parse that pointer; let the CLI report it in its own words.
+	let Some(repo) = repo else {
+		return git_worktree_add_cli(lower, merged);
+	};
+	match repo.as_git().worktree_add(merged, "HEAD", true) {
+		Ok(()) => Ok(()),
+		Err(pi_vcs::Error::Unsupported { .. }) => git_worktree_add_cli(lower, merged),
+		Err(err) => Err(IsoError::other(format!("git worktree add: {err}"))),
+	}
+}
+
+fn git_worktree_add_cli(lower: &Path, merged: &Path) -> IsoResult<()> {
 	let output = std::process::Command::new("git")
 		.arg("-C")
 		.arg(lower)
@@ -158,7 +154,25 @@ fn git_worktree_add(lower: &Path, merged: &Path) -> IsoResult<()> {
 	Err(command_failed("git worktree add", output.status.code().unwrap_or(-1), &output.stderr))
 }
 
+/// Unregister and delete the worktree at `merged`, in-process when possible.
+///
+/// Same fallback rule as [`git_worktree_add`]: the CLI only covers
+/// [`pi_vcs::Error::Unsupported`].
 fn git_worktree_remove(merged: &Path) -> IsoResult<()> {
+	let repo = pi_vcs::detect(merged).map_err(|err| {
+		IsoError::other(format!("detect git repository at {}: {err}", merged.display()))
+	})?;
+	let Some(repo) = repo else {
+		return git_worktree_remove_cli(merged);
+	};
+	match repo.as_git().worktree_remove(merged, true) {
+		Ok(_) => Ok(()),
+		Err(pi_vcs::Error::Unsupported { .. }) => git_worktree_remove_cli(merged),
+		Err(err) => Err(IsoError::other(format!("git worktree remove: {err}"))),
+	}
+}
+
+fn git_worktree_remove_cli(merged: &Path) -> IsoResult<()> {
 	let output = std::process::Command::new("git")
 		.arg("-C")
 		.arg(merged)
@@ -192,15 +206,15 @@ fn git_worktree_remove(merged: &Path) -> IsoResult<()> {
 /// contract ("merged mirrors lower's live working tree") holds for
 /// rcopy on git inputs too.
 fn seed_dirty_state(lower: &Path, merged: &Path) -> IsoResult<()> {
-	let staged = git_capture(lower, &["diff", "--binary", "--no-color", "--cached"])?;
+	let staged = git_diff_patch(lower, true)?;
 	if !staged.is_empty() {
-		git_apply(merged, &staged, &["--cached"])?;
-		git_apply(merged, &staged, &[])?;
+		git_apply(merged, &staged, true)?;
+		git_apply(merged, &staged, false)?;
 	}
 
-	let unstaged = git_capture(lower, &["diff", "--binary", "--no-color"])?;
+	let unstaged = git_diff_patch(lower, false)?;
 	if !unstaged.is_empty() {
-		git_apply(merged, &unstaged, &[])?;
+		git_apply(merged, &unstaged, false)?;
 	}
 
 	let untracked = git_capture(lower, &["ls-files", "--others", "--exclude-standard", "-z"])?;
@@ -250,7 +264,25 @@ fn git_capture(cwd: &Path, args: &[&str]) -> IsoResult<Vec<u8>> {
 	Ok(output.stdout)
 }
 
-fn git_apply(cwd: &Path, patch: &[u8], extra: &[&str]) -> IsoResult<()> {
+/// Capture `git diff --binary [--cached]` as patch bytes.
+///
+/// Deliberately stays on the CLI, matching `pi-agent`'s `git_diff_bytes`
+/// (`crates/pi-agent/src/tools/task_isolation.rs:766`). `pi_vcs::diff_text`
+/// renders a lossy `String`, skips dirty `SubmoduleModification` entries, and
+/// runs Git attribute filters that `pi_vcs::apply_patch` does not reproduce
+/// when it rewrites raw worktree bytes; any of those gaps would seed the wrong
+/// state with no error. Only the exact CLI bytes are trusted.
+fn git_diff_patch(cwd: &Path, cached: bool) -> IsoResult<Vec<u8>> {
+	let args: &[&str] = if cached {
+		&["diff", "--binary", "--no-color", "--cached"]
+	} else {
+		&["diff", "--binary", "--no-color"]
+	};
+	git_capture(cwd, args)
+}
+
+fn git_apply(cwd: &Path, patch: &[u8], cached: bool) -> IsoResult<()> {
+	let extra: &[&str] = if cached { &["--cached"] } else { &[] };
 	git_apply_with_program(Path::new("git"), cwd, patch, extra)
 }
 
@@ -324,15 +356,12 @@ fn copy_path(root: &Path, src: &Path, dst: &Path) -> IsoResult<()> {
 		.map_err(|err| IsoError::other(format!("stat {}: {err}", src.display())))?;
 	let file_type = meta.file_type();
 	if file_type.is_symlink() {
-		if symlink_escapes(root, src) {
-			return Ok(());
-		}
-		copy_symlink(src, dst)
+		fsutil::copy_symlink_confined(src, dst, root)
 	} else if file_type.is_dir() {
 		std::fs::create_dir_all(dst)
 			.map_err(|err| IsoError::other(format!("create {}: {err}", dst.display())))?;
 		copy_dir_contents(root, src, dst)?;
-		copy_dir_mtime(src, dst);
+		copy_file_mtime(src, dst);
 		Ok(())
 	} else if file_type.is_file() {
 		copy_file_verified(src, dst)
@@ -449,14 +478,12 @@ fn copy_dir_contents(root: &Path, src: &Path, dst: &Path) -> IsoResult<()> {
 		let src_path = entry.path();
 		let dst_path = dst.join(entry.file_name());
 		if file_type.is_symlink() {
-			if !symlink_escapes(root, &src_path) {
-				copy_symlink(&src_path, &dst_path)?;
-			}
+			fsutil::copy_symlink_confined(&src_path, &dst_path, root)?;
 		} else if file_type.is_dir() {
 			std::fs::create_dir_all(&dst_path)
 				.map_err(|err| IsoError::other(format!("create {}: {err}", dst_path.display())))?;
 			copy_dir_contents(root, &src_path, &dst_path)?;
-			copy_dir_mtime(&src_path, &dst_path);
+			copy_file_mtime(&src_path, &dst_path);
 		} else if file_type.is_file() {
 			copy_file_verified(&src_path, &dst_path)?;
 		}
@@ -464,114 +491,15 @@ fn copy_dir_contents(root: &Path, src: &Path, dst: &Path) -> IsoResult<()> {
 	Ok(())
 }
 
-#[cfg(unix)]
-fn copy_symlink(src: &Path, dst: &Path) -> IsoResult<()> {
-	let target = std::fs::read_link(src)
-		.map_err(|err| IsoError::other(format!("read_link {}: {err}", src.display())))?;
-	std::os::unix::fs::symlink(target, dst)
-		.map_err(|err| IsoError::other(format!("symlink {}: {err}", dst.display())))
-}
-
-#[cfg(windows)]
-fn copy_symlink(src: &Path, dst: &Path) -> IsoResult<()> {
-	let target = std::fs::read_link(src)
-		.map_err(|err| IsoError::other(format!("read_link {}: {err}", src.display())))?;
-	let meta = std::fs::symlink_metadata(src)
-		.map_err(|err| IsoError::other(format!("symlink_metadata {}: {err}", src.display())))?;
-	let res = if meta.file_type().is_dir() {
-		std::os::windows::fs::symlink_dir(target, dst)
-	} else {
-		std::os::windows::fs::symlink_file(target, dst)
-	};
-	res.map_err(|err| IsoError::other(format!("symlink {}: {err}", dst.display())))
-}
-
-#[cfg(not(any(unix, windows)))]
-fn copy_symlink(_src: &Path, _dst: &Path) -> IsoResult<()> {
-	Err(IsoError::other("symlink copy unsupported on this platform"))
-}
-
-/// Mirror `src`'s mtime onto `dst`. Failures are silently ignored — the
-/// mtime hint is an optimisation for [`crate::diff`], not a correctness
-/// requirement.
+/// Mirror `src`'s timestamps onto `dst`. Applies to directories as well as
+/// regular files: an mtime is metadata, not content. Failures are ignored —
+/// the timestamp only feeds [`crate::diff`]'s `(size, mtime)` shortcut, it is
+/// never a correctness requirement.
 fn copy_file_mtime(src: &Path, dst: &Path) {
 	let Ok(meta) = std::fs::metadata(src) else {
 		return;
 	};
-	let Ok(mtime) = meta.modified() else { return };
-	let _ = filetime_set(dst, mtime);
-}
-
-fn copy_dir_mtime(src: &Path, dst: &Path) {
-	let Ok(meta) = std::fs::metadata(src) else {
-		return;
-	};
-	let Ok(mtime) = meta.modified() else { return };
-	let _ = filetime_set(dst, mtime);
-}
-
-#[cfg(unix)]
-fn filetime_set(path: &Path, mtime: std::time::SystemTime) -> std::io::Result<()> {
-	use std::os::unix::ffi::OsStrExt;
-	let dur = mtime
-		.duration_since(std::time::UNIX_EPOCH)
-		.map_err(std::io::Error::other)?;
-	let times = [libc::timespec { tv_sec: dur.as_secs() as _, tv_nsec: 0 }, libc::timespec {
-		tv_sec:  dur.as_secs() as _,
-		tv_nsec: dur.subsec_nanos() as libc::c_long,
-	}];
-	let c_path = std::ffi::CString::new(path.as_os_str().as_bytes())?;
-	// SAFETY: `c_path` and `times` outlive the syscall; the kernel does
-	// not retain the pointers.
-	let rc = unsafe { libc::utimensat(libc::AT_FDCWD, c_path.as_ptr(), times.as_ptr(), 0) };
-	if rc == 0 {
-		Ok(())
-	} else {
-		Err(std::io::Error::last_os_error())
-	}
-}
-
-#[cfg(windows)]
-fn filetime_set(path: &Path, mtime: std::time::SystemTime) -> std::io::Result<()> {
-	use std::{
-		fs::OpenOptions,
-		os::windows::{fs::OpenOptionsExt, io::AsRawHandle},
-	};
-
-	use windows_sys::Win32::{
-		Foundation::FILETIME,
-		Storage::FileSystem::{FILE_FLAG_BACKUP_SEMANTICS, SetFileTime},
-	};
-
-	let dur = mtime
-		.duration_since(std::time::UNIX_EPOCH)
-		.map_err(|err| std::io::Error::other(err.to_string()))?;
-	// Windows FILETIME = 100-ns ticks since 1601-01-01.
-	const EPOCH_DIFF_100NS: u64 = 116_444_736_000_000_000;
-	let ticks = EPOCH_DIFF_100NS + dur.as_secs() * 10_000_000 + u64::from(dur.subsec_nanos() / 100);
-	let ft = FILETIME {
-		dwLowDateTime:  (ticks & 0xffff_ffff) as u32,
-		dwHighDateTime: (ticks >> 32) as u32,
-	};
-
-	let mut opts = OpenOptions::new();
-	opts.write(true);
-	opts.custom_flags(FILE_FLAG_BACKUP_SEMANTICS);
-	let file = opts.open(path)?;
-	// SAFETY: file owns the HANDLE for the duration of the call.
-	let ok = unsafe {
-		SetFileTime(file.as_raw_handle() as _, std::ptr::null(), std::ptr::null(), &raw const ft)
-	};
-	if ok != 0 {
-		Ok(())
-	} else {
-		Err(std::io::Error::last_os_error())
-	}
-}
-
-#[cfg(not(any(unix, windows)))]
-fn filetime_set(_path: &Path, _mtime: std::time::SystemTime) -> std::io::Result<()> {
-	Ok(())
+	let _ = fsutil::set_times_nofollow(dst, &meta);
 }
 
 #[cfg(test)]
@@ -614,6 +542,30 @@ mod tests {
 		}
 	}
 
+	/// Absolute path of the `sh` a test script's shebang must name.
+	///
+	/// Termux has no `/bin/sh`, so resolve through `PATH` like a real exec
+	/// would and keep `/bin/sh` as the conventional last resort.
+	#[cfg(unix)]
+	fn shell_path() -> PathBuf {
+		use std::os::unix::fs::PermissionsExt as _;
+
+		if let Some(path) = std::env::var_os("PATH") {
+			for dir in std::env::split_paths(&path) {
+				let candidate = dir.join("sh");
+				let executable = candidate
+					.metadata()
+					.is_ok_and(|meta| meta.is_file() && meta.permissions().mode() & 0o111 != 0);
+				// `#!` requires an absolute interpreter path and `PATH` may
+				// hold relative entries (`.` / `./bin`), so canonicalize.
+				if executable && let Ok(resolved) = candidate.canonicalize() {
+					return resolved;
+				}
+			}
+		}
+		PathBuf::from("/bin/sh")
+	}
+
 	#[cfg(unix)]
 	#[test]
 	fn git_apply_drains_stderr_while_writing_stdin() {
@@ -621,12 +573,12 @@ mod tests {
 
 		let root = TempDirGuard::new();
 		let fake_git = root.path().join("git");
-		fs::write(
-			&fake_git,
-			"#!/bin/sh\nprintf 'simulated apply failure\\n' >&2\nyes x | head -c 4194304 >&2\ncat \
+		let script = format!(
+			"#!{}\nprintf 'simulated apply failure\\n' >&2\nyes x | head -c 4194304 >&2\ncat \
 			 >/dev/null\nexit 42\n",
-		)
-		.expect("write fake git");
+			shell_path().display()
+		);
+		fs::write(&fake_git, script).expect("write fake git");
 		fs::set_permissions(&fake_git, fs::Permissions::from_mode(0o755))
 			.expect("make fake git executable");
 

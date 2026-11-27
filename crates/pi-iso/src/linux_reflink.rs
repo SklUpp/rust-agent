@@ -66,26 +66,19 @@ impl IsolationBackend for LinuxReflinkBackend {
 #[cfg(target_os = "linux")]
 mod imp {
 	use std::{
-		ffi::CString,
 		fs::{self, File, OpenOptions},
-		os::{
-			fd::AsRawFd,
-			unix::{
-				ffi::OsStrExt,
-				fs::{MetadataExt, PermissionsExt},
-			},
-		},
-		path::{Path, PathBuf},
+		os::{fd::AsRawFd, unix::fs::PermissionsExt},
+		path::Path,
 	};
 
-	use crate::{IsoError, IsoResult};
+	use crate::{IsoError, IsoResult, fsutil};
 
 	// `libc::Ioctl` is `c_int` on musl and `c_ulong` on glibc; the constant fits
 	// both.
 	const FICLONE: libc::Ioctl = 0x4004_9409;
 
 	pub fn start(lower: &Path, merged: &Path) -> IsoResult<()> {
-		let lower = canonical_existing_dir(lower)?;
+		let lower = fsutil::canonical_existing_dir(lower, "reflink source")?;
 		prepare_destination(merged)?;
 
 		let result = recursive_reflink(&lower, merged);
@@ -104,24 +97,6 @@ mod imp {
 				merged.display()
 			))),
 		}
-	}
-
-	fn canonical_existing_dir(path: &Path) -> IsoResult<PathBuf> {
-		let resolved = if path.is_absolute() {
-			path.to_path_buf()
-		} else {
-			std::env::current_dir().map_or_else(|_| path.to_path_buf(), |cwd| cwd.join(path))
-		};
-		let meta = fs::metadata(&resolved).map_err(|err| {
-			IsoError::other(format!("invalid reflink source {}: {err}", resolved.display()))
-		})?;
-		if !meta.is_dir() {
-			return Err(IsoError::other(format!(
-				"reflink source {} is not a directory",
-				resolved.display()
-			)));
-		}
-		Ok(fs::canonicalize(&resolved).unwrap_or(resolved))
 	}
 
 	fn prepare_destination(merged: &Path) -> IsoResult<()> {
@@ -185,7 +160,7 @@ mod imp {
 		}
 
 		preserve_permissions(dst, &meta)?;
-		let _ = set_times_nofollow(dst, &meta);
+		let _ = fsutil::set_times_nofollow(dst, &meta);
 		Ok(())
 	}
 
@@ -195,7 +170,7 @@ mod imp {
 		std::os::unix::fs::symlink(target, dst)
 			.map_err(|err| IsoError::other(format!("symlink {}: {err}", dst.display())))?;
 		if let Ok(meta) = fs::symlink_metadata(src) {
-			let _ = set_times_nofollow(dst, &meta);
+			let _ = fsutil::set_times_nofollow(dst, &meta);
 		}
 		Ok(())
 	}
@@ -221,7 +196,7 @@ mod imp {
 		}
 
 		preserve_permissions(dst, &meta)?;
-		let _ = set_times_nofollow(dst, &meta);
+		let _ = fsutil::set_times_nofollow(dst, &meta);
 		Ok(())
 	}
 
@@ -244,24 +219,5 @@ mod imp {
 		let mode = meta.permissions().mode();
 		fs::set_permissions(path, fs::Permissions::from_mode(mode))
 			.map_err(|err| IsoError::other(format!("set permissions on {}: {err}", path.display())))
-	}
-
-	fn set_times_nofollow(path: &Path, meta: &fs::Metadata) -> std::io::Result<()> {
-		let times = [
-			libc::timespec { tv_sec: meta.atime() as _, tv_nsec: meta.atime_nsec() as libc::c_long },
-			libc::timespec { tv_sec: meta.mtime() as _, tv_nsec: meta.mtime_nsec() as libc::c_long },
-		];
-		let c_path = CString::new(path.as_os_str().as_bytes())?;
-		// SAFETY: `c_path` and `times` live until the syscall returns; the
-		// kernel does not retain either pointer. AT_SYMLINK_NOFOLLOW preserves
-		// symlink timestamps instead of mutating the link target.
-		let rc = unsafe {
-			libc::utimensat(libc::AT_FDCWD, c_path.as_ptr(), times.as_ptr(), libc::AT_SYMLINK_NOFOLLOW)
-		};
-		if rc == 0 {
-			Ok(())
-		} else {
-			Err(std::io::Error::last_os_error())
-		}
 	}
 }

@@ -66,16 +66,15 @@ impl IsolationBackend for ApfsBackend {
 #[cfg(target_os = "macos")]
 mod imp {
 	use std::{
-		ffi::CString,
 		fs,
 		os::unix::ffi::OsStrExt,
-		path::{Path, PathBuf},
+		path::Path,
 	};
 
-	use crate::{IsoError, IsoResult};
+	use crate::{IsoError, IsoResult, fsutil};
 
 	pub fn start(lower: &Path, merged: &Path) -> IsoResult<()> {
-		let lower = canonical_existing_dir(lower)?;
+		let lower = fsutil::canonical_existing_dir(lower, "clone source")?;
 		if let Some(parent) = merged.parent() {
 			fs::create_dir_all(parent).map_err(|err| {
 				IsoError::other(format!("unable to create parent of {}: {err}", merged.display()))
@@ -88,8 +87,8 @@ mod imp {
 			})?;
 		}
 
-		let src_c = to_cstring(lower.as_os_str().as_bytes(), "lower")?;
-		let dst_c = to_cstring(merged.as_os_str().as_bytes(), "merged")?;
+		let src_c = fsutil::to_cstring(lower.as_os_str().as_bytes(), "lower")?;
+		let dst_c = fsutil::to_cstring(merged.as_os_str().as_bytes(), "merged")?;
 
 		// SAFETY: both pointers are valid CStrings whose backing storage lives
 		// until after the call. `clonefile` with `flags = 0` performs a
@@ -121,28 +120,5 @@ mod imp {
 				merged.display()
 			))),
 		}
-	}
-
-	fn canonical_existing_dir(path: &Path) -> IsoResult<PathBuf> {
-		let resolved = if path.is_absolute() {
-			path.to_path_buf()
-		} else {
-			std::env::current_dir().map_or_else(|_| path.to_path_buf(), |cwd| cwd.join(path))
-		};
-		let meta = fs::metadata(&resolved).map_err(|err| {
-			IsoError::other(format!("invalid clone source {}: {err}", resolved.display()))
-		})?;
-		if !meta.is_dir() {
-			return Err(IsoError::other(format!(
-				"clone source {} is not a directory",
-				resolved.display()
-			)));
-		}
-		Ok(fs::canonicalize(&resolved).unwrap_or(resolved))
-	}
-
-	fn to_cstring(bytes: &[u8], label: &str) -> IsoResult<CString> {
-		CString::new(bytes)
-			.map_err(|err| IsoError::other(format!("{label} path contains NUL byte: {err}")))
 	}
 }

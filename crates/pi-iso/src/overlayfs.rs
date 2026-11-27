@@ -84,7 +84,7 @@ mod imp {
 
 	use parking_lot::Mutex;
 
-	use crate::{IsoError, IsoResult, ProbeResult, command_failed};
+	use crate::{IsoError, IsoResult, ProbeResult, command_failed, fsutil};
 
 	#[derive(Clone, Copy)]
 	enum MountFlavor {
@@ -109,8 +109,8 @@ mod imp {
 	}
 
 	pub fn start(lower: &Path, merged: &Path) -> IsoResult<()> {
-		let lower = canonical_existing_dir(lower)?;
-		let merged = absolutize(merged);
+		let lower = fsutil::canonical_existing_dir(lower, "overlay lower")?;
+		let merged = fsutil::absolutize(merged)?;
 		let base = merged.parent().ok_or_else(|| {
 			IsoError::other(format!("merged path has no parent: {}", merged.display()))
 		})?;
@@ -151,7 +151,7 @@ mod imp {
 	}
 
 	pub fn stop(merged: &Path) -> IsoResult<()> {
-		let merged = absolutize(merged);
+		let merged = fsutil::absolutize(merged)?;
 		let result = {
 			let flavor = ACTIVE_MOUNTS.lock().remove(&merged);
 			match flavor {
@@ -181,10 +181,10 @@ mod imp {
 	}
 
 	fn kernel_mount(merged: &Path, opts: &str) -> IsoResult<()> {
-		let target = to_cstring(merged.as_os_str().as_bytes(), "merged")?;
+		let target = fsutil::to_cstring(merged.as_os_str().as_bytes(), "merged")?;
 		let source = CString::new("overlay").expect("static source");
 		let fstype = CString::new("overlay").expect("static fstype");
-		let opts_c = to_cstring(opts.as_bytes(), "overlay options")?;
+		let opts_c = fsutil::to_cstring(opts.as_bytes(), "overlay options")?;
 
 		// SAFETY: all pointers are valid CString-backed and outlive the call.
 		let rc = unsafe {
@@ -213,7 +213,7 @@ mod imp {
 	}
 
 	fn kernel_umount(merged: &Path) -> IsoResult<()> {
-		let target = to_cstring(merged.as_os_str().as_bytes(), "merged")?;
+		let target = fsutil::to_cstring(merged.as_os_str().as_bytes(), "merged")?;
 		// SAFETY: `target` lives until after the syscall returns.
 		let rc = unsafe { libc::umount2(target.as_ptr(), libc::MNT_DETACH) };
 		if rc == 0 {
@@ -305,38 +305,11 @@ mod imp {
 			.is_ok()
 	}
 
-	fn canonical_existing_dir(path: &Path) -> IsoResult<PathBuf> {
-		let resolved = absolutize(path);
-		let meta = fs::metadata(&resolved).map_err(|err| {
-			IsoError::other(format!("invalid overlay lower {}: {err}", resolved.display()))
-		})?;
-		if !meta.is_dir() {
-			return Err(IsoError::other(format!(
-				"overlay lower {} is not a directory",
-				resolved.display()
-			)));
-		}
-		Ok(fs::canonicalize(&resolved).unwrap_or(resolved))
-	}
-
-	fn absolutize(path: &Path) -> PathBuf {
-		if path.is_absolute() {
-			path.to_path_buf()
-		} else {
-			std::env::current_dir().map_or_else(|_| path.to_path_buf(), |cwd| cwd.join(path))
-		}
-	}
-
 	fn remove_dir_if_exists(path: &Path, label: &str) -> IsoResult<()> {
 		match fs::remove_dir_all(path) {
 			Ok(()) => Ok(()),
 			Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
 			Err(err) => Err(IsoError::other(format!("remove {label} {}: {err}", path.display()))),
 		}
-	}
-
-	fn to_cstring(bytes: &[u8], label: &str) -> IsoResult<CString> {
-		CString::new(bytes)
-			.map_err(|err| IsoError::other(format!("{label} path contains NUL byte: {err}")))
 	}
 }

@@ -65,11 +65,11 @@ impl IsolationBackend for ZfsBackend {
 mod imp {
 	use std::{
 		fs, io,
-		path::{Path, PathBuf},
+		path::Path,
 		process::{Command, Output},
 	};
 
-	use crate::{IsoError, IsoResult, ProbeResult};
+	use crate::{IsoError, IsoResult, ProbeResult, fsutil};
 
 	const SNAP_PREFIX: &str = "pi-iso-";
 
@@ -84,8 +84,8 @@ mod imp {
 	pub fn start(lower: &Path, merged: &Path) -> IsoResult<()> {
 		ensure_zfs_available()?;
 
-		let lower = canonical_existing_dir(lower)?;
-		let merged = absolute_path(merged);
+		let lower = fsutil::canonical_existing_dir_unavailable(lower, "ZFS clone source")?;
+		let merged = fsutil::absolutize(merged)?;
 		let source = dataset_for_mountpoint(&lower)?.ok_or_else(|| {
 			IsoError::unavailable(format!(
 				"{} is not exactly a mounted ZFS dataset mountpoint",
@@ -101,7 +101,7 @@ mod imp {
 
 		stop(&merged)?;
 
-		let suffix = dataset_suffix(&merged);
+		let suffix = dataset_suffix(&merged)?;
 		let snapshot = format!("{source}@{SNAP_PREFIX}{suffix}");
 		let clone = sibling_dataset(&source, &format!("{SNAP_PREFIX}{suffix}"));
 
@@ -121,7 +121,7 @@ mod imp {
 	}
 
 	pub fn stop(merged: &Path) -> IsoResult<()> {
-		let merged = absolute_path(merged);
+		let merged = fsutil::absolutize(merged)?;
 		if !merged.exists() {
 			return Ok(());
 		}
@@ -155,20 +155,6 @@ mod imp {
 		} else {
 			Err(IsoError::unavailable("zfs CLI is unavailable or cannot list datasets"))
 		}
-	}
-
-	fn canonical_existing_dir(path: &Path) -> IsoResult<PathBuf> {
-		let resolved = absolute_path(path);
-		let meta = fs::metadata(&resolved).map_err(|err| {
-			IsoError::unavailable(format!("invalid ZFS clone source {}: {err}", resolved.display()))
-		})?;
-		if !meta.is_dir() {
-			return Err(IsoError::unavailable(format!(
-				"ZFS clone source {} is not a directory",
-				resolved.display()
-			)));
-		}
-		Ok(fs::canonicalize(&resolved).unwrap_or(resolved))
 	}
 
 	fn dataset_for_mountpoint(path: &Path) -> IsoResult<Option<String>> {
@@ -293,12 +279,12 @@ mod imp {
 		}
 	}
 
-	fn dataset_suffix(path: &Path) -> String {
-		let normalized = normalize_path(&absolute_path(path));
+	fn dataset_suffix(path: &Path) -> IsoResult<String> {
+		let normalized = normalize_path(&fsutil::absolutize(path)?);
 		let bytes = normalized.as_bytes();
 		let a = fnv1a64(bytes, 0xcbf29ce484222325);
 		let b = fnv1a64(bytes, 0x84222325cbf29ce4 ^ bytes.len() as u64);
-		format!("{a:016x}-{b:016x}")
+		Ok(format!("{a:016x}-{b:016x}"))
 	}
 
 	fn fnv1a64(bytes: &[u8], seed: u64) -> u64 {
@@ -329,14 +315,6 @@ mod imp {
 			return false;
 		};
 		is_own_name(name) && is_own_snapshot(origin)
-	}
-
-	fn absolute_path(path: &Path) -> PathBuf {
-		if path.is_absolute() {
-			path.to_path_buf()
-		} else {
-			std::env::current_dir().map_or_else(|_| path.to_path_buf(), |cwd| cwd.join(path))
-		}
 	}
 
 	fn normalize_path(path: &Path) -> String {
