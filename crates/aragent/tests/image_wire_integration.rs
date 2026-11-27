@@ -164,6 +164,16 @@ fn setup_dirs(base: &Path, port: u16) -> (PathBuf, PathBuf, PathBuf) {
 	(agent_dir, session_dir, cwd)
 }
 
+/// Wire requests always prepend the bundled system prompt, so the conversation
+/// turns start at index 1.
+fn wire_turns(messages: &[serde_json::Value]) -> &[serde_json::Value] {
+	assert!(
+		messages.first().is_some_and(|m| m["role"] == "system"),
+		"wire request must start with the system prompt: {messages:?}"
+	);
+	&messages[1..]
+}
+
 // 1x1 transparent PNG
 const TINY_PNG: &[u8] = b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x00\x01\x00\x00\x00\x01\x08\x06\x00\x00\x00\x1f\x15c4\x00\x00\x00\nIDATx\x9cc\x00\x01\x00\x00\x05\x00\x01\r\n-\xb4\x00\x00\x00\x00IEND\xaeB`\x82";
 
@@ -202,7 +212,7 @@ fn test_cli_positional_image_wire_and_session_resume() {
 	// Check wire request
 	let reqs = server.requests.lock().expect("lock").clone();
 	assert_eq!(reqs.len(), 1, "mock server must have received 1 request");
-	let messages = reqs[0]["messages"].as_array().expect("messages array");
+	let messages = wire_turns(reqs[0]["messages"].as_array().expect("messages array"));
 	assert_eq!(messages.len(), 1);
 	let content_parts = messages[0]["content"].as_array().expect("content parts");
 	assert_eq!(content_parts.len(), 2, "must have text part and image_url part");
@@ -269,7 +279,7 @@ fn test_cli_positional_image_wire_and_session_resume() {
 
 	let reqs2 = server.requests.lock().expect("lock").clone();
 	assert_eq!(reqs2.len(), 2, "mock server must have received 2 requests total");
-	let resumed_messages = reqs2[1]["messages"].as_array().expect("resumed messages");
+	let resumed_messages = wire_turns(reqs2[1]["messages"].as_array().expect("resumed messages"));
 	assert!(resumed_messages.len() >= 3, "resumed history must carry previous turns");
 
 	// Message 0 is the historical user turn: must still have the image part!
@@ -314,7 +324,7 @@ fn test_cli_prompt_mentions_wire_transfer() {
 
 	let reqs = server.requests.lock().expect("lock").clone();
 	assert_eq!(reqs.len(), 1);
-	let messages = reqs[0]["messages"].as_array().expect("messages");
+	let messages = wire_turns(reqs[0]["messages"].as_array().expect("messages"));
 	let parts = messages[0]["content"].as_array().expect("content parts");
 
 	assert!(parts.iter().any(|p| p["type"] == "image_url"));
@@ -421,7 +431,7 @@ fn test_missing_or_oversize_image_file_handling() {
 
 	let reqs = server.requests.lock().expect("lock").clone();
 	assert_eq!(reqs.len(), 1);
-	let messages = reqs[0]["messages"].as_array().expect("messages");
+	let messages = wire_turns(reqs[0]["messages"].as_array().expect("messages"));
 	let content = messages[0]["content"].as_str().expect("must be pure text without image parts");
 	assert!(content.contains("(skipped: too large,"));
 
@@ -461,7 +471,7 @@ fn test_positional_file_contents_do_not_trigger_file_mentions() {
 
 	let reqs = server.requests.lock().expect("lock").clone();
 	assert_eq!(reqs.len(), 1);
-	let messages = reqs[0]["messages"].as_array().expect("messages");
+	let messages = wire_turns(reqs[0]["messages"].as_array().expect("messages"));
 	// Since no images should be attached from inside @doc.txt, content should be pure text!
 	let content = messages[0]["content"].as_str().expect("must be pure string, no image_url");
 	assert!(content.contains("Document mentions @secret.png in body"));

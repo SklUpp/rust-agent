@@ -167,6 +167,16 @@ fn setup_dirs(base: &Path, port: u16) -> (PathBuf, PathBuf, PathBuf) {
 	(agent_dir, session_dir, cwd)
 }
 
+/// Wire requests always prepend the bundled system prompt, so the conversation
+/// turns start at index 1.
+fn wire_turns(messages: &[serde_json::Value]) -> &[serde_json::Value] {
+	assert!(
+		messages.first().is_some_and(|m| m["role"] == "system"),
+		"wire request must start with the system prompt: {messages:?}"
+	);
+	&messages[1..]
+}
+
 #[test]
 fn test_cli_tool_result_image_replay_to_openai_chat_wire() {
 	let server = MockWireServer::start();
@@ -259,7 +269,7 @@ fn test_cli_tool_result_image_replay_to_openai_chat_wire() {
 
 	let reqs = server.requests.lock().expect("lock").clone();
 	assert_eq!(reqs.len(), 1, "mock server must have received 1 request");
-	let messages = reqs[0]["messages"].as_array().expect("messages array");
+	let messages = wire_turns(reqs[0]["messages"].as_array().expect("messages array"));
 
 	// Validate message sequence:
 	// - Message 0: User turn 1 prompt
@@ -376,7 +386,7 @@ fn test_cli_image_only_tool_result_uses_placeholder_on_wire() {
 
 	let reqs = server.requests.lock().expect("lock").clone();
 	assert_eq!(reqs.len(), 1);
-	let messages = reqs[0]["messages"].as_array().expect("messages");
+	let messages = wire_turns(reqs[0]["messages"].as_array().expect("messages"));
 
 	// Tool message has "(see attached image)" text placeholder
 	assert_eq!(messages[2]["role"], "tool");
@@ -452,7 +462,7 @@ fn test_cli_persisted_parts_user_message_keeps_array_content() {
 
 	let reqs = server.requests.lock().expect("lock").clone();
 	assert_eq!(reqs.len(), 1, "mock server must have received 1 request");
-	let messages = reqs[0]["messages"].as_array().expect("messages array");
+	let messages = wire_turns(reqs[0]["messages"].as_array().expect("messages array"));
 	assert_eq!(messages.len(), 2, "persisted user turn + new prompt: {messages:?}");
 
 	assert_eq!(messages[0]["role"], "user");
@@ -542,7 +552,7 @@ fn test_cli_aborted_tool_turn_with_image_is_excluded_from_replay() {
 
 	let reqs = server.requests.lock().expect("lock").clone();
 	assert_eq!(reqs.len(), 1);
-	let messages = reqs[0]["messages"].as_array().expect("messages");
+	let messages = wire_turns(reqs[0]["messages"].as_array().expect("messages"));
 
 	// TS `session-context.ts:561-582`: an aborted assistant and the contiguous
 	// tool results that belong to it are transcript events, not context. Only the
@@ -560,7 +570,7 @@ fn test_cli_aborted_tool_turn_with_image_is_excluded_from_replay() {
 		messages.iter().all(|message| message["role"] != "tool"),
 		"no tool result from the aborted turn may replay: {messages:?}"
 	);
-	let wire = serde_json::to_string(&messages).expect("serialize messages");
+	let wire = serde_json::to_string(messages).expect("serialize messages");
 	assert!(
 		!wire.contains("partial preview"),
 		"the interrupted partial result must not replay: {wire}"
@@ -685,7 +695,7 @@ fn test_cli_legacy_text_tool_session_replays_without_user_image_insertion() {
 
 	let reqs = server.requests.lock().expect("lock").clone();
 	assert_eq!(reqs.len(), 1);
-	let messages = reqs[0]["messages"].as_array().expect("messages");
+	let messages = wire_turns(reqs[0]["messages"].as_array().expect("messages"));
 
 	// Exactly 4 messages: User turn 1, Assistant, Tool result, User turn 2
 	assert_eq!(messages.len(), 4);
