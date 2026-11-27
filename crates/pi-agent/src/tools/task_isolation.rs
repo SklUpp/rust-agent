@@ -1019,20 +1019,93 @@ fn process_start_token(pid: u32) -> Option<String> {
 	(!token.is_empty()).then_some(token)
 }
 
-#[derive(Serialize)]
+/// Ownership marker written into a task-isolation base dir.
+///
+/// camelCase keeps the JSON byte-compatible with
+/// `packages/coding-agent/src/task/isolation-ownership.ts`, so either runtime
+/// can read the other's sandboxes.
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct OwnerMarker<'a> {
-	pid: u32,
-	id: &'a str,
-	#[serde(skip_serializing_if = "Option::is_none")]
-	start_token: Option<String>,
+pub struct OwnerMarker {
+	/// Owning process id; `<= 0` is malformed.
+	pub pid:         i64,
+	/// Task id that owns the sandbox.
+	#[serde(default, skip_serializing_if = "String::is_empty")]
+	pub id:          String,
+	/// Boot-stable start token; a mismatch means the pid was recycled.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub start_token: Option<String>,
+}
+
+/// Marker contents: `(owner_is_live, recorded_pid)`.
+///
+/// A missing or malformed marker means no verifiable owner (safe to reclaim),
+/// matching `hasLiveIsolationOwner`. `kill(pid, 0)` treats every error except
+/// `ESRCH` as alive (a live process can still report `EPERM`); a recorded
+/// start-time token that no longer matches the live pid means the pid was
+/// recycled, so the sandbox is dead.
+///
+/// `pid` is extracted independently of the optional fields, so a malformed
+/// `id` or `startToken` never makes a live sandbox look reclaimable.
+pub fn owner_is_live(dir: &Path) -> (bool, Option<i64>) {
+	let Ok(text) = fs::read_to_string(dir.join(ISOLATION_OWNER_FILE)) else {
+		return (false, None);
+	};
+	let Ok(value) = serde_json::from_str::<serde_json::Value>(&text) else {
+		return (false, None);
+	};
+	let Some(pid) = value.get("pid").and_then(serde_json::Value::as_i64) else {
+		return (false, None);
+	};
+	if pid <= 0 || !process_alive(pid) {
+		return (false, Some(pid));
+	}
+	let token = value
+		.get("startToken")
+		.and_then(serde_json::Value::as_str)
+		.filter(|token| !token.is_empty());
+	let live = token.is_none_or(|token| {
+		u32::try_from(pid)
+			.ok()
+			.and_then(process_start_token)
+			.is_none_or(|current| current == token)
+	});
+	(live, Some(pid))
+}
+
+#[cfg(unix)]
+fn process_alive(pid: i64) -> bool {
+	let Ok(pid) = libc::pid_t::try_from(pid) else {
+		return false;
+	};
+	// SAFETY: `kill` with signal 0 performs only the permission/existence check;
+	// it does not deliver a signal. `pid` is a plain integer.
+	let result = unsafe { libc::kill(pid, 0) };
+	if result == 0 {
+		return true;
+	}
+	!std::io::Error::last_os_error()
+		.raw_os_error()
+		.is_some_and(|code| code == libc::ESRCH)
+}
+
+#[cfg(not(unix))]
+fn process_alive(pid: i64) -> bool {
+	// `kill(0)` is Unix-only; pi-shell's Windows implementation pins identity
+	// with `OpenProcess` + `WaitForSingleObject`, which is the same check the
+	// process broker uses.
+	let Ok(pid) = i32::try_from(pid) else {
+		return false;
+	};
+	pi_shell::process::Process::from_pid(pid)
+		.is_some_and(|process| process.status() == pi_shell::process::ProcessStatus::Running)
 }
 
 /// Publish the owner marker atomically before the mount is materialised.
 fn write_owner(base_dir: &Path, id: &str) -> Result<(), String> {
 	let marker = OwnerMarker {
-		pid: std::process::id(),
-		id,
+		pid: i64::from(std::process::id()),
+		id: id.to_string(),
 		start_token: process_start_token(std::process::id()),
 	};
 	let bytes = serde_json::to_vec(&marker)
@@ -4484,6 +4557,37 @@ mod tests {
 			String::from_utf8_lossy(&output.stderr)
 		);
 		String::from_utf8_lossy(&output.stdout).trim().to_string()
+	}
+
+	#[test]
+	fn owner_marker_uses_camel_case_and_reports_liveness() {
+		let dir = TempDir::new("owner-marker");
+		write_owner(&dir.0, "task-x").expect("write owner");
+		let text = fs::read_to_string(dir.0.join(ISOLATION_OWNER_FILE)).expect("marker");
+		let value: serde_json::Value = serde_json::from_str(&text).expect("json");
+		assert_eq!(value["pid"], i64::from(std::process::id()));
+		assert_eq!(value["id"], "task-x");
+		assert!(value.get("start_token").is_none(), "camelCase only: {text}");
+		assert!(owner_is_live(&dir.0).0, "the writing process owns the marker");
+
+		fs::write(dir.0.join(ISOLATION_OWNER_FILE), r#"{"pid":0,"id":"dead"}"#).expect("dead marker");
+		assert_eq!(owner_is_live(&dir.0), (false, Some(0)));
+		fs::write(dir.0.join(ISOLATION_OWNER_FILE), r#"{"id":"no-pid"}"#).expect("partial marker");
+		assert_eq!(owner_is_live(&dir.0), (false, None));
+
+		// A malformed optional field must not suppress a live pid check.
+		fs::write(
+			dir.0.join(ISOLATION_OWNER_FILE),
+			format!(
+				r#"{{"pid":{},"id":123,"startToken":{{}}}}"#,
+				std::process::id()
+			),
+		)
+		.expect("malformed optional fields");
+		assert_eq!(
+			owner_is_live(&dir.0),
+			(true, Some(i64::from(std::process::id())))
+		);
 	}
 
 	#[test]

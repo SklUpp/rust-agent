@@ -63,8 +63,9 @@ use std::{
 };
 
 /// Ownership marker written by task isolation before the mount is materialised
-/// (`packages/coding-agent/src/task/isolation-ownership.ts`).
-pub const ISOLATION_OWNER_FILE: &str = ".omp-isolation-owner.json";
+/// (`packages/coding-agent/src/task/isolation-ownership.ts`), re-exported so
+/// the CLI and the task runtime share one contract.
+pub use pi_agent::tools::task_isolation::{ISOLATION_OWNER_FILE, owner_is_live};
 
 /// Prefix of quarantine directories; never rescanned as worktree entries.
 const TRASH_PREFIX: &str = ".trash-";
@@ -392,7 +393,7 @@ fn classify_dir(dir: &Path) -> Option<WorktreeEntry> {
 	if !has_owner && !has_mount {
 		return None;
 	}
-	let (live_owner, owner_pid) = isolation_owner(dir);
+	let (live_owner, owner_pid) = owner_is_live(dir);
 	let orphan_reason = (!live_owner).then(|| {
 		owner_pid.map_or_else(
 			|| "task-isolation leftover (no verifiable owner)".to_string(),
@@ -556,62 +557,6 @@ fn read_worktree_branch(head_file: &Path) -> Option<String> {
 	let head = fs::read_to_string(head_file).ok()?;
 	let head = head.trim();
 	head.strip_prefix("ref: refs/heads/").map(str::to_string)
-}
-
-/// Marker contents: `(owner_is_live, recorded_pid)`.
-///
-/// A missing or malformed marker means no verifiable owner (safe to reclaim),
-/// matching `hasLiveIsolationOwner`. `kill(pid, 0)` treats every error except
-/// `ESRCH` as alive (a live process can still report `EPERM`); a recorded
-/// start-time token that no longer matches the live pid means the pid was
-/// recycled, so the sandbox is dead.
-fn isolation_owner(dir: &Path) -> (bool, Option<i64>) {
-	let Ok(text) = fs::read_to_string(dir.join(ISOLATION_OWNER_FILE)) else {
-		return (false, None);
-	};
-	let Ok(value) = serde_json::from_str::<serde_json::Value>(&text) else {
-		return (false, None);
-	};
-	let Some(pid) = value.get("pid").and_then(serde_json::Value::as_i64) else {
-		return (false, None);
-	};
-	if pid <= 0 {
-		return (false, Some(pid));
-	}
-	if !process_alive(pid) {
-		return (false, Some(pid));
-	}
-	let token = value
-		.get("startToken")
-		.and_then(serde_json::Value::as_str)
-		.filter(|token| !token.is_empty());
-	let live =
-		token.is_none_or(|token| process_start_token(pid).is_none_or(|current| current == token));
-	(live, Some(pid))
-}
-
-fn process_alive(pid: i64) -> bool {
-	let Ok(pid) = libc::pid_t::try_from(pid) else {
-		return false;
-	};
-	// SAFETY: `kill` with signal 0 performs only the permission/existence check;
-	// it does not deliver a signal. `pid` is a plain integer.
-	let result = unsafe { libc::kill(pid, 0) };
-	if result == 0 {
-		return true;
-	}
-	!io::Error::last_os_error()
-		.raw_os_error()
-		.is_some_and(|code| code == libc::ESRCH)
-}
-
-fn process_start_token(pid: i64) -> Option<String> {
-	let stat = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
-	let rest = stat.rsplit_once(')')?.1;
-	// After `pid (comm)` the fields start at state (field 3); starttime is
-	// field 22, i.e. the 20th token here.
-	let token = rest.split_whitespace().nth(19)?.to_string();
-	(!token.is_empty()).then_some(token)
 }
 
 // ───────────────────────────────────────────────────────────────────────────
@@ -833,7 +778,7 @@ fn execute_entry(entry: &WorktreeEntry, canonical_base: &Path) -> ClearOutcome {
 	// the scan's classification can already be stale (an empty or orphaned
 	// directory may have been claimed by a task since), so the owner marker is
 	// probed regardless of `entry.kind`.
-	if isolation_owner(&entry.path).0 {
+	if owner_is_live(&entry.path).0 {
 		outcome.action = ClearAction::Refused;
 		outcome.error = Some(
 			"a live task still owns this isolation sandbox; stop that task (or wait for it to \

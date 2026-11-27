@@ -10,11 +10,23 @@ use crate::tool::Tool;
 /// platform boundary — not typos and not missing ports. Dispatch must state the
 /// boundary instead of the generic "Tool not found", which reads like a
 /// retryable typo and implies a backend could appear later.
-pub const EXCLUDED_TOOLS: [(&str, &str); 1] = [(
-	"computer",
-	"native desktop automation (screen capture, mouse and keyboard control) is excluded from the \
-	 Android build and no desktop backend exists, so nothing was captured or synthesized",
-)];
+pub const EXCLUDED_TOOLS: [(&str, &str); 3] = [
+	(
+		"computer",
+		"native desktop automation (screen capture, mouse and keyboard control) is excluded from \
+		 the Android build and no desktop backend exists, so nothing was captured or synthesized",
+	),
+	(
+		"browser",
+		"browser automation needs a Chromium/puppeteer runtime, which the Android/Termux build does \
+		 not ship, so no page was opened, driven, or captured",
+	),
+	(
+		"generate_image",
+		"image generation is deferred until an OpenAI-compatible image backend is configured; this \
+		 build does not generate images",
+	),
+];
 
 /// Boundary reason for an excluded-but-known tool name, or `None`.
 #[must_use]
@@ -196,6 +208,14 @@ mod tests {
 		assert!(diag.contains("\"computer\""), "{diag}");
 		assert!(!diag.contains("Tool not found"), "{diag}");
 		assert!(excluded_tool_reason("computer").is_some());
+		assert!(excluded_tool_reason("browser").is_some());
+		assert!(excluded_tool_reason("generate_image").is_some());
+		let browser = registry.missing_tool_diagnostic("browser");
+		assert!(browser.contains("excluded by the platform boundary"), "{browser}");
+		assert!(browser.contains("Chromium"), "{browser}");
+		let image = registry.missing_tool_diagnostic("generate_image");
+		assert!(image.contains("excluded by the platform boundary"), "{image}");
+		assert!(image.contains("OpenAI-compatible"), "{image}");
 		assert_eq!(excluded_tool_reason("computers"), None);
 		// A near-miss name stays a typo diagnostic.
 		assert_eq!(

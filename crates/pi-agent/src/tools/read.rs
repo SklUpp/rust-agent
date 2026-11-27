@@ -54,6 +54,7 @@ use tokio_util::sync::CancellationToken;
 
 use super::{
 	edit_variants::mode::{EditMode, FileDisplayMode, resolve_file_display_mode},
+	hashline::snapshot::SNAPSHOT_MAX_BYTES,
 	internal_urls::{self, InternalResource, InternalUrlRouter},
 	internal_urls_agent,
 	internal_urls_artifact,
@@ -71,8 +72,6 @@ const DEFAULT_READ_LIMIT: u64 = 300;
 /// ponytail: no settings seam yet; wire this to config when the settings
 /// store lands.
 const MAX_COLUMNS: usize = 768;
-/// Files at or below this size are scanned to EOF so `totalLines` is exact.
-const SNAPSHOT_MAX_BYTES: u64 = 4 * 1024 * 1024;
 const READ_CHUNK_SIZE: usize = 8 * 1024;
 const RANGE_LEADING_CONTEXT: u64 = 1;
 const RANGE_TRAILING_CONTEXT: u64 = 3;
@@ -97,8 +96,7 @@ const SUFFIX_SCAN_TIMEOUT: Duration = Duration::from_secs(5);
 #[cfg(any(target_os = "linux", target_os = "android"))]
 const O_NONBLOCK: i32 = 0o4000;
 
-const CONVERTIBLE_EXTENSIONS: &[&str] =
-	&[".pdf", ".doc", ".docx", ".ppt", ".pptx", ".xls", ".xlsx", ".rtf", ".epub"];
+const CONVERTIBLE_EXTENSIONS: &[&str] = &[".pdf", ".docx", ".pptx", ".xlsx", ".epub"];
 const IMAGE_EXTENSIONS: &[&str] = &[
 	".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".ico", ".tif", ".tiff", ".avif", ".heic", ".svgz",
 ];
@@ -376,7 +374,8 @@ impl ReadTool {
 		};
 		if display_mode.hash_lines
 			&& let Some(sink) = self.sink.as_deref()
-			&& let Some(bytes) = read_bounded_regular(&entry.absolute_path, SNAPSHOT_MAX_BYTES).await
+			&& let Some(bytes) =
+				read_bounded_regular(&entry.absolute_path, SNAPSHOT_MAX_BYTES as u64).await
 		{
 			let raw: Arc<[u8]> = bytes.into();
 			let full_text = normalize_snapshot_text(&raw);
@@ -1888,7 +1887,7 @@ async fn scan_reader(
 	cancel: &CancellationToken,
 ) -> Result<Window, String> {
 	let mut state = ScanState::new(start_line, max_lines, max_bytes, selected_limit);
-	let stop_after_collect = file_size > SNAPSHOT_MAX_BYTES;
+	let stop_after_collect = file_size > SNAPSHOT_MAX_BYTES as u64;
 	let mut chunk = [0u8; READ_CHUNK_SIZE];
 	let mut saw_any = false;
 	let mut ended_with_newline = false;
@@ -1995,11 +1994,11 @@ pub(super) async fn read_single_range(
 	let max_bytes = DEFAULT_MAX_BYTES.max(max_lines_to_collect * 512);
 
 	let buffered: Option<Arc<[u8]>> = match source {
-		TextSource::File { path, size } if *size <= SNAPSHOT_MAX_BYTES => {
-			read_bounded_regular(path, SNAPSHOT_MAX_BYTES).await
+		TextSource::File { path, size } if *size <= SNAPSHOT_MAX_BYTES as u64 => {
+			read_bounded_regular(path, SNAPSHOT_MAX_BYTES as u64).await
 		},
-		TextSource::Artifact { file, size, .. } if *size <= SNAPSHOT_MAX_BYTES => {
-			read_bounded_artifact(file, SNAPSHOT_MAX_BYTES).await
+		TextSource::Artifact { file, size, .. } if *size <= SNAPSHOT_MAX_BYTES as u64 => {
+			read_bounded_artifact(file, SNAPSHOT_MAX_BYTES as u64).await
 		},
 		TextSource::Memory { bytes, .. } => Some(bytes.to_vec()),
 		_ => None,
@@ -2311,11 +2310,11 @@ pub(super) async fn read_multi_range(
 	let mut total_lines: Option<u64> = None;
 
 	let buffered: Option<Arc<[u8]>> = match source {
-		TextSource::File { path, size } if *size <= SNAPSHOT_MAX_BYTES => {
-			read_bounded_regular(path, SNAPSHOT_MAX_BYTES).await
+		TextSource::File { path, size } if *size <= SNAPSHOT_MAX_BYTES as u64 => {
+			read_bounded_regular(path, SNAPSHOT_MAX_BYTES as u64).await
 		},
-		TextSource::Artifact { file, size, .. } if *size <= SNAPSHOT_MAX_BYTES => {
-			read_bounded_artifact(file, SNAPSHOT_MAX_BYTES).await
+		TextSource::Artifact { file, size, .. } if *size <= SNAPSHOT_MAX_BYTES as u64 => {
+			read_bounded_artifact(file, SNAPSHOT_MAX_BYTES as u64).await
 		},
 		TextSource::Memory { bytes, .. } => Some(bytes.to_vec()),
 		_ => None,
@@ -2702,10 +2701,10 @@ async fn record_read_snapshot(
 	file_size: u64,
 	seen: &[u64],
 ) -> Option<String> {
-	if file_size > SNAPSHOT_MAX_BYTES {
+	if file_size > SNAPSHOT_MAX_BYTES as u64 {
 		return None;
 	}
-	let raw: Arc<[u8]> = read_bounded_regular(path, SNAPSHOT_MAX_BYTES).await?.into();
+	let raw: Arc<[u8]> = read_bounded_regular(path, SNAPSHOT_MAX_BYTES as u64).await?.into();
 	let full_text = normalize_snapshot_text(&raw);
 	record_snapshot_text(sink, path, cwd, &full_text, &raw, seen)
 }
@@ -3706,7 +3705,7 @@ mod display_tests {
 			let mut file = fs::File::create(&leaf).expect("artifact");
 			file.write_all(b"inside-1\ninside-2\n").expect("head");
 			file
-				.set_len(SNAPSHOT_MAX_BYTES + 64)
+				.set_len(SNAPSHOT_MAX_BYTES as u64 + 64)
 				.expect("sparse tail");
 		}
 		let mut scope = UrlScope::default();
@@ -3722,7 +3721,7 @@ mod display_tests {
 		)
 		.await
 		.expect("resolve");
-		assert!(resolved.size > SNAPSHOT_MAX_BYTES);
+		assert!(resolved.size > SNAPSHOT_MAX_BYTES as u64);
 
 		fs::remove_file(&leaf).expect("unlink leaf");
 		std::os::unix::fs::symlink(&outside, &leaf).expect("symlink leaf");
@@ -4047,6 +4046,31 @@ mod display_tests {
 			_context: &ResolveContext,
 		) -> Result<InternalResource, String> {
 			Ok(InternalResource::text(&url.href, format!("handler says {}", url.href)))
+		}
+	}
+}
+
+#[cfg(test)]
+mod convertible_extension_tests {
+	use std::path::Path;
+
+	use super::*;
+
+	#[test]
+	fn only_convertible_extensions_report_a_document() {
+		for convertible in ["a.pdf", "a.docx", "a.pptx", "a.xlsx", "a.epub", "A.PDF"] {
+			assert_eq!(
+				unsupported_extension(Path::new(convertible)),
+				Some("Document"),
+				"{convertible} has a converter"
+			);
+		}
+		for plain in ["a.doc", "a.ppt", "a.xls", "a.rtf", "a.txt"] {
+			assert_eq!(
+				unsupported_extension(Path::new(plain)),
+				None,
+				"{plain} has no converter and must not be reported as a convertible document"
+			);
 		}
 	}
 }
