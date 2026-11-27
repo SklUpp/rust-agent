@@ -1726,7 +1726,7 @@ fn check_migration_status(report: &mut Report) {
 	let marker = dirs::base_config_root().join(dirs::MIGRATION_MARKER);
 	if marker.exists() {
 		report.info(
-			"migration",
+			"config",
 			"legacy-root",
 			format!(
 				"legacy {} is retained read-only; {} records the completed copy",
@@ -1736,7 +1736,7 @@ fn check_migration_status(report: &mut Report) {
 		);
 	} else {
 		report.info(
-			"migration",
+			"config",
 			"legacy-pending",
 			format!(
 				"legacy {} will be copied to {} on the next start unless PI_CONFIG_DIR or \

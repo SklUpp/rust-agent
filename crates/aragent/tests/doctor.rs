@@ -88,6 +88,16 @@ impl Fixture {
 		self.command().args(args).output().expect("run arag")
 	}
 
+	/// Like [`Fixture::command`] but without an explicit storage override, so
+	/// `~/.omp` is the legacy root and `~/.aragent` the default destination.
+	fn legacy_command(&self) -> Command {
+		let mut command = self.command();
+		command
+			.env_remove("PI_CONFIG_DIR")
+			.env_remove("PI_CODING_AGENT_DIR");
+		command
+	}
+
 	fn seed_session(&self) -> PathBuf {
 		let db = self.db();
 		let mut store = SqliteStore::open(&db).expect("open fixture database");
@@ -724,6 +734,64 @@ fn default_doctor_is_strictly_read_only() {
 	assert!(!fixture.base.join("security").exists(), "state dir must not be created");
 	assert!(!fixture.agent.join("config.yml").exists());
 	assert!(!fixture.base.join("config.yml").exists());
+}
+
+#[test]
+fn legacy_home_doctor_is_read_only_and_reports_migration_status() {
+	let fixture = Fixture::new("legacy-root");
+	let legacy_config = fixture.agent.join("config.yml");
+	fs::write(&legacy_config, "{}\n").expect("write legacy config");
+	set_mode(&legacy_config, 0o600);
+	let current = fixture.home.join(".aragent");
+	assert!(!current.exists(), "fixture must start without ~/.aragent");
+
+	// Root help/version must never perform startup side effects either.
+	for flag in ["--help", "-V"] {
+		let help = fixture
+			.legacy_command()
+			.arg(flag)
+			.output()
+			.expect("run arag");
+		assert_eq!(code(&help), 0, "{flag}: {}", stderr(&help));
+		assert!(!current.exists(), "{flag} must not create ~/.aragent");
+	}
+
+	let pending = fixture
+		.legacy_command()
+		.args(["doctor", "--json"])
+		.output()
+		.expect("run arag");
+	assert!(!stderr(&pending).contains("panicked"), "{}", stderr(&pending));
+	assert!(code(&pending) < 2, "doctor usage failure: {}", stderr(&pending));
+	let parsed = report(&pending);
+	assert_json_schema(&parsed);
+	assert_eq!(parsed["summary"]["errors"], 0, "{}", stdout(&pending));
+	assert!(section_codes(&parsed, "config").contains(&"legacy-pending"), "{}", stdout(&pending));
+	assert!(!current.exists(), "read-only doctor must not create ~/.aragent");
+
+	let marker = current.join(aragent::dirs::MIGRATION_MARKER);
+	fs::create_dir_all(&current).expect("create ~/.aragent");
+	set_mode(&current, 0o700);
+	fs::write(&marker, b"copied\n").expect("write migration marker");
+
+	let migrated = fixture
+		.legacy_command()
+		.args(["doctor", "--json"])
+		.output()
+		.expect("run arag");
+	assert!(!stderr(&migrated).contains("panicked"), "{}", stderr(&migrated));
+	assert!(code(&migrated) < 2, "doctor usage failure: {}", stderr(&migrated));
+	let parsed = report(&migrated);
+	assert_json_schema(&parsed);
+	assert_eq!(parsed["summary"]["errors"], 0, "{}", stdout(&migrated));
+	assert!(section_codes(&parsed, "config").contains(&"legacy-root"), "{}", stdout(&migrated));
+	assert!(!section_codes(&parsed, "config").contains(&"legacy-pending"));
+	assert!(!current.join("agent").exists(), "doctor must not create ~/.aragent/agent");
+	assert_eq!(
+		fs::read_to_string(&legacy_config).ok().as_deref(),
+		Some("{}\n"),
+		"doctor must never rewrite the legacy config"
+	);
 }
 
 #[cfg(unix)]

@@ -13,8 +13,8 @@ use aragent::{
 	agents,
 	approve::{ApprovalMode, Approvals},
 	args::{
-		Cli, Command, ExportFormat, ImportFormat, normalize_continue_session_args, parse_cli,
-		refused_verb_message,
+		Cli, Command, ExportFormat, ImportFormat, is_read_only_startup,
+		normalize_continue_session_args, parse_cli, refused_verb_message,
 	},
 	autolearn::{self, LocalLearnTool, ManageSkillTool, MemoryBackend},
 	catalog::Catalog,
@@ -249,8 +249,16 @@ fn run() -> std::result::Result<(), CliError> {
 	}
 	let profile = profile::resolve_cli(bootstrap.profile.as_deref())?;
 	// Copy-only legacy `~/.omp` -> `~/.aragent` migration. Runs before the
-	// profile environment is applied and never mutates the legacy tree.
-	aragent::migration::migrate_if_needed();
+	// profile environment is applied and never mutates the legacy tree. Skipped
+	// for read-only startup (`--help`, `--version`, `doctor`) so a help dump or
+	// read-only report cannot create the new config root, and for hidden workers,
+	// which run inside an already-resolved profile scope.
+	if !is_read_only_startup(&bootstrap.argv)
+		&& !daemon_broker::is_worker_invocation()
+		&& !pi_agent::lsp::mux::worker::is_worker_invocation()
+	{
+		aragent::migration::migrate_if_needed();
+	}
 	profile::activate(profile.as_deref());
 	// Hidden worker dispatch before clap/config/session boot: the broker worker
 	// is a separate process carrying its own scope in the environment, not a

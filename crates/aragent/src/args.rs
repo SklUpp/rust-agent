@@ -733,6 +733,29 @@ pub fn refused_verb_message(argv: &[std::ffi::OsString]) -> Option<String> {
 	None
 }
 
+/// Whether startup is read-only: a help/version request on the root or on the
+/// subcommand surface, the `doctor` verb, or the hidden `__probe` child that
+/// doctor forks. Startup side effects (the legacy `~/.omp` copy in particular)
+/// must be skipped for all of them, so neither a help dump nor a read-only
+/// doctor run writes to the config root. The probe child re-enters `run()` with
+/// this same argv shape, so it must be recognized here rather than by the
+/// caller.
+pub fn is_read_only_startup(argv: &[std::ffi::OsString]) -> bool {
+	let command = RawCli::command();
+	if requests_help_or_version(&command, argv, 1) {
+		return true;
+	}
+	let Some(index) = verb_slot_index(&command, argv) else {
+		return false;
+	};
+	match argv[index].to_str() {
+		Some("doctor" | "__probe") => true,
+		// `arag launch --help`, `arag repl --version`: the request follows the
+		// verb, so clap prints help instead of starting the runtime.
+		_ => requests_help_or_version(&command, argv, index + 1),
+	}
+}
+
 /// Whether the leading flag region requests root `--export <SESSION>`.
 ///
 /// Like the verb scan, the flag/value categories come from the clap surface, so
@@ -1605,6 +1628,38 @@ mod tests {
 
 	fn raw(args: &[&str]) -> Vec<std::ffi::OsString> {
 		args.iter().map(std::ffi::OsString::from).collect()
+	}
+
+	#[test]
+	fn read_only_startup_covers_help_version_and_doctor() {
+		for args in [
+			&["arag", "--help"][..],
+			&["arag", "-h"],
+			&["arag", "--version"],
+			&["arag", "-V"],
+			&["arag", "doctor"],
+			&["arag", "doctor", "--json"],
+			&["arag", "--continue", "doctor"],
+			&["arag", "__probe", "cpu"],
+			&["arag", "launch", "--help"],
+			&["arag", "repl", "--help"],
+			&["arag", "launch", "--version"],
+		] {
+			assert!(is_read_only_startup(&raw(args)), "{args:?}");
+		}
+
+		for args in [
+			&["arag"][..],
+			&["arag", "say hi"],
+			&["arag", "launch"],
+			&["arag", "launch", "doctor"],
+			&["arag", "--", "doctor"],
+			&["arag", "--model", "doctor"],
+			&["arag", "--resume", "doctor"],
+			&["arag", "--cwd", "doctor"],
+		] {
+			assert!(!is_read_only_startup(&raw(args)), "{args:?}");
+		}
 	}
 
 	#[test]
