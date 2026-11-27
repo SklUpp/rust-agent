@@ -77,6 +77,8 @@ jobs:
         run: cargo build --locked -p aragent
       - name: Run real CLI against local OpenAI-compatible fixture
         run: python3 scripts/standalone-smoke.py --binary target/debug/arag --timeout 120
+      - name: Run offline E2E runtime smoke suite (R9, R10, R11)
+        run: python3 scripts/e2e-runtime-smoke.py --binary target/debug/arag --timeout 60
       - name: Record host binary digest
         run: sha256sum target/debug/arag > target/debug/arag.sha256
       - name: Upload host binary
@@ -233,6 +235,9 @@ jobs:
 
           rule("In-tree shell minimizer attribution (crates/pi-shell/NOTICE)")
           lines.append(read("crates/pi-shell/NOTICE"))
+
+          rule("In-tree ctok tokenizer attribution (crates/pi-agent/src/utok/data/LICENSE.ctok)")
+          lines.append(read("crates/pi-agent/src/utok/data/LICENSE.ctok"))
 
           rule("Dependency license overview")
           for entry in sorted(overview, key=lambda e: (e.get("id", ""), e.get("name", ""))):
