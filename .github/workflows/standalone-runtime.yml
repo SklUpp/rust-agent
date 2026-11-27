@@ -10,6 +10,12 @@ on:
   pull_request:
     branches: [main]
   workflow_dispatch:
+    inputs:
+      refresh_patch_lock:
+        description: Refresh patch versions of rustls/rustls-webpki/tokio/url/rustix in Cargo.lock
+        required: false
+        type: boolean
+        default: false
 
 concurrency:
   group: standalone-runtime-${{ github.ref }}
@@ -50,6 +56,9 @@ jobs:
         uses: Swatinem/rust-cache@v2
         with:
           key: standalone-runtime-host
+      - name: Refresh patch-level security crates in Cargo.lock (manual dispatch only)
+        if: github.event_name == 'workflow_dispatch' && inputs.refresh_patch_lock
+        run: cargo update -p rustls -p rustls-webpki -p tokio -p url -p rustix
       - name: Check agent core and CLI
         run: cargo check --locked -p pi-agent -p aragent
       - name: Test agent core and CLI
@@ -111,6 +120,9 @@ jobs:
         uses: Swatinem/rust-cache@v2
         with:
           key: standalone-runtime-android
+      - name: Refresh patch-level security crates in Cargo.lock (manual dispatch only)
+        if: github.event_name == 'workflow_dispatch' && inputs.refresh_patch_lock
+        run: cargo update -p rustls -p rustls-webpki -p tokio -p url -p rustix
       - name: Build arag for aarch64-linux-android
         env:
           NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
@@ -158,6 +170,9 @@ jobs:
         uses: taiki-e/install-action@v2
         with:
           tool: cargo-deny@0.20.2,cargo-about@0.8.2
+      - name: Refresh patch-level security crates in Cargo.lock (manual dispatch only)
+        if: github.event_name == 'workflow_dispatch' && inputs.refresh_patch_lock
+        run: cargo update -p rustls -p rustls-webpki -p tokio -p url -p rustix
       - name: Check advisories, licenses, and sources
         run: cargo deny check
       - name: Generate dependency license data
@@ -248,4 +263,11 @@ jobs:
         with:
           name: third-party-notices
           path: THIRD-PARTY-NOTICES.generated.txt
+          if-no-files-found: error
+      - name: Upload refreshed Cargo.lock (manual dispatch only)
+        if: github.event_name == 'workflow_dispatch' && inputs.refresh_patch_lock
+        uses: actions/upload-artifact@v4
+        with:
+          name: refreshed-cargo-lock
+          path: Cargo.lock
           if-no-files-found: error

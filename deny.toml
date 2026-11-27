@@ -7,7 +7,14 @@ all-features = true
 [advisories]
 version = 2
 yanked = "deny"
-ignore = []
+ignore = [
+    # Unmaintained crate with no safe upstream replacement in Cargo.lock.
+    { id = "RUSTSEC-2026-0543", reason = "chrono is unmaintained upstream with no drop-in patch release yet" },
+    # Unmaintained proc-macro dependency pulled transitively; compile-time only.
+    { id = "RUSTSEC-2024-0436", reason = "paste is unmaintained transitive macro-only dependency; no runtime surface" },
+    # Bundled SQLite < 3.54.0 -wal page-size bug requires major rusqlite 0.33 -> 0.41 upgrade.
+    { id = "RUSTSEC-2026-0459", reason = "aragent opens only local 0700/0600 SQLite DBs; major rusqlite 0.41 upgrade tracked separately" },
+]
 
 [licenses]
 version = 2
@@ -45,6 +52,8 @@ exceptions = [
     # by upstream source availability; no obligations attach to our
     # unmodified use. Keep it package-scoped.
     { allow = ["MPL-2.0"], crate = "uluru@3.1.0" },
+    # option-ext (via fastembed -> hf-hub -> dirs -> dirs-sys) is MPL-2.0.
+    { allow = ["MPL-2.0"], crate = "option-ext@0.2.0" },
 ]
 
 # tree-sitter-graphql 0.1.0 has no SPDX expression in Cargo.toml. Its packaged
