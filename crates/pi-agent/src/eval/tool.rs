@@ -342,14 +342,8 @@ impl CellJob {
 		let control = CellControl::new(self.ctx.cancellation_token.clone(), idle);
 		let cancellation = control.kernel_token();
 		let run_id = format!("eval-{}-{}", self.language.token(), &util::random_token()[..8]);
-		let managed = managed_env(
-			&self.session,
-			&self.runtime.bridge().endpoint().url,
-			&self.runtime.bridge().endpoint().token,
-			self.runtime.bridge_session_id(),
-		);
 		let status_events = Arc::new(Mutex::new(Vec::new()));
-		let status_rx = self.runtime.bridge().register(
+		let (registration_token, status_rx) = self.runtime.bridge().register(
 			self.runtime.bridge_session_id(),
 			&run_id,
 			Arc::clone(&self.host),
@@ -357,6 +351,12 @@ impl CellJob {
 			format!("{} prelude", self.language.runtime_name()),
 			self.ctx.cancellation_token.clone(),
 			Some(control.clone()),
+		);
+		let managed = managed_env(
+			&self.session,
+			&self.runtime.bridge().endpoint().url,
+			&registration_token,
+			self.runtime.bridge_session_id(),
 		);
 		let mut drain = spawn_status_drain(status_rx, Arc::clone(&status_events));
 

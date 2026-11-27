@@ -1,8 +1,9 @@
 //! Loopback HTTP bridge used by the Python/Ruby/Julia preludes and the JS VM.
 //!
-//! The endpoint is `127.0.0.1` only, requires a per-process bearer token, bounds
-//! request headers/bodies, and compares the token in constant time. The token is
-//! passed to a kernel through its spawn environment and is never logged.
+//! The endpoint is `127.0.0.1` only, requires a bearer token scoped to one
+//! `(session, run)` registration, bounds request headers/bodies, and compares
+//! the token in constant time. The token is passed to a kernel through its
+//! spawn environment and is never logged.
 
 use std::{
 	collections::HashMap,
@@ -58,6 +59,9 @@ struct Registration {
 	cancellation: CancellationToken,
 	control: Option<CellControl>,
 	status: mpsc::UnboundedSender<EvalStatusEvent>,
+	/// Per-registration secret; the kernel must present the composite
+	/// `bridge_token.cell_token` bearer, so one cell cannot drive another.
+	cell_token: String,
 }
 
 #[derive(Clone)]
@@ -115,7 +119,10 @@ impl Bridge {
 		self.connections.load(Ordering::SeqCst)
 	}
 
-	/// Register one execution. The returned receiver carries host-side status
+	/// Register one execution.
+	///
+	/// Returns the bearer token scoped to this registration
+	/// (`bridge_token.cell_token`) and the receiver carrying host-side status
 	/// events for the cell; watchdog pause/resume is executed synchronously via
 	/// the optional [`CellControl`] instead of travelling through the channel.
 	pub fn register(
@@ -127,8 +134,9 @@ impl Bridge {
 		intent: impl Into<String>,
 		cancellation: CancellationToken,
 		control: Option<CellControl>,
-	) -> mpsc::UnboundedReceiver<EvalStatusEvent> {
+	) -> (String, mpsc::UnboundedReceiver<EvalStatusEvent>) {
 		let (status, receiver) = mpsc::unbounded_channel();
+		let cell_token = util::random_token();
 		let registration = Registration {
 			host,
 			ctx,
@@ -136,13 +144,14 @@ impl Bridge {
 			cancellation,
 			control,
 			status,
+			cell_token: cell_token.clone(),
 		};
 		self
 			.registrations
 			.lock()
 			.unwrap_or_else(|poison| poison.into_inner())
 			.insert(registration_key(session_id, run_id), registration);
-		receiver
+		(format!("{}.{cell_token}", self.endpoint.token), receiver)
 	}
 
 	pub fn unregister(&self, session_id: &str, run_id: &str) {
@@ -251,7 +260,13 @@ async fn handle_connection(
 		return;
 	};
 	let presented = authorization.strip_prefix("Bearer ").unwrap_or("");
-	if !constant_time_eq(presented.as_bytes(), token.as_bytes()) {
+	// The bearer is `bridge_token.cell_token`. Verify the bridge half before
+	// reading any body: an unauthenticated caller must not get a body read.
+	let Some((bridge_part, cell_part)) = presented.split_once('.') else {
+		let _ = write_response(&mut stream, 403, "text/plain", b"forbidden").await;
+		return;
+	};
+	if !constant_time_eq(bridge_part.as_bytes(), token.as_bytes()) {
 		let _ = write_response(&mut stream, 403, "text/plain", b"forbidden").await;
 		return;
 	}
@@ -300,6 +315,10 @@ async fn handle_connection(
 		.await;
 		return;
 	};
+	if !constant_time_eq(cell_part.as_bytes(), registration.cell_token.as_bytes()) {
+		let _ = write_response(&mut stream, 403, "text/plain", b"forbidden").await;
+		return;
+	}
 	if registration.cancellation.is_cancelled() {
 		let _ = write_response_json(&mut stream, 200, &failure("eval cell was interrupted")).await;
 		return;
@@ -457,6 +476,8 @@ fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
 #[cfg(test)]
 mod tests {
 	use super::*;
+	use crate::{eval::ArtifactRef, state::ToolResult, tool::ToolError};
+	use async_trait::async_trait;
 
 	#[test]
 	fn constant_time_compare_rejects_prefix_and_length_changes() {
@@ -464,5 +485,108 @@ mod tests {
 		assert!(!constant_time_eq(b"secret", b"secrez"));
 		assert!(!constant_time_eq(b"secret", b"secret2"));
 		assert!(!constant_time_eq(b"", b"x"));
+	}
+
+	/// Dispatch must never be reached: the scoped-token test only exercises
+	/// authentication and registration lookup.
+	struct RefusingHost;
+
+	#[async_trait]
+	impl EvalHost for RefusingHost {
+		async fn call_tool(
+			&self,
+			_: &str,
+			_: Value,
+			_: &AgentContext,
+		) -> Result<ToolResult, ToolError> {
+			Err(ToolError::Rejected("bridge dispatch is not expected in this test".to_string()))
+		}
+
+		async fn completion(&self, _: Value, _: &AgentContext) -> Result<Value, String> {
+			Err("bridge dispatch is not expected in this test".to_string())
+		}
+
+		async fn agent(&self, _: Value, _: &AgentContext) -> Result<Value, String> {
+			Err("bridge dispatch is not expected in this test".to_string())
+		}
+
+		async fn budget(&self, _: Value, _: &AgentContext) -> Result<Value, String> {
+			Err("bridge dispatch is not expected in this test".to_string())
+		}
+
+		fn concurrency(&self, _: &Value) -> Result<Value, String> {
+			Err("bridge dispatch is not expected in this test".to_string())
+		}
+
+		async fn write_artifact(&self, _: &str, _: &[u8]) -> Result<Option<ArtifactRef>, String> {
+			Ok(None)
+		}
+
+		fn enqueue_background_result(&self, _: &str, _: String) -> bool {
+			false
+		}
+	}
+
+	async fn post_bridge(url: &str, token: &str, body: &str) -> (u16, String) {
+		let address = url.strip_prefix("http://").expect("loopback url");
+		let mut stream = TcpStream::connect(address).await.expect("bridge connect");
+		let request = format!(
+			"POST /v1/tool HTTP/1.1\r\nHost: {address}\r\nAuthorization: Bearer {token}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+			body.len()
+		);
+		stream.write_all(request.as_bytes()).await.expect("bridge request");
+		let mut response = Vec::new();
+		stream.read_to_end(&mut response).await.expect("bridge response");
+		let text = String::from_utf8_lossy(&response).into_owned();
+		let status = text
+			.split_whitespace()
+			.nth(1)
+			.and_then(|code| code.parse().ok())
+			.expect("status line");
+		(status, text)
+	}
+
+	#[tokio::test]
+	async fn cell_token_is_scoped_to_its_registration() {
+		let bridge = Bridge::start().await.expect("bridge start");
+		let ctx = AgentContext::new(std::env::current_dir().expect("cwd"));
+		let (token_a, _events_a) = bridge.register(
+			"session-a",
+			"run-a",
+			Arc::new(RefusingHost),
+			ctx.clone(),
+			"test",
+			CancellationToken::new(),
+			None,
+		);
+		let (token_b, _events_b) = bridge.register(
+			"session-b",
+			"run-b",
+			Arc::new(RefusingHost),
+			ctx,
+			"test",
+			CancellationToken::new(),
+			None,
+		);
+		let body_b = r#"{"session":"session-b","run":"run-b","name":"echo","args":{}}"#;
+
+		let (status, response) = post_bridge(&bridge.endpoint().url, &token_a, body_b).await;
+		assert_eq!(status, 403, "cell token crossed registrations: {response}");
+
+		// The owning cell authenticates and reaches dispatch (the host refuses
+		// the call, but lookup and cell-token verification succeeded).
+		let (status, response) = post_bridge(&bridge.endpoint().url, &token_b, body_b).await;
+		assert_eq!(status, 200, "owning cell token was rejected: {response}");
+
+		// The bare bridge secret is no longer a bearer by itself, and a guessed
+		// cell half with the right bridge half is rejected.
+		let bare = bridge.endpoint().token.clone();
+		let (status, response) = post_bridge(&bridge.endpoint().url, &bare, body_b).await;
+		assert_eq!(status, 403, "bare bridge token was accepted: {response}");
+		let forged = format!("{bare}.{}", util::random_token());
+		let (status, response) = post_bridge(&bridge.endpoint().url, &forged, body_b).await;
+		assert_eq!(status, 403, "forged cell token was accepted: {response}");
+
+		bridge.shutdown().await;
 	}
 }
