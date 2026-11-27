@@ -741,12 +741,15 @@ fn test_mcp_tool_execution_preserves_content_and_cancellation() {
 	assert_eq!(res_ok.content, "hello from echo");
 	assert!(!res_ok.is_error);
 
-	// 2. Image payload is preserved (base64 data present)
+	// 2. Image payload is preserved in typed `details.images` without base64 text bloat
 	let res_img = rt
 		.block_on(image_tool.execute(&json!({}), &ctx))
 		.expect("execute image");
-	assert!(res_img.content.contains("image/png"));
-	assert!(res_img.content.contains("base64=aW1hZ2VkYXRh"));
+	assert!(res_img.content.contains("[Image: image/png]"));
+	assert!(!res_img.content.contains("aW1hZ2VkYXRh"));
+	let details = res_img.details.as_ref().expect("image tool details");
+	assert_eq!(details["images"][0]["mimeType"], "image/png");
+	assert_eq!(details["images"][0]["data"], "aW1hZ2VkYXRh");
 	assert!(!res_img.is_error);
 
 	// 3. Failing tool call preserves is_error == true
