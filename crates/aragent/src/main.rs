@@ -4765,7 +4765,7 @@ fn run_import_command(
 			let bundle: SessionBundle = serde_json::from_str(&content).map_err(|err| {
 				CliError::fail(format!("invalid session bundle {}: {err}", source_path.display()))
 			})?;
-			std::fs::create_dir_all(target_dir).map_err(|err| {
+			aragent::session_store::create_private_dir(target_dir).map_err(|err| {
 				CliError::fail(format!("cannot create {}: {err}", target_dir.display()))
 			})?;
 			let db_path = aragent::durable_session::database_path(target_dir);
@@ -4900,7 +4900,7 @@ fn run_foreign_import(
 	} else {
 		loaded.cwd.clone()
 	};
-	std::fs::create_dir_all(target_dir).map_err(|err| {
+	aragent::session_store::create_private_dir(target_dir).map_err(|err| {
 		CliError::fail(format!("cannot create {}: {err}", target_dir.display()))
 	})?;
 	let mut imported = SessionStore::open(&SessionOptions {
@@ -5726,7 +5726,7 @@ mod tests {
 			line!()
 		));
 		let _ = std::fs::remove_dir_all(&dir);
-		std::fs::create_dir_all(&dir).expect("create cli temp dir");
+		aragent::session_store::create_private_dir(&dir).expect("create cli temp dir");
 		let id = "cli-session-1";
 		let secret = "sk-cli-session-secret-2b4e6f8a";
 		aragent::auth::known_secrets::register(secret);
@@ -5824,7 +5824,7 @@ mod tests {
 			line!()
 		));
 		let _ = std::fs::remove_dir_all(&dir);
-		std::fs::create_dir_all(&dir).expect("create redact temp dir");
+		aragent::session_store::create_private_dir(&dir).expect("create redact temp dir");
 		let secret = "sk-config-markdown-secret-71c9d3";
 		let config_path = dir.join("config.yml");
 		std::fs::write(

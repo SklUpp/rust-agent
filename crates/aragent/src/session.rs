@@ -1585,7 +1585,7 @@ fn adopt_legacy_project_sessions(current_dir: &Path, legacy_dirs: &[PathBuf]) ->
 		return warnings;
 	}
 	let current_db = crate::durable_session::database_path(current_dir);
-	if let Err(error) = fs::create_dir_all(current_dir) {
+	if let Err(error) = crate::session_store::create_private_dir(current_dir) {
 		warnings.push(format!("cannot create {}: {error}", current_dir.display()));
 		return warnings;
 	}
@@ -1665,7 +1665,7 @@ fn adopt_legacy_jsonl_session(current_dir: &Path, legacy_dirs: &[PathBuf], id: &
 			continue;
 		}
 		let destination = current_dir.join(format!("{id}.{LOG_EXTENSION}"));
-		let _ = fs::create_dir_all(current_dir);
+		let _ = crate::session_store::create_private_dir(current_dir);
 		let _ = crate::migration::adopt_legacy_file(&destination, &source);
 		let source_artifacts = legacy_dir.join(id);
 		if source_artifacts.is_dir() {
@@ -1701,7 +1701,7 @@ impl SessionStore {
 		};
 		let legacy_dirs = if options.dir.is_none() { legacy_session_dirs(&options.cwd) } else { Vec::new() };
 
-		if let Err(err) = fs::create_dir_all(&dir) {
+		if let Err(err) = crate::session_store::create_private_dir(&dir) {
 			store.warn(format!("cannot create session directory {}: {err}", dir.display()));
 			return store;
 		}
@@ -5095,7 +5095,7 @@ fn adopt_legacy_session_match(
 ) -> Option<PathBuf> {
 	let file_name = matched.file_name()?;
 	let id = matched.file_stem()?.to_str()?;
-	let _ = fs::create_dir_all(current_dir);
+	let _ = crate::session_store::create_private_dir(current_dir);
 	let current_db = crate::durable_session::database_path(current_dir);
 	if !current_db.exists() {
 		for legacy_dir in legacy_dirs {
@@ -5320,7 +5320,7 @@ fn fork_durable_atomic(db_path: &Path, source_id: &str, new_cwd: Option<&Path>, 
 	let header: SessionHeader = serde_json::from_value(snapshot.header_payload.clone()).map_err(|e| e.to_string())?;
 	let new_id = output::session_id();
 	let new_dir = target_dir.map(PathBuf::from).unwrap_or_else(|| db_path.parent().unwrap_or_else(|| Path::new(".")).to_path_buf());
-	fs::create_dir_all(&new_dir).map_err(|e| e.to_string())?;
+	crate::session_store::create_private_dir(&new_dir).map_err(|e| e.to_string())?;
 	let mut fork_header = header.clone();
 	fork_header.id = new_id.clone();
 	fork_header.parent_session = Some(source_id.to_string());
@@ -5437,7 +5437,7 @@ fn fork_legacy_session(source_path: &Path, new_cwd: Option<&Path>, target_dir: O
 		.map(PathBuf::from)
 		.or_else(|| source_path.parent().map(Path::to_path_buf))
 		.unwrap_or_else(|| PathBuf::from("."));
-	fs::create_dir_all(&target_dir).map_err(|e| e.to_string())?;
+	crate::session_store::create_private_dir(&target_dir).map_err(|e| e.to_string())?;
 
 	header.id = new_id.clone();
 	header.parent_session = Some(original_id.clone());
@@ -5720,7 +5720,7 @@ pub fn import_legacy_v1(
 		parent_id = Some(asst_id);
 	}
 
-	fs::create_dir_all(target_dir).map_err(|e| e.to_string())?;
+	crate::session_store::create_private_dir(target_dir).map_err(|e| e.to_string())?;
 	// Create the target row directly: the source JSONL often shares this
 	// directory, and `SessionStore::open` would fall back to its read-only view.
 	let durable = crate::durable_session::DurableSession::create(
@@ -5778,7 +5778,7 @@ pub fn import_v3_session(source_path: &Path, target_dir: &Path) -> Result<PathBu
 			db_path.display()
 		));
 	}
-	fs::create_dir_all(target_dir).map_err(|error| error.to_string())?;
+	crate::session_store::create_private_dir(target_dir).map_err(|error| error.to_string())?;
 	// Explicit import target: create the SQLite row directly. Opening through
 	// `SessionStore` would fall back to the source JSONL's read-only view when
 	// source and target share a directory.
@@ -5861,7 +5861,7 @@ mod tests {
 			COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
 		);
 		let dir = std::env::temp_dir().join(unique);
-		fs::create_dir_all(&dir).expect("temp dir");
+		crate::session_store::create_private_dir(&dir).expect("temp dir");
 		dir
 	}
 
@@ -5961,7 +5961,7 @@ mod tests {
 		let base = temp_dir();
 		let legacy = base.join("legacy");
 		let current = base.join("current");
-		fs::create_dir_all(&legacy).expect("legacy");
+		crate::session_store::create_private_dir(&legacy).expect("legacy");
 		let legacy_db = rusqlite::Connection::open(legacy.join("sessions.db")).expect("legacy db");
 		legacy_db
 			.pragma_update(None, "journal_mode", "WAL")
@@ -6024,7 +6024,7 @@ mod tests {
 			}
 		}
 		let legacy_dir = session_dir_paths(&cwd, None).legacy.first().cloned().expect("legacy dir");
-		fs::create_dir_all(&legacy_dir).expect("legacy sessions");
+		crate::session_store::create_private_dir(&legacy_dir).expect("legacy sessions");
 		let legacy_db = crate::durable_session::database_path(&legacy_dir);
 		let mut legacy_store = SqliteStore::open(&legacy_db).expect("legacy store");
 		legacy_store

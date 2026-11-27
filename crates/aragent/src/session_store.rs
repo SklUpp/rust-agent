@@ -7922,7 +7922,10 @@ fn next_execution_id() -> String {
 /// Create a missing parent directory with mode 0700; existing dirs are left
 /// alone. Session history is per-user data, so new dirs must not be readable
 /// by others even when the umask is permissive.
-fn create_private_dir(dir: &Path) -> std::io::Result<()> {
+///
+/// Public so session/fork/import paths that pre-create a database parent use
+/// the same policy instead of a umask-driven `create_dir_all`.
+pub fn create_private_dir(dir: &Path) -> std::io::Result<()> {
 	if dir.exists() {
 		return Ok(());
 	}

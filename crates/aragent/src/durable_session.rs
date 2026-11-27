@@ -3178,7 +3178,7 @@ mod tests {
 			std::process::id(),
 			output::session_id()
 		));
-		std::fs::create_dir_all(&dir).expect("temp dir");
+		crate::session_store::create_private_dir(&dir).expect("temp dir");
 		let path = dir.join("sessions.db");
 		(dir, path)
 	}
