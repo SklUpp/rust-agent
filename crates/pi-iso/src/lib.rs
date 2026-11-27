@@ -57,7 +57,8 @@ pub enum BackendKind {
 	/// Kernel `overlay` filesystem (Linux), with optional `fuse-overlayfs`
 	/// fallback.
 	Overlayfs,
-	/// Windows `FSCTL_DUPLICATE_EXTENTS_TO_FILE` block clone tree (NTFS/ReFS).
+	/// Windows `FSCTL_DUPLICATE_EXTENTS_TO_FILE` block clone tree (ReFS only;
+	/// NTFS rejects the control with `ERROR_INVALID_FUNCTION`).
 	WindowsBlockClone,
 	/// Windows Projected File System.
 	Projfs,

@@ -1,9 +1,10 @@
 //! Windows block-clone based isolation.
 //!
-//! `FSCTL_DUPLICATE_EXTENTS_TO_FILE` asks NTFS/ReFS to share file extents
-//! copy-on-write between a source file and a destination file. The backend
-//! recursively materializes the directory tree and block-clones each regular
-//! file. There is no mount/session state to undo, so
+//! `FSCTL_DUPLICATE_EXTENTS_TO_FILE` asks ReFS to share file extents
+//! copy-on-write between a source file and a destination file. NTFS does not
+//! implement this control: it rejects the request with `ERROR_INVALID_FUNCTION`.
+//! The backend recursively materializes the directory tree and block-clones
+//! each regular file. There is no mount/session state to undo, so
 //! [`stop`](IsolationBackend::stop) is a recursive remove.
 
 use std::path::Path;
@@ -20,6 +21,129 @@ pub fn backend() -> &'static dyn IsolationBackend {
 	&WindowsBlockCloneBackend
 }
 
+/// Whether `path` resides on a ReFS volume.
+///
+/// `FSCTL_DUPLICATE_EXTENTS_TO_FILE` is implemented only by ReFS; NTFS and
+/// every other Windows filesystem reject it with `ERROR_INVALID_FUNCTION`. The
+/// path itself need not exist: `GetVolumePathNameW` reduces it to the volume
+/// mount point, which must exist.
+#[cfg(windows)]
+pub(crate) fn is_refs_path(path: &Path) -> Result<bool, String> {
+	use std::{io, os::windows::ffi::OsStrExt as _};
+
+	use windows_sys::Win32::{
+		Foundation::{
+			ERROR_FILENAME_EXCED_RANGE, ERROR_INSUFFICIENT_BUFFER, ERROR_MORE_DATA, MAX_PATH,
+		},
+		Storage::FileSystem::{GetVolumeInformationW, GetVolumePathNameW},
+	};
+
+	let requested: Vec<u16> = path
+		.as_os_str()
+		.encode_wide()
+		.chain(std::iter::once(0))
+		.collect();
+	// Extended-length and mounted-folder paths, and short junctions that point
+	// at one, can make GetVolumePathNameW return more units than the input
+	// path. Start with room for the trailing separator and NUL, then grow up to
+	// Windows' maximum path length.
+	const MAX_VOLUME_UNITS: usize = 32_768;
+	let mut capacity = (requested.len().max(MAX_PATH as usize + 1) + 2).min(MAX_VOLUME_UNITS);
+	let mut volume = loop {
+		let mut buffer = vec![0u16; capacity];
+		// SAFETY: `requested` is NUL-terminated and `buffer` is a writable
+		// buffer whose capacity in UTF-16 units is passed alongside it.
+		let ok = unsafe {
+			GetVolumePathNameW(requested.as_ptr(), buffer.as_mut_ptr(), buffer.len() as u32)
+		};
+		let err = io::Error::last_os_error();
+		let volume_len = buffer.iter().position(|&unit| unit == 0);
+		let ends_with_separator = volume_len.is_some_and(|len| {
+			len > 0 && (buffer[len - 1] == u16::from(b'\\') || buffer[len - 1] == u16::from(b'/'))
+		});
+		// A 1-unit-short buffer succeeds without the trailing separator, so a
+		// missing separator is also a truncation signal until the cap.
+		let retry = capacity < MAX_VOLUME_UNITS
+			&& if ok == 0 {
+				matches!(
+					err.raw_os_error().map(|code| code as u32),
+					Some(ERROR_FILENAME_EXCED_RANGE | ERROR_INSUFFICIENT_BUFFER | ERROR_MORE_DATA)
+				)
+			} else {
+				!ends_with_separator
+			};
+		if !retry {
+			if ok == 0 {
+				return Err(format!("GetVolumePathNameW({}): {err}", path.display()));
+			}
+			break buffer;
+		}
+		capacity = (capacity * 2).min(MAX_VOLUME_UNITS);
+	};
+	let volume_len = volume
+		.iter()
+		.position(|&unit| unit == 0)
+		.unwrap_or(volume.len());
+	if volume_len == 0 {
+		return Err(format!("GetVolumePathNameW({}) returned an empty volume", path.display()));
+	}
+	let mut volume = volume[..volume_len].to_vec();
+	// GetVolumeInformationW requires a trailing backslash on the root path.
+	if let Some(unit) = volume.last_mut() {
+		if *unit == u16::from(b'/') {
+			*unit = u16::from(b'\\');
+		}
+	}
+	if volume.last() != Some(&u16::from(b'\\')) {
+		volume.push(u16::from(b'\\'));
+	}
+	volume.push(0);
+
+	let mut fs_name = [0u16; 32];
+	// SAFETY: `volume` is NUL-terminated. The optional volume-name, serial,
+	// component-length, and flags outputs are null/zero, which the API accepts,
+	// and `fs_name` is writable with its capacity passed in UTF-16 units.
+	let ok = unsafe {
+		GetVolumeInformationW(
+			volume.as_ptr(),
+			std::ptr::null_mut(),
+			0,
+			std::ptr::null_mut(),
+			std::ptr::null_mut(),
+			std::ptr::null_mut(),
+			fs_name.as_mut_ptr(),
+			fs_name.len() as u32,
+		)
+	};
+	if ok == 0 {
+		return Err(format!(
+			"GetVolumeInformationW({}): {}",
+			path.display(),
+			io::Error::last_os_error()
+		));
+	}
+	let name_len = fs_name
+		.iter()
+		.position(|&unit| unit == 0)
+		.unwrap_or(fs_name.len());
+	Ok(String::from_utf16_lossy(&fs_name[..name_len]).eq_ignore_ascii_case("refs"))
+}
+
+/// Nearest ancestor of `path` that exists, so a not-yet-created destination
+/// can still be attributed to its volume.
+///
+/// Returns the path itself when it exists.
+#[cfg(any(windows, test))]
+fn nearest_existing_ancestor(path: &Path) -> std::path::PathBuf {
+	let mut current = if path.is_absolute() {
+		path.to_path_buf()
+	} else {
+		std::env::current_dir().map_or_else(|_| path.to_path_buf(), |cwd| cwd.join(path))
+	};
+	while !current.exists() && current.pop() {}
+	current
+}
+
 #[async_trait]
 impl IsolationBackend for WindowsBlockCloneBackend {
 	fn kind(&self) -> BackendKind {
@@ -29,6 +153,8 @@ impl IsolationBackend for WindowsBlockCloneBackend {
 	fn probe(&self) -> ProbeResult {
 		#[cfg(windows)]
 		{
+			// Volume capability is checked per path in `start`: `lower`/`merged`
+			// may be on ReFS while the process cwd or temp dir is on NTFS.
 			ProbeResult::available()
 		}
 		#[cfg(not(windows))]
@@ -92,6 +218,8 @@ mod imp {
 
 	pub fn start(lower: &Path, merged: &Path) -> IsoResult<()> {
 		let lower = canonical_existing_dir(lower)?;
+		require_refs(&lower, "block-clone source")?;
+		require_refs(&super::nearest_existing_ancestor(merged), "block-clone destination")?;
 		prepare_destination(merged)?;
 
 		let result = recursive_block_clone(&lower, merged);
@@ -135,6 +263,20 @@ mod imp {
 			IsoError::other(format!("unable to clear {} before block clone: {err}", merged.display()))
 		})?;
 		Ok(())
+	}
+
+	fn require_refs(path: &Path, role: &str) -> IsoResult<()> {
+		match super::is_refs_path(path) {
+			Ok(true) => Ok(()),
+			Ok(false) => Err(IsoError::unavailable(format!(
+				"{role} {} is not on a ReFS volume; FSCTL_DUPLICATE_EXTENTS_TO_FILE is ReFS-only",
+				path.display()
+			))),
+			Err(err) => Err(IsoError::unavailable(format!(
+				"unable to determine the filesystem of {role} {}: {err}",
+				path.display()
+			))),
+		}
 	}
 
 	fn remove_path(path: &Path) -> io::Result<()> {
@@ -376,5 +518,21 @@ mod imp {
 			dwLowDateTime:  (ticks & 0xffff_ffff) as u32,
 			dwHighDateTime: (ticks >> 32) as u32,
 		})
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use std::fs;
+
+	use super::nearest_existing_ancestor;
+
+	#[test]
+	fn nearest_existing_ancestor_returns_self_and_walks_up() {
+		let root = std::env::temp_dir().join(format!("pi-iso-ancestor-{}", std::process::id()));
+		fs::create_dir_all(&root).expect("create temp dir");
+		assert_eq!(nearest_existing_ancestor(&root), root);
+		assert_eq!(nearest_existing_ancestor(&root.join("missing").join("deeper")), root);
+		fs::remove_dir_all(&root).expect("remove temp dir");
 	}
 }
