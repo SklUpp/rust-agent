@@ -345,7 +345,8 @@ pub(crate) fn guard_chunk_stream(inner: ChunkStream, model: &str) -> ChunkStream
 		thinking_armed: true,
 	};
 
-	stream::unfold(state, |mut state| async move {
+	stream::unfold(Some(state), |state| async move {
+		let mut state = state?;
 		let item = state.stream.next().await?;
 		match item {
 			Err(error) => return Some((Err(error), None)),
