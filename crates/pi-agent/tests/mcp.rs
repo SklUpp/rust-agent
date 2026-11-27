@@ -1159,11 +1159,13 @@ async fn test_legacy_sse_stream_close_drains_pending() {
     });
 
     let conn = connect_to_server("abrupt_sse", config).await.expect("connect");
-    // Call tool - the SSE stream closes abruptly before response
+    // Call tool - the SSE stream closes abruptly before response. The request
+    // was already on the wire, so the remote call may have executed; this must
+    // never look like a clean retryable failure.
     let err = conn.call_tool("broken_tool", json!({})).await.unwrap_err();
     assert!(
-        matches!(err, McpError::Closed | McpError::Transport(_)),
-        "Expected Closed/Transport error on abruptly severed stream, got: {:?}",
+        matches!(err, McpError::UnknownOutcome(_)),
+        "Expected UnknownOutcome on abruptly severed stream, got: {:?}",
         err
     );
 }

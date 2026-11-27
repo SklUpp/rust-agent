@@ -13,8 +13,11 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use pi_agent::mcp::{
-	MCPHttpServerConfig, MCPServerConfig, MCPStdioServerConfig, McpError, connect_to_server,
+	MCPHttpServerConfig, MCPServerConfig, MCPSseServerConfig, MCPStdioServerConfig, McpError,
+	connect_to_server,
 };
+use pi_agent::mcp::transports::McpTransport;
+use pi_agent::mcp::transports::stdio::StdioTransport;
 use serde_json::{Value, json};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
@@ -814,4 +817,152 @@ async fn close_wins_over_concurrent_reconnect() {
 		.expect_err("closed session");
 	assert!(matches!(error, McpError::Closed), "{error:?}");
 	connection.close().await.expect("close is idempotent");
+}
+
+#[tokio::test]
+async fn tools_list_and_call_preserve_metadata_and_structured_content() {
+	let server = spawn_mock(|_, seen| match seen.body.get("method").and_then(Value::as_str) {
+		Some("initialize") => Reply::json(rpc_result(&seen.body, initialize_result())),
+		Some("notifications/initialized") => Reply::json("{}".to_string()),
+		Some("tools/list") => Reply::json(rpc_result(
+			&seen.body,
+			json!({
+				"tools": [{
+					"name": "alpha",
+					"title": "Alpha",
+					"description": "first tool",
+					"inputSchema": {},
+					"outputSchema": {"type": "object", "properties": {"answer": {"type": "number"}}},
+					"annotations": {"readOnlyHint": true}
+				}]
+			}),
+		)),
+		Some("tools/call") => Reply::json(rpc_result(
+			&seen.body,
+			json!({
+				"content": [{"type": "text", "text": "ok"}],
+				"structuredContent": {"answer": 42},
+				"isError": false
+			}),
+		)),
+		_ => Reply::json(rpc_result(&seen.body, json!({}))),
+	})
+	.await;
+	let connection = connect_to_server("metadata", MCPServerConfig::Http(http_config(&server.url)))
+		.await
+		.expect("connect");
+	let tools = connection.list_tools().await.expect("tools");
+	assert_eq!(tools.len(), 1);
+	assert_eq!(tools[0].title.as_deref(), Some("Alpha"));
+	assert_eq!(tools[0].output_schema.as_ref().unwrap()["type"], "object");
+	assert_eq!(tools[0].annotations.as_ref().unwrap()["readOnlyHint"], true);
+
+	let result = connection.call_tool("alpha", json!({})).await.expect("call");
+	assert_eq!(result.structured_content.as_ref().unwrap()["answer"], 42);
+	connection.close().await.expect("close");
+}
+
+/// The legacy stdio transport must not report a mutating call whose reply
+/// channel died as a clean retryable transport failure.
+#[tokio::test]
+async fn stdio_mid_call_stream_loss_is_unknown_outcome() {
+	let config = MCPStdioServerConfig {
+		command: "sh".to_string(),
+		args: vec!["-c".to_string(), "read line; exit 0".to_string()],
+		env: HashMap::new(),
+		cwd: None,
+		timeout: None,
+		request_id_format: None,
+	};
+	let transport = StdioTransport::spawn(&config).await.expect("spawn stdio transport");
+	let error = transport
+		.request("tools/call", Some(json!({})), Some(Duration::from_secs(5)))
+		.await
+		.expect_err("child exited before replying");
+	assert!(
+		matches!(&error, McpError::UnknownOutcome(message) if message.contains("unknown")),
+		"expected UnknownOutcome, got {error:?}"
+	);
+	transport.close().await.expect("close");
+}
+
+/// The legacy SSE stream dying while a `tools/call` POST awaits its response
+/// must surface `UnknownOutcome`; the server may already have run the call.
+#[tokio::test]
+async fn legacy_sse_mid_call_stream_loss_is_unknown_outcome() {
+	let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+	let addr = listener.local_addr().expect("addr");
+	let (method_tx, method_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+	let method_rx = Arc::new(tokio::sync::Mutex::new(method_rx));
+	let handle = tokio::spawn(async move {
+		while let Ok((mut socket, _)) = listener.accept().await {
+			let method_tx = method_tx.clone();
+			let method_rx = Arc::clone(&method_rx);
+			tokio::spawn(async move {
+				let Some(request) = read_seen(&mut socket).await else {
+					return;
+				};
+				if request.headers.starts_with("GET /sse") {
+					let _ = socket
+						.write_all(
+							b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\r\n\
+							  event: endpoint\ndata: /messages\n\n",
+						)
+						.await;
+					while let Some(method) = method_rx.lock().await.recv().await {
+						if method == "initialize" {
+							let response = json!({
+								"jsonrpc": "2.0",
+								"id": 1,
+								"result": {
+									"protocolVersion": "2025-11-25",
+									"capabilities": { "tools": {} },
+									"serverInfo": { "name": "mock-sse-drop", "version": "1.0.0" }
+								}
+							});
+							let event = format!("event: message\ndata: {response}\n\n");
+							let _ = socket.write_all(event.as_bytes()).await;
+						} else if method == "tools/call" {
+							// Accepted, but the stream dies before the result.
+							break;
+						}
+					}
+				} else {
+					let method = request
+						.body
+						.get("method")
+						.and_then(Value::as_str)
+						.unwrap_or_default()
+						.to_string();
+					let _ = method_tx.send(method);
+					let _ = socket
+						.write_all(b"HTTP/1.1 202 Accepted\r\nContent-Length: 0\r\n\r\n")
+						.await;
+				}
+			});
+		}
+	});
+
+	let config = MCPSseServerConfig {
+		url: format!("http://{addr}/sse"),
+		headers: HashMap::new(),
+		timeout: Some(5_000),
+		request_id_format: None,
+		header_policy: None,
+		auth: None,
+		oauth: None,
+	};
+	let connection = connect_to_server("sse-drop", MCPServerConfig::Sse(config))
+		.await
+		.expect("connect");
+	let error = connection
+		.call_tool("mutate", json!({}))
+		.await
+		.expect_err("stream died before the response");
+	assert!(
+		matches!(&error, McpError::UnknownOutcome(message) if message.contains("unknown")),
+		"expected UnknownOutcome, got {error:?}"
+	);
+	connection.close().await.expect("close");
+	handle.abort();
 }

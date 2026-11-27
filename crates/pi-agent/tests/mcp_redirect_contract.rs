@@ -1,12 +1,13 @@
-//! MCP redirect contracts over real localhost sockets: a same-origin relative
-//! `Location` must be followed with the configured credential and negotiated
-//! session/protocol headers intact while returning the actual JSON-RPC result,
-//! and a legacy SSE server advertising an absolute endpoint on another origin
-//! must be refused before any credential or request body reaches it. A
-//! missing-`Location` redirect is covered as the one uncovered boundary.
+//! MCP redirect contracts over real localhost sockets: no transport follows a
+//! redirect (rmcp uses `redirect(Policy::none())` and legacy SSE now matches
+//! it), so a 3xx is a typed failure and the second origin is never contacted
+//! with configured credentials. A legacy SSE server advertising an absolute
+//! endpoint on another origin is likewise refused before any credential or
+//! request body reaches it.
 //!
 //! Cross-origin HTTP redirect refusal is already covered by `mcp_boundaries.rs`
-//! and `mcp.rs`; it is deliberately not repeated here.
+//! and `mcp.rs`; the legacy SSE GET/POST refusals are the uncovered boundary
+//! added here.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -332,6 +333,101 @@ async fn legacy_sse_cross_origin_endpoint_is_refused_before_contact() {
 	);
 
 	hostile_handle.abort();
+}
+
+async fn silent_target() -> (String, Arc<AtomicUsize>, tokio::task::JoinHandle<()>) {
+	let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind target listener");
+	let addr = listener.local_addr().expect("target address");
+	let hits = Arc::new(AtomicUsize::new(0));
+	let counter = Arc::clone(&hits);
+	let handle = tokio::spawn(async move {
+		loop {
+			let Ok((mut socket, _)) = listener.accept().await else {
+				return;
+			};
+			counter.fetch_add(1, Ordering::SeqCst);
+			let _ = socket
+				.write_all(
+					b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+				)
+				.await;
+		}
+	});
+	(format!("http://{addr}/moved"), hits, handle)
+}
+
+#[tokio::test]
+async fn legacy_sse_get_redirect_is_refused_before_second_origin_contact() {
+	let (target_url, target_hits, target_handle) = silent_target().await;
+	let server = spawn_mock(move |_| Reply::redirect(307, Some(&target_url))).await;
+	let config = sse_config(&format!("{}/sse", server.url));
+
+	let error = connect_to_server("sse_get_redirect", MCPServerConfig::Sse(config))
+		.await
+		.expect_err("a legacy SSE GET redirect must be refused");
+	assert!(
+		matches!(&error, McpError::Http { status: 307, .. }),
+		"expected a typed HTTP 307 refusal, got {error:?}"
+	);
+
+	tokio::time::sleep(Duration::from_millis(50)).await;
+	assert_eq!(target_hits.load(Ordering::SeqCst), 0, "redirect target must not be contacted");
+	let captured = server.captured.lock().unwrap().clone();
+	assert_eq!(captured.len(), 1, "the refused redirect must not trigger another hop");
+	assert_eq!(captured[0].method(), "GET");
+
+	target_handle.abort();
+}
+
+#[tokio::test]
+async fn legacy_sse_post_redirect_is_refused_before_second_origin_contact() {
+	let (target_url, target_hits, target_handle) = silent_target().await;
+	let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+	let addr = listener.local_addr().expect("address");
+	let sse_handle = tokio::spawn(async move {
+		loop {
+			let Ok((mut socket, _)) = listener.accept().await else {
+				return;
+			};
+			let target_url = target_url.clone();
+			tokio::spawn(async move {
+				let Some(request) = read_request(&mut socket).await else {
+					return;
+				};
+				if request.method() == "GET" {
+					let _ = socket
+						.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\r\n")
+						.await;
+					let _ = socket
+						.write_all(b"event: endpoint\ndata: /messages\n\n")
+						.await;
+					// Keep the stream open while the test drives the POST.
+					tokio::time::sleep(Duration::from_secs(5)).await;
+				} else {
+					let response = format!(
+						"HTTP/1.1 307 Temporary Redirect\r\nLocation: {target_url}\r\n\
+						 Content-Length: 0\r\nConnection: close\r\n\r\n"
+					);
+					let _ = socket.write_all(response.as_bytes()).await;
+				}
+			});
+		}
+	});
+
+	let config = sse_config(&format!("http://{addr}/sse"));
+	let error = connect_to_server("sse_post_redirect", MCPServerConfig::Sse(config))
+		.await
+		.expect_err("a legacy SSE POST redirect must be refused");
+	assert!(
+		matches!(&error, McpError::Http { status: 307, .. }),
+		"expected a typed HTTP 307 refusal, got {error:?}"
+	);
+
+	tokio::time::sleep(Duration::from_millis(50)).await;
+	assert_eq!(target_hits.load(Ordering::SeqCst), 0, "redirect target must not be contacted");
+
+	target_handle.abort();
+	sse_handle.abort();
 }
 
 #[tokio::test]

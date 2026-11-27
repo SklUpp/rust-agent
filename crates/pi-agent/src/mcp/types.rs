@@ -286,6 +286,16 @@ pub struct MCPInitializeResult {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MCPToolDefinition {
 	pub name: String,
+	/// Optional JSON Schema for the tool's structured output (`outputSchema`).
+	/// Kept as raw JSON: it is forwarded to callers, not validated here.
+	#[serde(rename = "outputSchema", default, skip_serializing_if = "Option::is_none")]
+	pub output_schema: Option<Value>,
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub title: Option<String>,
+	/// Tool annotations are advisory hints; the raw object is preserved so a
+	/// newer spec field is not silently dropped.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub annotations: Option<Value>,
 	#[serde(default)]
 	pub description: Option<String>,
 	#[serde(rename = "inputSchema", default)]
@@ -327,6 +337,11 @@ pub enum MCPContent {
 pub struct MCPToolCallResult {
 	#[serde(default)]
 	pub content: Vec<MCPContent>,
+	/// Optional structured result (`structuredContent`). Absent stays `None`
+	/// and is not re-serialized as `null`; the raw JSON value is kept untyped
+	/// so a tool-specific shape is forwarded without loss.
+	#[serde(rename = "structuredContent", default, skip_serializing_if = "Option::is_none")]
+	pub structured_content: Option<Value>,
 	#[serde(rename = "isError", default)]
 	pub is_error: Option<bool>,
 	#[serde(rename = "_meta", default)]
@@ -696,5 +711,47 @@ mod tests {
 			serde_json::to_value(&params).unwrap(),
 			serde_json::json!({"name": "review", "arguments": {"path": "a/b"}})
 		);
+	}
+
+	#[test]
+	fn tool_metadata_and_structured_content_survive_the_wire() {
+		let tool: MCPToolDefinition = serde_json::from_value(serde_json::json!({
+			"name": "search",
+			"title": "Search",
+			"description": "find things",
+			"inputSchema": {"type": "object"},
+			"outputSchema": {"type": "object", "properties": {"hits": {"type": "number"}}},
+			"annotations": {"readOnlyHint": true, "priority": 0.5}
+		}))
+		.expect("tools/list metadata must decode");
+		assert_eq!(tool.title.as_deref(), Some("Search"));
+		assert_eq!(tool.output_schema.as_ref().unwrap()["type"], "object");
+		assert_eq!(tool.annotations.as_ref().unwrap()["readOnlyHint"], true);
+
+		// Round-trip keeps the camelCase wire names.
+		let wire = serde_json::to_value(&tool).expect("serialize");
+		assert_eq!(wire["outputSchema"]["type"], "object");
+		assert_eq!(wire["annotations"]["readOnlyHint"], true);
+		assert_eq!(wire["title"], "Search");
+
+		let result: MCPToolCallResult = serde_json::from_value(serde_json::json!({
+			"content": [{"type": "text", "text": "ok"}],
+			"structuredContent": {"hits": 2},
+			"isError": false
+		}))
+		.expect("tools/call structured content must decode");
+		assert_eq!(result.structured_content.as_ref().unwrap()["hits"], 2);
+		assert_eq!(
+			serde_json::to_value(&result).unwrap()["structuredContent"]["hits"],
+			2
+		);
+
+		// Older servers omit the new keys entirely: absent stays `None` and the
+		// serialized result does not invent nulls.
+		let legacy: MCPToolCallResult =
+			serde_json::from_value(serde_json::json!({"content": []})).expect("legacy result");
+		assert!(legacy.structured_content.is_none());
+		let serialized = serde_json::to_value(&legacy).unwrap();
+		assert!(serialized.get("structuredContent").is_none());
 	}
 }

@@ -5,14 +5,16 @@ use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
-use std::time::{Duration, Instant};
-use tokio::sync::oneshot;
+use std::time::Duration;
+use tokio::sync::{Mutex as AsyncMutex, oneshot};
 use tokio::task::JoinHandle;
 
 use crate::mcp::error::McpError;
 use crate::mcp::timeout::resolve_mcp_timeout_ms;
 use crate::mcp::transports::header_policy::{merge_mcp_headers, without_header};
-use crate::mcp::transports::{McpTransport, roots_list_reply};
+use crate::mcp::transports::{
+    McpTransport, PendingRequest, pending_failure, roots_list_reply,
+};
 use crate::mcp::types::{MCPSseServerConfig, RequestIdFormat};
 
 pub const MAX_MCP_FRAME_SIZE: usize = 16 * 1024 * 1024; // 16 MiB bound to prevent memory exhaustion
@@ -32,7 +34,7 @@ async fn read_bounded_body(mut response: reqwest::Response, max_bytes: usize) ->
 }
 
 struct PendingGuard<'a> {
-    map: &'a Mutex<HashMap<String, oneshot::Sender<Result<Value, McpError>>>>,
+    map: &'a Mutex<HashMap<String, PendingRequest>>,
     id_key: &'a str,
     active: bool,
 }
@@ -51,10 +53,12 @@ struct InnerSseTransport {
     url: String,
     configured_headers: HashMap<String, String>,
     endpoint_url: RwLock<Option<String>>,
-    pending_requests: Mutex<HashMap<String, oneshot::Sender<Result<Value, McpError>>>>,
+    pending_requests: Mutex<HashMap<String, PendingRequest>>,
+    /// Serializes `connect()`: two concurrent requests must share one SSE GET
+    /// and one installed reader, never race to overwrite each other's handle.
+    connect_lock: AsyncMutex<()>,
     next_id: AtomicU64,
     request_id_format: RequestIdFormat,
-    header_policy: Option<String>,
     timeout_ms: u64,
     sse_handle: Mutex<Option<JoinHandle<()>>>,
 }
@@ -67,8 +71,9 @@ impl Drop for InnerSseTransport {
         let mut ep = self.endpoint_url.write().unwrap();
         *ep = None;
         let mut map = self.pending_requests.lock().unwrap();
-        for (_, tx) in map.drain() {
-            let _ = tx.send(Err(McpError::Closed));
+        for (_, pending) in map.drain() {
+            let error = pending_failure(&pending.method, true, "Connection dropped");
+            let _ = pending.sender.send(Err(error));
         }
     }
 }
@@ -95,247 +100,101 @@ impl LegacySseTransport {
                 configured_headers: config.headers.clone(),
                 endpoint_url: RwLock::new(None),
                 pending_requests: Mutex::new(HashMap::new()),
+                connect_lock: AsyncMutex::new(()),
                 next_id: AtomicU64::new(1),
                 request_id_format: config.request_id_format.unwrap_or(RequestIdFormat::Number),
-                header_policy: config.header_policy.clone(),
                 timeout_ms,
                 sse_handle: Mutex::new(None),
             }),
         }
     }
 
-    fn check_origin(url1: &str, url2: &str) -> bool {
-        let parse1 = reqwest::Url::parse(url1);
-        let parse2 = reqwest::Url::parse(url2);
-        match (parse1, parse2) {
-            (Ok(u1), Ok(u2)) => u1.origin() == u2.origin(),
-            _ => false,
+    /// Merge generated headers under the configured ones (generated win).
+    fn request_headers(&self, generated: &HashMap<String, String>) -> HeaderMap {
+        let configured_clean =
+            without_header(&self.inner.configured_headers, "mcp-protocol-version");
+        let merged = merge_mcp_headers(generated, &configured_clean);
+        let mut header_map = HeaderMap::new();
+        for (k, v) in merged {
+            if let (Ok(name), Ok(value)) = (
+                HeaderName::from_bytes(k.as_bytes()),
+                HeaderValue::from_str(&v),
+            ) {
+                header_map.insert(name, value);
+            }
         }
+        header_map
     }
 
-    async fn get_with_redirect_policy(
+    /// Redirects are never followed, matching rmcp's `redirect(Policy::none())`
+    /// and the redirect contract: a 3xx is a typed failure, so manually chasing
+    /// `Location` cannot reopen the credential-forwarding surface.
+    fn refuse_redirect(resp: &reqwest::Response) -> Result<(), McpError> {
+        let status = resp.status();
+        if status.is_redirection() {
+            return Err(McpError::Http {
+                status: status.as_u16(),
+                message: "MCP redirects are not followed; configure the final endpoint URL"
+                    .to_string(),
+            });
+        }
+        Ok(())
+    }
+
+    async fn get_with_header_policy(
         &self,
-        target_initial: &str,
+        target: &str,
         generated_headers: &HashMap<String, String>,
-        overall_timeout: Option<Duration>,
+        timeout: Option<Duration>,
     ) -> Result<reqwest::Response, McpError> {
-        let start_time = Instant::now();
-        let configured_clean = without_header(&self.inner.configured_headers, "mcp-protocol-version");
-        let mut target_url = target_initial.to_string();
-        let mut hops = 0;
-        let is_origin_locked = self.inner.header_policy.as_deref() == Some("origin-locked");
-
-        loop {
-            let hop_timeout = match overall_timeout {
-                Some(total) => {
-                    let elapsed = start_time.elapsed();
-                    if elapsed >= total {
-                        return Err(McpError::Timeout(format!(
-                            "Request timed out during redirects after {:?}",
-                            total
-                        )));
-                    }
-                    Some(total - elapsed)
-                }
-                None => None,
-            };
-
-            let is_same_origin = Self::check_origin(&self.inner.url, &target_url);
-            let send_configured = if is_same_origin {
-                &configured_clean
-            } else {
-                &HashMap::new()
-            };
-
-            let mut active_generated = generated_headers.clone();
-            if !is_same_origin {
-                // Security: Strip session credentials on cross-origin redirects
-                active_generated.remove("mcp-session-id");
-                active_generated.remove("authorization");
-            }
-
-            let merged_headers = merge_mcp_headers(&active_generated, send_configured);
-            let mut req_builder = self.inner.client.get(&target_url);
-
-            let mut header_map = HeaderMap::new();
-            for (k, v) in merged_headers {
-                if let (Ok(hname), Ok(hval)) = (
-                    HeaderName::from_bytes(k.as_bytes()),
-                    HeaderValue::from_str(&v),
-                ) {
-                    header_map.insert(hname, hval);
-                }
-            }
-            req_builder = req_builder.headers(header_map);
-
-            let send = req_builder.send();
-            let resp = match hop_timeout {
-                Some(dur) => tokio::time::timeout(dur, send)
-                    .await
-                    .map_err(|_| McpError::Timeout(format!("Legacy SSE GET timed out: {dur:?}")))?,
-                None => send.await,
-            }
-            .map_err(|e| {
-                if e.is_timeout() {
-                    McpError::Timeout(format!("Legacy SSE GET timed out: {e}"))
-                } else {
-                    McpError::Transport(format!("Legacy SSE GET failed: {e}"))
-                }
-            })?;
-
-            let status = resp.status();
-            if status.is_redirection() {
-                hops += 1;
-                if hops > 5 {
-                    return Err(McpError::Transport("Too many redirects (max 5)".to_string()));
-                }
-
-                if let Some(loc) = resp.headers().get("location") {
-                    let loc_str = loc.to_str().map_err(|_| {
-                        McpError::Transport("Invalid redirect location header".to_string())
-                    })?;
-                    target_url = match reqwest::Url::parse(loc_str) {
-                        Ok(u) => u.to_string(),
-                        Err(_) => match reqwest::Url::parse(&target_url) {
-                            Ok(base) => base.join(loc_str).map_err(|_| {
-                                McpError::Transport("Failed to resolve relative redirect".to_string())
-                            })?.to_string(),
-                            Err(_) => {
-                                return Err(McpError::Transport("Invalid base URL for redirect".to_string()))
-                            }
-                        },
-                    };
-
-                    if is_origin_locked && !Self::check_origin(&self.inner.url, &target_url) {
-                        return Err(McpError::Transport(format!(
-                            "Origin-locked policy forbids cross-origin redirect to: {}",
-                            target_url
-                        )));
-                    }
-
-                    continue;
-                } else {
-                    return Err(McpError::Transport("Redirect without location header".to_string()));
-                }
-            }
-
-            return Ok(resp);
+        let req_builder = self
+            .inner
+            .client
+            .get(target)
+            .headers(self.request_headers(generated_headers));
+        let send = req_builder.send();
+        let resp = match timeout {
+            Some(dur) => tokio::time::timeout(dur, send)
+                .await
+                .map_err(|_| McpError::Timeout(format!("Legacy SSE GET timed out: {dur:?}")))?,
+            None => send.await,
         }
+        .map_err(|e| {
+            if e.is_timeout() {
+                McpError::Timeout(format!("Legacy SSE GET timed out: {e}"))
+            } else {
+                McpError::Transport(format!("Legacy SSE GET failed: {e}"))
+            }
+        })?;
+        Self::refuse_redirect(&resp)?;
+        Ok(resp)
     }
 
-    pub async fn post_with_redirect_policy(
+    pub async fn post_with_header_policy(
         &self,
-        target_initial: &str,
+        target: &str,
         body: &Value,
         generated_headers: &HashMap<String, String>,
-        overall_timeout: Option<Duration>,
+        timeout: Option<Duration>,
     ) -> Result<reqwest::Response, McpError> {
-        let start_time = Instant::now();
-        let configured_clean = without_header(&self.inner.configured_headers, "mcp-protocol-version");
-        let mut target_url = target_initial.to_string();
-        let mut hops = 0;
-        let is_origin_locked = self.inner.header_policy.as_deref() == Some("origin-locked");
-
-        loop {
-            let hop_timeout = match overall_timeout {
-                Some(total) => {
-                    let elapsed = start_time.elapsed();
-                    if elapsed >= total {
-                        return Err(McpError::Timeout(format!(
-                            "Request timed out during redirects after {:?}",
-                            total
-                        )));
-                    }
-                    Some(total - elapsed)
-                }
-                None => None,
-            };
-
-            let is_same_origin = Self::check_origin(&self.inner.url, &target_url);
-            let send_configured = if is_same_origin {
-                &configured_clean
-            } else {
-                &HashMap::new()
-            };
-
-            let mut active_generated = generated_headers.clone();
-            if !is_same_origin {
-                // Security: Strip session credentials on cross-origin redirects
-                active_generated.remove("mcp-session-id");
-                active_generated.remove("authorization");
-            }
-
-            let merged_headers = merge_mcp_headers(&active_generated, send_configured);
-            let mut req_builder = self.inner.client.post(&target_url).json(body);
-
-            let mut header_map = HeaderMap::new();
-            for (k, v) in merged_headers {
-                if let (Ok(hname), Ok(hval)) = (
-                    HeaderName::from_bytes(k.as_bytes()),
-                    HeaderValue::from_str(&v),
-                ) {
-                    header_map.insert(hname, hval);
-                }
-            }
-            req_builder = req_builder.headers(header_map);
-
-            if let Some(dur) = hop_timeout {
-                req_builder = req_builder.timeout(dur);
-            }
-
-            let resp = req_builder.send().await.map_err(|e| {
-                if e.is_timeout() {
-                    McpError::Timeout(format!("Legacy SSE POST timed out: {}", e))
-                } else {
-                    McpError::Transport(format!("Legacy SSE POST failed: {}", e))
-                }
-            })?;
-
-            let status = resp.status();
-            if status.is_redirection() {
-                hops += 1;
-                if hops > 5 {
-                    return Err(McpError::Transport("Too many redirects (max 5)".to_string()));
-                }
-
-                if is_origin_locked && (status.as_u16() == 301 || status.as_u16() == 302 || status.as_u16() == 303) {
-                    return Err(McpError::Transport(format!(
-                        "Refusing non-method-preserving redirect {} for POST",
-                        status.as_u16()
-                    )));
-                }
-
-                if let Some(loc) = resp.headers().get("location") {
-                    let loc_str = loc.to_str().map_err(|_| {
-                        McpError::Transport("Invalid redirect location header".to_string())
-                    })?;
-                    target_url = match reqwest::Url::parse(loc_str) {
-                        Ok(u) => u.to_string(),
-                        Err(_) => match reqwest::Url::parse(&target_url) {
-                            Ok(base) => base.join(loc_str).map_err(|_| {
-                                McpError::Transport("Failed to resolve relative redirect".to_string())
-                            })?.to_string(),
-                            Err(_) => {
-                                return Err(McpError::Transport("Invalid base URL for redirect".to_string()))
-                            }
-                        },
-                    };
-
-                    if is_origin_locked && !Self::check_origin(&self.inner.url, &target_url) {
-                        return Err(McpError::Transport(format!(
-                            "Origin-locked policy forbids cross-origin redirect to: {}",
-                            target_url
-                        )));
-                    }
-
-                    continue;
-                } else {
-                    return Err(McpError::Transport("Redirect without location header".to_string()));
-                }
-            }
-
-            return Ok(resp);
+        let mut req_builder = self
+            .inner
+            .client
+            .post(target)
+            .json(body)
+            .headers(self.request_headers(generated_headers));
+        if let Some(dur) = timeout {
+            req_builder = req_builder.timeout(dur);
         }
+        let resp = req_builder.send().await.map_err(|e| {
+            if e.is_timeout() {
+                McpError::Timeout(format!("Legacy SSE POST timed out: {}", e))
+            } else {
+                McpError::Transport(format!("Legacy SSE POST failed: {}", e))
+            }
+        })?;
+        Self::refuse_redirect(&resp)?;
+        Ok(resp)
     }
 
     pub async fn send_server_reply(&self, resp: Value) -> Result<(), McpError> {
@@ -346,12 +205,19 @@ impl LegacySseTransport {
         let mut generated_headers = HashMap::new();
         generated_headers.insert("content-type".to_string(), "application/json".to_string());
         let _ = self
-            .post_with_redirect_policy(&endpoint, &resp, &generated_headers, Some(Duration::from_secs(10)))
+            .post_with_header_policy(&endpoint, &resp, &generated_headers, Some(Duration::from_secs(10)))
             .await;
         Ok(())
     }
 
     pub async fn connect(&self) -> Result<(), McpError> {
+        if self.inner.endpoint_url.read().unwrap().is_some() {
+            return Ok(());
+        }
+        // Only the first caller opens the SSE stream; everyone else waits and
+        // then observes the installed endpoint instead of starting a second
+        // reader that would overwrite this one's handle.
+        let _connect = self.inner.connect_lock.lock().await;
         if self.inner.endpoint_url.read().unwrap().is_some() {
             return Ok(());
         }
@@ -366,7 +232,7 @@ impl LegacySseTransport {
             generated_headers.insert("accept".to_string(), "text/event-stream".to_string());
 
             let resp = self
-                .get_with_redirect_policy(&self.inner.url, &generated_headers, timeout_dur)
+                .get_with_header_policy(&self.inner.url, &generated_headers, timeout_dur)
                 .await?;
 
             if !resp.status().is_success() {
@@ -529,11 +395,11 @@ impl LegacySseTransport {
                                 } else if let Some(id) = id_val {
                                     if let Some(inner) = weak_inner.upgrade() {
                                         let id_key = serde_json::to_string(id).unwrap_or_default();
-                                        let tx = {
+                                        let pending = {
                                             let mut map = inner.pending_requests.lock().unwrap();
                                             map.remove(&id_key)
                                         };
-                                        if let Some(sender) = tx {
+                                        if let Some(PendingRequest { sender, .. }) = pending {
                                             if let Some(err) = parsed.get("error") {
                                                 let code = err.get("code").and_then(|c| c.as_i64()).unwrap_or(-1);
                                                 let message = err
@@ -575,12 +441,15 @@ impl LegacySseTransport {
                 *ep = None;
                 let mut map = inner.pending_requests.lock().unwrap();
                 // The POSTs behind these pending requests were already accepted
-                // when the event stream died: delivery is unverified. Requests
-                // that never left the client still see `McpError::Closed`.
-                for (_, tx) in map.drain() {
-                    let _ = tx.send(Err(McpError::Transport(
-                        "Connection lost while awaiting response".to_string(),
-                    )));
+                // when the event stream died: a mutating call may have run and
+                // reports an unknown outcome, never a clean retryable failure.
+                for (_, pending) in map.drain() {
+                    let error = pending_failure(
+                        &pending.method,
+                        true,
+                        "Connection lost while awaiting response",
+                    );
+                    let _ = pending.sender.send(Err(error));
                 }
             }
         });
@@ -625,7 +494,10 @@ impl McpTransport for LegacySseTransport {
         let (tx, rx) = oneshot::channel();
         {
             let mut map = self.inner.pending_requests.lock().unwrap();
-            map.insert(id_key.clone(), tx);
+            map.insert(
+                id_key.clone(),
+                PendingRequest { method: method.to_string(), sender: tx },
+            );
         }
 
         let mut guard = PendingGuard {
@@ -645,7 +517,7 @@ impl McpTransport for LegacySseTransport {
         generated_headers.insert("content-type".to_string(), "application/json".to_string());
 
         let post_res = self
-            .post_with_redirect_policy(&endpoint, &req_body, &generated_headers, timeout)
+            .post_with_header_policy(&endpoint, &req_body, &generated_headers, timeout)
             .await;
 
         let resp = match post_res {
@@ -662,30 +534,37 @@ impl McpTransport for LegacySseTransport {
             });
         }
 
-        let dur = match timeout {
-            Some(d) => d,
-            None => {
-                return rx
-                    .await
-                    .map_err(|_| McpError::Transport("Connection lost while awaiting response".to_string()))?
-                    .map(|v| {
-                        guard.active = false;
-                        v
+        let awaited = match timeout {
+            Some(dur) => match tokio::time::timeout(dur, rx).await {
+                Ok(res) => res,
+                Err(_) => {
+                    return Err(if method == "tools/call" {
+                        // The POST was accepted, so the remote side may have
+                        // executed the call before its response was lost.
+                        pending_failure(
+                            method,
+                            true,
+                            &format!("tools/call timed out after {dur:?}"),
+                        )
+                    } else {
+                        McpError::Timeout(format!(
+                            "Legacy SSE request '{method}' timed out after {dur:?}"
+                        ))
                     });
-            }
+                }
+            },
+            None => rx.await,
         };
-
-        match tokio::time::timeout(dur, rx).await {
-            Ok(res) => res
-                .map_err(|_| McpError::Transport("Connection lost while awaiting response".to_string()))?
-                .map(|v| {
-                    guard.active = false;
-                    v
-                }),
-            Err(_) => Err(McpError::Timeout(format!(
-                "Legacy SSE request '{}' timed out after {:?}",
-                method, dur
-            ))),
+        match awaited {
+            Ok(result) => {
+                guard.active = false;
+                result
+            }
+            Err(_) => Err(pending_failure(
+                method,
+                true,
+                "Connection lost while awaiting response",
+            )),
         }
     }
     async fn notify(&self, method: &str, params: Option<Value>) -> Result<(), McpError> {
@@ -717,7 +596,7 @@ impl McpTransport for LegacySseTransport {
         };
 
         let resp = self
-            .post_with_redirect_policy(&endpoint, &notification, &generated_headers, timeout_dur)
+            .post_with_header_policy(&endpoint, &notification, &generated_headers, timeout_dur)
             .await?;
 
         if !resp.status().is_success() {
@@ -739,8 +618,9 @@ impl McpTransport for LegacySseTransport {
             *ep = None;
         }
         let mut map = self.inner.pending_requests.lock().unwrap();
-        for (_, tx) in map.drain() {
-            let _ = tx.send(Err(McpError::Closed));
+        for (_, pending) in map.drain() {
+            let error = pending_failure(&pending.method, true, "Connection closed");
+            let _ = pending.sender.send(Err(error));
         }
         Ok(())
     }

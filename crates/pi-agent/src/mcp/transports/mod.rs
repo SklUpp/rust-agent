@@ -2,6 +2,7 @@ use async_trait::async_trait;
 use serde_json::{Value, json};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
+use tokio::sync::oneshot;
 
 use crate::mcp::error::McpError;
 
@@ -9,6 +10,33 @@ pub mod stdio;
 pub mod rmcp_adapter;
 pub mod sse;
 pub mod header_policy;
+
+/// One in-flight JSON-RPC request on a raw (non-rmcp) transport.
+///
+/// The method is kept beside the reply channel so teardown can classify the
+/// lost request: a `tools/call` may already have run remotely and must never
+/// look like a clean retryable failure, while a read-only request may.
+pub(crate) struct PendingRequest {
+    pub method: String,
+    pub sender: oneshot::Sender<Result<Value, McpError>>,
+}
+
+/// Error for a pending request whose transport ended.
+///
+/// `dispatched` is true when the request was on the wire (stream died, or the
+/// transport was closed after dispatch) and false when it definitely never
+/// left the client. Callers that never dispatched keep their original definite
+/// error instead of calling this helper.
+pub(crate) fn pending_failure(method: &str, dispatched: bool, detail: &str) -> McpError {
+    if !dispatched {
+        McpError::Closed
+    } else if method == "tools/call" {
+        McpError::UnknownOutcome(format!("{detail}; remote outcome unknown"))
+    } else {
+        McpError::Transport(format!("{detail} (connection lost while awaiting response)"))
+    }
+}
+
 #[async_trait]
 pub trait McpTransport: Send + Sync {
     async fn request(

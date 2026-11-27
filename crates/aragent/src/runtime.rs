@@ -5703,6 +5703,122 @@ mod tests_mcp_lifecycle {
 		assert!(newer_closed.load(Ordering::SeqCst), "teardown closes the tracked successor");
 		assert!(pi_agent::mcp::get_active_session(&name).is_none());
 	}
+
+	struct StaticTransport(serde_json::Value);
+
+	#[async_trait::async_trait]
+	impl pi_agent::mcp::transports::McpTransport for StaticTransport {
+		async fn request(
+			&self,
+			_method: &str,
+			_params: Option<serde_json::Value>,
+			_timeout: Option<std::time::Duration>,
+		) -> std::result::Result<serde_json::Value, McpError> {
+			Ok(self.0.clone())
+		}
+
+		async fn notify(
+			&self,
+			_method: &str,
+			_params: Option<serde_json::Value>,
+		) -> std::result::Result<(), McpError> {
+			Ok(())
+		}
+
+		async fn close(&self) -> std::result::Result<(), McpError> {
+			Ok(())
+		}
+	}
+
+	fn static_connection(result: serde_json::Value) -> Arc<McpConnection> {
+		Arc::new(McpConnection::new_for_test(
+			"mcp-static".to_string(),
+			MCPServerConfig::Stdio(MCPStdioServerConfig {
+				command:            "true".to_string(),
+				args:               Vec::new(),
+				env:                HashMap::new(),
+				cwd:                None,
+				timeout:            None,
+				request_id_format: None,
+			}),
+			Arc::new(tokio::sync::RwLock::new(
+				Arc::new(StaticTransport(result))
+					as Arc<dyn pi_agent::mcp::transports::McpTransport>,
+			)),
+			pi_agent::mcp::MCPServerInfo { name: "mcp-static".to_string(), version: None },
+			pi_agent::mcp::MCPServerCapabilities::default(),
+			None,
+		))
+	}
+
+	/// Images must stay typed in `details.images` (the loop turns them into
+	/// `ImagePart`s) and structured content must survive in `details`; neither
+	/// may be flattened to base64 text or dropped.
+	#[tokio::test]
+	async fn mcp_tool_result_preserves_images_and_structured_content() {
+		let connection = static_connection(serde_json::json!({
+			"content": [
+				{"type": "text", "text": "see image"},
+				{"type": "image", "data": "aGVsbG8=", "mimeType": "image/png"},
+				{"type": "audio", "data": "ZGF0YQ==", "mimeType": "audio/wav"},
+				{"type": "resource", "resource": {
+					"uri": "mem://doc", "mimeType": "text/plain", "text": "body"
+				}},
+				{"type": "resource", "resource": {
+					"uri": "mem://bin", "mimeType": "application/octet-stream", "blob": "YmxvYg=="
+				}}
+			],
+			"structuredContent": {"ok": true},
+			"isError": false
+		}));
+		let tool = McpTool::new("srv", "picture", "", serde_json::json!({}), connection);
+		let ctx = pi_agent::AgentContext::new(std::path::PathBuf::from("."));
+
+		let out = tool.execute(&serde_json::json!({}), &ctx).await.expect("execute");
+		assert!(!out.is_error);
+		assert!(out.content.contains("[Image: image/png]"), "{}", out.content);
+		assert!(
+			!out.content.contains("aGVsbG8="),
+			"image base64 must not be inlined into model text: {}",
+			out.content
+		);
+		assert!(out.content.contains("[Resource: mem://doc; text/plain]\nbody"));
+		assert!(out.content.contains("[Audio: audio/wav; base64=ZGF0YQ==]"));
+		assert!(out.content.contains(
+			"[Resource: mem://bin; application/octet-stream; base64=YmxvYg==]"
+		));
+
+		let details = out.details.as_ref().expect("details");
+		assert_eq!(details["structuredContent"]["ok"], true);
+		assert_eq!(details["images"][0]["data"], "aGVsbG8=");
+		assert_eq!(details["images"][0]["mimeType"], "image/png");
+		assert_eq!(details["rawContent"][1]["type"], "image");
+
+		let parts = pi_agent::tool_image_parts_of(&out).expect("image payload validates");
+		assert!(
+			matches!(parts.as_slice(), [pi_agent::ContentPart::Image { mime_type, .. }] if mime_type == "image/png"),
+			"unexpected image parts: {parts:?}"
+		);
+	}
+
+	/// An image-only result has no textual block: the structured payload must
+	/// still reach the model message, not just `details`.
+	#[tokio::test]
+	async fn mcp_tool_result_surfaces_structured_content_when_text_is_absent() {
+		let connection = static_connection(serde_json::json!({
+			"content": [
+				{"type": "image", "data": "aGVsbG8=", "mimeType": "image/png"}
+			],
+			"structuredContent": {"answer": 42}
+		}));
+		let tool = McpTool::new("srv", "picture", "", serde_json::json!({}), connection);
+		let ctx = pi_agent::AgentContext::new(std::path::PathBuf::from("."));
+
+		let out = tool.execute(&serde_json::json!({}), &ctx).await.expect("execute");
+		assert!(out.content.contains("[Image: image/png]"), "{}", out.content);
+		assert!(out.content.contains(r#"{"answer":42}"#), "{}", out.content);
+		assert!(!out.content.contains("aGVsbG8="), "{}", out.content);
+	}
 }
 
 /// Dynamic MCP tool implementing pi-agent's `Tool` trait.
@@ -5811,7 +5927,14 @@ impl Tool for McpTool {
 			res = self.connection.call_tool(&self.tool_name, args.clone()) => {
 				match res {
 					Ok(call_result) => {
+						// Raw blocks are the lossless form. Images stay typed in
+						// `details.images` and out of the model text; audio and
+						// resource payloads remain model-visible like before.
+						let raw_content =
+							serde_json::to_value(&call_result.content).unwrap_or(serde_json::Value::Null);
 						let mut content = String::new();
+						let mut has_text = false;
+						let mut images: Vec<serde_json::Value> = Vec::new();
 						for item in call_result.content {
 							match item {
 								MCPContent::Text { text } => {
@@ -5819,18 +5942,26 @@ impl Tool for McpTool {
 										content.push_str("\n\n");
 									}
 									content.push_str(&text);
+									has_text = true;
 								},
 								MCPContent::Image { data, mime_type } => {
 									if !content.is_empty() {
 										content.push_str("\n\n");
 									}
-									content.push_str(&format!("[Image: {mime_type}; base64={data}]"));
+									content.push_str(&format!("[Image: {mime_type}]"));
+									images.push(serde_json::json!({
+										"data": data,
+										"mimeType": mime_type,
+									}));
 								},
 								MCPContent::Audio { data, mime_type } => {
 									if !content.is_empty() {
 										content.push_str("\n\n");
 									}
-									content.push_str(&format!("[Audio: {mime_type}; base64={data}]"));
+									content.push_str(&format!(
+										"[Audio: {mime_type}; base64={data}]"
+									));
+									has_text = true;
 								},
 								MCPContent::Resource { resource } => {
 									if !content.is_empty() {
@@ -5844,23 +5975,56 @@ impl Tool for McpTool {
 										.unwrap_or_default();
 									if let Some(t) = &resource.text {
 										content.push_str(&format!("[Resource: {uri}{mime}]\n{t}"));
+										has_text = true;
 									} else if let Some(b) = &resource.blob {
 										content.push_str(&format!(
 											"[Resource: {uri}{mime}; base64={b}]"
 										));
+										has_text = true;
 									} else {
 										content.push_str(&format!("[Resource: {uri}{mime}]"));
 									}
 								},
 							}
 						}
+						// Text-less results (images only, or an empty content
+						// array) still need the structured payload in the model
+						// message; otherwise it would be invisible to the model.
+						if !has_text
+							&& let Some(structured) = &call_result.structured_content
+						{
+							if !content.is_empty() {
+								content.push_str("\n\n");
+							}
+							content.push_str(&structured.to_string());
+						}
 						let is_error = call_result.is_error.unwrap_or(false);
+						let mut details = serde_json::Map::new();
+						details.insert(
+							"serverName".to_string(),
+							serde_json::json!(self.server_name.as_str()),
+						);
+						details.insert(
+							"mcpToolName".to_string(),
+							serde_json::json!(self.tool_name.as_str()),
+						);
+						details.insert("isError".to_string(), serde_json::json!(is_error));
+						details.insert("rawContent".to_string(), raw_content);
+						if let Some(meta) = call_result._meta {
+							details.insert("mcpMeta".to_string(), meta);
+						}
+						if let Some(structured) = call_result.structured_content {
+							details.insert("structuredContent".to_string(), structured);
+						}
+						if !images.is_empty() {
+							details.insert("images".to_string(), serde_json::Value::Array(images));
+						}
 						Ok(pi_agent::ToolResult {
 							tool_call_id: String::new(),
 							content,
 							is_error,
 							terminate: false,
-							details: None,
+							details: Some(serde_json::Value::Object(details)),
 						})
 					},
 					Err(err) => Ok(pi_agent::ToolResult {

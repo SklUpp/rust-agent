@@ -10,11 +10,13 @@ use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
 
 use crate::mcp::error::McpError;
-use crate::mcp::transports::{McpTransport, roots_list_reply};
+use crate::mcp::transports::{
+    McpTransport, PendingRequest, pending_failure, roots_list_reply,
+};
 use crate::mcp::types::{MCPStdioServerConfig, RequestIdFormat};
 
 struct PendingGuard<'a> {
-    map: &'a Mutex<HashMap<String, oneshot::Sender<Result<Value, McpError>>>>,
+    map: &'a Mutex<HashMap<String, PendingRequest>>,
     id_key: &'a str,
     active: bool,
 }
@@ -92,7 +94,7 @@ pub struct StdioTransport {
     /// drop can signal grandchildren the MCP server may have spawned.
     pgid: Option<u32>,
     stdin_tx: mpsc::Sender<String>,
-    pending_requests: Arc<Mutex<HashMap<String, oneshot::Sender<Result<Value, McpError>>>>>,
+    pending_requests: Arc<Mutex<HashMap<String, PendingRequest>>>,
     next_id: AtomicU64,
     request_id_format: RequestIdFormat,
     read_handle: Mutex<Option<JoinHandle<()>>>,
@@ -136,7 +138,7 @@ impl StdioTransport {
         })?;
 
         let (stdin_tx, mut stdin_rx) = mpsc::channel::<String>(128);
-        let pending_requests: Arc<Mutex<HashMap<String, oneshot::Sender<Result<Value, McpError>>>>> =
+        let pending_requests: Arc<Mutex<HashMap<String, PendingRequest>>> =
             Arc::new(Mutex::new(HashMap::new()));
         let closed = Arc::new(AtomicBool::new(false));
 
@@ -238,12 +240,12 @@ impl StdioTransport {
                 if let Some(id) = id_val {
                     let id_key = serde_json::to_string(id).unwrap_or_default();
 
-                    let sender = {
+                    let pending = {
                         let mut map = pending_clone.lock().unwrap();
                         map.remove(&id_key)
                     };
 
-                    if let Some(tx) = sender {
+                    if let Some(PendingRequest { sender: tx, .. }) = pending {
                         if let Some(err) = parsed.get("error") {
                             let code = err.get("code").and_then(|c| c.as_i64()).unwrap_or(-1);
                             let message = err
@@ -265,12 +267,15 @@ impl StdioTransport {
             closed_reader.store(true, Ordering::Release);
             let mut map = pending_clone.lock().unwrap();
             // These requests were already dispatched when the stream died, so
-            // their delivery is unverified. `McpError::Closed` is reserved for
-            // requests that never left the client (see `request`/`close`).
-            for (_, tx) in map.drain() {
-                let _ = tx.send(Err(McpError::Transport(
-                    "Connection lost while awaiting response".to_string(),
-                )));
+            // a mutating call may have run remotely: it reports an unknown
+            // outcome instead of a clean retryable transport failure.
+            for (_, pending) in map.drain() {
+                let error = pending_failure(
+                    &pending.method,
+                    true,
+                    "Connection lost while awaiting response",
+                );
+                let _ = pending.sender.send(Err(error));
             }
         });
 
@@ -316,7 +321,10 @@ impl McpTransport for StdioTransport {
         let (tx, rx) = oneshot::channel();
         {
             let mut map = self.pending_requests.lock().unwrap();
-            map.insert(id_key.clone(), tx);
+            map.insert(
+                id_key.clone(),
+                PendingRequest { method: method.to_string(), sender: tx },
+            );
             if self.closed.load(Ordering::Acquire) {
                 map.remove(&id_key);
                 return Err(McpError::Closed);
@@ -337,12 +345,17 @@ impl McpTransport for StdioTransport {
         };
 
         let stdin_tx = self.stdin_tx.clone();
+        // Set only after the line is enqueued for the writer: an error before
+        // that never left the client and stays a definite failure.
+        let dispatched = Arc::new(AtomicBool::new(false));
+        let dispatched_send = Arc::clone(&dispatched);
         let send_and_recv = async move {
             let line = format!("{}\n", req);
             stdin_tx
                 .send(line)
                 .await
                 .map_err(|e| McpError::Transport(format!("Failed to write to stdin: {}", e)))?;
+            dispatched_send.store(true, Ordering::SeqCst);
             rx.await.map_err(|_| McpError::Transport("Connection lost while awaiting response".to_string()))?
         };
 
@@ -369,6 +382,18 @@ impl McpTransport for StdioTransport {
 
         if res.is_ok() {
             guard.active = false;
+        }
+        // Only a `tools/call` that actually reached the writer can have run
+        // remotely; a failure before enqueue keeps its definite error.
+        if method == "tools/call"
+            && dispatched.load(Ordering::SeqCst)
+            && matches!(&res, Err(McpError::Timeout(_)) | Err(McpError::Transport(_)))
+        {
+            return Err(pending_failure(
+                method,
+                true,
+                "tools/call did not receive a response",
+            ));
         }
         res
     }
@@ -412,8 +437,11 @@ impl McpTransport for StdioTransport {
             });
         }
         let mut map = self.pending_requests.lock().unwrap();
-        for (_, tx) in map.drain() {
-            let _ = tx.send(Err(McpError::Closed));
+        // Anything still pending was past the dispatch check in `request`; a
+        // mutating call may have run, so it reports an unknown outcome.
+        for (_, pending) in map.drain() {
+            let error = pending_failure(&pending.method, true, "Connection closed");
+            let _ = pending.sender.send(Err(error));
         }
 
         Ok(())
@@ -444,8 +472,9 @@ impl Drop for StdioTransport {
             }
         }
         let mut map = self.pending_requests.lock().unwrap();
-        for (_, tx) in map.drain() {
-            let _ = tx.send(Err(McpError::Closed));
+        for (_, pending) in map.drain() {
+            let error = pending_failure(&pending.method, true, "Connection dropped");
+            let _ = pending.sender.send(Err(error));
         }
     }
 }
