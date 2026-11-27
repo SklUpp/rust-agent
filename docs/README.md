@@ -75,6 +75,7 @@
 - `research-2026-11-27-21-target-dir07-provider-mcp-wire.md` — Целевое исследование Stage 2 (`TargetDir07ProviderMcpWire`): wire-контракт провайдеров и MCP (`DIR-07`)
 - `research-2026-11-27-22-multi-os-containment.md` — Мультиплатформенная процессная и файловая контейнеризация (`ResearchMultiOSContainment`): матрица Linux/Android/macOS/Windows, проверка лицензий и контракты `UnknownOutcome`/kill/PTY/net
 - `research-2026-11-27-23-agent-containment-architecture.md` — Архитектура сдерживания внутри `arag` (`ResearchAgentContainmentArchitecture`): инвентаризация швов спавна/БД/ФС, Host Control Plane vs Contained EP, P1/P2 дыры границ
+- `research-2026-11-27-24-omp-ts-uncovered-gaps.md` — Карта и аудит непокрытого/частичного TS/JS кода `~/omp-work/packages/` vs `rust-agent` (`ScoutOmpTsMap` + `ScoutOmpGapD1..D6`)
 
 ## Правила обновления
 
