@@ -1139,10 +1139,10 @@ mod tests {
 			Box::new(Cursor::new(Vec::<u8>::new()));
 		let input: ApprovalInput =
 			std::sync::Arc::new(std::sync::Mutex::new(closed));
-		let approvals = approvals(ApprovalMode::Yolo, &["hub"])
+		let start_approvals = approvals(ApprovalMode::Yolo, &["hub"])
 			.with_bash_policy(policy)
 			.with_input(Some(input));
-		let error = approvals
+		let error = start_approvals
 			.approve(
 				"hub",
 				&json!({
@@ -1160,7 +1160,7 @@ mod tests {
 		);
 
 		// A start without `application` never reaches the policy.
-		approvals
+		start_approvals
 			.approve("hub", &json!({"op": "start", "name": "empty"}))
 			.await
 			.expect("missing application is allowed");
