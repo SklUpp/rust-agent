@@ -285,6 +285,7 @@ struct Patterns {
 	opaque_status_words:         Regex,
 	ascii_word:                  Regex,
 	retry_delay:                 Regex,
+	thinking_loop:               Regex,
 }
 
 fn re(pattern: &str) -> Regex {
@@ -335,7 +336,7 @@ static PATTERNS: LazyLock<Patterns> = LazyLock::new(|| Patterns {
 	transient_envelope:          re_i(r"anthropic stream envelope error:"),
 	transient_envelope_before:   re_i(r"before message_start"),
 	transient_transport:         re_i(
-		r"\b(?:no[_ -]?capacity|(?:high|peak)[ _-]?demand|(?:at|over|insufficient)[ _-]?capacity|capacity[ _-]?(?:exceeded|exhausted)|peak[ _-]?load)\b|overloaded|provider.?returned.?error|rate.?limit|too many requests|\b(?:429|500|502|503|504)\b|service.?unavailable|server.?error|internal.?error|retry your request|network.?error|connection.?error|connection.?refused|unable.?to.?connect\.\s*is the computer able to access the url\?|other side closed|fetch failed|upstream.?connect|upstream.?request.?failed|reset before headers|socket hang up|timed? out|timeout|terminated|retry delay|stream stall|no error details in response|HTTP2(?:StreamReset|RefusedStream|EnhanceYourCalm)|nghttp2_(?:internal_error|refused_stream)|stream closed with error code nghttp2_(?:internal_error|refused_stream)|malformed.?function.?call",
+		r"\b(?:no[_ -]?capacity|(?:high|peak)[ _-]?demand|(?:at|over|insufficient)[ _-]?capacity|capacity[ _-]?(?:exceeded|exhausted)|peak[ _-]?load)\b|overloaded|provider.?returned.?error|rate.?limit|too many requests|\b(?:429|500|502|503|504)\b|service.?unavailable|server.?error|internal.?error|retry your request|network.?error|connection.?error|connection.?refused|unable.?to.?connect\.\s*is the computer able to access the url\?|other side closed|fetch failed|upstream.?connect|upstream.?request.?failed|reset before headers|socket hang up|timed? out|timeout|terminated|retry delay|connection reset|stream ended before completion|stream stall|no error details in response|HTTP2(?:StreamReset|RefusedStream|EnhanceYourCalm)|nghttp2_(?:internal_error|refused_stream)|stream closed with error code nghttp2_(?:internal_error|refused_stream)|malformed.?function.?call",
 	),
 	auth_failure:                re_i(
 		r"\b(?:401|403|unauthorized|forbidden|authentication|auth[_ ]?unavailable|no auth available|(?:invalid|no)[_ ]?api[_ ]?key)\b",
@@ -410,6 +411,7 @@ static PATTERNS: LazyLock<Patterns> = LazyLock::new(|| Patterns {
 	opaque_status_words:        re_i(r"\b(?:http|https|status|error|code|response|message)\b"),
 	ascii_word:                 re_i(r"[a-z\d]{3,}"),
 	retry_delay:                re(r#"(?i)"retryDelay"\s*:\s*"([0-9.]+)(ms|s)""#),
+	thinking_loop:              re_i(r"thinking loop detected"),
 });
 
 /// Token-context evidence only; excludes the generic numeric limit which media
@@ -817,6 +819,11 @@ fn classify_text(
 		}
 		if PATTERNS.empty_response.is_match(text) {
 			kinds |= ErrorFlags::EMPTY_RESPONSE | ErrorFlags::TRANSIENT;
+		}
+		if PATTERNS.thinking_loop.is_match(text) {
+			// The thinking-loop guard's own marker: retryable like the other
+			// transient kinds, but distinguishable for diagnostics/telemetry.
+			kinds |= ErrorFlags::THINKING_LOOP | ErrorFlags::TRANSIENT;
 		}
 		if PATTERNS.content_filter.is_match(text) {
 			kinds |= ErrorFlags::CONTENT_BLOCKED;

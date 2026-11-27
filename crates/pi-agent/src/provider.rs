@@ -30,8 +30,15 @@ pub(crate) mod retry;
 /// OpenAI-compatible chat-completions transport.
 pub mod http;
 
+/// Thinking-loop guard over streamed reasoning deltas (OpenAI-compatible path).
+pub mod thinking_loop;
+
 /// Per-model-request timeout with bounded retry after timeout.
 pub mod timeout;
+
+/// OpenAI-wire message hygiene: malformed-call removal and tool-call id
+/// clamping/deduplication.
+pub(crate) mod transform;
 
 /// Per-request credential callback (C6 exact OAuth). Called before every HTTP
 /// request with `force_refresh=false`; called again with `true` only after a
@@ -1004,6 +1011,8 @@ pub fn normalize_usage(raw: &OpenAiUsage) -> TokenUsage {
 
 /// Convert pi-agent domain messages into OpenAI API messages.
 pub fn to_openai_messages(messages: &[Message]) -> Result<Vec<OpenAiMessage>, ProviderError> {
+	let transformed = transform::transform_messages(messages);
+	let messages = transformed.as_ref();
 	let mut out = Vec::new();
 	let mut i = 0;
 	while i < messages.len() {

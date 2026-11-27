@@ -1750,7 +1750,8 @@ fn maybe_auto_compact(
 /// validation, model or image rejection, context overflow (compaction owns it),
 /// the user's own max-time budget, and interrupts — are reported, never retried.
 /// Unknown text is treated as permanent, like upstream's default-deny
-/// [`AIError::retriable`].
+/// [`AIError::retriable`]; transient kinds come from the shared
+/// [`pi_agent::provider::error_flags`] classifier.
 fn is_retryable_stream_error(error: &str) -> bool {
 	let lower = error.to_ascii_lowercase();
 	const PERMANENT: [&str; 14] = [
@@ -1772,23 +1773,8 @@ fn is_retryable_stream_error(error: &str) -> bool {
 	if error == crate::deadline::TIMEOUT_MESSAGE || PERMANENT.iter().any(|needle| lower.contains(needle)) {
 		return false;
 	}
-	const TRANSIENT: [&str; 14] = [
-		"429",
-		"rate limit",
-		"overloaded",
-		"500",
-		"502",
-		"503",
-		"504",
-		"timed out",
-		"timeout",
-		"connection",
-		"reset by peer",
-		"network",
-		"stream ended before completion",
-		"upstream",
-	];
-	TRANSIENT.iter().any(|needle| lower.contains(needle))
+	let flags = pi_agent::provider::error_flags::classify_message(error);
+	pi_agent::provider::error_flags::retriable(flags, false)
 }
 
 /// One pumped turn: prepare, stream frames, persist, then announce the end.
@@ -2138,6 +2124,14 @@ mod retry_policy_tests {
 		] {
 			assert!(is_retryable_stream_error(error), "{error} should retry");
 		}
+	}
+
+	#[test]
+	fn thinking_loop_failures_retry() {
+		let error = pi_agent::provider::thinking_loop::thinking_loop_error_message(
+			"8 near-identical segments within the last 24",
+		);
+		assert!(is_retryable_stream_error(&error), "{error} should retry");
 	}
 
 	#[test]

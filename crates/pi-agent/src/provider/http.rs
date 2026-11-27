@@ -446,7 +446,7 @@ impl ModelProvider for OpenAiCompatibleProvider {
 			.bytes_stream()
 			.map(|item| item.map_err(|err| err.to_string()));
 		let secrets = self.diagnostic_secrets(&key);
-		Ok(sse_stream(Box::pin(body))
+		let chunks = sse_stream(Box::pin(body))
 			.map(move |item| {
 				item.map_err(|error| match error {
 					ProviderError::Network(text) => {
@@ -463,7 +463,8 @@ impl ModelProvider for OpenAiCompatibleProvider {
 					other => other,
 				})
 			})
-			.boxed())
+			.boxed();
+		Ok(super::thinking_loop::guard_chunk_stream(chunks, &self.model))
 	}
 }
 
