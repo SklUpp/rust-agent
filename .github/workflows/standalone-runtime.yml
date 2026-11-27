@@ -143,3 +143,109 @@ jobs:
             target/aarch64-linux-android/release/arag
             target/aarch64-linux-android/release/arag.sha256
           if-no-files-found: error
+
+  license-notices:
+    name: License policy and third-party notices
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    # Metadata-only run: keep rustup from installing the pinned nightly just to
+    # answer `cargo metadata`.
+    env:
+      RUSTUP_TOOLCHAIN: stable
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install cargo-deny and cargo-about
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-deny@0.20.2,cargo-about@0.8.2
+      - name: Check advisories, licenses, and sources
+        run: cargo deny check
+      - name: Generate dependency license data
+        run: |
+          set -euo pipefail
+          mkdir -p target/about
+          cargo about generate --fail --locked --workspace --all-features --format json \
+            --output-file target/about/licenses.json
+      - name: Assemble THIRD-PARTY-NOTICES.generated.txt
+        run: |
+          set -euo pipefail
+          python3 - target/about/licenses.json THIRD-PARTY-NOTICES.generated.txt <<'PY'
+          import json
+          import sys
+          from pathlib import Path
+
+          data = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+          out = Path(sys.argv[2])
+          overview = data.get("overview", [])
+          licenses = data.get("licenses", [])
+
+          lines = []
+
+          def rule(title):
+              lines.extend(["", "=" * 78, title, "=" * 78, ""])
+
+          def read(path):
+              return Path(path).read_text(encoding="utf-8").strip("\n")
+
+          lines.extend(
+              [
+                  "THIRD-PARTY NOTICES",
+                  "===================",
+                  "",
+                  "Generated for the rust-agent workspace by",
+                  "`cargo about generate --locked --workspace --all-features --format json`",
+                  "and `cargo deny check` (policy: about.toml / deny.toml).",
+              ]
+          )
+
+          rule("Project license: MIT (LICENSE)")
+          lines.append(read("LICENSE"))
+
+          rule("Vendored rmcp 3.9.0: Apache-2.0 (crates/vendor/rmcp/LICENSE)")
+          lines.append(read("crates/vendor/rmcp/LICENSE"))
+
+          rule("Vendored brush-core 0.5.0: MIT (crates/vendor/brush-core/LICENSE)")
+          lines.append(read("crates/vendor/brush-core/LICENSE"))
+
+          rule("In-tree third-party builtins attribution (crates/pi-builtins/LICENSE)")
+          lines.append(read("crates/pi-builtins/LICENSE"))
+
+          rule("In-tree shell minimizer attribution (crates/pi-shell/NOTICE)")
+          lines.append(read("crates/pi-shell/NOTICE"))
+
+          rule("Dependency license overview")
+          for entry in sorted(overview, key=lambda e: (e.get("id", ""), e.get("name", ""))):
+              lines.append(
+                  f"  {entry.get('id', '?')} ({entry.get('name', '?')}): "
+                  f"{entry.get('count', 0)} crate(s)"
+              )
+
+          rule("License texts and attribution")
+          for item in licenses:
+              used_by = sorted(
+                  {
+                      f"{(u.get('crate') or {}).get('name', '?')} "
+                      f"{(u.get('crate') or {}).get('version', '?')}"
+                      for u in item.get("used_by", [])
+                      if u.get("crate")
+                  }
+              )
+              lines.extend(
+                  [
+                      "-" * 78,
+                      f"{item.get('id', '?')}: {item.get('name', '?')}",
+                  ]
+              )
+              if item.get("source_path"):
+                  lines.append(f"Source: {item['source_path']}")
+              lines.append(f"Used by ({len(used_by)}): {', '.join(used_by)}")
+              lines.extend(["", (item.get("text") or "").strip("\n"), ""])
+
+          out.write_text("\n".join(lines).rstrip("\n") + "\n", encoding="utf-8")
+          PY
+      - name: Upload third-party notices
+        uses: actions/upload-artifact@v4
+        with:
+          name: third-party-notices
+          path: THIRD-PARTY-NOTICES.generated.txt
+          if-no-files-found: error
