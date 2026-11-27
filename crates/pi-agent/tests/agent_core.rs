@@ -2322,6 +2322,13 @@ fn reasoning_effort_is_serialized_only_when_set() {
 		reasoning_effort: None,
 		prompt_cache_key: None,
 		service_tier: None,
+		max_tokens: None,
+		max_completion_tokens: None,
+		temperature: None,
+		top_p: None,
+		stop: None,
+		user: None,
+		metadata: None,
 	};
 	let payload = serde_json::to_value(&without).expect("serialize");
 	assert!(payload.get("reasoning_effort").is_none(), "got: {payload}");

@@ -87,6 +87,453 @@ pub struct ModelInfo {
 	pub supports_usage_in_streaming: Option<bool>,
 }
 
+/// Wire field carrying the output-token cap for an OpenAI-compatible model.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MaxTokensField {
+	/// Legacy `max_tokens` (Mistral, native Kimi/Moonshot, Z.ai/Zhipu, Chutes,
+	/// Fireworks, and DeepSeek's first-party API).
+	MaxTokens,
+	/// `max_completion_tokens`, used by OpenAI and every host that does not
+	/// require the legacy field.
+	MaxCompletionTokens,
+}
+
+impl MaxTokensField {
+	fn parse(value: &str) -> Option<Self> {
+		match value {
+			"max_tokens" => Some(Self::MaxTokens),
+			"max_completion_tokens" => Some(Self::MaxCompletionTokens),
+			_ => None,
+		}
+	}
+}
+
+/// Reasoning/thinking request dialect for an OpenAI-compatible endpoint.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ThinkingFormat {
+	/// OpenAI-style `reasoning_effort` (the fallback).
+	OpenAi,
+	/// OpenRouter's reasoning control.
+	OpenRouter,
+	/// Z.ai/Moonshot binary `thinking: { type }` block.
+	Zai,
+	/// Kimi-specific `thinking: { type, effort }` block.
+	Kimi,
+	/// Qwen's top-level `enable_thinking` dialect.
+	Qwen,
+	/// Qwen served with vLLM's `chat_template_kwargs.enable_thinking`.
+	QwenChatTemplate,
+	/// Generic chat-template thinking switch.
+	ChatTemplate,
+}
+
+impl ThinkingFormat {
+	fn parse(value: &str) -> Option<Self> {
+		match value {
+			"openai" => Some(Self::OpenAi),
+			"openrouter" => Some(Self::OpenRouter),
+			"zai" => Some(Self::Zai),
+			"kimi" => Some(Self::Kimi),
+			"qwen" => Some(Self::Qwen),
+			"qwen-chat-template" => Some(Self::QwenChatTemplate),
+			"chat-template" => Some(Self::ChatTemplate),
+			_ => None,
+		}
+	}
+}
+
+/// Resolved chat-completions compat record for one model: the subset of TS
+/// `ResolvedOpenAICompat` the headless runtime consumes, with `buildOpenAICompat`
+/// provider/base-URL/model-id defaults already applied and sparse catalog
+/// `compat` keys layered on top. Resolution happens once per lookup, never per
+/// request field.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OpenAiCompat {
+	/// Accept the `developer` role instead of folding it into `system`.
+	pub supports_developer_role:     bool,
+	/// Accept the OpenAI `store` request field.
+	pub supports_store:              bool,
+	/// Accept `reasoning_effort`.
+	pub supports_reasoning_effort:   bool,
+	/// Wire field carrying the output cap.
+	pub max_tokens_field:            MaxTokensField,
+	/// Reasoning/thinking request dialect.
+	pub thinking_format:             ThinkingFormat,
+	/// Effort remap for this model (detected Kimi K3 values first, catalog
+	/// `reasoningEffortMap` keys win).
+	pub reasoning_effort_map:        BTreeMap<String, String>,
+	/// Stream-watchdog idle floor, when the host needs a widened one.
+	pub stream_idle_timeout_ms:      Option<u64>,
+	/// Accept OpenAI strict-mode tool schemas.
+	pub supports_strict_mode:        bool,
+}
+
+impl OpenAiCompat {
+	/// Resolve the chat-completions compat record for one model: TS
+	/// `buildOpenAICompat` defaults from `provider`, `base_url`, `model_id`
+	/// and `reasoning`, then the merged sparse `compat` block overrides keys it
+	/// names. Unknown enum values keep the detected default.
+	#[must_use]
+	pub fn resolve(
+		provider: &str,
+		base_url: Option<&str>,
+		model_id: &str,
+		reasoning: bool,
+		sparse: Option<&serde_json::Value>,
+	) -> Self {
+		let url = base_url.unwrap_or_default().to_ascii_lowercase();
+		let model = model_id.to_ascii_lowercase();
+
+		let is_openai = provider == "openai" || url.contains("api.openai.com");
+		let is_azure = provider == "azure"
+			|| url.contains(".openai.azure.com")
+			|| url.contains("azure.com/openai")
+			|| url.contains("models.inference.ai.azure.com");
+		let is_openrouter = provider == "openrouter" || url.contains("openrouter.ai");
+		let is_cerebras = provider == "cerebras" || url.contains("cerebras.ai");
+		let is_together = provider == "together" || url.contains("api.together.xyz");
+		let is_copilot = provider == "github-copilot";
+		let is_zenmux = provider == "zenmux";
+		let is_zai = provider == "zai" || url.contains("api.z.ai");
+		let is_zhipu = provider == "zhipu-coding-plan" || url.contains("open.bigmodel.cn");
+		let is_kilo = provider == "kilo" || url.contains("api.kilo.ai");
+		let is_alibaba = provider == "alibaba-coding-plan"
+			|| provider == "alibaba-token-plan"
+			|| url.contains("dashscope")
+			|| url.contains("token-plan.");
+		let is_xai = provider == "xai" || provider == "xai-oauth" || url.contains("api.x.ai");
+		let is_mistral = provider == "mistral" || url.contains("mistral.ai");
+		let is_chutes = url.contains("chutes.ai");
+		let is_fireworks = url.contains("fireworks.ai");
+		let is_google_aistudio = url.contains("generativelanguage.googleapis.com");
+		let is_xiaomi = provider == "xiaomi"
+			|| provider.starts_with("xiaomi-token-plan-")
+			|| url.contains("xiaomimimo.com");
+		let is_moonshot_native = provider == "moonshot"
+			|| provider == "kimi-code"
+			|| url.contains("api.moonshot.ai")
+			|| url.contains("api.kimi.com");
+		let is_opencode = provider == "opencode-go"
+			|| provider == "opencode-zen"
+			|| url.contains("opencode.ai");
+		let is_deepseek_family = provider == "deepseek" || url.contains("deepseek.com");
+		let is_deepseek_direct = provider == "deepseek" || url.contains("api.deepseek.com");
+		let is_nvidia = provider == "nvidia" || url.contains("integrate.api.nvidia.com");
+		let is_venice = provider == "venice" || url.contains("api.venice.ai");
+		let is_qwen = model.contains("qwen");
+		let is_mimo = model.contains("mimo");
+		let is_moonshot_kimi = is_moonshot_native && is_kimi_model_id(&model);
+		let is_kimi_k3 = is_kimi_k3_id(&model);
+		let is_local = matches!(provider, "llama.cpp" | "lm-studio" | "vllm" | "ollama")
+			|| has_local_http_host(&url);
+
+		// TS `isNonStandard`: hosts that reject OpenAI-only fields such as `store`.
+		let is_non_standard = is_cerebras
+			|| is_xai
+			|| is_mistral
+			|| is_google_aistudio
+			|| is_chutes
+			|| is_deepseek_family
+			|| is_fireworks
+			|| is_alibaba
+			|| is_zai
+			|| is_zhipu
+			|| is_kilo
+			|| is_qwen
+			|| is_xiaomi
+			|| is_moonshot_native
+			|| is_opencode;
+
+		let supports_developer_role = is_openai || is_azure;
+		let supports_store = !is_non_standard;
+		let supports_reasoning_effort = !is_xai
+			&& !(is_xiaomi && is_mimo)
+			&& (!(is_zai || is_zhipu) || is_glm52_reasoning_effort_id(&model));
+		let use_max_tokens = is_mistral
+			|| is_moonshot_native
+			|| is_zai
+			|| is_zhipu
+			|| is_chutes
+			|| is_fireworks
+			|| is_deepseek_direct;
+		let max_tokens_field = if use_max_tokens {
+			MaxTokensField::MaxTokens
+		} else {
+			MaxTokensField::MaxCompletionTokens
+		};
+
+		// TS `thinkingFormat` ladder (chat-completions dialect).
+		let thinking_format = if (is_moonshot_kimi && !is_kimi_k3)
+			|| is_zai
+			|| is_zhipu
+			|| (is_xiaomi && is_mimo)
+		{
+			ThinkingFormat::Zai
+		} else if is_openrouter {
+			ThinkingFormat::OpenRouter
+		} else if is_qwen && (is_nvidia || provider == "vllm") {
+			ThinkingFormat::QwenChatTemplate
+		} else if is_qwen && (is_fireworks || is_venice) {
+			ThinkingFormat::OpenAi
+		} else if is_alibaba || is_qwen {
+			ThinkingFormat::Qwen
+		} else {
+			ThinkingFormat::OpenAi
+		};
+
+		// TS `mergeModelReasoningEffortMap`: detected Kimi K3 map first, then
+		// the catalog's sparse map wins key by key.
+		let mut reasoning_effort_map = BTreeMap::new();
+		if is_kimi_k3 {
+			for (from, to) in [("minimal", "low"), ("medium", "high"), ("xhigh", "max"), ("max", "max")] {
+				reasoning_effort_map.insert(from.to_string(), to.to_string());
+			}
+		}
+
+		// TS stream-watchdog floors: slow reasoning/cold-load hosts idle for
+		// minutes before the first SSE event.
+		let glm_coding_plan = is_glm_coding_plan_id(&model) && (is_zai || is_zhipu || is_opencode);
+		let long_coding_plan_idle = glm_coding_plan || provider == "alibaba-coding-plan";
+		let stream_idle_timeout_ms = if long_coding_plan_idle {
+			Some(600_000)
+		} else if (is_xiaomi && is_mimo)
+			|| is_local
+			|| (reasoning
+				&& (is_kimi_k26_id(&model)
+					|| (is_moonshot_kimi && is_kimi_k3)
+					|| (is_moonshot_kimi && is_kimi_k27_code_id(&model))
+					|| is_deepseek_direct))
+		{
+			Some(300_000)
+		} else {
+			None
+		};
+
+		let supports_strict_mode = is_openai
+			|| is_azure
+			|| is_openrouter
+			|| is_cerebras
+			|| is_together
+			|| is_copilot
+			|| is_zenmux
+			|| is_deepseek_family;
+
+		let mut compat = Self {
+			supports_developer_role,
+			supports_store,
+			supports_reasoning_effort,
+			max_tokens_field,
+			thinking_format,
+			reasoning_effort_map,
+			stream_idle_timeout_ms,
+			supports_strict_mode,
+		};
+
+		let Some(sparse) = sparse.filter(|value| value.is_object()) else {
+			return compat;
+		};
+		if let Some(value) = sparse.get("supportsDeveloperRole").and_then(serde_json::Value::as_bool) {
+			compat.supports_developer_role = value;
+		}
+		if let Some(value) = sparse.get("supportsStore").and_then(serde_json::Value::as_bool) {
+			compat.supports_store = value;
+		}
+		if let Some(value) = sparse
+			.get("supportsReasoningEffort")
+			.and_then(serde_json::Value::as_bool)
+		{
+			compat.supports_reasoning_effort = value;
+		}
+		if let Some(value) = sparse
+			.get("maxTokensField")
+			.and_then(serde_json::Value::as_str)
+			.and_then(MaxTokensField::parse)
+		{
+			compat.max_tokens_field = value;
+		}
+		if let Some(value) = sparse
+			.get("thinkingFormat")
+			.and_then(serde_json::Value::as_str)
+			.and_then(ThinkingFormat::parse)
+		{
+			compat.thinking_format = value;
+		}
+		if let Some(map) = sparse
+			.get("reasoningEffortMap")
+			.and_then(serde_json::Value::as_object)
+		{
+			for (from, to) in map {
+				if let Some(to) = to.as_str() {
+					compat.reasoning_effort_map.insert(from.clone(), to.to_string());
+				}
+			}
+		}
+		if let Some(value) = sparse
+			.get("streamIdleTimeoutMs")
+			.and_then(serde_json::Value::as_u64)
+		{
+			compat.stream_idle_timeout_ms = Some(value);
+		}
+		if let Some(value) = sparse.get("supportsStrictMode").and_then(serde_json::Value::as_bool) {
+			compat.supports_strict_mode = value;
+		}
+		compat
+	}
+}
+
+/// Kimi-family ids in namespace or bare form (`moonshotai/kimi-*`,
+/// `kimi-k2.6`, `kimi.k3`). Input is already lowercase.
+fn is_kimi_model_id(model: &str) -> bool {
+	model.contains("moonshotai/kimi")
+		|| model.starts_with("kimi-")
+		|| model.starts_with("kimi.")
+		|| model.contains("/kimi-")
+		|| model.contains("/kimi.")
+}
+
+/// Suffix after a segment-anchored `needle` (`needle` at the start or right
+/// after `/`), matching TS `(^|\/)needle`.
+fn segment_suffix<'a>(model: &'a str, needle: &str) -> Option<&'a str> {
+	model
+		.match_indices(needle)
+		.find(|(index, _)| {
+			let index = *index;
+			index == 0 || model.as_bytes()[index - 1] == b'/'
+		})
+		.map(|(index, _)| &model[index + needle.len()..])
+}
+
+/// Separator-or-end boundary used by the Kimi/GLM id patterns.
+fn is_separator_boundary(rest: &str) -> bool {
+	rest.is_empty()
+		|| rest.starts_with('-')
+		|| rest.starts_with('.')
+		|| rest.starts_with(':')
+		|| rest.starts_with('_')
+}
+
+/// TS `isKimiK3ModelId`: `kimi-k3`, `kimi-k3.1`, `kimi-k3-turbo`.
+fn is_kimi_k3_id(model: &str) -> bool {
+	let Some(rest) = segment_suffix(model, "kimi-k3") else {
+		return false;
+	};
+	let rest = match rest.strip_prefix('.') {
+		Some(after) => {
+			let digits = after.bytes().take_while(u8::is_ascii_digit).count();
+			if digits == 0 {
+				return false;
+			}
+			&after[digits..]
+		},
+		None => rest,
+	};
+	is_separator_boundary(rest)
+}
+
+/// TS `isKimiK26ModelId`: `kimi-k2.6`, router form `kimi-k2p6`.
+fn is_kimi_k26_id(model: &str) -> bool {
+	let Some(rest) = segment_suffix(model, "kimi-k2") else {
+		return false;
+	};
+	let rest = if let Some(after) = rest.strip_prefix(".6") {
+		after
+	} else if let Some(after) = rest.strip_prefix("p6") {
+		after
+	} else {
+		return false;
+	};
+	rest.is_empty() || rest.starts_with('-') || rest.starts_with(':')
+}
+
+/// TS `KIMI_K27_CODE_MODEL_PATTERN`: `kimi-k2.7-code`, `kimi-k27-code`,
+/// `kimi-k2p7-code`, with the optional `-highspeed` suffix.
+fn is_kimi_k27_code_id(model: &str) -> bool {
+	let Some(rest) = segment_suffix(model, "kimi-k2") else {
+		return false;
+	};
+	let rest = rest.strip_prefix(['.', '-', '_']).unwrap_or(rest);
+	let rest = rest.strip_prefix('p').unwrap_or(rest);
+	let Some(rest) = rest.strip_prefix('7') else {
+		return false;
+	};
+	let rest = rest.strip_prefix(['-', '.', '_']).unwrap_or(rest);
+	let Some(rest) = rest.strip_prefix("code") else {
+		return false;
+	};
+	let rest = rest.strip_prefix(['-', '.', '_']).unwrap_or(rest);
+	rest.is_empty() || rest == "highspeed"
+}
+
+/// TS `GLM_CODING_PLAN_MODEL_PATTERN`: `glm-5`, `glm-5.2`, `glm-5-turbo`.
+fn is_glm_coding_plan_id(model: &str) -> bool {
+	let Some(rest) = segment_suffix(model, "glm-5") else {
+		return false;
+	};
+	rest.is_empty() || rest.starts_with('.') || rest.starts_with('-')
+}
+
+/// TS `isGlm52ReasoningEffortModelId`, without the shared GLM semver parser:
+/// GLM-5.2+ base/air/turbo (and 5.3+ flash) SKUs accept `reasoning_effort`.
+fn is_glm52_reasoning_effort_id(model: &str) -> bool {
+	let Some(position) = model.find("glm-") else {
+		return false;
+	};
+	let rest = &model[position + 4..];
+	let version_len = rest
+		.bytes()
+		.take_while(|byte| byte.is_ascii_digit() || *byte == b'.')
+		.count();
+	if version_len == 0 {
+		return false;
+	}
+	let version = &rest[..version_len];
+	let mut parts = version.split('.');
+	let Some(major) = parts.next().and_then(|part| part.parse::<u32>().ok()) else {
+		return false;
+	};
+	let minor = parts.next().and_then(|part| part.parse::<u32>().ok()).unwrap_or(0);
+	if (major, minor) < (5, 2) {
+		return false;
+	}
+	let suffix = &rest[version_len..];
+	if suffix.starts_with('v') {
+		return false;
+	}
+	let variant = suffix.strip_prefix('-').unwrap_or(suffix);
+	let variant = variant.split(['-', '.', '_']).next().unwrap_or(variant);
+	if matches!(variant, "flashx" | "preview") {
+		return false;
+	}
+	!(variant == "flash" && (major, minor) < (5, 3))
+}
+
+/// TS `hasLocalLoopbackBaseUrl` for the stream-timeout floor: loopback,
+/// RFC1918, and `.local` hosts. `url` is already lowercase.
+fn has_local_http_host(url: &str) -> bool {
+	let authority = url.split_once("://").map_or(url, |(_, rest)| rest);
+	let authority = authority.split(['/', '?', '#']).next().unwrap_or_default();
+	let authority = authority
+		.rsplit_once('@')
+		.map_or(authority, |(_, host)| host);
+	let host = if let Some(rest) = authority.strip_prefix('[') {
+		rest.split_once(']').map_or(rest, |(host, _)| host)
+	} else {
+		authority.split(':').next().unwrap_or(authority)
+	};
+	if matches!(host, "localhost" | "127.0.0.1" | "0.0.0.0" | "::1") {
+		return true;
+	}
+	if host.starts_with("10.") || host.starts_with("192.168.") || host.ends_with(".local") {
+		return true;
+	}
+	if let Some(rest) = host.strip_prefix("172.") {
+		if let Some(second) = rest.split('.').next().and_then(|octet| octet.parse::<u8>().ok()) {
+			return (16..=31).contains(&second);
+		}
+	}
+	false
+}
+
 #[derive(Deserialize)]
 struct ModelEntry {
 	#[serde(default)]
@@ -685,6 +1132,25 @@ impl Catalog {
 			.as_deref()
 	}
 
+	/// Resolved OpenAI-compatible wire compat for this model (TS
+	/// `buildOpenAICompat` defaults plus the model's merged sparse `compat`
+	/// block). `None` when the provider/model row is absent.
+	#[must_use]
+	pub fn openai_compat(&self, provider: &str, model: &str) -> Option<OpenAiCompat> {
+		let info = self.providers.get(provider)?.get(model)?;
+		let base_url = info
+			.base_url
+			.as_deref()
+			.or_else(|| self.connections.get(provider)?.base_url.as_deref());
+		Some(OpenAiCompat::resolve(
+			provider,
+			base_url,
+			model,
+			info.reasoning,
+			info.compat.as_ref(),
+		))
+	}
+
 	/// Sparse `compat` block resolved for this model, provider default and
 	/// model keys already merged (precedence in [`ModelInfo::compat`]).
 	#[must_use]
@@ -928,5 +1394,113 @@ mod tests {
 		assert!(err.to_string().contains("`providers` must be a mapping"));
 		assert!(Catalog::load_from(&[json, missing], &yml).is_err());
 		fs::remove_dir_all(dir).ok();
+	}
+
+	#[test]
+	fn openai_compat_defaults_cover_cerebras_kimi_glm_deepseek_and_local() {
+		let openai = OpenAiCompat::resolve("openai", None, "gpt-5", true, None);
+		assert!(openai.supports_developer_role);
+		assert!(openai.supports_store);
+		assert_eq!(openai.max_tokens_field, MaxTokensField::MaxCompletionTokens);
+		assert_eq!(openai.thinking_format, ThinkingFormat::OpenAi);
+		assert!(openai.supports_strict_mode);
+
+		let cerebras = OpenAiCompat::resolve("cerebras", None, "llama-3.3-70b", false, None);
+		assert!(!cerebras.supports_developer_role);
+		assert!(!cerebras.supports_store);
+		assert!(cerebras.supports_reasoning_effort);
+		assert_eq!(cerebras.max_tokens_field, MaxTokensField::MaxCompletionTokens);
+		assert!(cerebras.supports_strict_mode);
+
+		let kimi = OpenAiCompat::resolve("moonshot", None, "kimi-k2.6", true, None);
+		assert!(!kimi.supports_developer_role);
+		assert!(!kimi.supports_store);
+		assert_eq!(kimi.max_tokens_field, MaxTokensField::MaxTokens);
+		assert_eq!(kimi.thinking_format, ThinkingFormat::Zai);
+		assert_eq!(kimi.stream_idle_timeout_ms, Some(300_000));
+
+		let glm = OpenAiCompat::resolve("zai", None, "glm-5.2", true, None);
+		assert!(!glm.supports_developer_role);
+		assert!(!glm.supports_store);
+		assert!(glm.supports_reasoning_effort);
+		assert_eq!(glm.max_tokens_field, MaxTokensField::MaxTokens);
+		assert_eq!(glm.thinking_format, ThinkingFormat::Zai);
+		assert_eq!(glm.stream_idle_timeout_ms, Some(600_000));
+
+		let deepseek = OpenAiCompat::resolve(
+			"deepseek",
+			Some("https://api.deepseek.com/v1"),
+			"deepseek-reasoner",
+			true,
+			None,
+		);
+		assert!(!deepseek.supports_developer_role);
+		assert!(!deepseek.supports_store);
+		assert_eq!(deepseek.max_tokens_field, MaxTokensField::MaxTokens);
+		assert_eq!(deepseek.stream_idle_timeout_ms, Some(300_000));
+		assert!(deepseek.supports_strict_mode);
+
+		let local = OpenAiCompat::resolve(
+			"llama.cpp",
+			Some("http://127.0.0.1:8080/v1"),
+			"llama3",
+			true,
+			None,
+		);
+		assert!(!local.supports_developer_role);
+		assert!(local.supports_store);
+		assert_eq!(local.max_tokens_field, MaxTokensField::MaxCompletionTokens);
+		assert_eq!(local.stream_idle_timeout_ms, Some(300_000));
+		assert!(!local.supports_strict_mode);
+	}
+
+	#[test]
+	fn openai_compat_applies_sparse_catalog_overrides() {
+		let dir = temp_dir();
+		let yml = dir.join("models.yml");
+		write(
+			&yml,
+			"providers:\n  local:\n    baseUrl: http://127.0.0.1:9999/v1\n    models:\n      - id: m1\n        reasoning: true\n        compat:\n          supportsDeveloperRole: true\n          supportsStore: false\n          supportsReasoningEffort: false\n          maxTokensField: max_tokens\n          thinkingFormat: qwen\n          reasoningEffortMap:\n            high: medium\n          streamIdleTimeoutMs: 1234\n          supportsStrictMode: true\n",
+		);
+		let catalog = Catalog::load_from(&[dir.join("missing.json")], &yml).expect("catalog");
+		let compat = catalog.openai_compat("local", "m1").expect("compat");
+		assert!(compat.supports_developer_role);
+		assert!(!compat.supports_store);
+		assert!(!compat.supports_reasoning_effort);
+		assert_eq!(compat.max_tokens_field, MaxTokensField::MaxTokens);
+		assert_eq!(compat.thinking_format, ThinkingFormat::Qwen);
+		assert_eq!(
+			compat.reasoning_effort_map.get("high").map(String::as_str),
+			Some("medium")
+		);
+		assert_eq!(compat.stream_idle_timeout_ms, Some(1_234));
+		assert!(compat.supports_strict_mode);
+		fs::remove_dir_all(dir).ok();
+	}
+
+	#[test]
+	fn openai_compat_kimi_k3_remaps_efforts_and_catalog_map_wins() {
+		let sparse = serde_json::json!({"reasoningEffortMap": {"medium": "low"}});
+		let compat = OpenAiCompat::resolve(
+			"openrouter",
+			None,
+			"moonshotai/kimi-k3",
+			true,
+			Some(&sparse),
+		);
+		assert_eq!(compat.thinking_format, ThinkingFormat::OpenRouter);
+		assert_eq!(
+			compat.reasoning_effort_map.get("minimal").map(String::as_str),
+			Some("low")
+		);
+		assert_eq!(
+			compat.reasoning_effort_map.get("medium").map(String::as_str),
+			Some("low"),
+			"catalog override replaces the detected K3 remap"
+		);
+		assert_eq!(
+			compat.reasoning_effort_map.get("xhigh").map(String::as_str),
+			Some("max")
+		);
 	}
 }

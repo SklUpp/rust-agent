@@ -19,6 +19,10 @@ const MAX_SSE_LINE_BYTES: usize = 1024 * 1024;
 /// Bounded, redacted response-body handling shared by the HTTP adapters.
 pub(crate) mod body;
 
+/// Replay-safe stream retries: buffer until the first meaningful chunk, then
+/// allow empty-completion retries only while nothing visible escaped.
+pub mod empty_retry;
+
 /// Semantic provider-error classification (flags, rate-limit reasons, OAuth
 /// retryability) ported from `packages/ai/src/error/`.
 pub mod error_flags;
@@ -29,6 +33,9 @@ pub(crate) mod retry;
 
 /// OpenAI-compatible chat-completions transport.
 pub mod http;
+
+/// Transient-failure retry for non-mutating oneshot `complete()` calls.
+pub mod oneshot_retry;
 
 /// Thinking-loop guard over streamed reasoning deltas (OpenAI-compatible path).
 pub mod thinking_loop;
@@ -694,6 +701,27 @@ pub struct OpenAiChatRequest {
 	/// OpenAI-compatible `service_tier`; omitted when unset.
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub service_tier: Option<String>,
+	/// Output-token cap for legacy chat-completions models (`max_tokens`).
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub max_tokens: Option<u64>,
+	/// Output-token cap for reasoning-era models (`max_completion_tokens`).
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub max_completion_tokens: Option<u64>,
+	/// Sampling temperature (`0.0`..=`2.0`); omitted when unset.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub temperature: Option<f64>,
+	/// Nucleus-sampling probability mass; omitted when unset.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub top_p: Option<f64>,
+	/// Stop sequence(s); a string or array of strings, passed through verbatim.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub stop: Option<serde_json::Value>,
+	/// End-user identifier for abuse monitoring; omitted when unset.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub user: Option<String>,
+	/// Request metadata object, passed through verbatim.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub metadata: Option<serde_json::Value>,
 }
 
 /// `stream_options` body field asking the host for a usage trailer.
@@ -815,6 +843,12 @@ pub struct OpenAiResponseMessage {
 	pub reasoning_text: Option<String>,
 	#[serde(default)]
 	pub tool_calls: Option<Vec<OpenAiToolCall>>,
+	/// Safety refusal text; omitted when the host reports none.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub refusal: Option<String>,
+	/// Structured annotations (citations, file references) carried verbatim.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub annotations: Option<Vec<serde_json::Value>>,
 }
 
 /// SSE chunk schema for a streamed chat completion.
@@ -863,6 +897,12 @@ pub struct OpenAiDelta {
 	pub reasoning_text: Option<String>,
 	#[serde(default)]
 	pub tool_calls: Option<Vec<OpenAiStreamToolCall>>,
+	/// Safety refusal text; omitted when the host reports none.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub refusal: Option<String>,
+	/// Structured annotations carried verbatim; omitted when absent.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub annotations: Option<Vec<serde_json::Value>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

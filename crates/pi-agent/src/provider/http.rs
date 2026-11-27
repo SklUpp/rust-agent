@@ -288,6 +288,13 @@ impl OpenAiCompatibleProvider {
 			},
 			prompt_cache_key: self.prompt_cache_enabled.then(|| self.prompt_cache_key()).flatten(),
 			service_tier: self.service_tier.clone(),
+			max_tokens: None,
+			max_completion_tokens: None,
+			temperature: None,
+			top_p: None,
+			stop: None,
+			user: None,
+			metadata: None,
 		})
 	}
 }
