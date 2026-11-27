@@ -16,7 +16,7 @@
 use std::{
 	collections::{BTreeMap, BTreeSet, HashMap},
 	fs,
-	io::{IsTerminal as _, Read as _, Write},
+	io::{BufRead as _, IsTerminal as _, Read as _, Write},
 	path::{Path, PathBuf},
 	process::{Command, Stdio},
 	time::{Duration, SystemTime, UNIX_EPOCH},
