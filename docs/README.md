@@ -67,6 +67,7 @@
 - `research-2026-11-27-15-unified-domain5-frontends-ops.md` — Унифицированный аудит Домена 5 (`ScoutUnifiedFrontendsOps`): TUI/CLI/REPL/RPC/ACP, hooks, profiles, R9–R11
 - `research-2026-11-27-16-unified-domain6-platform-pkg.md` — Унифицированный аудит Домена 6 (`ScoutUnifiedPlatformPkg`): платформа/Android HAL, packaging/notices, CI и R12
 - `research-2026-11-27-17-unified-corpus-index.md` — Унифицированный индекс корпуса (`ScoutDocsUnifiedIndex`): 25-строчная матрица, 22 конфликта и 12 целевых направлений Stage 2 (`DIR-01..DIR-12`)
+- `research-2026-11-27-18-unified-reviews-errata.md` — Независимый аудит ревью унифицированных исследований (`ReviewUnifiedBatch1`, `ReviewUnifiedBatch2`, `ReviewUnifiedBatch3`)
 
 ## Правила обновления
 
