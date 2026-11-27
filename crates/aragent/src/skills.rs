@@ -624,6 +624,13 @@ fn provider_scans(
 	}
 	if options.enable_pi_user {
 		scans.push(scan(agent_dir.join("skills"), "native", "user", true));
+		if let Some(legacy) = dirs::legacy_agent_dir() {
+			let legacy = legacy.join("skills");
+			if legacy != agent_dir.join("skills") {
+				// Read-only fallback; an earlier scan of the same skill wins.
+				scans.push(scan(legacy, "native", "user", true));
+			}
+		}
 	}
 
 	if let Some(home) = home {

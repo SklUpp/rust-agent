@@ -34,7 +34,9 @@ use std::{
 /// Largest file a version/guarded write will read or publish.
 pub const VERSION_MAX_BYTES: u64 = 4 * 1024 * 1024;
 /// Env override for the lock directory (tests and profile-aware hosts).
-pub const LOCK_DIR_ENV: &str = "OMP_WORKSPACE_WRITER_LOCK_DIR";
+pub const LOCK_DIR_ENV: &str = "ARAGENT_WORKSPACE_WRITER_LOCK_DIR";
+/// Legacy override kept for existing deployments; read-only compatibility.
+pub const LEGACY_LOCK_DIR_ENV: &str = "OMP_WORKSPACE_WRITER_LOCK_DIR";
 
 static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -61,26 +63,44 @@ pub fn canonical_identity(path: &Path) -> PathBuf {
 /// Deterministic, profile-independent lock root under the current user's home.
 ///
 /// The root is one coordination namespace for every profile and data root of
-/// this UID: `$HOME/.omp/run/workspace-writer`. `PI_CONFIG_DIR` and profile
+/// this UID: `$HOME/.aragent/run/workspace-writer`. `PI_CONFIG_DIR` and profile
 /// variables are deliberately ignored, so CLI/TUI/headless runs of the same
 /// project cannot split into parallel writer namespaces. The explicit
 /// [`LOCK_DIR_ENV`] override replaces that one root; it does not create a
-/// second namespace. There is no `/tmp` assumption: without a home, an
-/// absolute `TMPDIR` is the only fallback, and resolution otherwise fails
-/// closed.
+/// second namespace. The legacy [`LEGACY_LOCK_DIR_ENV`] is honored only when
+/// the current variable is unset. There is no `/tmp` assumption: without a
+/// home, an absolute `TMPDIR` is the only fallback, and resolution otherwise
+/// fails closed. Runtime locks are never dual-read from `~/.omp`.
 pub fn default_lock_dir() -> io::Result<PathBuf> {
-	if let Some(exact) = env_nonempty(LOCK_DIR_ENV) {
+	resolve_lock_dir(
+		env_nonempty(LOCK_DIR_ENV),
+		env_nonempty(LEGACY_LOCK_DIR_ENV),
+		env_nonempty("HOME").or_else(|| env_nonempty("USERPROFILE")),
+		env_nonempty("TMPDIR"),
+	)
+}
+
+/// Pure precedence resolver behind [`default_lock_dir`]: current override,
+/// exact legacy override, `$HOME/.aragent/run/workspace-writer`, then an
+/// absolute `$TMPDIR` fallback. Kept pure so tests never mutate process env.
+fn resolve_lock_dir(
+	current: Option<PathBuf>,
+	legacy: Option<PathBuf>,
+	home: Option<PathBuf>,
+	temp: Option<PathBuf>,
+) -> io::Result<PathBuf> {
+	if let Some(exact) = current.or(legacy) {
 		return Ok(exact);
 	}
-	if let Some(home) = env_nonempty("HOME").or_else(|| env_nonempty("USERPROFILE")) {
-		return Ok(home.join(".omp").join("run").join("workspace-writer"));
+	if let Some(home) = home {
+		return Ok(home.join(".aragent").join("run").join("workspace-writer"));
 	}
-	if let Some(temp) = env_nonempty("TMPDIR").filter(|path| path.is_absolute()) {
-		return Ok(temp.join(format!("omp-workspace-writer-{}", current_uid())));
+	if let Some(temp) = temp.filter(|path| path.is_absolute()) {
+		return Ok(temp.join(format!("aragent-workspace-writer-{}", current_uid())));
 	}
 	Err(io::Error::new(
 		io::ErrorKind::NotFound,
-		"cannot resolve a per-user coordination root; set OMP_WORKSPACE_WRITER_LOCK_DIR",
+		"cannot resolve a per-user coordination root; set ARAGENT_WORKSPACE_WRITER_LOCK_DIR",
 	))
 }
 
@@ -600,5 +620,52 @@ impl std::error::Error for WriteError {
 impl From<io::Error> for WriteError {
 	fn from(error: io::Error) -> Self {
 		Self::Io(error)
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	#[test]
+	fn lock_dir_resolution_prefers_current_then_legacy_then_home() {
+		assert_eq!(LOCK_DIR_ENV, "ARAGENT_WORKSPACE_WRITER_LOCK_DIR");
+		assert_eq!(LEGACY_LOCK_DIR_ENV, "OMP_WORKSPACE_WRITER_LOCK_DIR");
+		let home = PathBuf::from("/home/tester");
+		assert_eq!(
+			resolve_lock_dir(
+				Some(PathBuf::from("/explicit/current")),
+				Some(PathBuf::from("/explicit/legacy")),
+				Some(home.clone()),
+				None,
+			)
+			.unwrap(),
+			PathBuf::from("/explicit/current")
+		);
+		assert_eq!(
+			resolve_lock_dir(
+				None,
+				Some(PathBuf::from("/explicit/legacy")),
+				Some(home.clone()),
+				None,
+			)
+			.unwrap(),
+			PathBuf::from("/explicit/legacy")
+		);
+		assert_eq!(
+			resolve_lock_dir(None, None, Some(home.clone()), None).unwrap(),
+			home.join(".aragent/run/workspace-writer")
+		);
+	}
+
+	#[test]
+	fn lock_dir_resolution_uses_only_an_absolute_temp_fallback() {
+		let fallback =
+			resolve_lock_dir(None, None, None, Some(PathBuf::from("/tmp"))).expect("temp root");
+		assert_eq!(
+			fallback,
+			PathBuf::from("/tmp").join(format!("aragent-workspace-writer-{}", current_uid()))
+		);
+		assert!(resolve_lock_dir(None, None, None, Some(PathBuf::from("relative"))).is_err());
 	}
 }

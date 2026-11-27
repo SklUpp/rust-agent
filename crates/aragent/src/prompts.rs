@@ -1,8 +1,9 @@
 //! Prompt resolution from files.
 //!
 //! Order (CLI input first, most specific file next):
-//! `--system-prompt` > `<cwd>/.omp/SYSTEM.md` > `~/.omp/agent/SYSTEM.md` >
-//! `share/omp/system-prompt.md`. `APPEND_SYSTEM.md` is additive on the same
+//! `--system-prompt` > `<cwd>/.omp/SYSTEM.md` > `~/.aragent/agent/SYSTEM.md`
+//! > legacy `~/.omp/agent/SYSTEM.md` > `share/aragent/system-prompt.md` (with
+//! `share/omp` as a read-only fallback). `APPEND_SYSTEM.md` is additive on the same
 //! roots; `PERSONALITY.md`, `RULES.md` and `AGENTS.md` contribute context
 //! files. A CLI value is a file path when that file exists (unless it contains
 //! a newline, which makes it a literal prompt) — `resolvePromptInput`
@@ -42,11 +43,13 @@ pub fn resolve_input(input: &str) -> String {
 pub fn resolve(cli_system: Option<&str>, cli_append: Option<&str>, cwd: &Path) -> Result<Prompts> {
 	let project = dirs::project_config_dir(cwd);
 	let agent = dirs::agent_dir();
+	let legacy_agent = dirs::legacy_agent_dir().filter(|dir| *dir != agent);
 
 	let system = match cli_system {
 		Some(input) => Some(resolve_input(input)),
 		None => {
 			let mut candidates = vec![project.join("SYSTEM.md"), agent.join("SYSTEM.md")];
+			candidates.extend(legacy_agent.as_ref().map(|dir| dir.join("SYSTEM.md")));
 			candidates.extend(
 				dirs::share_dirs()
 					.into_iter()
@@ -58,12 +61,28 @@ pub fn resolve(cli_system: Option<&str>, cli_append: Option<&str>, cwd: &Path) -
 
 	let append = match cli_append {
 		Some(input) => Some(resolve_input(input)),
-		None => first_file([project.join("APPEND_SYSTEM.md"), agent.join("APPEND_SYSTEM.md")]),
+		None => first_file(
+			[
+				Some(project.join("APPEND_SYSTEM.md")),
+				Some(agent.join("APPEND_SYSTEM.md")),
+				legacy_agent.as_ref().map(|dir| dir.join("APPEND_SYSTEM.md")),
+			]
+			.into_iter()
+			.flatten(),
+		),
 	};
 
 	let mut files = Vec::new();
 	for name in ["PERSONALITY.md", "RULES.md", "AGENTS.md"] {
-		for path in [project.join(name), agent.join(name)] {
+		// Project + current user always contribute; the legacy user file only
+		// fills the user slot when the current agent dir has no such file.
+		let current_user = agent.join(name);
+		let user = if current_user.is_file() {
+			current_user
+		} else {
+			legacy_agent.as_ref().map_or(current_user, |dir| dir.join(name))
+		};
+		for path in [project.join(name), user] {
 			if let Ok(content) = fs::read_to_string(&path)
 				&& !content.trim().is_empty()
 			{

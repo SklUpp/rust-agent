@@ -521,6 +521,15 @@ fn discover_rules(cwd: &Path, agent_dir: &Path) -> Vec<Rule> {
 			push(100, rule);
 		}
 	}
+	// Legacy `<~/.omp>/agent/rules`: read-only fallback, ranked just below the
+	// current user rules so the current definition wins on ordering.
+	if let Some(legacy_dir) = dirs::legacy_agent_dir().filter(|dir| dir.as_path() != agent_dir) {
+		for path in read_dir_files(&legacy_dir.join("rules"), &["md", "mdc"]) {
+			if let Some(rule) = load_rule_file(&path, "native", None, None) {
+				push(99, rule);
+			}
+		}
+	}
 
 	// `.agent/rules` and `.agents/rules`: walk up cwd → repo root, then ~.
 	let mut current = cwd.to_path_buf();
@@ -5175,7 +5184,7 @@ fn venv_runtime(venv: &Path, base: &HashMap<String, String>) -> Option<pi_agent:
 }
 
 /// Mirrors TS setup/runtime candidate order while substituting the reported
-/// profile/XDG-aware managed env for the shared helper's `$HOME/.omp` default:
+/// profile/XDG-aware managed env for the shared helper's `$HOME/.aragent` default:
 /// explicit interpreter, active/project venv, managed env, PATH.
 fn python_candidates(
 	cwd: &Path,

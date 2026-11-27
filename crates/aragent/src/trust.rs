@@ -148,9 +148,20 @@ pub struct TrustStore {
 
 impl TrustStore {
 	/// Load `<agent_dir>/trust.json` (missing file means no grants).
+	///
+	/// For the active default agent dir, a missing current file falls back to
+	/// the legacy `~/.omp/agent/trust.json` read-only (no explicit override).
+	/// The in-memory grants then persist to the current path on [`Self::save`].
 	#[must_use]
 	pub fn load_from_agent_dir(agent_dir: &Path) -> Self {
-		Self::load(&agent_dir.join(TRUST_FILE_NAME))
+		let path = agent_dir.join(TRUST_FILE_NAME);
+		if !path.exists() && agent_dir == crate::dirs::agent_dir().as_path()
+			&& let Some(legacy) = crate::dirs::legacy_agent_dir().map(|dir| dir.join(TRUST_FILE_NAME))
+			&& legacy.is_file()
+		{
+			return Self::load_at(&path, &legacy);
+		}
+		Self::load(&path)
 	}
 
 	/// Load the active profile's trust store.
@@ -163,29 +174,37 @@ impl TrustStore {
 	/// starting from an empty store (a corrupt store never grants trust).
 	#[must_use]
 	pub fn load(path: &Path) -> Self {
-		let file = match fs::read_to_string(path) {
+		Self::load_at(path, path)
+	}
+
+	/// Read `read_path` but bind writes to `write_path` (legacy read fallback).
+	fn load_at(write_path: &Path, read_path: &Path) -> Self {
+		let file = match fs::read_to_string(read_path) {
 			Ok(text) => match serde_json::from_str::<TrustFile>(&text) {
 				Ok(file) if file.version == SCHEMA_VERSION => file,
 				Ok(file) => {
 					eprintln!(
 						"warning: ignoring trust store {}: unsupported schema version {}",
-						path.display(),
+						read_path.display(),
 						file.version
 					);
 					TrustFile::default()
 				},
 				Err(error) => {
-					eprintln!("warning: ignoring unreadable trust store {}: {error}", path.display());
+					eprintln!(
+						"warning: ignoring unreadable trust store {}: {error}",
+						read_path.display()
+					);
 					TrustFile::default()
 				},
 			},
 			Err(error) if error.kind() == std::io::ErrorKind::NotFound => TrustFile::default(),
 			Err(error) => {
-				eprintln!("warning: cannot read trust store {}: {error}", path.display());
+				eprintln!("warning: cannot read trust store {}: {error}", read_path.display());
 				TrustFile::default()
 			},
 		};
-		Self { path: path.to_path_buf(), file }
+		Self { path: write_path.to_path_buf(), file }
 	}
 
 	#[must_use]

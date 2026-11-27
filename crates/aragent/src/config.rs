@@ -1574,8 +1574,11 @@ impl Config {
 			// `docs/settings.md`: `agent/settings.json` is the legacy global
 			// settings file, superseded once any main YAML exists. Reading it
 			// here mirrors the migration result without writing.
-			let legacy = dirs::agent_dir().join("settings.json");
-			if legacy.is_file() {
+			let legacy = std::iter::once(dirs::agent_dir())
+				.chain(dirs::legacy_agent_dir())
+				.map(|dir| dir.join("settings.json"))
+				.find(|path| path.is_file());
+			if let Some(legacy) = legacy {
 				match Self::load_settings_json(&legacy) {
 					Ok(Some(overlay)) => legacy_overlay = Some((legacy, overlay)),
 					Ok(None) => {
@@ -3166,15 +3169,19 @@ pub(crate) fn json_to_value(json: &serde_json::Value) -> Value {
 	}
 }
 
-/// `~/.omp/agent/config.yml`, falling back to `.yaml`; `None` when neither
-/// exists.
+/// `~/.aragent/agent/config.yml`, falling back to `.yaml`; when absent and no
+/// explicit storage override is set, the legacy `~/.omp/agent/config.yml` /
+/// `.yaml` stays readable. `None` when neither root has a config.
 #[must_use]
 pub fn base_path() -> Option<PathBuf> {
-	let dir = dirs::agent_dir();
-	dirs::MAIN_CONFIG_FILENAMES
-		.iter()
-		.map(|name| dir.join(name))
-		.find(|path| path.is_file())
+	std::iter::once(dirs::agent_dir())
+		.chain(dirs::legacy_agent_dir())
+		.find_map(|dir| {
+			dirs::MAIN_CONFIG_FILENAMES
+				.iter()
+				.map(|name| dir.join(name))
+				.find(|path| path.is_file())
+		})
 }
 
 fn parse_hooks(value: &Value, path: &Path) -> Result<HookConfig> {
@@ -4414,6 +4421,46 @@ mod tests {
 		}
 		let err = result.err().expect("missing overlay must fail");
 		assert!(err.to_string().contains("config file not found"), "error was {err}");
+	}
+
+	#[test]
+	fn base_path_reads_current_then_legacy_user_root() {
+		let _env = crate::TEST_ENV_LOCK.lock().expect("env lock");
+		let home = std::env::temp_dir().join(format!("aragent-config-dual-{}", std::process::id()));
+		let _ = std::fs::remove_dir_all(&home);
+		let legacy = home.join(".omp/agent/config.yml");
+		let current = home.join(".aragent/agent/config.yml");
+		std::fs::create_dir_all(legacy.parent().unwrap()).expect("legacy dir");
+		std::fs::write(&legacy, "defaultModel: legacy/model\n").expect("legacy config");
+		let keys = ["HOME", "PI_CONFIG_DIR", "PI_CODING_AGENT_DIR", "ARAGENT_PROFILE", "OMP_PROFILE", "PI_PROFILE"];
+		let saved = keys.map(std::env::var_os);
+		// SAFETY: guarded by TEST_ENV_LOCK, like the other env-mutating tests.
+		unsafe {
+			env::set_var("HOME", &home);
+			for key in ["PI_CONFIG_DIR", "PI_CODING_AGENT_DIR", "ARAGENT_PROFILE", "OMP_PROFILE", "PI_PROFILE"] {
+				env::remove_var(key);
+			}
+		}
+		let legacy_path = base_path();
+		std::fs::create_dir_all(current.parent().unwrap()).expect("current dir");
+		std::fs::write(&current, "defaultModel: current/model\n").expect("current config");
+		let current_path = base_path();
+		std::fs::remove_file(&current).expect("remove current");
+		// SAFETY: guarded by TEST_ENV_LOCK.
+		unsafe { env::set_var("PI_CONFIG_DIR", home.join(".elsewhere")) };
+		let explicit_path = base_path();
+		unsafe {
+			for (key, value) in keys.into_iter().zip(saved) {
+				match value {
+					Some(value) => env::set_var(key, value),
+					None => env::remove_var(key),
+				}
+			}
+		}
+		let _ = std::fs::remove_dir_all(&home);
+		assert_eq!(legacy_path, Some(legacy), "legacy config stays readable");
+		assert_eq!(current_path, Some(current), "the current root wins");
+		assert_eq!(explicit_path, None, "an explicit PI_CONFIG_DIR disables the legacy fallback");
 	}
 
 	#[test]

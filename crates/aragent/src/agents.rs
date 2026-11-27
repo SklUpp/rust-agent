@@ -85,6 +85,13 @@ pub fn discover_agents(
 	if user_dir.is_dir() {
 		append_dir(&user_dir, AgentSource::User, &mut agents, &mut seen)?;
 	}
+	// Legacy `~/.omp/agent/agents` is read-only: names already seen above win.
+	if let Some(legacy_dir) = dirs::legacy_agent_dir().map(|dir| dir.join("agents"))
+		&& legacy_dir.is_dir()
+		&& legacy_dir != user_dir
+	{
+		append_dir(&legacy_dir, AgentSource::User, &mut agents, &mut seen)?;
+	}
 
 	for root in extension_roots {
 		let dir = dirs::absolute(cwd, root).join("agents");

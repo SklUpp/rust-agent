@@ -41,6 +41,7 @@ impl Sandbox {
 			.env("OMP_SHARE_DIR", self.root.join("share"))
 			.env_remove("PI_CONFIG_FILES")
 			.env_remove("PI_PROFILE")
+			.env_remove("ARAGENT_PROFILE")
 			.env_remove("OMP_PROFILE")
 			.current_dir(self.project())
 			.stdin(Stdio::null());
@@ -338,7 +339,7 @@ fn path_prints_the_agent_directory_and_init_xdg_creates_it() {
 	);
 
 	sandbox.stdout(&["config", "init-xdg"]);
-	for dir in ["xdg/data/omp", "xdg/state/omp", "xdg/cache/omp"] {
+	for dir in ["xdg/data/aragent", "xdg/state/aragent", "xdg/cache/aragent"] {
 		assert!(sandbox.root.join(dir).is_dir(), "missing {dir}");
 	}
 }
@@ -457,8 +458,8 @@ fn empty_xdg_variables_fall_back_to_home() {
 		.output()
 		.expect("run arag");
 	assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
-	assert!(sandbox.root.join("home/.local/share/omp").is_dir());
-	assert!(!sandbox.project().join("omp").exists(), "an empty XDG var must not create ./omp");
+	assert!(sandbox.root.join("home/.local/share/aragent").is_dir());
+	assert!(!sandbox.project().join("aragent").exists(), "an empty XDG var must not create ./aragent");
 }
 
 fn get_json(sandbox: &Sandbox, key: &str) -> serde_json::Value {

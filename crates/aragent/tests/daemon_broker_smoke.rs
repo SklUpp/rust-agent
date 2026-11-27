@@ -520,6 +520,7 @@ fn ps_cli(agent: &Path, base: &Path, args: &[&str]) -> std::process::Output {
 		.args(args)
 		.env("PI_CONFIG_DIR", base)
 		.env("PI_CODING_AGENT_DIR", agent)
+		.env_remove("ARAGENT_PROFILE")
 		.env_remove("OMP_PROFILE")
 		.env_remove("PI_PROFILE")
 		.env_remove(protocol::RUNTIME_ROOT_ENV)

@@ -353,6 +353,7 @@ pub fn run_doctor(options: &DoctorOptions, cwd: &Path, out: &mut dyn Write) -> R
 	check_redaction(&mut report, &session_dbs, options)?;
 	check_artifacts(&mut report, &sessions_root, &blobs_root, &session_dbs, options);
 	check_locks(&mut report, &agent_dir, options.fix);
+	check_migration_status(&mut report);
 	check_permissions(
 		&mut report,
 		&config_root,
@@ -546,7 +547,7 @@ fn config_layers(cwd: &Path, overlays: &[PathBuf]) -> Vec<PathBuf> {
 		layers.push(base);
 	}
 	for name in dirs::MAIN_CONFIG_FILENAMES {
-		let path = cwd.join(dirs::CONFIG_DIR_NAME).join(name);
+		let path = cwd.join(dirs::PROJECT_CONFIG_DIR_NAME).join(name);
 		if path.is_file() && !layers.contains(&path) {
 			layers.push(path);
 		}
@@ -1710,6 +1711,40 @@ fn check_gc_lock(report: &mut Report, agent_dir: &Path, fix: bool) {
 		}
 	} else if parsed.is_ok() {
 		report.info("locks", "gc-lock-active", "gc.lock has a live owner".to_string());
+	}
+}
+
+/// Legacy `~/.omp` migration status. Read-only: doctor never runs the copy.
+fn check_migration_status(report: &mut Report) {
+	let Some(home) = dirs::home_dir() else {
+		return;
+	};
+	let legacy = home.join(dirs::LEGACY_CONFIG_DIR_NAME);
+	if !legacy.exists() || dirs::explicit_storage_override() {
+		return;
+	}
+	let marker = dirs::base_config_root().join(dirs::MIGRATION_MARKER);
+	if marker.exists() {
+		report.info(
+			"migration",
+			"legacy-root",
+			format!(
+				"legacy {} is retained read-only; {} records the completed copy",
+				legacy.display(),
+				marker.display()
+			),
+		);
+	} else {
+		report.info(
+			"migration",
+			"legacy-pending",
+			format!(
+				"legacy {} will be copied to {} on the next start unless PI_CONFIG_DIR or \
+				 PI_CODING_AGENT_DIR is set",
+				legacy.display(),
+				dirs::base_config_root().display()
+			),
+		);
 	}
 }
 

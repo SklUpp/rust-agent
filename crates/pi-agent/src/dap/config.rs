@@ -350,7 +350,14 @@ fn config_sources(cwd: &Path, env: &HashMap<String, String>) -> Vec<PathBuf> {
 		}
 	}
 	if let Some(home) = home_dir(env) {
-		for dir in [".omp/agent", ".claude", ".codex", ".gemini"] {
+		let explicit = env.get("PI_CONFIG_DIR").is_some_and(|value| !value.is_empty())
+			|| env.get("PI_CODING_AGENT_DIR").is_some_and(|value| !value.is_empty());
+		let mut dirs = vec![".aragent/agent"];
+		if !explicit {
+			dirs.push(".omp/agent");
+		}
+		dirs.extend([".claude", ".codex", ".gemini"]);
+		for dir in dirs {
 			push_config_files(&mut sources, &home.join(dir));
 		}
 		// Plugin roots are excluded by the Android boundary; the home fallback stays.

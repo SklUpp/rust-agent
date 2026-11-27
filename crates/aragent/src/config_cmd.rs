@@ -850,8 +850,13 @@ fn archive_legacy_symlink(settings_json: &Path, expected: (u64, u64, Option<Syst
 /// `Settings.init()` migration, under the same lock the writer uses so the
 /// absent-check, seed, write and archive form one critical section.
 fn init_legacy_migration(cwd: &Path) -> Result<()> {
-	let path = resolve_write_path(&global_config_path())?;
+	let path = current_write_path(&global_config_path())?;
 	if path.exists() {
+		return Ok(());
+	}
+	// A legacy YAML is read directly and persisted on the first write; seeding
+	// settings.json now would shadow it with an empty-first document.
+	if config::base_path().is_some_and(|legacy| legacy.is_file()) {
 		return Ok(());
 	}
 	if let Some(dir) = path.parent() {
@@ -2236,7 +2241,7 @@ fn init_xdg(out: &mut impl Write) -> Result<()> {
 		home_of("XDG_CACHE_HOME", ".cache")?,
 	];
 	for dir in targets {
-		let dir = dir.join("omp");
+		let dir = dir.join(dirs::XDG_APP_DIR_NAME);
 		fs::create_dir_all(&dir)
 			.map_err(|err| Error::with_source(format!("cannot create {}", dir.display()), err))?;
 		let shown = match home.as_deref() {
@@ -2370,8 +2375,62 @@ fn normalize_provider_limits(json: &Json) -> Result<Json> {
 // Persistence
 // ═══════════════════════════════════════════════════════════════════════════
 
+/// Write destination: only the current `~/.aragent` agent dir. Reading may
+/// fall back to a legacy `~/.omp` config, but a write must never land there.
 fn global_config_path() -> PathBuf {
-	config::base_path().unwrap_or_else(|| dirs::agent_dir().join(dirs::MAIN_CONFIG_FILENAMES[0]))
+	let dir = dirs::agent_dir();
+	dirs::MAIN_CONFIG_FILENAMES
+		.iter()
+		.map(|name| dir.join(name))
+		.find(|path| path.is_file())
+		.unwrap_or_else(|| dir.join(dirs::MAIN_CONFIG_FILENAMES[0]))
+}
+
+fn path_within(path: &Path, root: &Path) -> bool {
+	let normalize = |value: &Path| {
+		if let Ok(real) = fs::canonicalize(value) {
+			return real;
+		}
+		let absolute = dirs::absolute(Path::new("."), value);
+		if let (Some(parent), Some(name)) = (absolute.parent(), absolute.file_name())
+			&& let Ok(parent) = fs::canonicalize(parent)
+		{
+			return parent.join(name);
+		}
+		absolute
+	};
+	normalize(path).starts_with(normalize(root))
+}
+
+fn path_in_legacy_root(path: &Path) -> bool {
+	if dirs::explicit_storage_override() {
+		return false;
+	}
+	if dirs::legacy_config_root().is_some_and(|root| path_within(path, &root)) {
+		return true;
+	}
+	// A named profile's legacy root is `<home>/.omp/profiles/<name>`; a link to
+	// the shared base root (`<home>/.omp/agent/...`) is legacy too.
+	dirs::home_dir()
+		.is_some_and(|home| path_within(path, &home.join(dirs::LEGACY_CONFIG_DIR_NAME)))
+}
+
+/// Resolve a config write without ever following a current-root symlink into
+/// the legacy tree. The atomic rename writes a regular file over the link's
+/// current path, so the legacy target is left untouched.
+fn current_write_path(source: &Path) -> Result<PathBuf> {
+	let resolved = resolve_write_path(source)?;
+	if path_in_legacy_root(&resolved) {
+		let source = dirs::absolute(Path::new("."), source);
+		if source.parent().is_some_and(path_in_legacy_root) {
+			return Err(Error::new(format!(
+				"refusing to write {}: its directory resolves into the legacy root",
+				source.display()
+			)));
+		}
+		return Ok(source);
+	}
+	Ok(resolved)
 }
 
 /// `#resolveYamlWritePath`: write through symlinks (including a dangling link's
@@ -2410,18 +2469,20 @@ fn resolve_write_path(path: &Path) -> Result<PathBuf> {
 fn persist_global(cwd: &Path, segments: &[&str], value: Option<Value>) -> Result<()> {
 	let source = global_config_path();
 	let roots = trust_roots(cwd);
-	let path = resolve_write_path(&source)?;
+	let path = current_write_path(&source)?;
 	// The lock file lives next to the config, so the directory must exist first.
 	if let Some(dir) = path.parent() {
 		fs::create_dir_all(dir)
 			.map_err(|err| Error::with_source(format!("cannot create {}", dir.display()), err))?;
 	}
 	let _lock = ConfigLock::acquire(&path)?;
-	// `Settings.init()` migrates legacy settings.json into config.yml before the
-	// command runs, so an absent file must be seeded from it instead of starting
-	// empty: otherwise the first write would shadow every legacy setting.
+	// Start from the dual-read legacy YAML when it exists; otherwise
+	// `Settings.init()` migrates legacy settings.json. Either way the first
+	// write lands in the current root and the legacy file stays untouched.
 	let mut root = if path.is_file() {
 		read_target(&path)?
+	} else if let Some(legacy) = config::base_path().filter(|legacy| legacy.is_file()) {
+		read_target(&legacy)?
 	} else {
 		seed_legacy_global(&path, cwd)?
 	};
@@ -2518,7 +2579,8 @@ impl ConfigLock {
 	const RETRIES: usize = 50;
 	const RETRY_DELAY: Duration = Duration::from_millis(100);
 
-	/// `target` is already symlink-resolved, matching `withFileLock(writePath)`.
+	/// `target` is symlink-resolved unless resolution would enter the legacy
+	/// tree; then it is the current-root path so the lock also stays current.
 	fn acquire(target: &Path) -> Result<Self> {
 		let mut lock_path = target.as_os_str().to_os_string();
 		lock_path.push(".lock");
@@ -2958,6 +3020,83 @@ mod tests {
 			}),
 			Some("always")
 		);
+	}
+
+	#[cfg(unix)]
+	#[test]
+	fn persist_global_seeds_from_legacy_but_never_writes_its_yaml() {
+		let _env = crate::TEST_ENV_LOCK.lock().expect("env lock");
+		let base = std::env::temp_dir().join(format!(
+			"aragent-config-write-{}-{:?}",
+			std::process::id(),
+			std::time::SystemTime::now()
+				.duration_since(std::time::UNIX_EPOCH)
+				.map(|elapsed| elapsed.as_nanos())
+				.unwrap_or_default()
+		));
+		let home = base.join("home");
+		let cwd = base.join("project");
+		std::fs::create_dir_all(&cwd).expect("project");
+		let keys = [
+			"HOME",
+			"PI_CONFIG_DIR",
+			"PI_CODING_AGENT_DIR",
+			"ARAGENT_PROFILE",
+			"OMP_PROFILE",
+			"PI_PROFILE",
+		];
+		let saved = keys.map(std::env::var_os);
+		// SAFETY: guarded by TEST_ENV_LOCK.
+		unsafe {
+			std::env::set_var("HOME", &home);
+			for key in &keys[1..] {
+				std::env::remove_var(*key);
+			}
+		}
+		let legacy = home.join(".omp/agent/config.yml");
+		std::fs::create_dir_all(legacy.parent().expect("legacy parent")).expect("legacy dir");
+		std::fs::write(&legacy, "defaultModel: legacy\n").expect("legacy config");
+		fn exercise(home: &Path, cwd: &Path, legacy: &Path) {
+			persist_global(cwd, &["enabledModels"], Some(Value::List(vec![Value::Str("m".into())])))
+				.expect("persist from legacy");
+			let current = home.join(".aragent/agent/config.yml");
+			let current_text = std::fs::read_to_string(&current).expect("current config");
+			assert!(current_text.contains("defaultModel: legacy"), "{current_text}");
+			assert!(current_text.contains("enabledModels"), "{current_text}");
+			assert_eq!(
+				std::fs::read_to_string(legacy).unwrap(),
+				"defaultModel: legacy\n",
+				"the legacy file is only a read source"
+			);
+			std::fs::remove_file(&current).expect("remove current");
+			std::os::unix::fs::symlink(legacy, &current).expect("legacy symlink");
+			persist_global(cwd, &["defaultModel"], Some(Value::Str("new".into())))
+				.expect("persist through a legacy link");
+			assert!(
+				!std::fs::symlink_metadata(&current)
+					.expect("current exists")
+					.file_type()
+					.is_symlink(),
+				"the write materializes a regular file at the current path"
+			);
+			assert_eq!(
+				std::fs::read_to_string(legacy).unwrap(),
+				"defaultModel: legacy\n",
+				"the symlink target stays untouched"
+			);
+			assert!(std::fs::read_to_string(&current).unwrap().contains("defaultModel: new"));
+		}
+		exercise(&home, &cwd, &legacy);
+		// SAFETY: guarded by TEST_ENV_LOCK.
+		unsafe {
+			for (key, value) in keys.into_iter().zip(saved) {
+				match value {
+					Some(value) => std::env::set_var(key, value),
+					None => std::env::remove_var(key),
+				}
+			}
+		}
+		let _ = std::fs::remove_dir_all(&base);
 	}
 
 	#[test]

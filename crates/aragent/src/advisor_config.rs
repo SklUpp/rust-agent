@@ -150,7 +150,7 @@ fn collect_paths(
 	loop {
 		for filename in filenames {
 			for path in [
-				current.join(crate::dirs::CONFIG_DIR_NAME).join(filename),
+				current.join(crate::dirs::PROJECT_CONFIG_DIR_NAME).join(filename),
 				current.join(filename),
 			] {
 				if !paths.contains(&path) {
@@ -175,7 +175,7 @@ fn collect_paths(
 		let owner = if path
 			.parent()
 			.and_then(Path::file_name)
-			.is_some_and(|name| name == crate::dirs::CONFIG_DIR_NAME)
+			.is_some_and(|name| name == crate::dirs::PROJECT_CONFIG_DIR_NAME)
 		{
 			path.parent().and_then(Path::parent).map(Path::to_path_buf)
 		} else {

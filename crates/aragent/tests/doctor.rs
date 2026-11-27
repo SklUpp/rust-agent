@@ -71,11 +71,13 @@ impl Fixture {
 			"PI_CONFIG_FILES",
 			"PI_PROFILE",
 			"OMP_PROFILE",
+			"ARAGENT_PROFILE",
 			"XDG_DATA_HOME",
 			"XDG_STATE_HOME",
 			"XDG_CACHE_HOME",
 			"OMP_DAEMON_RUNTIME_ROOT",
 			"OMP_WORKSPACE_WRITER_LOCK_DIR",
+			"ARAGENT_WORKSPACE_WRITER_LOCK_DIR",
 		] {
 			command.env_remove(key);
 		}
@@ -594,6 +596,26 @@ fn dead_gc_lock_is_removed_and_permissions_are_repaired() {
 	let again = fixture.run(&["doctor", "--json"]);
 	assert_eq!(code(&again), 0, "{}", stdout(&again));
 	assert_eq!(report(&again)["clean"], true);
+}
+
+#[test]
+fn doctor_reports_aragent_session_writer_locks() {
+	let fixture = Fixture::new("aragent-locks");
+	let session_lock_dir = fixture.home.join(".aragent/run/session-writer");
+	fs::create_dir_all(&session_lock_dir).expect("session lock dir");
+	set_mode(&session_lock_dir, 0o700);
+	let lock = session_lock_dir.join("idle-test.lock");
+	fs::write(&lock, "idle\n").expect("idle lock");
+	set_mode(&lock, 0o600);
+
+	let report = fixture.run(&["doctor", "--json"]);
+	assert_eq!(code(&report), 0, "{}", stdout(&report));
+	let output = stdout(&report);
+	assert!(
+		output.contains("session-writer") && output.contains("idle-test.lock"),
+		"doctor must enumerate ~/.aragent lock roots: {output}"
+	);
+	assert!(lock.exists(), "doctor never removes advisory locks");
 }
 
 #[cfg(unix)]

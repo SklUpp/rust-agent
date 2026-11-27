@@ -542,3 +542,47 @@ fn untrusted_router_hides_project_ssh_hosts() {
 		index.content
 	);
 }
+
+#[test]
+fn legacy_trust_store_is_read_only_and_writes_move_to_aragent() {
+	let home = TempDir::new("legacy-home");
+	let legacy = home.path().join(".omp/agent/trust.json");
+	write_file(
+		&legacy,
+		r#"{"version":1,"workspaces":{"/legacy/ws":{"granted_at_ms":7,"config_hashes":{}}}}"#,
+	);
+	let saved: Vec<_> = ["HOME", "PI_CONFIG_DIR", "PI_CODING_AGENT_DIR", "ARAGENT_PROFILE", "OMP_PROFILE", "PI_PROFILE"]
+		.iter()
+		.map(|key| (*key, std::env::var_os(key)))
+		.collect();
+	// SAFETY: this test binary's other cases use explicit agent dirs and never
+	// read HOME while this value is installed.
+	unsafe {
+		std::env::set_var("HOME", home.path());
+		for key in ["PI_CONFIG_DIR", "PI_CODING_AGENT_DIR", "ARAGENT_PROFILE", "OMP_PROFILE", "PI_PROFILE"] {
+			std::env::remove_var(key);
+		}
+	}
+	let mut store = TrustStore::load_from_agent_dir(&aragent::dirs::agent_dir());
+	let entries = store.list();
+	let current = home.path().join(".aragent/agent");
+	let project = project_workspace(home.path());
+	let grant = store.grant(&project);
+	unsafe {
+		for (key, value) in saved {
+			match value {
+				Some(value) => std::env::set_var(key, value),
+				None => std::env::remove_var(key),
+			}
+		}
+	}
+	assert_eq!(store.path(), current.join("trust.json"));
+	assert_eq!(entries.len(), 1, "legacy grants stay readable");
+	assert_eq!(entries[0].path, "/legacy/ws");
+	grant.expect("grant writes the current root");
+	assert!(current.join("trust.json").is_file());
+	assert_eq!(
+		fs::read_to_string(&legacy).expect("legacy untouched"),
+		r#"{"version":1,"workspaces":{"/legacy/ws":{"granted_at_ms":7,"config_hashes":{}}}}"#
+	);
+}

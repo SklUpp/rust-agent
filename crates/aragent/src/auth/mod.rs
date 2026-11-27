@@ -164,8 +164,21 @@ pub struct AuthBackend {
 
 impl AuthBackend {
 	/// Open the store at `<agent dir>/agent.db` (`getAgentDbPath()`).
+	///
+	/// The legacy `~/.omp/agent/agent.db` is snapshotted into the current agent
+	/// dir when the current file is absent and no explicit storage override is
+	/// set. The legacy database and its sidecars are never modified.
 	pub fn open() -> Result<Self, AuthError> {
-		Self::open_at(crate::dirs::agent_dir().join("agent.db"))
+		let dir = crate::dirs::agent_dir();
+		let path = dir.join("agent.db");
+		if let Some(legacy_dir) = crate::dirs::legacy_agent_dir() {
+			if let Err(error) =
+				crate::migration::adopt_legacy_sqlite(&path, &legacy_dir.join("agent.db"))
+			{
+				eprintln!("warning: cannot adopt legacy auth store {}: {error}", legacy_dir.display());
+			}
+		}
+		Self::open_at(path)
 	}
 
 	/// Open a specific database (tests, broker hand-off).

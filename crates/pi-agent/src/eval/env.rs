@@ -254,7 +254,7 @@ pub fn explicit_python(interpreter: &str, cwd: &Path, base: &HashMap<String, Str
 }
 
 /// Interpreter candidates in upstream priority order: active/project venv,
-/// managed `~/.omp/python-env`, then `python` and `python3` on `PATH`.
+/// managed `~/.aragent/python-env`, then `python` and `python3` on `PATH`.
 pub fn enumerate_python(cwd: &Path, base: &HashMap<String, String>, interpreter: Option<&str>) -> Vec<InterpreterRuntime> {
 	if let Some(interpreter) = interpreter {
 		return vec![explicit_python(interpreter, cwd, base)];
@@ -284,7 +284,7 @@ pub fn enumerate_python(cwd: &Path, base: &HashMap<String, String>, interpreter:
 		}
 	}
 	if let Some(home) = base.get("HOME") {
-		let venv = Path::new(home).join(".omp").join("python-env");
+		let venv = Path::new(home).join(".aragent").join("python-env");
 		let bin = venv_bin(&venv);
 		let program = python_binary(&bin);
 		if program.is_file() {

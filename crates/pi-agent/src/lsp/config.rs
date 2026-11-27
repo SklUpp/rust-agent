@@ -333,7 +333,7 @@ fn project_config_dirs(cwd: &Path) -> Vec<PathBuf> {
 
 fn user_config_dirs() -> Vec<PathBuf> {
 	let mut dirs = Vec::new();
-	if let Some(agent) = native_agent_dir() {
+	for agent in native_agent_dirs() {
 		dirs.push(agent);
 	}
 	if let Some(home) = home_dir() {
@@ -344,24 +344,41 @@ fn user_config_dirs() -> Vec<PathBuf> {
 	dirs
 }
 
-fn native_agent_dir() -> Option<PathBuf> {
-	if let Some(dir) = std::env::var_os("PI_CODING_AGENT_DIR").map(PathBuf::from) {
-		if !dir.as_os_str().is_empty() {
-			return Some(dir);
-		}
-	}
-	let base = std::env::var_os("PI_CONFIG_DIR")
+/// Current user agent dir first, then the legacy `~/.omp/...` dir as a
+/// read-only fallback when no explicit storage override is set.
+fn native_agent_dirs() -> Vec<PathBuf> {
+	let explicit_agent = std::env::var_os("PI_CODING_AGENT_DIR")
 		.map(PathBuf::from)
-		.filter(|path| !path.as_os_str().is_empty())
-		.or_else(|| home_dir().map(|home| home.join(".omp")))?;
-	let profile = ["OMP_PROFILE", "PI_PROFILE"]
+		.filter(|dir| !dir.as_os_str().is_empty());
+	if let Some(dir) = explicit_agent {
+		return vec![dir];
+	}
+	let explicit_config = std::env::var_os("PI_CONFIG_DIR")
+		.map(PathBuf::from)
+		.filter(|path| !path.as_os_str().is_empty());
+	let profile = ["ARAGENT_PROFILE", "OMP_PROFILE", "PI_PROFILE"]
 		.iter()
 		.find_map(|key| std::env::var(key).ok())
 		.filter(|value| !value.is_empty());
-	Some(match profile {
+	let agent_in = |base: &Path| match &profile {
 		Some(profile) => base.join("profiles").join(profile).join("agent"),
 		None => base.join("agent"),
-	})
+	};
+	let base = explicit_config
+		.or_else(|| home_dir().map(|home| home.join(".aragent")));
+	let mut dirs = Vec::new();
+	if let Some(base) = base {
+		dirs.push(agent_in(&base));
+	}
+	if !dirs.is_empty() && std::env::var_os("PI_CONFIG_DIR").is_none() {
+		if let Some(home) = home_dir() {
+			let legacy = agent_in(&home.join(".omp"));
+			if !dirs.contains(&legacy) {
+				dirs.push(legacy);
+			}
+		}
+	}
+	dirs
 }
 
 fn home_dir() -> Option<PathBuf> {

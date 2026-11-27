@@ -1493,6 +1493,108 @@ pub struct SessionStore {
 	_diagnostics: Option<crate::diagnostics::SessionTrace>,
 }
 
+/// Copy legacy project session state into the current directory without ever
+/// touching the legacy tree. Destination wins; only JSONL logs and artifact
+/// directories are copied beside a shared `sessions.db` so no orphan WAL can
+/// pair with a different database.
+fn adopt_legacy_project_sessions(current_dir: &Path, legacy_dirs: &[PathBuf]) -> Vec<String> {
+	let mut warnings = Vec::new();
+	if legacy_dirs.is_empty() {
+		return warnings;
+	}
+	let current_db = crate::durable_session::database_path(current_dir);
+	if let Err(error) = fs::create_dir_all(current_dir) {
+		warnings.push(format!("cannot create {}: {error}", current_dir.display()));
+		return warnings;
+	}
+	// Only the project database is adopted eagerly (so `--continue` and writable
+	// opens see legacy history); individual JSONL logs and artifacts are copied
+	// lazily by [`adopt_legacy_jsonl_session`] when that session is resumed.
+	for legacy_dir in legacy_dirs {
+		if !legacy_dir.is_dir() || current_db.exists() {
+			continue;
+		}
+		let legacy_db = crate::durable_session::database_path(legacy_dir);
+		if legacy_db.is_file()
+			&& let Err(error) = crate::migration::adopt_legacy_sqlite(&current_db, &legacy_db)
+		{
+			warnings.push(format!("cannot adopt {}: {error}", legacy_db.display()));
+		}
+	}
+	warnings
+}
+
+/// Import one legacy-only durable session row into the current database.
+///
+/// Used when the current `sessions.db` already exists; the file copy path
+/// never overwrites it. Errors are warnings, never fatal.
+fn import_legacy_durable_session(current_dir: &Path, legacy_dirs: &[PathBuf], id: &str) -> Vec<String> {
+	let mut warnings = Vec::new();
+	let current_db = crate::durable_session::database_path(current_dir);
+	if !current_db.is_file()
+		|| crate::durable_session::session_exists(&current_db, id).unwrap_or(false)
+	{
+		return warnings;
+	}
+	for legacy_dir in legacy_dirs {
+		let legacy_db = crate::durable_session::database_path(legacy_dir);
+		if !crate::durable_session::session_exists(&legacy_db, id).unwrap_or(false) {
+			continue;
+		}
+		let imported = crate::session_store::SqliteStore::open_read_only(legacy_db.as_path())
+			.and_then(|store| store.export_session(id))
+			.and_then(|export| {
+				let mut current = crate::session_store::SqliteStore::open(current_db.as_path())?;
+				current.import_session(export)
+			});
+		if let Err(error) = imported {
+			warnings.push(format!("cannot import legacy session {id}: {error}"));
+		}
+		break;
+	}
+	warnings
+}
+
+/// Adopt the newest session recorded only in a legacy database.
+fn adopt_latest_legacy_session(current_dir: &Path, legacy_dirs: &[PathBuf]) -> Option<String> {
+	let current_db = crate::durable_session::database_path(current_dir);
+	if crate::durable_session::latest_session_id(&current_db).ok().flatten().is_some() {
+		return None;
+	}
+	for legacy_dir in legacy_dirs {
+		let legacy_db = crate::durable_session::database_path(legacy_dir);
+		let Ok(Some(id)) = crate::durable_session::latest_session_id(&legacy_db) else {
+			continue;
+		};
+		import_legacy_durable_session(current_dir, legacy_dirs, &id);
+		if crate::durable_session::session_exists(&current_db, &id).unwrap_or(false) {
+			return Some(id);
+		}
+	}
+	None
+}
+
+/// Copy a legacy JSONL session log (and its artifact directory) into the
+/// current directory before the caller resumes it read-only.
+fn adopt_legacy_jsonl_session(current_dir: &Path, legacy_dirs: &[PathBuf], id: &str) {
+	for legacy_dir in legacy_dirs {
+		let source = legacy_dir.join(format!("{id}.{LOG_EXTENSION}"));
+		if !source.is_file() {
+			continue;
+		}
+		let destination = current_dir.join(format!("{id}.{LOG_EXTENSION}"));
+		let _ = fs::create_dir_all(current_dir);
+		let _ = crate::migration::adopt_legacy_file(&destination, &source);
+		let source_artifacts = legacy_dir.join(id);
+		if source_artifacts.is_dir() {
+			let destination_artifacts = current_dir.join(id);
+			if fs::symlink_metadata(&destination_artifacts).is_err() {
+				let _ = crate::migration::copy_merge(&source_artifacts, &destination_artifacts);
+			}
+		}
+	}
+}
+
 impl SessionStore {
 	/// Open (or resume) a session. IO/corruption disable persistence and
 	/// surface through [`take_warnings`](Self::take_warnings). Writer lease
@@ -1502,11 +1604,6 @@ impl SessionStore {
 		if !options.enabled {
 			return Self::default();
 		}
-
-		let sessions_root = options
-			.dir
-			.clone()
-			.unwrap_or_else(SessionOptions::default_sessions_root);
 
 		let mut store = Self {
 			enabled: false,
@@ -1518,15 +1615,16 @@ impl SessionStore {
 
 		let (dir, file_override) = match &options.dir {
 			Some(dir) => (dir.clone(), None),
-			None => {
-				let computed = compute_default_session_dir(&options.cwd, Some(&sessions_root));
-				(computed, None)
-			},
+			None => (compute_default_session_dir(&options.cwd, None), None),
 		};
+		let legacy_dirs = if options.dir.is_none() { legacy_session_dirs(&options.cwd) } else { Vec::new() };
 
 		if let Err(err) = fs::create_dir_all(&dir) {
 			store.warn(format!("cannot create session directory {}: {err}", dir.display()));
 			return store;
+		}
+		for warning in adopt_legacy_project_sessions(&dir, &legacy_dirs) {
+			store.warn(warning);
 		}
 
 		if let Some(file) = file_override {
@@ -1537,12 +1635,15 @@ impl SessionStore {
 		let continued = if options.continue_latest && options.id.is_none() {
 			match crate::durable_session::latest_session_id(&db_path) {
 				Ok(Some(id)) => Some(id),
-				Ok(None) => {
-					store.warn(format!(
-						"no previous durable session in {}; starting a new one",
-						dir.display()
-					));
-					None
+				Ok(None) => match adopt_latest_legacy_session(&dir, &legacy_dirs) {
+					Some(id) => Some(id),
+					None => {
+						store.warn(format!(
+							"no previous durable session in {}; starting a new one",
+							dir.display()
+						));
+						None
+					},
 				},
 				Err(err) => {
 					store.warn(format!("cannot read the latest session: {err}"));
@@ -1564,11 +1665,20 @@ impl SessionStore {
 			Some(id) => id.clone(),
 			None => output::session_id(),
 		};
+		// A session that exists only in a legacy `sessions.db` is imported into
+		// the current database before this writable open.
+		for warning in import_legacy_durable_session(&dir, &legacy_dirs, &id) {
+			store.warn(warning);
+		}
 		// Legacy JSONL stays readable and importable, never a second live
 		// journal. The SQLite row wins; only a session absent from the database
-		// falls back to its old log as a read-only view.
+		// falls back to its old log as a read-only view, copied to the current
+		// directory first so a later import targets the new root.
 		let durable_has_session =
 			crate::durable_session::session_exists(&db_path, &id).unwrap_or(false);
+		if !durable_has_session && find_session_by_id_or_stem(&dir, &id).ok().flatten().is_none() {
+			adopt_legacy_jsonl_session(&dir, &legacy_dirs, &id);
+		}
 		if !durable_has_session
 			&& let Ok(Some(legacy)) = find_session_by_id_or_stem(&dir, &id)
 		{
@@ -1684,10 +1794,6 @@ impl SessionStore {
 		if !options.enabled {
 			return Self::default();
 		}
-		let sessions_root = options
-			.dir
-			.clone()
-			.unwrap_or_else(SessionOptions::default_sessions_root);
 		let mut store = Self {
 			enabled: false,
 			model: options.model.clone(),
@@ -1697,9 +1803,12 @@ impl SessionStore {
 		};
 		let dir = match &options.dir {
 			Some(dir) => dir.clone(),
-			None => compute_default_session_dir(&options.cwd, Some(&sessions_root)),
+			None => compute_default_session_dir(&options.cwd, None),
 		};
-		let db_path = crate::durable_session::database_path(&dir);
+		let legacy_dirs = if options.dir.is_none() { legacy_session_dirs(&options.cwd) } else { Vec::new() };
+		let current_db = crate::durable_session::database_path(&dir);
+		let mut snapshot_dir = dir.clone();
+		let mut db_path = current_db.clone();
 		let id = match options.id.as_ref() {
 			Some(id) if !valid_session_id(id) => {
 				store.warn(format!(
@@ -1708,24 +1817,63 @@ impl SessionStore {
 				));
 				return store;
 			},
-			Some(id) => id.clone(),
-			None if options.continue_latest => match crate::durable_session::latest_session_id(&db_path) {
-				Ok(Some(id)) => id,
-				Ok(None) => {
-					store.warn("no session available for snapshot".to_string());
-					return store;
-				},
-				Err(err) => {
-					store.warn(format!("cannot find latest session: {err}"));
-					return store;
-				},
+			Some(id) => {
+				if !crate::durable_session::session_exists(&current_db, id).unwrap_or(false)
+					&& let Some((legacy_dir, legacy_db)) = legacy_dirs.iter().find_map(|legacy_dir| {
+						let legacy_db = crate::durable_session::database_path(legacy_dir);
+						crate::durable_session::session_exists(&legacy_db, id)
+							.ok()
+							.filter(|exists| *exists)
+							.map(|_| (legacy_dir.clone(), legacy_db))
+					})
+				{
+					snapshot_dir = legacy_dir;
+					db_path = legacy_db;
+				}
+				id.clone()
+			},
+			None if options.continue_latest => {
+				let latest = crate::durable_session::latest_session_id(&current_db).ok().flatten();
+				match latest {
+					Some(id) => id,
+					None => {
+						let legacy = legacy_dirs.iter().find_map(|legacy_dir| {
+							let legacy_db = crate::durable_session::database_path(legacy_dir);
+							crate::durable_session::latest_session_id(&legacy_db)
+								.ok()
+								.flatten()
+								.map(|id| (legacy_dir.clone(), legacy_db, id))
+						});
+						match legacy {
+							Some((legacy_dir, legacy_db, id)) => {
+								snapshot_dir = legacy_dir;
+								db_path = legacy_db;
+								id
+							},
+							None => {
+								store.warn("no session available for snapshot".to_string());
+								return store;
+							},
+						}
+					},
+				}
 			},
 			None => {
 				store.warn("snapshot open requires an explicit session id".to_string());
 				return store;
 			},
 		};
-		let identity_file = dir.join(format!("{id}.{LOG_EXTENSION}"));
+		let identity_file = snapshot_dir.join(format!("{id}.{LOG_EXTENSION}"));
+		if !db_path.exists() {
+			// Read-only inspection never copies: a legacy JSONL log is opened
+			// where it lives and appends stay refused.
+			for legacy_dir in &legacy_dirs {
+				let legacy_log = legacy_dir.join(format!("{id}.{LOG_EXTENSION}"));
+				if legacy_log.is_file() {
+					return store.open_legacy_read_only(legacy_log);
+				}
+			}
+		}
 		let snapshot = match crate::session_store::SqliteStore::open_read_only(&db_path)
 			.and_then(|sqlite| sqlite.load_session_snapshot(&id))
 		{
@@ -3722,7 +3870,27 @@ struct SessionDirPaths {
 	current: PathBuf,
 	legacy_absolute: PathBuf,
 	legacy_home: Option<PathBuf>,
+	/// Legacy `~/.omp` (and XDG `omp`) project directories, read-only.
+	legacy: Vec<PathBuf>,
 	root: PathBuf,
+}
+
+/// Legacy session roots, read-only: the home `~/.omp/agent/sessions` root and
+/// the XDG `$XDG_DATA_HOME/omp/sessions` root when it applies.
+fn legacy_session_roots() -> Vec<PathBuf> {
+	let mut roots = Vec::new();
+	if let Some(dir) = dirs::legacy_agent_dir() {
+		let root = dir.join(SESSIONS_SUBDIR);
+		if !roots.contains(&root) {
+			roots.push(root);
+		}
+	}
+	if let Some(root) = dirs::legacy_agent_subdir(SESSIONS_SUBDIR, dirs::AgentDirCategory::Data)
+		&& !roots.contains(&root)
+	{
+		roots.push(root);
+	}
+	roots
 }
 
 /// Current and pre-migration session directories for `cwd`.
@@ -3789,10 +3957,29 @@ fn session_dir_paths(cwd: &Path, sessions_root: Option<&Path>) -> SessionDirPath
 		};
 		Some(root.join(name))
 	});
+	let current = root.join(&encoded_dir_name);
+	let mut legacy = Vec::new();
+	if sessions_root.is_none() {
+		let abs_str = resolved_cwd.to_string_lossy();
+		let legacy_abs_name = format!(
+			"--{}--",
+			abs_str
+				.trim_start_matches(|c| c == '/' || c == '\\')
+				.replace(['/', '\\', ':'], "-")
+		);
+		for legacy_root in legacy_session_roots() {
+			for candidate in [legacy_root.join(&encoded_dir_name), legacy_root.join(&legacy_abs_name)] {
+				if candidate != current && !legacy.contains(&candidate) {
+					legacy.push(candidate);
+				}
+			}
+		}
+	}
 	SessionDirPaths {
-		current: root.join(encoded_dir_name),
+		current,
 		legacy_absolute,
 		legacy_home,
+		legacy,
 		root,
 	}
 }
@@ -3811,7 +3998,17 @@ pub fn session_completion_dirs(cwd: &Path, sessions_root: Option<&Path>) -> Vec<
 			dirs.push(legacy);
 		}
 	}
+	for legacy in paths.legacy {
+		if !dirs.contains(&legacy) {
+			dirs.push(legacy);
+		}
+	}
 	dirs
+}
+
+/// Legacy project session directories for `cwd` (read-only fallbacks).
+fn legacy_session_dirs(cwd: &Path) -> Vec<PathBuf> {
+	session_dir_paths(cwd, None).legacy
 }
 
 pub fn compute_default_session_dir(cwd: &Path, sessions_root: Option<&Path>) -> PathBuf {
@@ -4776,7 +4973,49 @@ pub fn continue_recent_with_breadcrumb(
 		}
 	}
 
-	find_most_recent_session_in_dir(&dir)
+	if let Some(found) = find_most_recent_session_in_dir(&dir)? {
+		return Ok(Some(found));
+	}
+	if session_dir.is_none() {
+		let legacy_dirs = legacy_session_dirs(cwd);
+		for legacy_dir in &legacy_dirs {
+			if let Some(matched) = find_most_recent_session_in_dir(legacy_dir)?
+				&& let Some(adopted) = adopt_legacy_session_match(&dir, &matched, &legacy_dirs)
+			{
+				return Ok(Some(adopted));
+			}
+		}
+	}
+	Ok(None)
+}
+
+/// Adopt one resume match found in a legacy directory: import a durable row or
+/// copy a JSONL log (plus artifacts) into `current_dir`, then return the
+/// current-root path. `None` when the source cannot be adopted.
+fn adopt_legacy_session_match(
+	current_dir: &Path,
+	matched: &Path,
+	legacy_dirs: &[PathBuf],
+) -> Option<PathBuf> {
+	let file_name = matched.file_name()?;
+	let id = matched.file_stem()?.to_str()?;
+	let _ = fs::create_dir_all(current_dir);
+	let current_db = crate::durable_session::database_path(current_dir);
+	if !current_db.exists() {
+		for legacy_dir in legacy_dirs {
+			let legacy_db = crate::durable_session::database_path(legacy_dir);
+			if crate::migration::adopt_legacy_sqlite(&current_db, &legacy_db).unwrap_or(false) {
+				break;
+			}
+		}
+	}
+	import_legacy_durable_session(current_dir, legacy_dirs, id);
+	if crate::durable_session::session_exists(&current_db, id).unwrap_or(false) {
+		return Some(crate::durable_session::session_path(current_dir, id));
+	}
+	adopt_legacy_jsonl_session(current_dir, legacy_dirs, id);
+	let copied = current_dir.join(file_name);
+	copied.exists().then_some(copied)
 }
 
 fn find_most_recent_session_in_dir(dir: &Path) -> Result<Option<PathBuf>, String> {
@@ -4907,23 +5146,56 @@ pub fn resolve_resumable_session(
 	if let Some(matched) = scan_dir_for_resume(&local_dir, arg)? {
 		return Ok(Some(matched));
 	}
+	if session_dir.is_none() {
+		let legacy_dirs = legacy_session_dirs(cwd);
+		for legacy_dir in &legacy_dirs {
+			let matched = scan_durable_dir_for_resume(legacy_dir, arg)
+				.or_else(|| scan_dir_for_resume(legacy_dir, arg).ok().flatten());
+			if let Some(matched) = matched
+				&& let Some(adopted) = adopt_legacy_session_match(&local_dir, &matched, &legacy_dirs)
+			{
+				return Ok(Some(adopted));
+			}
+		}
+	}
 
 	if session_dir.is_some() || !allow_global_fallback {
 		return Ok(None);
 	}
 
 	let root = SessionOptions::default_sessions_root();
-	if !root.is_dir() {
-		return Ok(None);
-	}
-	for entry in fs::read_dir(&root).map_err(|e| e.to_string())?.flatten() {
-		let path = entry.path();
-		if path.is_dir() {
-			if let Some(matched) = scan_durable_dir_for_resume(&path, arg) {
-				return Ok(Some(matched));
+	if root.is_dir() {
+		for entry in fs::read_dir(&root).map_err(|e| e.to_string())?.flatten() {
+			let path = entry.path();
+			if path.is_dir() {
+				if let Some(matched) = scan_durable_dir_for_resume(&path, arg) {
+					return Ok(Some(matched));
+				}
+				if let Some(matched) = scan_dir_for_resume(&path, arg)? {
+					return Ok(Some(matched));
+				}
 			}
-			if let Some(matched) = scan_dir_for_resume(&path, arg)? {
-				return Ok(Some(matched));
+		}
+	}
+
+	// Global legacy fallback: adopt the first match found under any legacy
+	// sessions root so a resumed session lives in the current root afterwards.
+	for legacy_root in legacy_session_roots() {
+		let Ok(entries) = fs::read_dir(&legacy_root) else {
+			continue;
+		};
+		for entry in entries.flatten() {
+			let path = entry.path();
+			if !path.is_dir() {
+				continue;
+			}
+			let matched = scan_durable_dir_for_resume(&path, arg)
+				.or_else(|| scan_dir_for_resume(&path, arg).ok().flatten());
+			if let Some(matched) = matched
+				&& let Some(adopted) =
+					adopt_legacy_session_match(&local_dir, &matched, std::slice::from_ref(&path))
+			{
+				return Ok(Some(adopted));
 			}
 		}
 	}
@@ -5495,6 +5767,214 @@ mod tests {
 		let dir = std::env::temp_dir().join(unique);
 		fs::create_dir_all(&dir).expect("temp dir");
 		dir
+	}
+
+	#[test]
+	fn legacy_session_dirs_point_at_the_omp_root() {
+		let _env = crate::TEST_ENV_LOCK.lock().expect("env lock");
+		let home = temp_dir();
+		let keys = [
+			"HOME",
+			"PI_CONFIG_DIR",
+			"PI_CODING_AGENT_DIR",
+			"ARAGENT_PROFILE",
+			"OMP_PROFILE",
+			"PI_PROFILE",
+			"XDG_DATA_HOME",
+			"XDG_STATE_HOME",
+			"XDG_CACHE_HOME",
+		];
+		let saved = keys.map(std::env::var_os);
+		// SAFETY: guarded by TEST_ENV_LOCK.
+		unsafe {
+			std::env::set_var("HOME", &home);
+			for key in &keys[1..] {
+				std::env::remove_var(*key);
+			}
+		}
+		let dirs = legacy_session_dirs(Path::new("/work/project"));
+		unsafe {
+			for (key, value) in keys.into_iter().zip(saved) {
+				match value {
+					Some(value) => std::env::set_var(key, value),
+					None => std::env::remove_var(key),
+				}
+			}
+		}
+		assert!(!dirs.is_empty());
+		for dir in dirs {
+			assert!(
+				dir.starts_with(home.join(".omp").join("agent").join(SESSIONS_SUBDIR)),
+				"legacy session dir outside ~/.omp: {}",
+				dir.display()
+			);
+		}
+		let _ = fs::remove_dir_all(home);
+	}
+
+	#[test]
+	fn global_legacy_session_is_adopted_from_its_own_project_dir() {
+		let _env = crate::TEST_ENV_LOCK.lock().expect("env lock");
+		let base = temp_dir();
+		let home = base.join("home");
+		let cwd = base.join("cwd");
+		fs::create_dir_all(&cwd).expect("cwd");
+		let keys = [
+			"HOME",
+			"PI_CONFIG_DIR",
+			"PI_CODING_AGENT_DIR",
+			"ARAGENT_PROFILE",
+			"OMP_PROFILE",
+			"PI_PROFILE",
+			"XDG_DATA_HOME",
+			"XDG_STATE_HOME",
+			"XDG_CACHE_HOME",
+		];
+		let saved = keys.map(std::env::var_os);
+		// SAFETY: guarded by TEST_ENV_LOCK.
+		unsafe {
+			std::env::set_var("HOME", &home);
+			for key in &keys[1..] {
+				std::env::remove_var(*key);
+			}
+		}
+		let other_project = home.join(".omp/agent/sessions/other-project");
+		fs::create_dir_all(&other_project).expect("legacy project");
+		let legacy_log = other_project.join("abc123.jsonl");
+		fs::write(&legacy_log, "{\"type\":\"message\"}\n").expect("legacy log");
+		let expected = compute_default_session_dir(&cwd, None).join("abc123.jsonl");
+		let resolved = resolve_resumable_session("abc123", &cwd, None, true)
+			.expect("resolve")
+			.expect("adopted");
+		// SAFETY: guarded by TEST_ENV_LOCK.
+		unsafe {
+			for (key, value) in keys.into_iter().zip(saved) {
+				match value {
+					Some(value) => std::env::set_var(key, value),
+					None => std::env::remove_var(key),
+				}
+			}
+		}
+		assert_eq!(resolved, expected);
+		assert_eq!(fs::read_to_string(&resolved).unwrap(), "{\"type\":\"message\"}\n");
+		assert!(legacy_log.is_file(), "the legacy log stays in place");
+	}
+
+	#[test]
+	fn legacy_project_adoption_copies_db_and_resume_log_lazily() {
+		let base = temp_dir();
+		let legacy = base.join("legacy");
+		let current = base.join("current");
+		fs::create_dir_all(&legacy).expect("legacy");
+		let legacy_db = rusqlite::Connection::open(legacy.join("sessions.db")).expect("legacy db");
+		legacy_db
+			.pragma_update(None, "journal_mode", "WAL")
+			.expect("wal mode");
+		legacy_db
+			.pragma_update(None, "wal_autocheckpoint", 0)
+			.expect("no autocheckpoint");
+		legacy_db
+			.execute_batch("CREATE TABLE probe(value TEXT); INSERT INTO probe VALUES ('wal');")
+			.expect("seed legacy");
+		assert!(legacy.join("sessions.db-wal").is_file(), "row must live in the WAL");
+		fs::write(legacy.join("s1.jsonl"), b"{}\n").expect("log");
+		fs::create_dir_all(legacy.join("s1")).expect("artifacts");
+		fs::write(legacy.join("s1/artifact.txt"), b"artifact").expect("artifact");
+		let legacy_dirs = [legacy.clone()];
+		let report = adopt_legacy_project_sessions(&current, &legacy_dirs);
+		assert!(report.is_empty(), "{report:?}");
+		assert!(!current.join("sessions.db-wal").exists(), "snapshot has no legacy sidecars");
+		let snapshot = rusqlite::Connection::open(current.join("sessions.db")).expect("snapshot");
+		let value: String = snapshot
+			.query_row("SELECT value FROM probe", [], |row| row.get(0))
+			.expect("committed WAL row");
+		assert_eq!(value, "wal");
+		drop(snapshot);
+		assert!(legacy.join("sessions.db-wal").is_file(), "legacy sidecars stay in place");
+		assert!(!current.join("s1.jsonl").exists(), "logs are adopted on resume");
+		adopt_legacy_jsonl_session(&current, &legacy_dirs, "s1");
+		assert_eq!(fs::read_to_string(current.join("s1.jsonl")).unwrap(), "{}\n");
+		assert_eq!(fs::read_to_string(current.join("s1/artifact.txt")).unwrap(), "artifact");
+		assert!(legacy.join("sessions.db").is_file(), "legacy is never moved");
+		let _ = fs::remove_dir_all(base);
+	}
+
+	#[test]
+	fn legacy_durable_session_is_copied_before_writable_open() {
+		use crate::session_store::{NewSession, SqliteStore};
+		let _env = crate::TEST_ENV_LOCK.lock().expect("env lock");
+		let base = temp_dir();
+		let home = base.join("home");
+		let cwd = base.join("project");
+		fs::create_dir_all(&home).expect("home");
+		fs::create_dir_all(&cwd).expect("project");
+		let keys = [
+			"HOME",
+			"PI_CONFIG_DIR",
+			"PI_CODING_AGENT_DIR",
+			"ARAGENT_PROFILE",
+			"OMP_PROFILE",
+			"PI_PROFILE",
+			"XDG_DATA_HOME",
+			"XDG_STATE_HOME",
+			"XDG_CACHE_HOME",
+		];
+		let saved = keys.map(std::env::var_os);
+		// SAFETY: guarded by TEST_ENV_LOCK.
+		unsafe {
+			std::env::set_var("HOME", &home);
+			for key in &keys[1..] {
+				std::env::remove_var(*key);
+			}
+		}
+		let legacy_dir = session_dir_paths(&cwd, None).legacy.first().cloned().expect("legacy dir");
+		fs::create_dir_all(&legacy_dir).expect("legacy sessions");
+		let legacy_db = crate::durable_session::database_path(&legacy_dir);
+		let mut legacy_store = SqliteStore::open(&legacy_db).expect("legacy store");
+		legacy_store
+			.create_session(NewSession {
+				id:                    "legacy-1".to_string(),
+				parent_session_id:     None,
+				payload:               json!({
+					"type": "session",
+					"id": "legacy-1",
+					"timestamp": "2026-01-01T00:00:00Z",
+					"cwd": cwd.to_string_lossy(),
+				}),
+				initial_branch_id:     "branch-1".to_string(),
+				initial_branch_payload: json!({}),
+			})
+			.expect("legacy session");
+		drop(legacy_store);
+		let store = SessionStore::open(SessionOptions {
+			enabled: true,
+			cwd: cwd.clone(),
+			model: Some("local/llama3".to_string()),
+			provider: Some("local".to_string()),
+			dir: None,
+			id: Some("legacy-1".to_string()),
+			continue_latest: false,
+			no_title: false,
+			parent_session: None,
+		});
+		let current_dir = compute_default_session_dir(&cwd, None);
+		let current_db = crate::durable_session::database_path(&current_dir);
+		let adopted = crate::durable_session::session_exists(&current_db, "legacy-1").unwrap_or(false);
+		drop(store);
+		// SAFETY: guarded by TEST_ENV_LOCK.
+		unsafe {
+			for (key, value) in keys.into_iter().zip(saved) {
+				match value {
+					Some(value) => std::env::set_var(key, value),
+					None => std::env::remove_var(key),
+				}
+			}
+		}
+		assert!(current_db.is_file(), "legacy DB copied into the current root");
+		assert!(adopted, "legacy-only session is visible in the current DB");
+		assert!(legacy_db.is_file(), "the legacy DB is never moved");
+		assert_ne!(current_dir, legacy_dir);
+		let _ = fs::remove_dir_all(base);
 	}
 
 	fn options(dir: PathBuf, id: Option<&str>) -> SessionOptions {

@@ -59,9 +59,10 @@ pub const MAX_META_BYTES: u64 = 4 * 1024 * 1024;
 /// Profile-scoped runtime root (`<agent dir>/run/daemons`).
 ///
 /// Mirrors `aragent::dirs`/`default_log_root` without depending on the CLI
-/// crate: `PI_CONFIG_DIR` else `~/.omp`, a named profile relocated to
+/// crate: `PI_CONFIG_DIR` else `~/.aragent`, a named profile relocated to
 /// `<base>/profiles/<profile>/agent`, `PI_CODING_AGENT_DIR` override in default
-/// mode. Never ambient `/tmp`.
+/// mode. Never ambient `/tmp`, and never the legacy `~/.omp` root: broker
+/// sockets and leases are not dual-read.
 #[must_use]
 pub fn runtime_root() -> PathBuf {
 	if let Some(exact) = std::env::var_os(RUNTIME_ROOT_ENV)
@@ -75,15 +76,15 @@ pub fn runtime_root() -> PathBuf {
 		.filter(|path| !path.as_os_str().is_empty())
 		.unwrap_or_else(|| {
 			// Mirrors `aragent::dirs::base_config_root`: `$PI_CONFIG_DIR` else
-			// `~/.omp` (never a bare relative `agent` when HOME is missing).
+			// `~/.aragent` (never a bare relative `agent` when HOME is missing).
 			std::env::var_os("HOME")
 				.or_else(|| std::env::var_os("USERPROFILE"))
 				.map(PathBuf::from)
 				.filter(|path| !path.as_os_str().is_empty())
 				.unwrap_or_else(|| PathBuf::from("."))
-				.join(".omp")
+				.join(".aragent")
 		});
-	let profile = ["OMP_PROFILE", "PI_PROFILE"]
+	let profile = ["ARAGENT_PROFILE", "OMP_PROFILE", "PI_PROFILE"]
 		.iter()
 		.find_map(|key| std::env::var(key).ok())
 		.filter(|value| !value.is_empty());

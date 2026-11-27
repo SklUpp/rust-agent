@@ -279,13 +279,13 @@ pub(super) async fn resolve_archive_read_path(
 
 /// Upstream skips suffix matching under the sshfs remote mount to avoid hangs.
 /// This crate has no XDG/profile-aware dirs layer, so the default
-/// `$HOME/.omp/remote` root is approximated here; an XDG-relocated root only
+/// `$HOME/.aragent/remote` root is approximated here; an XDG-relocated root only
 /// costs the bounded suffix-scan timeout, never a hang.
 fn is_remote_mount(path: &Path, ctx: &AgentContext) -> bool {
 	let Some(home) = ctx.env.get("HOME").filter(|home| !home.is_empty()) else {
 		return false;
 	};
-	path.starts_with(Path::new(home).join(".omp").join("remote"))
+	path.starts_with(Path::new(home).join(".aragent").join("remote"))
 }
 
 // ---------------------------------------------------------------------------

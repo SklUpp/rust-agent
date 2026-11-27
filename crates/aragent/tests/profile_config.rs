@@ -52,6 +52,7 @@ fn isolated(cmd: &mut ProcCommand, root: &Path, home: &Path) {
 		.env("HOME", home)
 		.env("OMP_SHARE_DIR", root.join("share"))
 		.env_remove("PI_CODING_AGENT_DIR")
+		.env_remove("ARAGENT_PROFILE")
 		.env_remove("OMP_PROFILE")
 		.env_remove("PI_PROFILE")
 		.env_remove("PI_CONFIG_FILES")
@@ -872,6 +873,7 @@ fn alias_installs_a_managed_shell_function_and_requires_a_profile() {
 		.env("PI_CONFIG_DIR", &root)
 		.env("HOME", &home)
 		.env("SHELL", "/bin/bash")
+		.env_remove("ARAGENT_PROFILE")
 		.env_remove("OMP_PROFILE")
 		.env_remove("PI_PROFILE")
 		.args(["--alias", "wk"])
@@ -1092,7 +1094,7 @@ fn xdg_pins_sessions_for_default_and_named_profiles() {
 	let xdg = root.join("xdg-data");
 	fs::create_dir_all(&home).expect("home");
 	fs::create_dir_all(&work).expect("work");
-	let xdg_app = xdg.join("omp");
+	let xdg_app = xdg.join("aragent");
 	fs::create_dir_all(&xdg_app).expect("xdg app root");
 
 	let add_session = |sessions_root: &Path, id: &str| {
@@ -1120,7 +1122,7 @@ fn xdg_pins_sessions_for_default_and_named_profiles() {
 		stdout(&output)
 	};
 
-	// Default profile: an existing $XDG_DATA_HOME/omp redirects sessions.
+	// Default profile: an existing $XDG_DATA_HOME/aragent redirects sessions.
 	let default = complete(&["__complete", "sessions"], &[]);
 	assert!(default.contains("xdg-default"), "stdout: {default}");
 

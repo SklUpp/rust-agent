@@ -248,6 +248,9 @@ fn run() -> std::result::Result<(), CliError> {
 		return Err(CliError::usage(message));
 	}
 	let profile = profile::resolve_cli(bootstrap.profile.as_deref())?;
+	// Copy-only legacy `~/.omp` -> `~/.aragent` migration. Runs before the
+	// profile environment is applied and never mutates the legacy tree.
+	aragent::migration::migrate_if_needed();
 	profile::activate(profile.as_deref());
 	// Hidden worker dispatch before clap/config/session boot: the broker worker
 	// is a separate process carrying its own scope in the environment, not a

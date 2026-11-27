@@ -54,22 +54,22 @@ use crate::{
 /// every program of this UID; not split by runtime env overrides. Tests use
 /// [`SessionWriterLease::acquire_in`] with an explicit private root.
 fn default_session_lock_root() -> io::Result<PathBuf> {
-	if let Some(home) = std::env::var_os("HOME").filter(|value| !value.is_empty()) {
-		return Ok(PathBuf::from(home)
-			.join(".omp")
-			.join("run")
-			.join("session-writer"));
-	}
-	if let Some(home) = std::env::var_os("USERPROFILE").filter(|value| !value.is_empty()) {
-		return Ok(PathBuf::from(home)
-			.join(".omp")
-			.join("run")
-			.join("session-writer"));
-	}
-	Err(io::Error::new(
-		io::ErrorKind::NotFound,
-		"cannot resolve session writer lock root; HOME is unset",
-	))
+	let home = std::env::var_os("HOME")
+		.filter(|value| !value.is_empty())
+		.or_else(|| std::env::var_os("USERPROFILE").filter(|value| !value.is_empty()))
+		.map(PathBuf::from);
+	resolve_session_lock_root(home)
+}
+
+/// Pure resolver so tests never mutate the process-wide `HOME`.
+fn resolve_session_lock_root(home: Option<PathBuf>) -> io::Result<PathBuf> {
+	home.map(|home| home.join(".aragent").join("run").join("session-writer"))
+		.ok_or_else(|| {
+			io::Error::new(
+				io::ErrorKind::NotFound,
+				"cannot resolve session writer lock root; HOME is unset",
+			)
+		})
 }
 
 fn canonical_db_identity(db_path: &Path) -> PathBuf {
@@ -3792,7 +3792,9 @@ mod tests {
 
 #[cfg(test)]
 mod projection_tests {
-	use super::{MessageEntry, seed_entries};
+	use std::path::PathBuf;
+
+	use super::{MessageEntry, resolve_session_lock_root, seed_entries};
 	use serde_json::{Value, json};
 
 	fn entry(value: Value) -> MessageEntry {
@@ -3942,5 +3944,15 @@ mod projection_tests {
 			.filter_map(|(_, id)| id)
 			.collect();
 		assert_eq!(ids, vec!["u1"], "terminal error turns are archive-only");
+	}
+
+	#[test]
+	fn default_session_lock_root_uses_aragent_not_legacy_omp() {
+		let home = PathBuf::from("/home/tester");
+		assert_eq!(
+			resolve_session_lock_root(Some(home.clone())).expect("lock root"),
+			home.join(".aragent/run/session-writer")
+		);
+		assert!(resolve_session_lock_root(None).is_err(), "no home fails closed");
 	}
 }

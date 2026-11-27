@@ -65,6 +65,7 @@ fn isolate(command: &mut ProcCommand, sandbox: &Sandbox) {
 		.env("PI_CODING_AGENT_DIR", sandbox.agent())
 		.env("OMP_SHARE_DIR", sandbox.path().join("share"))
 		.env_remove("PREFIX")
+		.env_remove("ARAGENT_PROFILE")
 		.env_remove("OMP_PROFILE")
 		.env_remove("PI_PROFILE")
 		.env_remove("PI_CONFIG_FILES")

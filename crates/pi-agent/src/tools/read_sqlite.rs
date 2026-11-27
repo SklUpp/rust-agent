@@ -294,7 +294,7 @@ fn is_remote_mount_path(path: &Path, ctx: &AgentContext) -> bool {
 	let Some(home) = ctx.env.get("HOME").filter(|home| !home.is_empty()) else {
 		return false;
 	};
-	path.starts_with(Path::new(home).join(".omp").join("remote"))
+	path.starts_with(Path::new(home).join(".aragent").join("remote"))
 }
 
 fn is_sqlite_file(path: &Path) -> bool {

@@ -48,6 +48,7 @@ pub mod memory_embeddings;
 pub mod memory_protocol;
 pub mod memory_store;
 pub mod memory_vectors;
+pub mod migration;
 pub mod output;
 pub mod plan_yolo;
 pub mod prewalk;

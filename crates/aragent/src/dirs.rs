@@ -1,14 +1,38 @@
 //! Filesystem locations shared with the TypeScript runtime.
 //!
-//! Anchors: `packages/utils/src/dirs.ts` (`CONFIG_DIR_NAME = ".omp"`,
-//! `MAIN_CONFIG_FILENAMES = ["config.yml", "config.yaml"]`, `getAgentDir()`),
-//! so a Rust binary and the JS CLI read the same files.
+//! The user storage root moved from `~/.omp` to `~/.aragent`; the project
+//! surface stays `<cwd>/.omp` so repository-controlled files
+//! (`.omp/settings.json`, `.omp/config.yml`, `.omp/mcp.json`, `.omp/rules`,
+//! `.omp/agents`, `.omp/skills`, ...) keep their established location.
+//!
+//! Dual-read: without an explicit storage override, the legacy `~/.omp` root
+//! and its XDG `*/omp` counterpart stay readable through
+//! [`legacy_config_root`], [`legacy_agent_dir`], [`legacy_root_subdir`] and
+//! [`legacy_agent_subdir`]. A profile-derived `PI_CODING_AGENT_DIR` is not an
+//! explicit override. Nothing is ever written there.
 
 use std::env;
 use std::path::{Path, PathBuf};
 
-/// Config directory name (mirrors `CONFIG_DIR_NAME`).
-pub const CONFIG_DIR_NAME: &str = ".omp";
+/// Project-local config directory name. The legacy name is kept for the
+/// project surface only: `<cwd>/.omp`.
+pub const PROJECT_CONFIG_DIR_NAME: &str = ".omp";
+
+/// User storage root directory name (`~/.aragent`).
+pub const CONFIG_DIR_NAME: &str = ".aragent";
+
+/// Legacy user storage root directory name (`~/.omp`), read-only.
+pub const LEGACY_CONFIG_DIR_NAME: &str = ".omp";
+
+/// XDG application directory name for the current root.
+pub const XDG_APP_DIR_NAME: &str = "aragent";
+
+/// XDG application directory name for the legacy root, read-only.
+pub const XDG_LEGACY_APP_DIR_NAME: &str = "omp";
+
+/// Marker written into the new user root after a successful copy-only
+/// migration from `~/.omp`.
+pub const MIGRATION_MARKER: &str = ".migrated-from-omp-v1";
 
 /// Canonical config filename first, legacy YAML fallback second.
 pub const MAIN_CONFIG_FILENAMES: [&str; 2] = ["config.yml", "config.yaml"];
@@ -24,11 +48,43 @@ pub fn home_dir() -> Option<PathBuf> {
 	env_path("HOME").or_else(|| env_path("USERPROFILE"))
 }
 
-/// `$PI_CONFIG_DIR` else `~/.omp`, before profile relocation.
+/// An explicit storage-root override disables implicit migration and every
+/// legacy `~/.omp` read fallback.
+///
+/// `profile::activate(Some(name))` writes `PI_CODING_AGENT_DIR` for the profile
+/// it just selected; that value is derived, not a user override, so named
+/// profiles keep their legacy read fallbacks and startup migration.
+#[must_use]
+pub fn explicit_storage_override() -> bool {
+	if env_path("PI_CONFIG_DIR").is_some() {
+		return true;
+	}
+	let Some(dir) = env_path("PI_CODING_AGENT_DIR") else {
+		return false;
+	};
+	!is_profile_derived(&dir, &base_config_root())
+}
+
+/// `$PI_CONFIG_DIR` else `~/.aragent`, before profile relocation.
 #[must_use]
 pub fn base_config_root() -> PathBuf {
 	env_path("PI_CONFIG_DIR").unwrap_or_else(|| {
 		home_dir().map_or_else(|| PathBuf::from(CONFIG_DIR_NAME), |home| home.join(CONFIG_DIR_NAME))
+	})
+}
+
+/// Legacy `~/.omp` config root while no explicit override is set.
+///
+/// Profile-aware: a named profile resolves to `<legacy>/profiles/<name>`.
+#[must_use]
+pub fn legacy_config_root() -> Option<PathBuf> {
+	if explicit_storage_override() {
+		return None;
+	}
+	let base = home_dir()?.join(LEGACY_CONFIG_DIR_NAME);
+	Some(match crate::profile::active_from_env() {
+		Some(profile) => profile_config_root(&base, &profile),
+		None => base,
 	})
 }
 
@@ -84,11 +140,24 @@ fn agent_dir_from(profile: Option<&str>, override_dir: Option<&Path>) -> PathBuf
 /// `resolvePreProfileAgentDir`: a `PI_CODING_AGENT_DIR` equal to the agent dir
 /// of the (bypassed) `PI_PROFILE` is profile-derived, not a user override.
 fn is_profile_derived(dir: &Path, base: &Path) -> bool {
-	let Some(legacy) = env::var("PI_PROFILE").ok().and_then(|raw| crate::profile::normalize(Some(raw.as_str())).ok().flatten())
-	else {
-		return false;
-	};
-	profile_agent_dir_in(base, &legacy) == dir
+	crate::profile::PROFILE_ENV_KEYS.iter().find_map(|key| {
+		let raw = env::var(key).ok()?;
+		let profile = crate::profile::normalize(Some(raw.as_str())).ok().flatten()?;
+		(profile_agent_dir_in(base, &profile) == dir).then_some(())
+	}).is_some()
+}
+
+/// Legacy `~/.omp` agent directory while no explicit override is set.
+#[must_use]
+pub fn legacy_agent_dir() -> Option<PathBuf> {
+	if explicit_storage_override() {
+		return None;
+	}
+	let base = home_dir()?.join(LEGACY_CONFIG_DIR_NAME);
+	Some(match crate::profile::active_from_env() {
+		Some(profile) => profile_agent_dir_in(&base, &profile),
+		None => base.join("agent"),
+	})
 }
 
 /// XDG category for an agent subdirectory (`dirs.ts` `XdgCategory`). Only the
@@ -108,21 +177,52 @@ impl AgentDirCategory {
 			Self::Cache => "XDG_CACHE_HOME",
 		}
 	}
+
+	/// `$XDG_*_HOME` when set to a non-empty value.
+	#[must_use]
+	pub fn xdg_home(self) -> Option<PathBuf> {
+		env_path(self.env_var())
+	}
 }
 
 /// `rootSubdir(name, category)` (`dirs.ts`): a sibling of `agent/` under the
-/// config root, or flat under `$XDG_*_HOME/omp` when the XDG pin applies.
+/// config root, or flat under `$XDG_*_HOME/aragent` when the XDG pin applies.
 #[must_use]
 pub fn root_subdir(name: &str, category: AgentDirCategory) -> PathBuf {
 	xdg_agent_root(category).unwrap_or_else(config_root).join(name)
 }
 
+/// Read-only legacy counterpart of [`root_subdir`]: the XDG `$XDG_*/omp/<name>`
+/// pin when it exists, else `<legacy config root>/<name>`. `None` under an
+/// explicit storage override.
+#[must_use]
+pub fn legacy_root_subdir(name: &str, category: AgentDirCategory) -> Option<PathBuf> {
+	if explicit_storage_override() {
+		return None;
+	}
+	xdg_legacy_agent_root(category).or_else(legacy_config_root).map(|root| root.join(name))
+}
+
 /// Agent subdirectory honoring the DirResolver XDG redirect. Mirrors
 /// `agentSubdir(undefined, subdir, category)`: without an XDG redirect the path
-/// is `<agent dir>/<subdir>`; with one it is flat under `$XDG_*_HOME/omp`.
+/// is `<agent dir>/<subdir>`; with one it is flat under `$XDG_*_HOME/aragent`.
 #[must_use]
 pub fn agent_subdir(subdir: &str, category: AgentDirCategory) -> PathBuf {
 	agent_category_root(category).join(subdir)
+}
+
+/// Read-only legacy agent subdirectory: the XDG `$XDG_*/omp/<subdir>` pin when
+/// it exists, else `<legacy agent dir>/<subdir>`. `None` under an explicit
+/// storage override.
+#[must_use]
+pub fn legacy_agent_subdir(subdir: &str, category: AgentDirCategory) -> Option<PathBuf> {
+	if explicit_storage_override() {
+		return None;
+	}
+	if let Some(root) = xdg_legacy_agent_root(category) {
+		return Some(root.join(subdir));
+	}
+	legacy_agent_dir().map(|dir| dir.join(subdir))
 }
 
 /// Agent-managed worktrees root (`getWorktreesDir()` default,
@@ -144,9 +244,13 @@ fn agent_category_root(category: AgentDirCategory) -> PathBuf {
 
 /// `DirResolver` XDG pin rules: Linux/macOS only, only when the agent dir is its
 /// default (no explicit `PI_CODING_AGENT_DIR` override), and — for a named
-/// profile — only when that category already contains `omp/profiles/<name>`.
+/// profile — only when that category already contains `aragent/profiles/<name>`.
 /// The base `arag` root is never consulted for a named profile, so a profile
 /// cannot silently move to XDG once the base app dir appears.
+///
+/// The runtime root is write-only-new: this helper never returns the legacy
+/// `omp` directory, so no mutation can land there. Read fallbacks use
+/// [`xdg_legacy_agent_root`].
 fn xdg_agent_root(category: AgentDirCategory) -> Option<PathBuf> {
 	if !cfg!(any(target_os = "linux", target_os = "macos")) {
 		return None;
@@ -159,14 +263,52 @@ fn xdg_agent_root(category: AgentDirCategory) -> Option<PathBuf> {
 		None => base.join("agent"),
 	};
 	let override_dir = env_path("PI_CODING_AGENT_DIR");
+	// `PI_CONFIG_DIR` changes the base root but does not disable the XDG pin;
+	// only an explicit (non-profile-derived) `PI_CODING_AGENT_DIR` does.
+	if override_dir.is_some()
+		&& !is_profile_derived_override(profile_name, &base, override_dir.as_deref())
+	{
+		return None;
+	}
 	if agent_dir_from(profile_name, override_dir.as_deref()) != default_agent {
 		return None;
 	}
 	xdg_pin(env_path(category.env_var()).as_deref(), profile_name, Path::exists)
 }
 
-/// Resolve the XDG app root for one category: `$XDG_*/omp` for the default
-/// profile, `$XDG_*/omp/profiles/<name>` for a named one, and only when that
+/// Legacy XDG `omp` app root, read-only. Same pin preconditions as
+/// [`xdg_agent_root`]; `None` under an explicit storage override.
+fn xdg_legacy_agent_root(category: AgentDirCategory) -> Option<PathBuf> {
+	if !cfg!(any(target_os = "linux", target_os = "macos")) || explicit_storage_override() {
+		return None;
+	}
+	let base = base_config_root();
+	let profile_name = crate::profile::active_from_env();
+	let profile = profile_name.as_deref();
+	let default_agent = match profile {
+		Some(name) => profile_agent_dir_in(&base, name),
+		None => base.join("agent"),
+	};
+	if agent_dir_from(profile, env_path("PI_CODING_AGENT_DIR").as_deref()) != default_agent {
+		return None;
+	}
+	xdg_pin_named(
+		env_path(category.env_var()).as_deref(),
+		profile,
+		XDG_LEGACY_APP_DIR_NAME,
+		Path::exists,
+	)
+}
+
+fn is_profile_derived_override(profile: Option<&str>, base: &Path, override_dir: Option<&Path>) -> bool {
+	match (profile, override_dir) {
+		(Some(profile), Some(dir)) => profile_agent_dir_in(base, profile) == dir,
+		_ => false,
+	}
+}
+
+/// Resolve the XDG app root for one category: `$XDG_*/aragent` for the default
+/// profile, `$XDG_*/aragent/profiles/<name>` for a named one, and only when that
 /// exact directory exists. The base app root is never consulted for a named
 /// profile, so a profile's location cannot change once the base appears.
 fn xdg_pin(
@@ -174,7 +316,16 @@ fn xdg_pin(
 	profile: Option<&str>,
 	exists: impl Fn(&Path) -> bool,
 ) -> Option<PathBuf> {
-	let app_root = env_root?.join("omp");
+	xdg_pin_named(env_root, profile, XDG_APP_DIR_NAME, exists)
+}
+
+fn xdg_pin_named(
+	env_root: Option<&Path>,
+	profile: Option<&str>,
+	app: &str,
+	exists: impl Fn(&Path) -> bool,
+) -> Option<PathBuf> {
+	let app_root = env_root?.join(app);
 	let candidate = match profile {
 		Some(name) => app_root.join("profiles").join(name),
 		None => app_root,
@@ -185,12 +336,15 @@ fn xdg_pin(
 /// Project-local config directory (`<cwd>/.omp`).
 #[must_use]
 pub fn project_config_dir(cwd: &Path) -> PathBuf {
-	cwd.join(CONFIG_DIR_NAME)
+	cwd.join(PROJECT_CONFIG_DIR_NAME)
 }
 
-/// Shared install data directories, most specific first: `$OMP_SHARE_DIR`,
-/// `$PREFIX/share/omp` (Termux/nix prefixes), `<exe>/../share/omp`,
-/// `~/.local/share/omp`, `/usr/local/share/omp`, `/usr/share/omp`.
+/// Shared install data directories, most specific first.
+///
+/// `$ARAGENT_SHARE_DIR`, `$PREFIX/share/aragent` (Termux/nix prefixes),
+/// `<exe>/../share/aragent`, `~/.local/share/aragent`,
+/// `/usr/local/share/aragent`, `/usr/share/aragent`; then the legacy
+/// `$OMP_SHARE_DIR` and `share/omp` paths as read-only fallbacks.
 #[must_use]
 pub fn share_dirs() -> Vec<PathBuf> {
 	let mut dirs: Vec<PathBuf> = Vec::new();
@@ -199,23 +353,42 @@ pub fn share_dirs() -> Vec<PathBuf> {
 			dirs.push(path);
 		}
 	};
-	if let Some(dir) = env_path("OMP_SHARE_DIR") {
+	if let Some(dir) = env_path("ARAGENT_SHARE_DIR") {
 		push(dir);
 	}
-	if let Some(prefix) = env_path("PREFIX") {
-		push(prefix.join("share/omp"));
+	let prefix = env_path("PREFIX");
+	if let Some(prefix) = &prefix {
+		push(prefix.join("share").join(XDG_APP_DIR_NAME));
 	}
 	if let Ok(exe) = env::current_exe()
 		&& let Some(bin) = exe.parent()
 		&& let Some(prefix) = bin.parent()
 	{
-		push(prefix.join("share/omp"));
+		push(prefix.join("share").join(XDG_APP_DIR_NAME));
 	}
 	if let Some(home) = home_dir() {
-		push(home.join(".local/share/omp"));
+		push(home.join(".local/share").join(XDG_APP_DIR_NAME));
 	}
-	push(PathBuf::from("/usr/local/share/omp"));
-	push(PathBuf::from("/usr/share/omp"));
+	push(PathBuf::from("/usr/local/share").join(XDG_APP_DIR_NAME));
+	push(PathBuf::from("/usr/share").join(XDG_APP_DIR_NAME));
+
+	if let Some(dir) = env_path("OMP_SHARE_DIR") {
+		push(dir);
+	}
+	if let Some(prefix) = &prefix {
+		push(prefix.join("share").join(XDG_LEGACY_APP_DIR_NAME));
+	}
+	if let Ok(exe) = env::current_exe()
+		&& let Some(bin) = exe.parent()
+		&& let Some(prefix) = bin.parent()
+	{
+		push(prefix.join("share").join(XDG_LEGACY_APP_DIR_NAME));
+	}
+	if let Some(home) = home_dir() {
+		push(home.join(".local/share").join(XDG_LEGACY_APP_DIR_NAME));
+	}
+	push(PathBuf::from("/usr/local/share").join(XDG_LEGACY_APP_DIR_NAME));
+	push(PathBuf::from("/usr/share").join(XDG_LEGACY_APP_DIR_NAME));
 	dirs
 }
 
@@ -235,8 +408,10 @@ mod tests {
 
 	#[test]
 	fn filenames_match_typescript() {
-		assert_eq!(CONFIG_DIR_NAME, ".omp");
+		assert_eq!(PROJECT_CONFIG_DIR_NAME, ".omp");
+		assert_eq!(CONFIG_DIR_NAME, ".aragent");
 		assert_eq!(MAIN_CONFIG_FILENAMES, ["config.yml", "config.yaml"]);
+		assert_eq!(project_config_dir(Path::new("/work")), PathBuf::from("/work/.omp"));
 	}
 
 	#[test]
@@ -247,11 +422,11 @@ mod tests {
 
 	#[test]
 	fn profile_layout_nests_under_the_config_root() {
-		let base = Path::new("/home/u/.omp");
-		assert_eq!(profile_config_root(base, "work"), PathBuf::from("/home/u/.omp/profiles/work"));
+		let base = Path::new("/home/u/.aragent");
+		assert_eq!(profile_config_root(base, "work"), PathBuf::from("/home/u/.aragent/profiles/work"));
 		assert_eq!(
 			profile_config_root(base, "work").join("agent"),
-			PathBuf::from("/home/u/.omp/profiles/work/agent")
+			PathBuf::from("/home/u/.aragent/profiles/work/agent")
 		);
 	}
 
@@ -264,8 +439,8 @@ mod tests {
 	fn xdg_pin_requires_the_category_directory_to_exist() {
 		assert_eq!(pin(None, None, &[]), None, "an unset variable never redirects");
 		assert_eq!(
-			pin(Some("/xdg"), None, &["/xdg/omp"]),
-			Some(PathBuf::from("/xdg/omp"))
+			pin(Some("/xdg"), None, &["/xdg/aragent"]),
+			Some(PathBuf::from("/xdg/aragent"))
 		);
 		assert_eq!(pin(Some("/xdg"), None, &[]), None, "no migrated app root yet");
 	}
@@ -273,14 +448,127 @@ mod tests {
 	#[test]
 	fn xdg_pin_never_uses_the_base_app_root_for_a_named_profile() {
 		assert_eq!(
-			pin(Some("/xdg"), Some("work"), &["/xdg/omp", "/xdg/omp/profiles/work"]),
-			Some(PathBuf::from("/xdg/omp/profiles/work"))
+			pin(Some("/xdg"), Some("work"), &["/xdg/aragent", "/xdg/aragent/profiles/work"]),
+			Some(PathBuf::from("/xdg/aragent/profiles/work"))
 		);
 		assert_eq!(
-			pin(Some("/xdg"), Some("work"), &["/xdg/omp"]),
+			pin(Some("/xdg"), Some("work"), &["/xdg/aragent"]),
 			None,
 			"the base app root is not consulted for a named profile"
 		);
 		assert_eq!(pin(Some("/xdg"), Some("work"), &[]), None);
+	}
+
+	#[test]
+	fn legacy_roots_are_profile_aware_and_override_disabled() {
+		let _env = crate::TEST_ENV_LOCK.lock().expect("env lock");
+		let home = env::temp_dir().join(format!("aragent-dirs-legacy-{}", std::process::id()));
+		let keys = [
+			"HOME",
+			"PI_CONFIG_DIR",
+			"PI_CODING_AGENT_DIR",
+			"ARAGENT_PROFILE",
+			"OMP_PROFILE",
+			"PI_PROFILE",
+			"XDG_DATA_HOME",
+			"XDG_STATE_HOME",
+			"XDG_CACHE_HOME",
+		];
+		let saved = keys.map(env::var_os);
+		// SAFETY: guarded by TEST_ENV_LOCK.
+		unsafe {
+			env::set_var("HOME", &home);
+			for key in &keys[1..] {
+				env::remove_var(*key);
+			}
+		}
+		let plain = (legacy_config_root(), legacy_agent_dir());
+		let plain_security = legacy_root_subdir("security", AgentDirCategory::State);
+		unsafe { env::set_var("ARAGENT_PROFILE", "work") };
+		let profiled = (legacy_config_root(), legacy_agent_dir());
+		// SAFETY: guarded by TEST_ENV_LOCK.
+		unsafe { env::set_var("PI_CONFIG_DIR", home.join("explicit")) };
+		let overridden = (legacy_config_root(), legacy_agent_dir());
+		unsafe {
+			for (key, value) in keys.into_iter().zip(saved) {
+				match value {
+					Some(value) => env::set_var(key, value),
+					None => env::remove_var(key),
+				}
+			}
+		}
+		assert_eq!(plain.0, Some(home.join(".omp")));
+		assert_eq!(plain.1, Some(home.join(".omp/agent")));
+		assert_eq!(plain_security, Some(home.join(".omp/security")));
+		assert_eq!(profiled.0, Some(home.join(".omp/profiles/work")));
+		assert_eq!(profiled.1, Some(home.join(".omp/profiles/work/agent")));
+		assert_eq!(overridden, (None, None), "an explicit override disables legacy reads");
+	}
+
+	#[test]
+	fn profile_activation_is_not_an_explicit_storage_override() {
+		let _env = crate::TEST_ENV_LOCK.lock().expect("env lock");
+		let home = env::temp_dir().join(format!("aragent-dirs-profile-{}", std::process::id()));
+		let keys = [
+			"HOME",
+			"PI_CONFIG_DIR",
+			"PI_CODING_AGENT_DIR",
+			"ARAGENT_PROFILE",
+			"OMP_PROFILE",
+			"PI_PROFILE",
+		];
+		let saved = keys.map(env::var_os);
+		// SAFETY: guarded by TEST_ENV_LOCK.
+		unsafe {
+			env::set_var("HOME", &home);
+			for key in &keys[1..] {
+				env::remove_var(*key);
+			}
+		}
+		crate::profile::activate(Some("work"));
+		let derived_override = env::var("PI_CODING_AGENT_DIR").ok();
+		let override_with_profile = explicit_storage_override();
+		let legacy = legacy_agent_dir();
+		// SAFETY: guarded by TEST_ENV_LOCK.
+		unsafe {
+			env::set_var("PI_CONFIG_DIR", home.join("explicit"));
+		}
+		let override_with_config_dir = explicit_storage_override();
+		// SAFETY: guarded by TEST_ENV_LOCK.
+		unsafe {
+			env::remove_var("PI_CONFIG_DIR");
+			env::set_var("PI_CODING_AGENT_DIR", home.join("custom-agent"));
+		}
+		let override_with_custom_agent_dir = explicit_storage_override();
+		unsafe {
+			for (key, value) in keys.into_iter().zip(saved) {
+				match value {
+					Some(value) => env::set_var(key, value),
+					None => env::remove_var(key),
+				}
+			}
+		}
+		assert_eq!(
+			derived_override,
+			Some(home.join(".aragent/profiles/work/agent").display().to_string())
+		);
+		assert!(!override_with_profile, "the profile's own agent dir is derived, not a user override");
+		assert_eq!(legacy, Some(home.join(".omp/profiles/work/agent")));
+		assert!(override_with_config_dir, "PI_CONFIG_DIR is always authoritative");
+		assert!(
+			override_with_custom_agent_dir,
+			"a user-supplied PI_CODING_AGENT_DIR stays authoritative even with an active profile"
+		);
+	}
+
+	#[test]
+	fn legacy_xdg_pin_uses_the_omp_name() {
+		let existing = [PathBuf::from("/xdg/omp")];
+		assert_eq!(
+			xdg_pin_named(Some(Path::new("/xdg")), None, XDG_LEGACY_APP_DIR_NAME, |path| {
+				existing.iter().any(|item| item == path)
+			}),
+			Some(PathBuf::from("/xdg/omp"))
+		);
 	}
 }

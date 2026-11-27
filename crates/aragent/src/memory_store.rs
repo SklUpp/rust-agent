@@ -529,8 +529,13 @@ impl MemoryStore {
 	}
 
 	/// Open (creating the schema if needed) the agent's memory store.
+	///
+	/// A legacy `~/.omp/agent/memory.db` is snapshotted into the current agent
+	/// dir when the current file is absent and no explicit override applies.
 	pub fn open(agent_dir: &Path) -> MemoryResult<Self> {
-		Self::open_at(Self::database_path(agent_dir))
+		let path = Self::database_path(agent_dir);
+		Self::adopt_legacy(agent_dir, &path);
+		Self::open_at(path)
 	}
 
 	/// Open an existing store; missing database is an explicit error, so a read
@@ -538,12 +543,31 @@ impl MemoryStore {
 	pub fn open_existing(agent_dir: &Path) -> MemoryResult<Self> {
 		let path = Self::database_path(agent_dir);
 		if !path.is_file() {
+			Self::adopt_legacy(agent_dir, &path);
+		}
+		if !path.is_file() {
 			return Err(MemoryStoreError::NotFound(format!(
 				"memory store not found at {}; run a session with memories enabled first",
 				path.display()
 			)));
 		}
 		Self::open_at(path)
+	}
+
+	/// Destination-wins copy of the legacy store into the active default agent
+	/// dir. Explicit custom dirs never consult the legacy root.
+	fn adopt_legacy(agent_dir: &Path, current: &Path) {
+		if agent_dir != crate::dirs::agent_dir().as_path() {
+			return;
+		}
+		let Some(legacy_dir) = crate::dirs::legacy_agent_dir() else {
+			return;
+		};
+		if let Err(error) =
+			crate::migration::adopt_legacy_sqlite(current, &legacy_dir.join(MEMORY_DB_FILE))
+		{
+			eprintln!("warning: cannot adopt legacy memory store {}: {error}", legacy_dir.display());
+		}
 	}
 
 	/// Open a store at an explicit path (tests, alternate agent dirs).

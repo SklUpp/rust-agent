@@ -2,7 +2,8 @@
 //!
 //! Anchors: `packages/coding-agent/src/security/store.ts`.
 //!
-//! Layout (`~/.omp/security/<project-key>` unless a state root is injected):
+//! Layout (`~/.aragent/security/<project-key>` unless a state root is injected,
+//! with the legacy `~/.omp/security` tree copied read-only on first open):
 //! - `index.json` lists plan/scan ids; guarded by an in-process mutex plus a
 //!   cross-process `flock`;
 //! - `plans/<secplan_id>.json`;
@@ -138,11 +139,24 @@ impl SecurityStore {
 		let canonical = resolve_repository_root(repository_root);
 		let canonical_text = canonical.to_string_lossy().to_string();
 		let project_key = encode_security_project_key(&canonical_text);
+		let current_root = crate::dirs::root_subdir("security", crate::dirs::AgentDirCategory::State);
 		let project_directory = match state_root {
 			Some(root) => root.join(&project_key),
-			None => crate::dirs::root_subdir("security", crate::dirs::AgentDirCategory::State)
-				.join(&project_key),
+			None => current_root.join(&project_key),
 		};
+		if state_root.is_none() && !project_directory.exists() {
+			if let Some(legacy_root) =
+				crate::dirs::legacy_root_subdir("security", crate::dirs::AgentDirCategory::State)
+			{
+				let legacy = legacy_root.join(&project_key);
+				if legacy.is_dir() {
+					let report = crate::migration::copy_merge(&legacy, &project_directory);
+					for warning in &report.warnings {
+						eprintln!("warning: security store migration: {warning}");
+					}
+				}
+			}
+		}
 		ensure_private_directory(&project_directory)?;
 		let store = Self {
 			repository_root: canonical_text,

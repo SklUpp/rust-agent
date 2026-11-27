@@ -15,8 +15,9 @@ use std::path::PathBuf;
 
 use crate::{Error, Result, dirs};
 
-/// Profile selectors, canonical first.
-pub const PROFILE_ENV_KEYS: [&str; 2] = ["OMP_PROFILE", "PI_PROFILE"];
+/// Profile selectors, canonical first. `OMP_PROFILE` and `PI_PROFILE` stay
+/// accepted because they are existing user state.
+pub const PROFILE_ENV_KEYS: [&str; 3] = ["ARAGENT_PROFILE", "OMP_PROFILE", "PI_PROFILE"];
 
 /// Flags whose following token is always their value, even when it starts with
 /// `-`. Mirrors `STRING_SETTERS` in `cli/flag-tables.ts`, reduced to the flags
@@ -311,23 +312,43 @@ fn is_windows_reserved(value: &str) -> bool {
 			&& base.as_bytes()[3].is_ascii_digit())
 }
 
-/// `OMP_PROFILE` (primary) wins over `PI_PROFILE` (fallback), including when
-/// explicitly empty. The variable names stay: they are existing user state.
+/// `ARAGENT_PROFILE` wins over `OMP_PROFILE`, which wins over `PI_PROFILE`,
+/// including when explicitly empty: an explicit empty selector means the
+/// default profile rather than falling through to a lower-precedence value.
 pub fn resolve_env(primary: Option<&str>, fallback: Option<&str>) -> Result<Option<String>> {
 	normalize(if primary.is_some() { primary } else { fallback })
+}
+
+/// Three-key chain with the same explicit-empty semantics as [`resolve_env`].
+pub fn resolve_env_chain(
+	first: Option<&str>,
+	second: Option<&str>,
+	third: Option<&str>,
+) -> Result<Option<String>> {
+	if first.is_some() {
+		return normalize(first);
+	}
+	resolve_env(second, third)
 }
 
 fn env_value(key: &str) -> Option<String> {
 	env::var(key).ok()
 }
 
+fn env_chain() -> [Option<String>; 3] {
+	[
+		env_value(PROFILE_ENV_KEYS[0]),
+		env_value(PROFILE_ENV_KEYS[1]),
+		env_value(PROFILE_ENV_KEYS[2]),
+	]
+}
+
 /// Safe module-load equivalent: invalid env falls back to the default profile
 /// so a bare library call never panics before CLI validation.
 #[must_use]
 pub fn active_from_env() -> Option<String> {
-	let primary = env_value(PROFILE_ENV_KEYS[0]);
-	let fallback = env_value(PROFILE_ENV_KEYS[1]);
-	resolve_env(primary.as_deref(), fallback.as_deref()).ok().flatten()
+	let [first, second, third] = env_chain();
+	resolve_env_chain(first.as_deref(), second.as_deref(), third.as_deref()).ok().flatten()
 }
 
 /// Resolve the selected profile: an explicit CLI `--profile` (including
@@ -335,15 +356,15 @@ pub fn active_from_env() -> Option<String> {
 pub fn resolve_cli(raw: Option<&str>) -> Result<Option<String>> {
 	match raw {
 		Some(value) => normalize(Some(value)),
-		None => resolve_env(
-			env_value(PROFILE_ENV_KEYS[0]).as_deref(),
-			env_value(PROFILE_ENV_KEYS[1]).as_deref(),
-		),
+		None => {
+			let [first, second, third] = env_chain();
+			resolve_env_chain(first.as_deref(), second.as_deref(), third.as_deref())
+		},
 	}
 }
 
-/// Apply a resolved profile to the process environment. `None` clears both
-/// selectors; an explicit non-profile `PI_CODING_AGENT_DIR` baseline is left
+/// Apply a resolved profile to the process environment. `None` clears every
+/// selector; an explicit non-profile `PI_CODING_AGENT_DIR` baseline is left
 /// untouched, while a profile-derived value is dropped so the default profile
 /// cannot inherit a named profile's agent dir (`setProfile(undefined)`).
 pub fn activate(profile: Option<&str>) {
@@ -351,18 +372,21 @@ pub fn activate(profile: Option<&str>) {
 		Some(name) => {
 			// SAFETY: startup is single-threaded before the agent runtime exists.
 			unsafe {
-				env::set_var(PROFILE_ENV_KEYS[0], name);
-				env::set_var(PROFILE_ENV_KEYS[1], name);
+				for key in PROFILE_ENV_KEYS {
+					env::set_var(key, name);
+				}
 				env::set_var("PI_CODING_AGENT_DIR", dirs::profile_agent_dir(name));
 			}
 		},
 		None => {
 			let derived_override = env_value("PI_CODING_AGENT_DIR").is_some_and(|dir| {
-				env_value("PI_PROFILE").is_some_and(|legacy| {
-					normalize(Some(legacy.as_str()))
-						.ok()
-						.flatten()
-						.is_some_and(|name| dirs::profile_agent_dir(&name) == PathBuf::from(dir.as_str()))
+				PROFILE_ENV_KEYS.iter().any(|key| {
+					env_value(key).is_some_and(|legacy| {
+						normalize(Some(legacy.as_str()))
+							.ok()
+							.flatten()
+							.is_some_and(|name| dirs::profile_agent_dir(&name) == PathBuf::from(dir.as_str()))
+					})
 				})
 			});
 			// SAFETY: startup is single-threaded before the agent runtime exists.
@@ -389,7 +413,9 @@ pub struct AliasInstall {
 /// Create or replace a managed shell function that runs `arag --profile=<name>`.
 pub fn install_alias(alias_name: &str, profile: Option<&str>) -> Result<AliasInstall> {
 	let Some(profile) = profile else {
-		return Err(Error::new("--alias requires --profile <name> or OMP_PROFILE"));
+		return Err(Error::new(
+			"--alias requires --profile <name> or ARAGENT_PROFILE/OMP_PROFILE",
+		));
 	};
 	let shell = detect_shell()?;
 	let alias = validate_alias_name(alias_name, shell)?;

@@ -930,7 +930,7 @@ fn load_configured_hosts(cwd: &Path, allow_project_config: bool) -> Vec<Configur
 	if allow_project_config {
 		candidates.push(cwd.join(".omp").join("ssh.json"));
 	}
-	if let Some(agent) = agent_dir() {
+	for agent in agent_dirs() {
 		candidates.push(agent.join("ssh.json"));
 	}
 	if allow_project_config {
@@ -1020,21 +1020,36 @@ fn expand_tilde(value: &str) -> PathBuf {
 	}
 }
 
-/// User agent dir: `PI_CODING_AGENT_DIR`, else `PI_CONFIG_DIR`/`~/.omp` with an
-/// optional named profile (`profiles/<profile>/agent`).
-fn agent_dir() -> Option<PathBuf> {
+/// User agent dirs: current `~/.aragent` first, then the legacy `~/.omp` dir
+/// as a read-only fallback (no explicit `PI_*` storage override). Named
+/// profiles relocate both (`profiles/<profile>/agent`).
+fn agent_dirs() -> Vec<PathBuf> {
 	if let Some(dir) = non_empty_env("PI_CODING_AGENT_DIR") {
-		return Some(dir);
+		return vec![dir];
 	}
-	let base = non_empty_env("PI_CONFIG_DIR")
-		.or_else(|| home_dir().map(|home| home.join(".omp")))?;
-	let profile = ["OMP_PROFILE", "PI_PROFILE"]
+	let explicit_config = non_empty_env("PI_CONFIG_DIR");
+	let profile = ["ARAGENT_PROFILE", "OMP_PROFILE", "PI_PROFILE"]
 		.iter()
 		.find_map(|key| non_empty_env(key));
-	Some(match profile {
+	let agent_in = |base: &Path| match &profile {
 		Some(profile) => base.join("profiles").join(profile).join("agent"),
 		None => base.join("agent"),
-	})
+	};
+	let base = explicit_config
+		.or_else(|| home_dir().map(|home| home.join(".aragent")));
+	let mut dirs = Vec::new();
+	if let Some(base) = base {
+		dirs.push(agent_in(&base));
+	}
+	if non_empty_env("PI_CONFIG_DIR").is_none()
+		&& let Some(home) = home_dir()
+	{
+		let legacy = agent_in(&home.join(".omp"));
+		if !dirs.contains(&legacy) {
+			dirs.push(legacy);
+		}
+	}
+	dirs
 }
 
 fn non_empty_env(key: &str) -> Option<PathBuf> {
@@ -1157,7 +1172,7 @@ fn format_configured_index(hosts: &[ConfiguredHost]) -> String {
 fn format_host_index(hosts: &[SshConfigHost]) -> String {
 	if hosts.is_empty() {
 		return "# SSH hosts\n\nNo SSH hosts are configured. Add hosts to an `ssh.json` capability \
-		        file (`~/.omp/agent/ssh.json` or `<project>/.omp/ssh.json`), or read \
+		        file (`~/.aragent/agent/ssh.json` or `<project>/.omp/ssh.json`), or read \
 		        `ssh://<host>/<path>` with any destination OpenSSH can resolve (e.g. a \
 		        `~/.ssh/config` alias).\n"
 			.to_string();
