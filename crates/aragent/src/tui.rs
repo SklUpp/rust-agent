@@ -29,7 +29,7 @@ mod imp {
 	use std::io::{self, Write};
 	use std::panic::{AssertUnwindSafe, catch_unwind};
 	use std::sync::Arc;
-	use std::sync::atomic::{AtomicBool, AtomicPtr, Ordering};
+	use std::sync::atomic::{AtomicBool, AtomicI32, AtomicPtr, AtomicUsize, Ordering};
 	use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 	use std::time::{Duration, Instant};
 
@@ -197,6 +197,107 @@ mod imp {
 
 	static SAVED_TTY: AtomicPtr<libc::termios> = AtomicPtr::new(std::ptr::null_mut());
 	static TTY_ACTIVE: AtomicBool = AtomicBool::new(false);
+	/// Write end of the SIGWINCH self-pipe (`-1` while no terminal is active).
+	static WINCH_WRITE: AtomicI32 = AtomicI32::new(-1);
+	/// Handlers currently inside `wake_on_resize`; teardown waits for zero
+	/// after restoring the old disposition so no write can race `close(2)`.
+	static WINCH_IN_FLIGHT: AtomicUsize = AtomicUsize::new(0);
+
+	#[cfg(target_os = "android")]
+	fn errno_location() -> *mut libc::c_int {
+		// SAFETY: Bionic exposes the thread-local errno through `__errno`.
+		unsafe { libc::__errno() }
+	}
+
+	#[cfg(target_os = "linux")]
+	fn errno_location() -> *mut libc::c_int {
+		// libc 0.2 does not declare `__errno_location` for Linux targets.
+		unsafe extern "C" {
+			#[link_name = "__errno_location"]
+			fn linux_errno_location() -> *mut libc::c_int;
+		}
+		// SAFETY: glibc/musl return the thread-local errno pointer.
+		unsafe { linux_errno_location() }
+	}
+
+	/// Async-signal-safe SIGWINCH handler: a non-blocking one-byte write wakes
+	/// the `poll(2)` in the event loop so a resize or the Termux on-screen
+	/// keyboard is repainted immediately instead of on the next 50 ms tick.
+	extern "C" fn wake_on_resize(_sig: libc::c_int) {
+		WINCH_IN_FLIGHT.fetch_add(1, Ordering::SeqCst);
+		// A handler must not leak errno from its non-blocking write.
+		#[cfg(any(target_os = "android", target_os = "linux"))]
+		let errno = errno_location();
+		#[cfg(any(target_os = "android", target_os = "linux"))]
+		let saved_errno = unsafe { *errno };
+		let fd = WINCH_WRITE.load(Ordering::SeqCst);
+		if fd >= 0 {
+			let byte = 1u8;
+			// SAFETY: `fd` is the live pipe write end; errors (full pipe)
+			// are irrelevant because polling still wakes on the reader side.
+			unsafe {
+				libc::write(fd, (&byte as *const u8).cast(), 1);
+			}
+		}
+		#[cfg(any(target_os = "android", target_os = "linux"))]
+		unsafe {
+			*errno = saved_errno;
+		}
+		WINCH_IN_FLIGHT.fetch_sub(1, Ordering::SeqCst);
+	}
+
+	struct ResizeWake {
+		read: libc::c_int,
+		write: libc::c_int,
+		old: libc::sigaction,
+	}
+
+	/// Install the self-pipe + SIGWINCH handler. Failure falls back to the
+	/// existing 50 ms size polling; it is never fatal.
+	fn install_resize_wake() -> Option<ResizeWake> {
+		let mut fds = [-1 as libc::c_int; 2];
+		// SAFETY: two-element array receives the pipe descriptors.
+		if unsafe { libc::pipe(fds.as_mut_ptr()) } != 0 {
+			return None;
+		}
+		for fd in fds {
+			// SAFETY: valid freshly created descriptors.
+			let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+			if flags >= 0 {
+				// SAFETY: same descriptor, additive flag change.
+				unsafe {
+					libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK);
+				}
+			}
+			// SAFETY: same descriptor, additive flag change.
+			unsafe {
+				libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC);
+			}
+		}
+		WINCH_WRITE.store(fds[1], Ordering::SeqCst);
+
+		// SAFETY: zeroed `sigaction` is immediately filled below.
+		let mut action: libc::sigaction = unsafe { std::mem::zeroed() };
+		action.sa_sigaction = wake_on_resize as *const () as libc::sighandler_t;
+		action.sa_flags = libc::SA_RESTART;
+		// SAFETY: initialises the handler mask for use by `sigaction`.
+		unsafe {
+			libc::sigemptyset(&mut action.sa_mask);
+		}
+		// SAFETY: zeroed output slot for the previous action.
+		let mut old: libc::sigaction = unsafe { std::mem::zeroed() };
+		// SAFETY: valid action and output pointers for SIGWINCH.
+		if unsafe { libc::sigaction(libc::SIGWINCH, &action, &mut old) } != 0 {
+			WINCH_WRITE.store(-1, Ordering::SeqCst);
+			// SAFETY: descriptors created above, not yet owned elsewhere.
+			unsafe {
+				libc::close(fds[0]);
+				libc::close(fds[1]);
+			}
+			return None;
+		}
+		Some(ResizeWake { read: fds[0], write: fds[1], old })
+	}
 
 	/// Async-signal-safe restore used by SIGTERM/SIGHUP/SIGINT handlers before
 	/// the process re-raises the signal. It performs only lock-free atomic
@@ -214,7 +315,7 @@ mod imp {
 					libc::tcsetattr(libc::STDIN_FILENO, libc::TCSANOW, saved);
 				}
 			}
-			let reset = b"\x1b[0m\x1b[?25h\x1b[?1049l\r\n";
+			let reset = b"\x1b[?2004l\x1b[0m\x1b[?25h\x1b[?1049l\r\n";
 			// SAFETY: fixed buffer and the process's stdout descriptor.
 			unsafe {
 				libc::write(libc::STDOUT_FILENO, reset.as_ptr().cast(), reset.len());
@@ -228,12 +329,22 @@ mod imp {
 		}
 	}
 
+	/// True when the next frame no longer matches the size of the last one.
+	fn viewport_changed(previous: Option<(usize, usize)>, current: (usize, usize)) -> bool {
+		previous != Some(current)
+	}
+
 	struct Terminal {
 		out: io::Stdout,
 		saved: libc::termios,
 		old_term: libc::sighandler_t,
 		old_hup: libc::sighandler_t,
 		old_int: libc::sighandler_t,
+		/// Size of the last painted frame. A mismatch means the terminal (or
+		/// the Termux on-screen keyboard) changed size, so the alt-screen
+		/// buffer may hold rows longer than the new viewport.
+		last_size: Option<(usize, usize)>,
+		resize: Option<ResizeWake>,
 	}
 
 	impl Terminal {
@@ -293,10 +404,39 @@ mod imp {
 				return Err(aragent::Error::new("cannot enter raw terminal mode"));
 			}
 
-			let mut terminal = Self { out: io::stdout(), saved, old_term, old_hup, old_int };
-			write!(terminal.out, "\x1b[?1049h\x1b[H\x1b[2J\x1b[?25l")?;
+			let mut terminal = Self {
+				out: io::stdout(),
+				saved,
+				old_term,
+				old_hup,
+				old_int,
+				last_size: None,
+				resize: install_resize_wake(),
+			};
+			write!(terminal.out, "\x1b[?1049h\x1b[?2004h\x1b[H\x1b[2J\x1b[?25l")?;
 			terminal.out.flush()?;
 			Ok(terminal)
+		}
+
+		fn winch_fd(&self) -> libc::c_int {
+			self.resize.as_ref().map_or(-1, |wake| wake.read)
+		}
+
+		/// Consume pending SIGWINCH bytes so the next resize can wake `poll`.
+		fn drain_winch(&self) {
+			let Some(wake) = self.resize.as_ref() else {
+				return;
+			};
+			let mut buffer = [0u8; 64];
+			loop {
+				// SAFETY: non-blocking descriptor and a valid writable buffer.
+				let read = unsafe {
+					libc::read(wake.read, buffer.as_mut_ptr().cast(), buffer.len())
+				};
+				if read <= 0 {
+					break;
+				}
+			}
 		}
 
 		fn size(&self) -> (usize, usize) {
@@ -317,6 +457,17 @@ mod imp {
 			let (rows, cursor_row, cursor_col) = app.render();
 			let mut frame = String::with_capacity(rows.len() * (width + 8) + 32);
 			frame.push_str("\x1b[?25l");
+			// After a resize (Termux keyboard shown/hidden, split screen,
+			// rotate) old rows can be wider or more numerous than the new
+			// viewport; absolute row addressing alone leaves them behind and
+			// a full-width row auto-wraps onto the next physical line. Ctrl-L
+			// requests the same full clear.
+			let resized = viewport_changed(self.last_size, (width, height));
+			self.last_size = Some((width, height));
+			if resized || app.clear_screen {
+				app.clear_screen = false;
+				frame.push_str("\x1b[H\x1b[2J");
+			}
 			for (index, row) in rows.iter().enumerate() {
 				frame.push_str(&format!("\x1b[{};1H", index + 1));
 				frame.push_str(row);
@@ -335,7 +486,7 @@ mod imp {
 			// Restore the visible state first, while `TTY_ACTIVE` is still true:
 			// a signal arriving during this drop then performs the same
 			// idempotent restore instead of leaving raw mode/alt-screen behind.
-			let _ = write!(self.out, "\x1b[0m\x1b[?25h\x1b[?1049l");
+			let _ = write!(self.out, "\x1b[?2004l\x1b[0m\x1b[?25h\x1b[?1049l");
 			let _ = self.out.flush();
 			// SAFETY: restoring the captured attributes on the terminal.
 			unsafe {
@@ -343,6 +494,27 @@ mod imp {
 			}
 			TTY_ACTIVE.store(false, Ordering::SeqCst);
 			SAVED_TTY.store(std::ptr::null_mut(), Ordering::SeqCst);
+			if let Some(wake) = self.resize.take() {
+				// SAFETY: restores the disposition captured by `install_resize_wake`.
+				// Do this first: no new invocation can start after the old
+				// action is back in place.
+				unsafe {
+					libc::sigaction(libc::SIGWINCH, &wake.old, std::ptr::null_mut());
+				}
+				// An in-flight handler that already loaded `wake.write` must
+				// finish its non-blocking write before either descriptor is
+				// closed. Publishing `-1` first makes any handler that starts
+				// after this load a sentinel and skip the write entirely.
+				WINCH_WRITE.store(-1, Ordering::SeqCst);
+				while WINCH_IN_FLIGHT.load(Ordering::SeqCst) != 0 {
+					std::hint::spin_loop();
+				}
+				// SAFETY: both descriptors are owned by this `ResizeWake`.
+				unsafe {
+					libc::close(wake.read);
+					libc::close(wake.write);
+				}
+			}
 			// SAFETY: restore the previous dispositions for this process.
 			unsafe {
 				libc::signal(libc::SIGTERM, self.old_term);
@@ -374,20 +546,142 @@ mod imp {
 		CtrlD,
 		CtrlL,
 		CtrlU,
+		PasteStart,
+		PasteEnd,
 	}
 
-	/// Parse complete key sequences, retaining an incomplete UTF-8 suffix.
-	fn parse_keys(buffer: &mut Vec<u8>) -> Vec<Key> {
+	const PASTE_START: &[u8] = b"\x1b[200~";
+	const PASTE_END: &[u8] = b"\x1b[201~";
+	const ASK_ACTION_HINT: &str =
+		"[1-9] select · [Enter] confirm · [o] other · [c] chat · [Esc] cancel";
+
+	/// True when `bytes` is a non-empty proper prefix of `target`, i.e. the
+	/// sequence may complete once more terminal input arrives.
+	fn is_partial_sequence(bytes: &[u8], target: &[u8]) -> bool {
+		!bytes.is_empty() && bytes.len() < target.len() && target.starts_with(bytes)
+	}
+
+	/// A physical Esc key arrives as a lone byte and must not wait forever for
+	/// a sequence continuation. After a short idle period outside bracketed
+	/// paste it is safe to treat it as `Key::Esc`; longer prefixes and paste
+	/// bytes stay pending for real key sequences or the paste-end delimiter.
+	const ESC_IDLE_FLUSH: Duration = Duration::from_millis(25);
+
+	fn flush_idle_escape(
+		buffer: &mut Vec<u8>,
+		held_since: Option<Instant>,
+		now: Instant,
+		paste_mode: bool,
+	) -> bool {
+		// Inside bracketed paste a lone ESC can be the first byte of a split
+		// `ESC[201~` end delimiter, so it must stay pending.
+		if paste_mode {
+			return false;
+		}
+		if buffer.len() == 1
+			&& buffer[0] == 0x1b
+			&& held_since.is_some_and(|since| now.duration_since(since) >= ESC_IDLE_FLUSH)
+		{
+			buffer.clear();
+			true
+		} else {
+			false
+		}
+	}
+
+	/// Parse complete key sequences, retaining incomplete escape sequences,
+	/// paste delimiters and UTF-8 suffixes.
+	///
+	/// While `paste_mode` is true the bytes are bracketed-paste contents, not
+	/// key bindings: CRLF becomes one newline, printable text stays text, and
+	/// control bytes (Ctrl-C/D/U, ESC) are ignored. Only the paste-end
+	/// delimiter leaves paste mode.
+	fn parse_keys(buffer: &mut Vec<u8>, paste_mode: &mut bool) -> Vec<Key> {
 		let mut keys = Vec::new();
 		let mut index = 0;
 		while index < buffer.len() {
+			let remaining = &buffer[index..];
+			if *paste_mode {
+				if remaining.starts_with(PASTE_END) {
+					keys.push(Key::PasteEnd);
+					*paste_mode = false;
+					index += PASTE_END.len();
+					continue;
+				}
+				if is_partial_sequence(remaining, PASTE_END) {
+					break;
+				}
+				let byte = buffer[index];
+				match byte {
+					b'\r' => {
+						// Hold a trailing CR so a split CRLF is not doubled.
+						if index + 1 >= buffer.len() {
+							break;
+						}
+						index += 1;
+						if buffer[index] == b'\n' {
+							index += 1;
+						}
+						keys.push(Key::Char('\n'));
+					},
+					b'\n' => {
+						keys.push(Key::Char('\n'));
+						index += 1;
+					},
+					b'\t' => {
+						keys.push(Key::Char('\t'));
+						index += 1;
+					},
+					b if b < 0x20 || b == 0x7f => index += 1,
+					0x20..=0x7e => {
+						keys.push(Key::Char(char::from(byte)));
+						index += 1;
+					},
+					_ => {
+						let length = utf8_len(byte);
+						if length == 0 {
+							index += 1;
+						} else if index + length > buffer.len() {
+							break;
+						} else {
+							if let Ok(text) = std::str::from_utf8(&buffer[index..index + length])
+								&& let Some(ch) = text.chars().next()
+							{
+								keys.push(Key::Char(ch));
+							}
+							index += length;
+						}
+					},
+				}
+				continue;
+			}
+
 			let byte = buffer[index];
 			match byte {
 				0x1b => {
+					if remaining.starts_with(PASTE_START) {
+						keys.push(Key::PasteStart);
+						*paste_mode = true;
+						index += PASTE_START.len();
+						continue;
+					}
+					if remaining.starts_with(PASTE_END) {
+						keys.push(Key::PasteEnd);
+						*paste_mode = false;
+						index += PASTE_END.len();
+						continue;
+					}
+					// A lone ESC or a prefix of a paste delimiter must not be
+					// consumed as `Esc`: the next read may complete it.
+					if is_partial_sequence(remaining, PASTE_START)
+						|| is_partial_sequence(remaining, PASTE_END)
+					{
+						break;
+					}
 					if index + 1 >= buffer.len() {
-						keys.push(Key::Esc);
-						index += 1;
-					} else if buffer[index + 1] == b'[' {
+						break;
+					}
+					if buffer[index + 1] == b'[' {
 						let mut end = index + 2;
 						while end < buffer.len() && !(0x40..=0x7e).contains(&buffer[end]) {
 							end += 1;
@@ -513,6 +807,41 @@ mod imp {
 			self.chars.is_empty()
 		}
 
+		/// Visible single-row window of the input plus the display width of the
+		/// text left of the cursor. On overflow the window keeps the cursor in
+		/// view instead of clipping the live tail off the right edge.
+		fn window(&self, width: usize) -> (String, usize) {
+			let width = width.max(1);
+			let before: usize = self.chars[..self.cursor].iter().map(|&ch| char_width(ch)).sum();
+			let mut start = 0;
+			if before > width {
+				let mut used = 0;
+				for (index, ch) in self.chars[..self.cursor].iter().enumerate().rev() {
+					let ch_width = char_width(*ch);
+					if used + ch_width > width {
+						start = index + 1;
+						break;
+					}
+					used += ch_width;
+					start = index;
+				}
+			}
+			let mut text = String::new();
+			let mut used = 0;
+			for ch in self.chars[start..].iter().copied() {
+				let ch_width = char_width(ch);
+				if used + ch_width > width {
+					break;
+				}
+				// The prompt editor is one physical row; pasted newlines and
+				// tabs are shown as spaces.
+				text.push(if ch == '\n' || ch == '\t' { ' ' } else { ch });
+				used += ch_width;
+			}
+			let prefix = self.chars[start..self.cursor].iter().map(|&ch| char_width(ch)).sum();
+			(text, prefix)
+		}
+
 		fn set_text(&mut self, text: &str) {
 			self.chars = text.chars().collect();
 			self.cursor = self.chars.len();
@@ -556,7 +885,9 @@ mod imp {
 			|| (0x1dc0..=0x1dff).contains(&code)
 			|| (0x20d0..=0x20ff).contains(&code)
 			|| (0xfe20..=0xfe2f).contains(&code)
+			|| (0xfe00..=0xfe0f).contains(&code)
 			|| (0x200b..=0x200f).contains(&code)
+			|| code == 0x200d
 		{
 			return 0;
 		}
@@ -656,7 +987,7 @@ mod imp {
 
 	// ── App state ──────────────────────────────────────────────────────────
 
-	#[derive(Clone, Copy, PartialEq, Eq)]
+	#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 	enum Kind {
 		User,
 		Assistant,
@@ -686,6 +1017,13 @@ mod imp {
 	struct Entry {
 		kind: Kind,
 		text: String,
+	}
+
+	/// Flattened, sanitized visual lines for one `(entry_rev, width)`.
+	struct WrapCache {
+		rev: u64,
+		width: usize,
+		lines: Vec<(Kind, String)>,
 	}
 
 	struct WorkerRow {
@@ -967,6 +1305,11 @@ mod imp {
 		dialog: Option<Dialog>,
 		ask_timeout: Option<Duration>,
 		history_lines: Vec<String>,
+		/// Bumped whenever transcript text or the displayed view changes.
+		entry_rev: u64,
+		wrap_cache: Option<WrapCache>,
+		clear_screen: bool,
+		pasting: bool,
 	}
 
 	impl App {
@@ -993,11 +1336,21 @@ mod imp {
 				dialog: None,
 				ask_timeout,
 				history_lines: Vec::new(),
+				entry_rev: 0,
+				wrap_cache: None,
+				clear_screen: false,
+				pasting: false,
 			}
+		}
+
+		/// Invalidate the wrapped-body cache after a transcript/view mutation.
+		fn invalidate_wrap(&mut self) {
+			self.entry_rev = self.entry_rev.wrapping_add(1);
 		}
 
 		fn push(&mut self, kind: Kind, text: impl Into<String>) {
 			self.entries.push(Entry { kind, text: text.into() });
+			self.invalidate_wrap();
 			self.dirty = true;
 		}
 
@@ -1023,6 +1376,7 @@ mod imp {
 			self
 				.entries
 				.push(Entry { kind: Kind::Separator, text: String::new() });
+			self.invalidate_wrap();
 			self.dirty = true;
 		}
 
@@ -1088,6 +1442,7 @@ mod imp {
 				},
 				Event::AgentEnd { .. } => {},
 			}
+			self.invalidate_wrap();
 			self.dirty = true;
 		}
 
@@ -1097,6 +1452,7 @@ mod imp {
 				.push(Entry { kind: Kind::Tool, text: format!("→ {tool} {}", summarize(args)) });
 			let index = self.entries.len() - 1;
 			self.tools.insert(id, index);
+			self.invalidate_wrap();
 			self.dirty = true;
 		}
 
@@ -1105,6 +1461,7 @@ mod imp {
 				&& let Some(entry) = self.entries.get_mut(index)
 			{
 				entry.text = format!("→ {tool} {}", summarize(partial));
+				self.invalidate_wrap();
 				self.dirty = true;
 			}
 		}
@@ -1122,6 +1479,7 @@ mod imp {
 				},
 				None => self.entries.push(Entry { kind, text }),
 			}
+			self.invalidate_wrap();
 			self.dirty = true;
 		}
 
@@ -1315,7 +1673,53 @@ mod imp {
 			self.maybe_open_dialog();
 		}
 
+		/// Route one pasted character. Custom ask input owns the text while it
+		/// is open; other dialog states ignore paste instead of leaking it into
+		/// the chat prompt. Newlines/tabs flatten to spaces for the single-line
+		/// custom answer.
+		fn insert_pasted_char(&mut self, ch: char) {
+			if let Some(Dialog::Ask(state)) = self.dialog.as_mut() {
+				if state.custom_mode {
+					let ch = if ch == '\n' || ch == '\t' { ' ' } else { ch };
+					if !ch.is_control() {
+						state.custom_input.insert(ch);
+					}
+				}
+				return;
+			}
+			if self.dialog.is_some() {
+				return;
+			}
+			self.input.insert(ch);
+			self.history_pos = None;
+		}
+
 		fn on_key(&mut self, key: Key) -> Option<Action> {
+			// Paste starts before dialogs so an active dialog cannot swallow
+			// the delimiter or interpret pasted `y`/`n` as an answer.
+			if matches!(key, Key::PasteStart) {
+				self.pasting = true;
+				self.dirty = true;
+				return None;
+			}
+			if self.pasting {
+				match key {
+					Key::PasteEnd => self.pasting = false,
+					Key::Char(ch) => self.insert_pasted_char(ch),
+					Key::Enter => self.insert_pasted_char('\n'),
+					Key::Tab => self.insert_pasted_char('\t'),
+					// Never let pasted bytes trigger shortcuts, Ctrl actions
+					// or dialog decisions.
+					_ => {},
+				}
+				self.dirty = true;
+				return None;
+			}
+			if matches!(key, Key::PasteEnd) {
+				self.dirty = true;
+				return None;
+			}
+
 			if let Some(dialog) = self.dialog.take() {
 				match dialog {
 					Dialog::Approval { name, detail, reply } => {
@@ -1350,9 +1754,13 @@ mod imp {
 
 			if !matches!(&self.view, View::Chat) {
 				match key {
-					Key::Esc | Key::Char('q') | Key::Char('Q') => self.view = View::Chat,
+					Key::Esc | Key::Char('q') | Key::Char('Q') => {
+						self.view = View::Chat;
+						self.invalidate_wrap();
+					},
 					Key::CtrlC => {
 						self.view = View::Chat;
+						self.invalidate_wrap();
 						if self.busy {
 							self.dirty = true;
 							return Some(Action::Cancel);
@@ -1363,6 +1771,10 @@ mod imp {
 					},
 					Key::PageDown => {
 						self.scroll = self.scroll.saturating_sub(self.height / 2);
+					},
+					Key::CtrlL => {
+						self.scroll = 0;
+						self.clear_screen = true;
 					},
 					_ => {},
 				}
@@ -1385,6 +1797,7 @@ mod imp {
 				},
 				Key::CtrlL => {
 					self.scroll = 0;
+					self.clear_screen = true;
 				},
 				Key::CtrlU => self.input.clear(),
 				Key::Enter => {
@@ -1483,30 +1896,61 @@ mod imp {
 					self.input.insert(ch);
 					self.history_pos = None;
 				},
+				// Handled before the prompt match; kept for exhaustiveness.
+				Key::PasteStart | Key::PasteEnd => {},
 				Key::Esc => {},
 			}
 			self.dirty = true;
 			None
 		}
 
-		fn body_total(&self, width: usize) -> usize {
+		/// Sanitize and wrap the active view once per `(entry_rev, width)`;
+		/// every frame reuses the result instead of walking the transcript
+		/// twice (total + viewport) on each keystroke and streamed token.
+		fn body_total(&mut self, width: usize) -> usize {
+			self.wrapped_body(width).len()
+		}
+
+		fn wrapped_body(&mut self, width: usize) -> &[(Kind, String)] {
 			let width = width.max(1);
-			match &self.view {
-				View::Chat => self
-					.entries
-					.iter()
-					.map(|entry| wrap_text(&sanitize(&entry.text), width).len().max(1))
-					.sum(),
-				View::Text { lines, .. } => lines
-					.iter()
-					.map(|line| wrap_text(&sanitize(line), width).len().max(1))
-					.sum(),
+			let stale = self
+				.wrap_cache
+				.as_ref()
+				.map_or(true, |cache| cache.rev != self.entry_rev || cache.width != width);
+			if stale {
+				let lines = match &self.view {
+					View::Chat => {
+						let mut lines = Vec::new();
+						for entry in &self.entries {
+							let wrapped = wrap_text(&sanitize(&entry.text), width);
+							if wrapped.is_empty() {
+								lines.push((entry.kind, String::new()));
+							}
+							for line in wrapped {
+								lines.push((entry.kind, line));
+							}
+						}
+						lines
+					},
+					View::Text { lines: view_lines, .. } => {
+						let mut lines = Vec::new();
+						for line in view_lines {
+							for wrapped in wrap_text(&sanitize(line), width) {
+								lines.push((Kind::System, wrapped));
+							}
+						}
+						lines
+					},
+				};
+				self.wrap_cache = Some(WrapCache { rev: self.entry_rev, width, lines });
 			}
+			&self.wrap_cache.as_ref().expect("wrap cache populated above").lines
 		}
 
 		fn open_text_view(&mut self, title: impl Into<String>, lines: Vec<String>) {
 			self.scroll = 0;
 			self.view = View::Text { title: title.into(), lines };
+			self.invalidate_wrap();
 			self.dirty = true;
 		}
 
@@ -1647,62 +2091,159 @@ mod imp {
 					} else if let Some(custom) = state.custom.as_deref() {
 						lines.push(format!("custom: {}", one_line(custom)));
 					}
-					lines.push(
-						"[1-9] select · [Enter] confirm · [o] other · [c] chat · [Esc] cancel"
-							.to_string(),
-					);
+					lines.push(ASK_ACTION_HINT.to_string());
 					lines
 				},
 			}
 		}
 
-		fn body_lines(&self, width: usize, height: usize) -> Vec<(Kind, String)> {
-			let width = width.max(1);
-			let mut lines: Vec<(Kind, String)> = Vec::new();
-			match &self.view {
-				View::Chat => {
-					for entry in &self.entries {
-						let text = sanitize(&entry.text);
-						let wrapped = wrap_text(&text, width);
-						if wrapped.is_empty() {
-							lines.push((entry.kind, String::new()));
-						}
-						for line in wrapped {
-							lines.push((entry.kind, line));
-						}
-					}
-				},
-				View::Text { lines: view_lines, .. } => {
-					for line in view_lines {
-						for wrapped in wrap_text(&sanitize(line), width) {
-							lines.push((Kind::System, wrapped));
-						}
-					}
-				},
+		/// Short-screen ask layout: question, a window of option rows around
+		/// the selected/recommended option, then the action hint. Descriptions
+		/// are dropped before the actionable rows.
+		fn short_ask_dialog(&self, cap: usize) -> Option<Vec<String>> {
+			let Dialog::Ask(state) = self.dialog.as_ref()? else {
+				return None;
+			};
+			let question = state.current()?;
+			let mut lines = vec![format!(
+				"Question {}/{}: {}",
+				state.index + 1,
+				state.questions.len(),
+				one_line(&question.question)
+			)];
+			let budget = cap.saturating_sub(2);
+			if state.custom_mode {
+				lines.push(format!("custom> {}", one_line(&state.custom_input.text())));
+			} else if budget > 0 && !question.options.is_empty() {
+				let count = question.options.len();
+				let selected = state
+					.selected
+					.iter()
+					.next()
+					.copied()
+					.or_else(|| {
+						question.recommended.and_then(|value| usize::try_from(value).ok())
+					})
+					.filter(|index| *index < count)
+					.unwrap_or(0);
+				let window = budget.min(count);
+				let mut start = selected.saturating_sub(window / 2);
+				if start + window > count {
+					start = count.saturating_sub(window);
+				}
+				for index in start..(start + window).min(count) {
+					let option = &question.options[index];
+					let marked = state.selected.contains(&index);
+					let recommended = question
+						.recommended
+						.and_then(|value| usize::try_from(value).ok())
+						== Some(index);
+					lines.push(format!(
+						"  {}{} {}{}",
+						if marked { "●" } else { "○" },
+						index + 1,
+						one_line(&option.label),
+						if recommended { " (Recommended)" } else { "" }
+					));
+				}
 			}
-			let total = lines.len();
-			let max_scroll = total.saturating_sub(height);
-			let start = max_scroll.saturating_sub(self.scroll.min(max_scroll));
-			lines.into_iter().skip(start).take(height).collect()
+			lines.push(ASK_ACTION_HINT.to_string());
+			lines.truncate(cap);
+			Some(lines)
+		}
+
+		fn body_lines(&mut self, width: usize, height: usize) -> Vec<(Kind, String)> {
+			let scroll = self.scroll;
+			let lines = self.wrapped_body(width);
+			let max_scroll = lines.len().saturating_sub(height);
+			let start = max_scroll.saturating_sub(scroll.min(max_scroll));
+			lines.iter().skip(start).take(height).cloned().collect()
 		}
 
 		fn render(&mut self) -> (Vec<String>, usize, usize) {
-			let width = self.width.max(20);
-			let height = self.height.max(6);
+			// Never clamp UP: `Terminal::draw` writes into the physical
+			// viewport, and a row wider than `width` auto-wraps and shifts
+			// every later absolute row address. Use the measured size exactly
+			// and degrade the surrounding chrome on tiny Termux viewports.
+			let width = self.width.max(1);
+			let height = self.height.max(1);
 			let content_width = width.saturating_sub(1).max(1);
 			let view_title = match &self.view {
 				View::Chat => None,
 				View::Text { title, .. } => Some(title.clone()),
 			};
+
 			let mut dialog = self.dialog_lines(content_width);
-			// A dialog never eats the whole screen; keep one transcript row.
-			let fixed = 4usize;
+			let dialog_active = !dialog.is_empty();
+			let ask_short = matches!(self.dialog.as_ref(), Some(Dialog::Ask(_)));
+
+			// Row budget: chrome is best-effort. An active dialog outranks it,
+			// shrinking the transcript first and hiding hint/session/header
+			// before the dialog action line can be pushed off a short screen.
+			let mut hint_height = usize::from(height >= 2);
+			let mut header_height = usize::from(height >= 3);
+			let mut session_height = usize::from(height >= 4);
+			let mut input_height = usize::from(height >= 2 || !dialog_active);
+			let dialog_min = if dialog_active {
+				if ask_short && height >= 4 {
+					// question + one option row + action hint
+					3
+				} else if height <= 3 {
+					1
+				} else {
+					2
+				}
+			} else {
+				0
+			};
+			loop {
+				let fixed = input_height + hint_height + header_height + session_height;
+				let available = height.saturating_sub(fixed);
+				if available >= dialog_min {
+					break;
+				}
+				if hint_height > 0 {
+					hint_height = 0;
+				} else if session_height > 0 {
+					session_height = 0;
+				} else if header_height > 0 {
+					header_height = 0;
+				} else if input_height > 0 && height > 1 {
+					input_height = 0;
+				} else {
+					break;
+				}
+			}
+			let fixed = input_height + hint_height + header_height + session_height;
 			let available = height.saturating_sub(fixed);
-			let dialog_cap = available.saturating_sub(1).min(height / 2);
+			// On tiny screens the dialog may take every free row. On normal
+			// screens keep the historical half-screen cap and one body row.
+			let dialog_cap = if dialog_active {
+				if height <= 6 {
+					available
+				} else {
+					available.saturating_sub(1).min(height / 2)
+				}
+			} else {
+				0
+			};
 			if dialog.len() > dialog_cap {
-				dialog.truncate(dialog_cap);
-				if let Some(last) = dialog.last_mut() {
-					*last = "…".to_string();
+				if ask_short && dialog_cap >= 3
+					&& let Some(short) = self.short_ask_dialog(dialog_cap)
+				{
+					dialog = short;
+				}
+				if dialog.len() > dialog_cap {
+					if dialog_cap == 0 {
+						dialog.clear();
+					} else {
+						// Keep the first context rows and the final action row;
+						// replacing the last row with "…" hid the only
+						// actionable line.
+						let last = dialog.last().cloned().unwrap_or_default();
+						dialog.truncate(dialog_cap - 1);
+						dialog.push(last);
+					}
 				}
 			}
 			let dialog_height = dialog.len();
@@ -1716,24 +2257,50 @@ mod imp {
 			let body = self.body_lines(content_width, body_height);
 
 			let mut rows: Vec<String> = Vec::with_capacity(height);
-			let busy = if self.busy { " · working" } else { "" };
-			let workers = match self.running_workers() {
-				0 => String::new(),
-				count => format!(" · {count} worker(s)"),
-			};
-			let header = format!(
-				"\x1b[1momp\x1b[0m {} · {}{}{}",
-				clip(&one_line(&self.status.model), content_width.saturating_sub(24)),
-				clip(&one_line(&self.status.cwd), content_width / 2),
-				workers,
-				busy
-			);
-			rows.push(header);
-			rows.push(format!(
-				"\x1b[2msession {} · approvals {} · /help for commands\x1b[0m",
-				clip(&one_line(&self.status.session), 40),
-				self.status.approvals
-			));
+			if header_height > 0 {
+				let busy = if self.busy { " · working" } else { "" };
+				let workers = match self.running_workers() {
+					0 => String::new(),
+					count => format!(" · {count} worker(s)"),
+				};
+				let header = if content_width >= 24 {
+					format!(
+						"omp {} · {}{}{}",
+						clip(&one_line(&self.status.model), content_width.saturating_sub(24)),
+						clip(&one_line(&self.status.cwd), content_width / 2),
+						workers,
+						busy
+					)
+				} else {
+					format!(
+						"omp {}{}",
+						clip(
+							&one_line(&self.status.model),
+							content_width.saturating_sub(4)
+						),
+						workers
+					)
+				};
+				rows.push(format!("\x1b[1m{}\x1b[0m", clip(&header, content_width)));
+			}
+			if session_height > 0 {
+				let session = if content_width >= 32 {
+					format!(
+						"session {} · approvals {} · /help for commands",
+						clip(&one_line(&self.status.session), 40),
+						self.status.approvals
+					)
+				} else {
+					format!(
+						"session {}",
+						clip(
+							&one_line(&self.status.session),
+							content_width.saturating_sub(8)
+						)
+					)
+				};
+				rows.push(format!("\x1b[2m{}\x1b[0m", clip(&session, content_width)));
+			}
 			for (kind, line) in &body {
 				let text = clip(line, content_width);
 				if text.is_empty() {
@@ -1742,42 +2309,57 @@ mod imp {
 					rows.push(format!("{}{}\x1b[0m", kind.style(), text));
 				}
 			}
-			while rows.len() < 2 + body_height {
+			while rows.len() < header_height + session_height + body_height {
 				rows.push(String::new());
 			}
 			for line in &dialog {
 				rows.push(format!("\x1b[1m{}\x1b[0m", clip(&sanitize(line), content_width)));
 			}
 			let viewing = view_title.is_some();
-			let input_text = self.input.text();
+			let prompt = if content_width >= 4 { "> " } else { "" };
+			let prompt_width = display_width(prompt);
+			let input_width = content_width.saturating_sub(prompt_width).max(1);
 			let input_line = if viewing {
-				let title = view_title.as_deref().unwrap_or_default();
-				format!(
-					"\x1b[2m[{}] — Esc closes the view\x1b[0m",
-					clip(&one_line(title), content_width.saturating_sub(16))
-				)
+				let title = clip(&one_line(view_title.as_deref().unwrap_or_default()), content_width);
+				let banner = format!("[{title}] — Esc closes the view");
+				format!("\x1b[2m{}\x1b[0m", clip(&banner, content_width))
 			} else {
-				let text = clip(&one_line(&input_text), content_width.saturating_sub(3));
-				format!("\x1b[1m> \x1b[0m{text}")
+				let (text, _) = self.input.window(input_width);
+				format!("\x1b[1m{prompt}\x1b[0m{text}")
 			};
-			let cursor_prefix = self.input.prefix();
-			let cursor_col = if viewing {
+			// `cursor_col` is a 1-based physical column. The input window
+			// width already leaves the last physical cell unused; a cursor at
+			// the end of the text may therefore sit exactly at `width`.
+			let cursor_col = if viewing || input_height == 0 {
 				1
 			} else {
-				(3 + display_width(&cursor_prefix)).min(content_width)
+				let (_, prefix_width) = self.input.window(input_width);
+				(1 + prompt_width + prefix_width).min(width)
 			};
-			rows.push(input_line);
-			rows.push(
-				"\x1b[2mEnter send · Ctrl-C cancel/clear · PgUp/PgDn scroll · \
-				 /status /history /workers /memory /model /cwd /config\x1b[0m"
-					.to_string(),
-			);
+			if input_height > 0 {
+				rows.push(input_line);
+			}
+			if hint_height > 0 {
+				let hint = if content_width >= 48 {
+					"Enter send · Ctrl-C cancel/clear · PgUp/PgDn scroll · \
+					 /status /history /workers /memory /model /cwd /config"
+				} else if content_width >= 22 {
+					"Enter send · /help · PgUp/PgDn scroll"
+				} else {
+					"Enter · /help"
+				};
+				rows.push(format!("\x1b[2m{}\x1b[0m", clip(hint, content_width)));
+			}
 			while rows.len() < height {
 				rows.push(String::new());
 			}
 			rows.truncate(height);
 
-			let input_row = (2 + body_height + dialog_height + 1).min(height);
+			let input_row = if input_height > 0 {
+				(header_height + session_height + body_height + dialog_height + 1).min(height)
+			} else {
+				height
+			};
 			(rows, input_row, cursor_col)
 		}
 	}
@@ -2043,13 +2625,18 @@ mod imp {
 				app.live_thinking = None;
 				app.tools.clear();
 				app.scroll = 0;
+				app.invalidate_wrap();
+				app.wrap_cache = None;
 				app.dirty = true;
 			},
 			UiCommand::Config => {
 				let lines = config_lines(session);
 				app.open_text_view("Config", lines);
 			},
-			UiCommand::Chat => app.view = View::Chat,
+			UiCommand::Chat => {
+				app.view = View::Chat;
+				app.invalidate_wrap();
+			},
 			UiCommand::Model(Some(id)) => {
 				session.select_model(id.clone());
 				app.push_system(format!("model: {id}"));
@@ -2167,16 +2754,24 @@ mod imp {
 
 	// ── Event loop ─────────────────────────────────────────────────────────
 
-	/// Non-blocking readiness of stdin, distinguishing hangup.
-	fn stdin_ready(timeout_ms: i32) -> (bool, bool) {
-		let mut poll_fd = libc::pollfd { fd: libc::STDIN_FILENO, events: libc::POLLIN, revents: 0 };
-		// SAFETY: one valid pollfd, bounded timeout.
-		let result = unsafe { libc::poll(&mut poll_fd, 1, timeout_ms) };
+	/// Non-blocking readiness of stdin (and the SIGWINCH wake pipe),
+	/// distinguishing hangup.
+	fn stdin_ready(timeout_ms: i32, wake_fd: libc::c_int) -> (bool, bool, bool) {
+		let mut poll_fds = [
+			libc::pollfd { fd: libc::STDIN_FILENO, events: libc::POLLIN, revents: 0 },
+			libc::pollfd { fd: wake_fd, events: libc::POLLIN, revents: 0 },
+		];
+		let count = if wake_fd >= 0 { 2 } else { 1 };
+		// SAFETY: `count` valid pollfds (the second is ignored when absent),
+		// bounded timeout.
+		let result = unsafe { libc::poll(poll_fds.as_mut_ptr(), count, timeout_ms) };
 		if result <= 0 {
-			return (false, false);
+			return (false, false, false);
 		}
-		let eof = poll_fd.revents & (libc::POLLHUP | libc::POLLERR | libc::POLLNVAL) != 0;
-		(poll_fd.revents & libc::POLLIN != 0, eof)
+		let eof = poll_fds[0].revents & (libc::POLLHUP | libc::POLLERR | libc::POLLNVAL) != 0;
+		let readable = poll_fds[0].revents & libc::POLLIN != 0;
+		let woken = count == 2 && poll_fds[1].revents & libc::POLLIN != 0;
+		(readable, eof, woken)
 	}
 
 	fn read_stdin(buffer: &mut [u8]) -> Option<usize> {
@@ -2202,6 +2797,12 @@ mod imp {
 		cancel: &'a Arc<std::sync::Mutex<crate::TurnCancelState>>,
 		busy: bool,
 		buffer: Vec<u8>,
+		/// Parser-side bracketed-paste state; survives split reads but is
+		/// separate from `App::pasting` (which is updated key by key).
+		paste_mode: bool,
+		/// When `buffer` became exactly `ESC`, for the idle standalone-Esc
+		/// flush. Cleared as soon as more bytes arrive.
+		esc_since: Option<Instant>,
 	}
 
 	fn event_loop(context: &mut LoopContext<'_>) -> Result<Action> {
@@ -2215,8 +2816,29 @@ mod imp {
 				clear_cancel(context.cancel);
 				return Ok(Action::None);
 			}
-			let timeout = if context.app.dirty { 0 } else { 50 };
-			let (readable, eof) = stdin_ready(timeout);
+			let mut keys = Vec::new();
+			if flush_idle_escape(
+				&mut context.buffer,
+				context.esc_since,
+				Instant::now(),
+				context.paste_mode,
+			) {
+				context.esc_since = None;
+				keys.push(Key::Esc);
+			}
+			let timeout = if context.app.dirty || !keys.is_empty() {
+				0
+			} else if context.esc_since.is_some() && !context.paste_mode {
+				ESC_IDLE_FLUSH.as_millis().min(50) as i32
+			} else {
+				50
+			};
+			let (readable, eof, woken) = stdin_ready(timeout, context.terminal.winch_fd());
+			if woken {
+				context.terminal.drain_winch();
+				// The draw below re-reads `TIOCGWINSZ` and clears old rows.
+				context.app.dirty = true;
+			}
 			if eof {
 				return Ok(Action::Exit);
 			}
@@ -2227,44 +2849,58 @@ mod imp {
 					Some(0) => {},
 					Some(count) => {
 						context.buffer.extend_from_slice(&chunk[..count]);
-						for key in parse_keys(&mut context.buffer) {
-							let Some(action) = context.app.on_key(key) else {
-								continue;
-							};
-							match action {
-								Action::None => {},
-								Action::Cancel => {
-									cancel_turn(context.cancel);
-									context.app.fail_dialogs();
-									context.app.push_system("cancelling turn (Ctrl-C)…");
-								},
-								Action::Steer(text) => {
-									let accepted =
-										context.runner.steer(vec![ContentPart::text(text.as_str())]);
-									if !accepted {
-										context
-											.app
-											.push_system("steering unavailable: the turn is finishing");
-										context.app.input.set_text(&text);
-									}
-								},
-								Action::Submit(prompt) => {
-									if !context.busy {
-										return Ok(Action::Submit(prompt));
-									}
-								},
-								Action::Command(command) => {
-									if context.busy {
-										context.app.busy_command(command);
-									} else {
-										return Ok(Action::Command(command));
-									}
-								},
-								Action::Exit => return Ok(Action::Exit),
-							}
+						keys.extend(parse_keys(
+							&mut context.buffer,
+							&mut context.paste_mode,
+						));
+						if !context.paste_mode
+							&& context.buffer.len() == 1
+							&& context.buffer[0] == 0x1b
+						{
+							context.esc_since.get_or_insert_with(Instant::now);
+						} else {
+							context.esc_since = None;
 						}
-						context.app.dirty = true;
 					},
+				}
+			}
+			if !keys.is_empty() {
+				context.app.dirty = true;
+			}
+			for key in keys {
+				let Some(action) = context.app.on_key(key) else {
+					continue;
+				};
+				match action {
+					Action::None => {},
+					Action::Cancel => {
+						cancel_turn(context.cancel);
+						context.app.fail_dialogs();
+						context.app.push_system("cancelling turn (Ctrl-C)…");
+					},
+					Action::Steer(text) => {
+						let accepted =
+							context.runner.steer(vec![ContentPart::text(text.as_str())]);
+						if !accepted {
+							context
+								.app
+								.push_system("steering unavailable: the turn is finishing");
+							context.app.input.set_text(&text);
+						}
+					},
+					Action::Submit(prompt) => {
+						if !context.busy {
+							return Ok(Action::Submit(prompt));
+						}
+					},
+					Action::Command(command) => {
+						if context.busy {
+							context.app.busy_command(command);
+						} else {
+							return Ok(Action::Command(command));
+						}
+					},
+					Action::Exit => return Ok(Action::Exit),
 				}
 			}
 			if context.app.dirty {
@@ -2322,6 +2958,8 @@ mod imp {
 						cancel: &cancel,
 						busy: false,
 						buffer: Vec::new(),
+						paste_mode: false,
+						esc_since: None,
 					};
 					event_loop(&mut idle)?
 				};
@@ -2356,6 +2994,8 @@ mod imp {
 									cancel: &cancel,
 									busy: true,
 									buffer: Vec::new(),
+									paste_mode: false,
+									esc_since: None,
 								};
 								event_loop(&mut busy)
 							};
@@ -2395,6 +3035,44 @@ mod imp {
 	#[cfg(test)]
 	mod tests {
 		use super::*;
+		use pi_agent::tools::ask::AskOption;
+
+		fn test_app() -> App {
+			App::new(
+				Status {
+					model: "test-model".to_string(),
+					provider: String::new(),
+					cwd: "/tmp/project".to_string(),
+					session: "session-123".to_string(),
+					approvals: "always-ask".to_string(),
+					tools_enabled: true,
+				},
+				None,
+			)
+		}
+
+		/// Visible row text with SGR escape sequences stripped.
+		fn visible_text(row: &str) -> String {
+			let mut text = String::new();
+			let mut chars = row.chars().peekable();
+			while let Some(ch) = chars.next() {
+				if ch == '\x1b' && chars.peek() == Some(&'[') {
+					chars.next();
+					for escape in chars.by_ref() {
+						if ('@'..='~').contains(&escape) {
+							break;
+						}
+					}
+					continue;
+				}
+				text.push(ch);
+			}
+			text
+		}
+
+		fn visible_width(row: &str) -> usize {
+			visible_text(row).chars().map(char_width).sum()
+		}
 
 		#[test]
 		fn wrapping_respects_wide_and_combining_chars() {
@@ -2425,14 +3103,16 @@ mod imp {
 
 		#[test]
 		fn key_parser_reads_arrows_and_partial_utf8() {
+			let mut paste_mode = false;
 			let mut buffer = b"\x1b[5~\xe4\xbd".to_vec();
-			let keys = parse_keys(&mut buffer);
+			let keys = parse_keys(&mut buffer, &mut paste_mode);
 			assert_eq!(keys, vec![Key::PageUp]);
 			assert_eq!(buffer, b"\xe4\xbd".to_vec());
 			buffer.extend_from_slice(b"\xa0");
-			let keys = parse_keys(&mut buffer);
+			let keys = parse_keys(&mut buffer, &mut paste_mode);
 			assert_eq!(keys, vec![Key::Char('你')]);
 			assert!(buffer.is_empty());
+			assert!(!paste_mode);
 		}
 
 		#[test]
@@ -2511,6 +3191,488 @@ mod imp {
 				Some(UiCommand::Memory(vec!["create".into(), "keep".into(), "terse".into()]))
 			);
 			assert_eq!(parse_ui_command("/unknown x"), None);
+		}
+
+		#[test]
+		fn variation_selectors_and_zwj_are_zero_width() {
+			assert_eq!(display_width("❤\u{fe0f}"), 1);
+			assert_eq!(display_width("👩\u{200d}💻"), 4);
+			assert_eq!(clip("❤\u{fe0f}", 1), "❤\u{fe0f}");
+		}
+
+		#[test]
+		fn render_respects_narrow_and_short_viewports() {
+			let mut app = test_app();
+			for index in 0..8 {
+				app.push(
+					Kind::Assistant,
+					format!("line {index} with long text 你好世界 and more trailing words"),
+				);
+			}
+			app.input.set_text("a very long prompt that must scroll with the cursor");
+			for width in 10..=18 {
+				for height in 4..=6 {
+					app.width = width;
+					app.height = height;
+					let (rows, input_row, cursor_col) = app.render();
+					assert_eq!(rows.len(), height, "width={width} height={height}");
+					let limit = width.saturating_sub(1).max(1);
+					for (index, row) in rows.iter().enumerate() {
+						let rendered = visible_width(row);
+						assert!(
+							rendered <= limit,
+							"width={width} height={height} row={index} rendered={rendered}: {row:?}"
+						);
+					}
+					assert!(input_row >= 1 && input_row <= height);
+					// Cursor columns are 1-based: a full input row ends on
+					// the last physical column, not one cell short.
+					assert_eq!(cursor_col, width, "width={width} height={height}");
+				}
+			}
+		}
+
+		#[test]
+		fn resize_clear_tracking_detects_size_changes() {
+			assert!(viewport_changed(None, (80, 24)));
+			assert!(!viewport_changed(Some((80, 24)), (80, 24)));
+			assert!(viewport_changed(Some((80, 24)), (79, 24)));
+			assert!(viewport_changed(Some((80, 24)), (80, 25)));
+
+			let mut app = test_app();
+			let _ = app.on_key(Key::CtrlL);
+			assert!(app.clear_screen);
+		}
+
+		#[test]
+		fn wrap_cache_invalidates_on_content_and_width() {
+			let mut app = test_app();
+			app.push(Kind::Assistant, "first line");
+			let first_rev = app.entry_rev;
+			let first = app.wrapped_body(20).to_vec();
+			let first_ptr = app.wrap_cache.as_ref().expect("cache").lines.as_ptr();
+			let again = app.wrapped_body(20).to_vec();
+			assert_eq!(first, again);
+			assert_eq!(first_ptr, app.wrap_cache.as_ref().expect("cache").lines.as_ptr());
+
+			app.push(Kind::Assistant, "second line");
+			assert_ne!(app.entry_rev, first_rev);
+			let longer = app.wrapped_body(20).to_vec();
+			assert!(longer.len() > first.len());
+
+			let narrow = app.wrapped_body(5).to_vec();
+			assert_eq!(app.wrap_cache.as_ref().expect("cache").width, 5);
+			assert!(narrow.len() >= longer.len());
+		}
+
+		#[test]
+		fn input_window_keeps_cursor_visible() {
+			let mut input = LineInput::default();
+			input.set_text("abcdefghij");
+			let (text, prefix) = input.window(4);
+			assert_eq!(text, "ghij");
+			assert_eq!(prefix, 4);
+
+			input.cursor = 2;
+			let (text, prefix) = input.window(4);
+			assert_eq!(text, "abcd");
+			assert_eq!(prefix, 2);
+
+			input.set_text("你好世界");
+			let (text, prefix) = input.window(4);
+			assert_eq!(text, "世界");
+			assert_eq!(prefix, 4);
+		}
+
+		#[test]
+		fn bracketed_paste_keeps_newlines_in_input() {
+			let mut paste_mode = false;
+			let mut buffer = b"\x1b[200~line1\nline2\x1b[201~".to_vec();
+			let keys = parse_keys(&mut buffer, &mut paste_mode);
+			assert_eq!(keys.first(), Some(&Key::PasteStart));
+			assert_eq!(keys.last(), Some(&Key::PasteEnd));
+			assert!(keys.iter().any(|key| *key == Key::Char('\n')));
+			assert!(!keys.iter().any(|key| matches!(key, Key::Enter | Key::CtrlC)));
+			assert!(!paste_mode);
+			assert!(buffer.is_empty());
+
+			let mut app = test_app();
+			for key in keys {
+				let _ = app.on_key(key);
+			}
+			assert_eq!(app.input.text(), "line1\nline2");
+			assert!(!app.pasting);
+		}
+
+		#[test]
+		fn paste_delimiters_survive_split_reads() {
+			let mut paste_mode = false;
+			let mut buffer = Vec::new();
+
+			buffer.extend_from_slice(b"\x1b");
+			assert!(parse_keys(&mut buffer, &mut paste_mode).is_empty());
+			buffer.extend_from_slice(b"[20");
+			assert!(parse_keys(&mut buffer, &mut paste_mode).is_empty());
+			buffer.extend_from_slice(b"0~ab");
+			assert_eq!(
+				parse_keys(&mut buffer, &mut paste_mode),
+				vec![Key::PasteStart, Key::Char('a'), Key::Char('b')]
+			);
+			assert!(paste_mode);
+
+			buffer.extend_from_slice(b"cd\x1b[20");
+			assert_eq!(
+				parse_keys(&mut buffer, &mut paste_mode),
+				vec![Key::Char('c'), Key::Char('d')]
+			);
+			assert_eq!(buffer, b"\x1b[20".to_vec());
+			assert!(paste_mode);
+
+			buffer.extend_from_slice(b"1~");
+			assert_eq!(parse_keys(&mut buffer, &mut paste_mode), vec![Key::PasteEnd]);
+			assert!(!paste_mode);
+			assert!(buffer.is_empty());
+		}
+
+		#[cfg(any(target_os = "android", target_os = "linux"))]
+		#[test]
+		fn winch_handler_restores_errno_after_failed_write() {
+			let errno = errno_location();
+			let saved_errno = unsafe { *errno };
+			// An impossible descriptor makes the handler write fail with EBADF,
+			// so only the explicit save/restore can keep the test errno.
+			WINCH_WRITE.store(libc::c_int::MAX, Ordering::SeqCst);
+			unsafe {
+				*errno = 0x1234;
+			}
+			wake_on_resize(libc::SIGWINCH);
+			let handler_errno = unsafe { *errno };
+			WINCH_WRITE.store(-1, Ordering::SeqCst);
+			unsafe {
+				*errno = saved_errno;
+			}
+			assert_eq!(handler_errno, 0x1234);
+			assert_eq!(WINCH_IN_FLIGHT.load(Ordering::SeqCst), 0);
+		}
+
+		#[test]
+		fn standalone_escape_flushes_only_after_idle_timeout() {
+			let start = Instant::now();
+			let mut buffer = b"\x1b".to_vec();
+			assert!(!flush_idle_escape(
+				&mut buffer,
+				Some(start),
+				start + Duration::from_millis(24),
+				false
+			));
+			assert_eq!(buffer, b"\x1b".to_vec());
+
+			assert!(flush_idle_escape(
+				&mut buffer,
+				Some(start),
+				start + Duration::from_millis(25),
+				false
+			));
+			assert!(buffer.is_empty());
+
+			let mut longer = b"\x1b[".to_vec();
+			assert!(!flush_idle_escape(
+				&mut longer,
+				Some(start),
+				start + Duration::from_secs(5),
+				false
+			));
+			assert_eq!(longer, b"\x1b[".to_vec());
+		}
+
+		#[test]
+		fn idle_escape_does_not_flush_split_paste_end() {
+			let start = Instant::now();
+			let mut paste_mode = false;
+			let mut buffer = b"\x1b[200~hello\x1b".to_vec();
+			let keys = parse_keys(&mut buffer, &mut paste_mode);
+			assert_eq!(
+				keys,
+				vec![
+					Key::PasteStart,
+					Key::Char('h'),
+					Key::Char('e'),
+					Key::Char('l'),
+					Key::Char('l'),
+					Key::Char('o'),
+				]
+			);
+			assert!(paste_mode);
+			assert_eq!(buffer, b"\x1b".to_vec());
+
+			let mut app = test_app();
+			for key in keys {
+				let _ = app.on_key(key);
+			}
+			assert!(app.pasting);
+			assert_eq!(app.input.text(), "hello");
+
+			assert!(!flush_idle_escape(
+				&mut buffer,
+				Some(start),
+				start + Duration::from_secs(1),
+				paste_mode
+			));
+			assert!(paste_mode);
+			assert_eq!(buffer, b"\x1b".to_vec());
+
+			buffer.extend_from_slice(b"[201~\r");
+			let keys = parse_keys(&mut buffer, &mut paste_mode);
+			assert_eq!(keys, vec![Key::PasteEnd, Key::Enter]);
+			assert!(!paste_mode);
+			assert!(buffer.is_empty());
+
+			let _ = app.on_key(Key::PasteEnd);
+			assert!(!app.pasting);
+			assert!(matches!(
+				app.on_key(Key::Enter),
+				Some(Action::Submit(text)) if text == "hello"
+			));
+		}
+
+		#[test]
+		fn paste_normalizes_crlf_and_ignores_control_actions() {
+			let mut paste_mode = false;
+			let mut buffer = b"\x1b[200~x\x03\x04\x15\x1b[By\r\nz\r".to_vec();
+			let keys = parse_keys(&mut buffer, &mut paste_mode);
+			assert_eq!(
+				keys,
+				vec![
+					Key::PasteStart,
+					Key::Char('x'),
+					Key::Char('['),
+					Key::Char('B'),
+					Key::Char('y'),
+					Key::Char('\n'),
+					Key::Char('z'),
+				]
+			);
+			assert!(!keys.iter().any(|key| matches!(
+				key,
+				Key::CtrlC | Key::CtrlD | Key::CtrlU | Key::Up | Key::Esc
+			)));
+			assert!(paste_mode);
+			assert_eq!(buffer, b"\r".to_vec());
+
+			buffer.extend_from_slice(b"\n\x1b[201~");
+			assert_eq!(
+				parse_keys(&mut buffer, &mut paste_mode),
+				vec![Key::Char('\n'), Key::PasteEnd]
+			);
+			assert!(!paste_mode);
+			assert!(buffer.is_empty());
+		}
+
+		#[test]
+		fn pasted_dialog_keys_do_not_answer_active_approval() {
+			let (reply, _receiver) = tokio::sync::oneshot::channel();
+			let mut app = test_app();
+			app.dialog = Some(Dialog::Approval {
+				name: "dangerous tool".to_string(),
+				detail: Some("would delete files".to_string()),
+				reply,
+			});
+			let mut paste_mode = false;
+			let mut buffer = b"\x1b[200~y\x03n\x1b[201~".to_vec();
+			for key in parse_keys(&mut buffer, &mut paste_mode) {
+				let _ = app.on_key(key);
+			}
+			assert!(app.dialog.is_some());
+			assert!(app.input.text().is_empty(), "non-custom dialog paste must not leak");
+			assert!(!app.pasting);
+			assert!(!paste_mode);
+		}
+
+		#[test]
+		fn paste_goes_to_custom_ask_input_at_cursor() {
+			use pi_agent::tools::ask::AskQuestion;
+
+			let (reply, _receiver) = tokio::sync::oneshot::channel();
+			let mut state = AskState::new(
+				vec![AskQuestion {
+					id: "pick".to_string(),
+					question: "Pick one".to_string(),
+					header: None,
+					options: vec![AskOption {
+						label: "one".to_string(),
+						description: None,
+						preview: None,
+					}],
+					multi: false,
+					recommended: None,
+				}],
+				reply,
+				CancellationToken::new(),
+				None,
+			);
+			state.custom_mode = true;
+			state.custom_input.set_text("tail");
+			state.custom_input.cursor = 0;
+
+			let mut app = test_app();
+			app.dialog = Some(Dialog::Ask(state));
+			let mut paste_mode = false;
+			let mut buffer = b"\x1b[200~hello\r\nworld\x1b[201~".to_vec();
+			for key in parse_keys(&mut buffer, &mut paste_mode) {
+				let _ = app.on_key(key);
+			}
+
+			let Some(Dialog::Ask(state)) = app.dialog.as_ref() else {
+				panic!("ask dialog must remain active");
+			};
+			assert_eq!(state.custom_input.text(), "hello worldtail");
+			assert_eq!(state.custom_input.cursor, "hello world".chars().count());
+			assert!(state.custom_mode);
+			assert!(app.input.text().is_empty(), "custom paste must not hit chat input");
+			assert!(!app.pasting);
+			assert!(!paste_mode);
+		}
+
+		#[test]
+		fn render_cursor_is_one_based() {
+			let mut app = test_app();
+			app.width = 10;
+			app.height = 4;
+			let (_, _, cursor_col) = app.render();
+			assert_eq!(cursor_col, 3, "empty prompt starts after \"> \" at column 3");
+			app.input.set_text("abcdefghijklmnopqrstuvwxyz");
+			let (_, _, cursor_col) = app.render();
+			assert_eq!(cursor_col, 10, "end of a full input row sits on column width");
+		}
+
+		#[test]
+		fn active_dialog_action_visible_on_tiny_viewports() {
+			let mut app = test_app();
+			let (reply, _receiver) = tokio::sync::oneshot::channel();
+			app.dialog = Some(Dialog::Approval {
+				name: "dangerous tool".to_string(),
+				detail: Some(
+					"a deliberately long detail that wraps on every narrow viewport".to_string(),
+				),
+				reply,
+			});
+			for width in 1..=10 {
+				for height in 1..=6 {
+					app.width = width;
+					app.height = height;
+					let (rows, input_row, cursor_col) = app.render();
+					assert_eq!(rows.len(), height, "width={width} height={height}");
+					let limit = width.saturating_sub(1).max(1);
+					for (index, row) in rows.iter().enumerate() {
+						assert!(
+							visible_width(row) <= limit,
+							"width={width} height={height} row={index}: {row:?}"
+						);
+					}
+					assert!(
+						rows.iter().any(|row| visible_text(row).starts_with('[')),
+						"width={width} height={height} lost dialog action: {rows:?}"
+					);
+					assert!(input_row >= 1 && input_row <= height);
+					assert!(cursor_col >= 1 && cursor_col <= width);
+				}
+			}
+		}
+
+		#[test]
+		fn short_ask_dialogs_show_question_selected_option_and_hint() {
+			use pi_agent::tools::ask::AskQuestion;
+
+			let (reply, _receiver) = tokio::sync::oneshot::channel();
+			let mut state = AskState::new(
+				vec![AskQuestion {
+					id: "pick".to_string(),
+					question: "Pick a deployment target".to_string(),
+					header: None,
+					options: vec![
+						AskOption {
+							label: "Alpha".to_string(),
+							description: Some("first choice".to_string()),
+							preview: None,
+						},
+						AskOption {
+							label: "Beta".to_string(),
+							description: Some("second choice".to_string()),
+							preview: None,
+						},
+						AskOption {
+							label: "Gamma".to_string(),
+							description: Some("third choice".to_string()),
+							preview: None,
+						},
+					],
+					multi: false,
+					recommended: Some(0),
+				}],
+				reply,
+				CancellationToken::new(),
+				None,
+			);
+			state.selected.insert(1);
+			let mut app = test_app();
+			app.dialog = Some(Dialog::Ask(state));
+			for width in 10..=20 {
+				for height in 4..=6 {
+					app.width = width;
+					app.height = height;
+					let (rows, _, _) = app.render();
+					assert_eq!(rows.len(), height, "width={width} height={height}");
+					let texts: Vec<String> = rows.iter().map(|row| visible_text(row)).collect();
+					assert!(
+						texts.iter().any(|text| text.contains("Question")),
+						"width={width} height={height} lost question: {texts:?}"
+					);
+					assert!(
+						texts.iter().any(|text| text.contains("●2 Beta")),
+						"width={width} height={height} lost selected option: {texts:?}"
+					);
+					assert!(
+						texts.iter().any(|text| text.contains("[1-9]")),
+						"width={width} height={height} lost action hint: {texts:?}"
+					);
+				}
+			}
+		}
+
+		#[test]
+		fn short_custom_ask_dialog_shows_prompt_and_action() {
+			use pi_agent::tools::ask::AskQuestion;
+
+			let (reply, _receiver) = tokio::sync::oneshot::channel();
+			let mut state = AskState::new(
+				vec![AskQuestion {
+					id: "custom".to_string(),
+					question: "Type a branch name".to_string(),
+					header: None,
+					options: vec![AskOption {
+						label: "main".to_string(),
+						description: None,
+						preview: None,
+					}],
+					multi: false,
+					recommended: None,
+				}],
+				reply,
+				CancellationToken::new(),
+				None,
+			);
+			state.custom_mode = true;
+			state.custom_input.set_text("feature/x");
+			let mut app = test_app();
+			app.dialog = Some(Dialog::Ask(state));
+			app.width = 20;
+			app.height = 4;
+			let (rows, _, _) = app.render();
+			assert_eq!(rows.len(), 4);
+			let texts: Vec<String> = rows.iter().map(|row| visible_text(row)).collect();
+			assert!(texts.iter().any(|text| text.contains("Question 1/1")));
+			assert!(texts.iter().any(|text| text.contains("custom> feature/x")));
+			assert!(texts.iter().any(|text| text.contains("[1-9]")));
 		}
 	}
 }
