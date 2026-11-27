@@ -216,9 +216,21 @@ def test_r9_migration_and_r11_doctor(binary: Path, timeout: float) -> None:
         env = make_isolated_env(home)
 
         # Read-only startup checks must NOT create ~/.aragent
+        expected_version = None
+        cargo_toml = Path("Cargo.toml")
+        if cargo_toml.is_file():
+            for line in cargo_toml.read_text(encoding="utf-8").splitlines():
+                if line.startswith('version = "') and line.endswith('"'):
+                    expected_version = line.split('"', 2)[1]
+                    break
         for flag in ("--help", "-h", "--version", "-V"):
             p = subprocess.run([str(binary), flag], env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=timeout)
             check(p.returncode == 0, f"{flag} failed rc={p.returncode}: {p.stderr}")
+            if flag in ("--version", "-V") and expected_version is not None:
+                check(
+                    p.stdout.strip() == f"arag {expected_version}",
+                    f"unexpected {flag} output: {p.stdout!r}, expected 'arag {expected_version}'",
+                )
             check(not (home / ".aragent").exists(), f"{flag} must not create ~/.aragent")
 
         doc_before = subprocess.run(

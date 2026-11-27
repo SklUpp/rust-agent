@@ -1170,13 +1170,13 @@ mod tests {
 			"*",
 			BashApproval::Prompt,
 		)]);
-		let approvals = approvals(ApprovalMode::Yolo, &["hub"])
+		let non_start_approvals = approvals(ApprovalMode::Yolo, &["hub"])
 			.with_bash_policy(prompt_everything);
-		approvals
+		non_start_approvals
 			.approve("hub", &json!({"op": "ps"}))
 			.await
 			.expect("ps is unaffected");
-		approvals
+		non_start_approvals
 			.approve("hub", &json!({"op": "list"}))
 			.await
 			.expect("list is unaffected");

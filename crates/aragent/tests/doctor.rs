@@ -794,6 +794,15 @@ fn legacy_home_doctor_is_read_only_and_reports_migration_status() {
 	);
 }
 
+#[test]
+fn doctor_returns_exit_code_2_when_destructive_flags_lack_guards() {
+	let fixture = Fixture::new("exit-2");
+	let missing_yes = fixture.run(&["doctor", "--prune-artifacts"]);
+	assert_eq!(code(&missing_yes), 2, "{}", stderr(&missing_yes));
+	let missing_backup = fixture.run(&["doctor", "--redact-legacy", "--yes"]);
+	assert_eq!(code(&missing_backup), 2, "{}", stderr(&missing_backup));
+}
+
 #[cfg(unix)]
 fn set_mode(path: &Path, mode: u32) {
 	use std::os::unix::fs::PermissionsExt;
