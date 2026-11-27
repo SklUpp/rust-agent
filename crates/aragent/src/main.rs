@@ -18,6 +18,7 @@ use aragent::{
 	},
 	autolearn::{self, LocalLearnTool, ManageSkillTool, MemoryBackend},
 	catalog::Catalog,
+	commit,
 	completions,
 	config::Config,
 	config_cmd, daemon_broker,
@@ -705,12 +706,33 @@ fn run() -> std::result::Result<(), CliError> {
 			run_cleanse_command(session.as_deref(), *confirm, &base, cli.session_dir.as_deref())?;
 			return Ok(());
 		},
-		Some(Command::Commit { message }) => {
+		Some(Command::Commit {
+			message,
+			files,
+			all,
+			dry_run,
+			push,
+			no_changelog,
+			legacy,
+			context,
+			model,
+		}) => {
 			let base = match &cli.cwd {
 				Some(cwd) => dirs::absolute(&std::env::current_dir()?, cwd),
 				None => std::env::current_dir()?,
 			};
-			run_commit_command(message.as_deref(), &base)?;
+			let options = commit::CommitOptions {
+				message,
+				files,
+				all,
+				dry_run,
+				push,
+				no_changelog,
+				legacy,
+				context,
+				model,
+			};
+			commit::run_commit(&options, &base).map_err(CliError::fail)?;
 			return Ok(());
 		},
 		Some(Command::Ttsr {
@@ -5459,78 +5481,6 @@ fn run_cleanse_command(
 	Ok(())
 }
 
-/// Headless `arag commit`: `git add -A` then `git commit` in the cwd.
-fn run_commit_command(message: Option<&str>, cwd: &Path) -> std::result::Result<(), CliError> {
-	let msg = message
-		.map(str::trim)
-		.filter(|s| !s.is_empty())
-		.unwrap_or("arag commit");
-	let status = std::process::Command::new("git")
-		.args(["rev-parse", "--is-inside-work-tree"])
-		.current_dir(cwd)
-		.stdout(std::process::Stdio::null())
-		.stderr(std::process::Stdio::null())
-		.status()
-		.map_err(|err| CliError::fail(format!("git not available: {err}")))?;
-	if !status.success() {
-		return Err(CliError::fail(format!("not a git repository: {}", cwd.display())));
-	}
-	let unmerged = std::process::Command::new("git")
-		.args(["ls-files", "-u"])
-		.current_dir(cwd)
-		.output()
-		.map_err(|err| CliError::fail(format!("git ls-files failed: {err}")))?;
-	if !unmerged.status.success() {
-		// `output()` succeeds for a non-zero exit; empty stdout would otherwise
-		// read as "no conflicts".
-		return Err(CliError::fail(format!(
-			"git ls-files -u exited {}: {}",
-			unmerged.status.code().unwrap_or(-1),
-			String::from_utf8_lossy(&unmerged.stderr).trim()
-		)));
-	}
-	if !unmerged.stdout.is_empty() {
-		return Err(CliError::fail(
-			"cannot commit: unresolved merge conflicts exist. Resolve conflicts before committing."
-				.to_string(),
-		));
-	}
-	let diff = std::process::Command::new("git")
-		.args(["status", "--porcelain"])
-		.current_dir(cwd)
-		.output()
-		.map_err(|err| CliError::fail(format!("git status failed: {err}")))?;
-	if !diff.status.success() {
-		return Err(CliError::fail(format!(
-			"git status --porcelain exited {}: {}",
-			diff.status.code().unwrap_or(-1),
-			String::from_utf8_lossy(&diff.stderr).trim()
-		)));
-	}
-	if diff.stdout.is_empty() {
-		println!("Nothing to commit, working tree clean.");
-		return Ok(());
-	}
-	let add = std::process::Command::new("git")
-		.args(["add", "-A"])
-		.current_dir(cwd)
-		.status()
-		.map_err(|err| CliError::fail(format!("git add failed: {err}")))?;
-	if !add.success() {
-		return Err(CliError::fail(format!("git add -A exited {}", add.code().unwrap_or(-1))));
-	}
-	let commit = std::process::Command::new("git")
-		.args(["commit", "-m", msg])
-		.current_dir(cwd)
-		.status()
-		.map_err(|err| CliError::fail(format!("git commit failed: {err}")))?;
-	if !commit.success() {
-		return Err(CliError::fail(format!("git commit exited {}", commit.code().unwrap_or(-1))));
-	}
-	println!("Committed: {msg}");
-	Ok(())
-}
-
 #[cfg(test)]
 mod tests {
 	use super::*;
@@ -5565,66 +5515,6 @@ mod tests {
 		invalidate_inherited_cache_key(&mut key, &mut source);
 		assert_eq!(key.as_deref(), Some("explicit-cache"));
 		assert_eq!(source, Some(PromptCacheKeySource::Explicit));
-	}
-
-	/// Fresh repo in a temp dir, or `None` when `git` is unavailable / cannot init.
-	fn temp_git_dir(name: &str) -> Option<std::path::PathBuf> {
-		let dir = std::env::temp_dir().join(format!("aragent-{name}-{}", std::process::id()));
-		let _ = std::fs::remove_dir_all(&dir);
-		std::fs::create_dir_all(&dir).ok()?;
-		let init = std::process::Command::new("git")
-			.args(["init", "-q", "."])
-			.current_dir(&dir)
-			.status()
-			.ok()?;
-		if init.success() {
-			Some(dir)
-		} else {
-			let _ = std::fs::remove_dir_all(&dir);
-			None
-		}
-	}
-
-	/// `output()` succeeds for a non-zero git exit, so a broken index used to be
-	/// reported as "Nothing to commit, working tree clean." with exit 0.
-	#[test]
-	fn commit_command_surfaces_a_failing_git_probe() {
-		let Some(dir) = temp_git_dir("commit-corrupt-index") else {
-			return;
-		};
-		std::fs::write(dir.join("tracked.txt"), "x").expect("write tracked");
-		let added = std::process::Command::new("git")
-			.args(["add", "-A"])
-			.current_dir(&dir)
-			.status()
-			.expect("git add");
-		assert!(added.success(), "git add must succeed in the fixture repo");
-		std::fs::write(dir.join(".git/index"), b"garbage").expect("corrupt index");
-
-		let error = run_commit_command(Some("unused"), &dir).expect_err("a broken index must fail");
-		assert!(
-			error.message.starts_with("git ls-files -u exited"),
-			"unexpected message: {}",
-			error.message
-		);
-		let _ = std::fs::remove_dir_all(&dir);
-	}
-
-	#[test]
-	fn commit_command_reports_a_clean_tree_without_committing() {
-		let Some(dir) = temp_git_dir("commit-clean-tree") else {
-			return;
-		};
-		if let Err(error) = run_commit_command(Some("unused"), &dir) {
-			panic!("a clean tree is not an error: {}", error.message);
-		}
-		let head = std::process::Command::new("git")
-			.args(["rev-parse", "--verify", "-q", "HEAD"])
-			.current_dir(&dir)
-			.output()
-			.expect("git rev-parse");
-		assert!(!head.status.success(), "nothing may be committed on a clean tree");
-		let _ = std::fs::remove_dir_all(&dir);
 	}
 
 	/// `run()` forwards `Command::Trust` straight to `run_trust_command`; this

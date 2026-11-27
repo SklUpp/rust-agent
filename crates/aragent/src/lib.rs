@@ -24,6 +24,7 @@ pub mod ask;
 pub mod auth;
 pub mod autolearn;
 pub mod catalog;
+pub mod commit;
 pub mod completions;
 pub mod config;
 pub mod config_cmd;

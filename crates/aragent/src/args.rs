@@ -1366,13 +1366,41 @@ pub enum Command {
 		confirm: bool,
 	},
 
-	/// Stage and commit the current working tree via `git add -A` / `git commit`.
+	/// Stage and commit safely: never sweeps unrelated dirty or untracked files.
 	///
-	/// Usage: `arag commit [--message MSG]`. Requires a git repository.
+	/// Usage: `arag commit [--message MSG] [--dry-run] [--push] [--files PATH]...`.
+	/// Requires a git repository. An occupied index is committed as-is; otherwise
+	/// only tracked modified files are staged, lockfiles are skipped, and
+	/// untracked files need `--all` or `--files`.
 	Commit {
-		/// Commit message (default: `arag commit`).
+		/// Commit message. Skips conventional inference when provided.
 		#[arg(short = 'm', long = "message", value_name = "MSG")]
-		message: Option<String>,
+		message:      Option<String>,
+		/// Explicit paths to stage instead of every tracked change; repeat the
+		/// flag for multiple paths. Hyphen-leading paths are accepted.
+		#[arg(long = "files", value_name = "PATH", allow_hyphen_values = true)]
+		files:        Vec<PathBuf>,
+		/// Stage every change, untracked files included.
+		#[arg(long)]
+		all:          bool,
+		/// Print the plan and proposed message without staging or committing.
+		#[arg(long = "dry-run")]
+		dry_run:      bool,
+		/// Push the current branch after committing.
+		#[arg(long)]
+		push:         bool,
+		/// Accepted for CLI parity; this build never writes a changelog.
+		#[arg(long = "no-changelog")]
+		no_changelog: bool,
+		/// Use the deterministic `update N files` summary.
+		#[arg(long)]
+		legacy:       bool,
+		/// Extra context for the inferred commit message.
+		#[arg(short = 'c', long = "context", value_name = "TEXT")]
+		context:      Option<String>,
+		/// Model override. Accepted for CLI parity; inference stays local.
+		#[arg(long = "model", value_name = "MODEL")]
+		model:        Option<String>,
 	},
 
 	/// Inspect and test Time-Traveling Stream Rules (TTSR).
@@ -2287,9 +2315,106 @@ mod tests {
 		);
 		assert_eq!(
 			parse(&["arag", "commit", "--message", "ship it"]).command,
-			Some(Command::Commit { message: Some("ship it".to_string()) })
+			Some(Command::Commit {
+				message:      Some("ship it".to_string()),
+				files:        Vec::new(),
+				all:          false,
+				dry_run:      false,
+				push:         false,
+				no_changelog: false,
+				legacy:       false,
+				context:      None,
+				model:        None,
+			})
 		);
-		assert_eq!(parse(&["arag", "commit"]).command, Some(Command::Commit { message: None }));
+		assert_eq!(
+			parse(&["arag", "commit"]).command,
+			Some(Command::Commit {
+				message:      None,
+				files:        Vec::new(),
+				all:          false,
+				dry_run:      false,
+				push:         false,
+				no_changelog: false,
+				legacy:       false,
+				context:      None,
+				model:        None,
+			})
+		);
+		assert_eq!(
+			parse(&[
+				"arag",
+				"commit",
+				"--dry-run",
+				"--push",
+				"--legacy",
+				"--no-changelog",
+				"--context",
+				"guard empty input",
+				"--model",
+				"fast",
+				"--files",
+				"a.rs",
+				"--files",
+				"b.rs",
+			])
+			.command,
+			Some(Command::Commit {
+				message:      None,
+				files:        vec![PathBuf::from("a.rs"), PathBuf::from("b.rs")],
+				all:          false,
+				dry_run:      true,
+				push:         true,
+				no_changelog: true,
+				legacy:       true,
+				context:      Some("guard empty input".to_string()),
+				model:        Some("fast".to_string()),
+			})
+		);
+		// `allow_hyphen_values` keeps hyphen-leading paths out of flag parsing.
+		assert_eq!(
+			parse(&["arag", "commit", "--files", "-name"]).command,
+			Some(Command::Commit {
+				message:      None,
+				files:        vec![PathBuf::from("-name")],
+				all:          false,
+				dry_run:      false,
+				push:         false,
+				no_changelog: false,
+				legacy:       false,
+				context:      None,
+				model:        None,
+			})
+		);
+		// A following flag stays a flag: `--files` takes one value per flag.
+		assert_eq!(
+			parse(&["arag", "commit", "--files", "a.rs", "--dry-run"]).command,
+			Some(Command::Commit {
+				message:      None,
+				files:        vec![PathBuf::from("a.rs")],
+				all:          false,
+				dry_run:      true,
+				push:         false,
+				no_changelog: false,
+				legacy:       false,
+				context:      None,
+				model:        None,
+			})
+		);
+		assert_eq!(
+			parse(&["arag", "commit", "--files", "-name", "--dry-run"]).command,
+			Some(Command::Commit {
+				message:      None,
+				files:        vec![PathBuf::from("-name")],
+				all:          false,
+				dry_run:      true,
+				push:         false,
+				no_changelog: false,
+				legacy:       false,
+				context:      None,
+				model:        None,
+			})
+		);
 	}
 
 	#[test]
