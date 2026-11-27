@@ -450,22 +450,12 @@ impl Drop for StdioTransport {
     }
 }
 
-/// SIGKILL the transport's whole process group. `kill` also accepts an
-/// already-reaped pid (ESRCH), so no liveness check is needed.
+/// SIGKILL the transport's whole process group. A dead group is a harmless
+/// ESRCH, and the shared primitive refuses the harness's own process group.
 fn kill_process_group(pgid: Option<u32>) {
-    #[cfg(unix)]
-    if let Some(pgid) = pgid
-        && let Ok(pgid) = i32::try_from(pgid)
-        && pgid > 0
-    {
-        // SAFETY: `kill` tolerates any pid; the pgid came from `spawn` with
-        // `process_group(0)`, so it names a group this transport created.
-        unsafe {
-            libc::kill(-pgid, libc::SIGKILL);
-        }
+    if let Some(pgid) = pgid.and_then(|pgid| i32::try_from(pgid).ok()) {
+        let _ = pi_shell::process::kill_process_group(pgid, pi_shell::process::KILL_SIGNAL);
     }
-    #[cfg(not(unix))]
-    let _ = pgid;
 }
 
 #[cfg(test)]

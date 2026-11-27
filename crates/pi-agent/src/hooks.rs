@@ -943,18 +943,12 @@ impl Drop for ProcessGroupGuard {
 }
 
 fn kill_group(pid: Option<u32>) {
-	#[cfg(unix)]
-	if let Some(pid) = pid.and_then(|pid| i32::try_from(pid).ok()) {
-		// `kill_on_drop` still reaps the direct child; the group signal also
-		// reaches anything the hook spawned.
-		// SAFETY: `kill` tolerates an already-reaped pid (ESRCH); the pid was
-		// returned by `spawn` and only ever widened to its process group.
-		unsafe {
-			libc::kill(-pid, libc::SIGKILL);
-		}
+	// `kill_on_drop` still reaps the direct child; the group signal also
+	// reaches anything the hook spawned. A dead group is a harmless ESRCH, and
+	// the shared primitive refuses the harness's own process group.
+	if let Some(pgid) = pid.and_then(|pid| i32::try_from(pid).ok()) {
+		let _ = pi_shell::process::kill_process_group(pgid, pi_shell::process::KILL_SIGNAL);
 	}
-	#[cfg(not(unix))]
-	let _ = pid;
 }
 
 #[cfg(all(test, unix))]

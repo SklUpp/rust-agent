@@ -39,7 +39,7 @@ use std::{
 use async_trait::async_trait;
 use pi_shell::{
 	cancel::CancelToken,
-	process::{KILL_SIGNAL, Process, TERM_SIGNAL},
+	process::{KILL_SIGNAL, Process, TERM_SIGNAL, kill_process_group},
 };
 use portable_pty::{
 	ChildKiller, CommandBuilder, MasterPty, PtySize, native_pty_system,
@@ -1020,7 +1020,7 @@ impl Drop for AbandonLaunch {
 			(state.pinned.take(), state.group_id.take())
 		};
 		if let Some(group_id) = group_id {
-			kill_process_group(group_id, KILL_SIGNAL);
+			let _ = kill_process_group(group_id, KILL_SIGNAL);
 		}
 		if let Some(process) = pinned {
 			let _ = process.kill_tree(Some(KILL_SIGNAL));
@@ -1152,7 +1152,7 @@ impl ProcessManager {
 				continue;
 			}
 			if let Some(group_id) = group_id {
-				kill_process_group(group_id, KILL_SIGNAL);
+				let _ = kill_process_group(group_id, KILL_SIGNAL);
 			}
 			if let Some(process) = pinned {
 				let _ = process.kill_tree(Some(KILL_SIGNAL));
@@ -1973,7 +1973,7 @@ impl ProcessManager {
 			state.restart_task = Some(task);
 			drop(state);
 			if let Some(group_id) = leftover_group {
-				kill_process_group(group_id, KILL_SIGNAL);
+				let _ = kill_process_group(group_id, KILL_SIGNAL);
 			}
 			self.publish(record, ProcessEventKind::Restarting);
 			record.notify_change();
@@ -1986,7 +1986,7 @@ impl ProcessManager {
 		};
 		drop(state);
 		if let Some(group_id) = leftover_group {
-			kill_process_group(group_id, KILL_SIGNAL);
+			let _ = kill_process_group(group_id, KILL_SIGNAL);
 		}
 		self.publish(record, ProcessEventKind::Exited);
 		record.notify_change();
@@ -2339,7 +2339,7 @@ impl ProcessManager {
 		.await;
 		if !settled {
 			if let Some(group_id) = group_id {
-				kill_process_group(group_id, KILL_SIGNAL);
+				let _ = kill_process_group(group_id, KILL_SIGNAL);
 			}
 			if let Some(mut killer) = lock(&record.state)
 				.killer
@@ -2522,7 +2522,7 @@ impl Drop for Inner {
 				task.abort();
 			}
 			if let Some(group_id) = group_id {
-				kill_process_group(group_id, KILL_SIGNAL);
+				let _ = kill_process_group(group_id, KILL_SIGNAL);
 			}
 			if let Some(process) = pinned {
 				let _ = process.kill_tree(Some(KILL_SIGNAL));
@@ -2766,29 +2766,6 @@ fn spawn_detached(spec: &ProcessSpec, log_path: &Path) -> Result<SpawnedDetached
 unsafe extern "C" {
 	/// `setsid(2)` from the platform C library; no `libc` crate wiring needed.
 	fn setsid() -> i32;
-	/// `kill(2)`; used only with a negative pid to sweep a process group.
-	fn kill(pid: i32, signal: i32) -> i32;
-}
-
-/// Sweep the remaining members of a generation's process group. The root pid's
-/// group id stays reserved while any member lives, so this cannot hit an
-/// unrelated recycled pid; `ESRCH` (empty group) is the normal case.
-fn kill_process_group(group_id: i32, signal: i32) {
-	if group_id <= 1 {
-		return;
-	}
-	#[cfg(unix)]
-	{
-		// SAFETY: `kill(2)` is async-signal-safe and has no memory effects; a
-		// negative pid targets exactly that process group.
-		unsafe {
-			let _ = kill(-group_id, signal);
-		}
-	}
-	#[cfg(not(unix))]
-	{
-		let _ = (group_id, signal);
-	}
 }
 
 struct SpawnedPipe {

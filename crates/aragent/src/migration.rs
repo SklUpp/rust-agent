@@ -26,6 +26,8 @@ use std::{
 	path::{Path, PathBuf},
 };
 
+use pi_agent::tools::atomic_publish::publish_staged_file_io;
+
 use crate::dirs::{self, AgentDirCategory};
 
 /// Marker written into the new user root after a clean migration.
@@ -448,95 +450,17 @@ fn create_private_parent(parent: &Path) -> io::Result<()> {
 	Ok(())
 }
 
-/// Publish a fully written sibling temp with a no-clobber hard link. The temp
-/// inode is removed afterwards, so the destination appears atomically and an
-/// existing destination is never overwritten, even by a concurrent writer.
-fn publish_file(temporary: &Path, dst: &Path) -> io::Result<bool> {
-	match fs::hard_link(temporary, dst) {
-		Ok(()) => {
-			fs::remove_file(temporary)?;
-			Ok(true)
-		},
-		Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
-			let _ = fs::remove_file(temporary);
-			Ok(false)
-		},
-		// Android app-private storage can deny hard links. Fall back to a
-		// kernel-level no-clobber rename. If the filesystem cannot provide one,
-		// fail rather than expose a partial destination file.
-		Err(error)
-			if matches!(
-				error.kind(),
-				io::ErrorKind::PermissionDenied | io::ErrorKind::Unsupported
-			) =>
-		{
-			publish_without_hardlink(temporary, dst)
-		},
+/// Drop a private staging copy after publication.
+///
+/// The publication primitive already removes it on success, so `NotFound` is
+/// the normal case; any other removal failure is surfaced instead of silently
+/// leaving a private copy behind while migration reports a clean pass.
+fn remove_staged(path: &Path) -> io::Result<bool> {
+	match fs::remove_file(path) {
+		Ok(()) => Ok(true),
+		Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(true),
 		Err(error) => Err(error),
 	}
-}
-
-fn publish_without_hardlink(temporary: &Path, dst: &Path) -> io::Result<bool> {
-	match rename_noreplace(temporary, dst)? {
-		Some(true) => Ok(true),
-		Some(false) => {
-			let _ = fs::remove_file(temporary);
-			Ok(false)
-		},
-		None => {
-			let _ = fs::remove_file(temporary);
-			Err(io::Error::new(
-				io::ErrorKind::Unsupported,
-				"atomic no-clobber file publication is unavailable on this filesystem",
-			))
-		},
-	}
-}
-
-/// `renameat2(..., RENAME_NOREPLACE)` where the platform exposes it. `None`
-/// means the syscall is unavailable or does not support the flag.
-#[cfg(any(target_os = "linux", target_os = "android"))]
-fn rename_noreplace(src: &Path, dst: &Path) -> io::Result<Option<bool>> {
-	use std::ffi::CString;
-	use std::os::unix::ffi::OsStrExt as _;
-
-	const RENAME_NOREPLACE: libc::c_uint = 1;
-	let src = CString::new(src.as_os_str().as_bytes()).map_err(|_| {
-		io::Error::new(io::ErrorKind::InvalidInput, "source path contains a NUL byte")
-	})?;
-	let dst = CString::new(dst.as_os_str().as_bytes()).map_err(|_| {
-		io::Error::new(io::ErrorKind::InvalidInput, "destination path contains a NUL byte")
-	})?;
-	// SAFETY: both pointers are valid NUL-terminated paths and the flag is a
-	// valid renameat2 flag.
-	let result = unsafe {
-		libc::syscall(
-			libc::SYS_renameat2,
-			libc::AT_FDCWD,
-			src.as_ptr(),
-			libc::AT_FDCWD,
-			dst.as_ptr(),
-			RENAME_NOREPLACE,
-		)
-	};
-	if result == 0 {
-		return Ok(Some(true));
-	}
-	let error = io::Error::last_os_error();
-	match error.raw_os_error() {
-		Some(code) if code == libc::EEXIST => Ok(Some(false)),
-		Some(code)
-			if code == libc::ENOSYS || code == libc::EINVAL || code == libc::EOPNOTSUPP =>
-		{
-			Ok(None)
-		},
-		_ => Err(error),
-	}
-}
-
-#[cfg(not(any(target_os = "linux", target_os = "android")))]
-fn rename_noreplace(_src: &Path, _dst: &Path) -> io::Result<Option<bool>> {
-	Ok(None)
 }
 
 fn copy_private_file(src: &Path, dst: &Path) -> io::Result<bool> {
@@ -548,11 +472,16 @@ fn copy_private_file(src: &Path, dst: &Path) -> io::Result<bool> {
 	// partial destination that destination-wins would treat as authoritative.
 	let result = fs::copy(src, &temporary)
 		.and_then(|_| set_file_mode(&temporary, mode))
-		.and_then(|()| publish_file(&temporary, dst));
-	if result.is_err() {
-		let _ = fs::remove_file(&temporary);
+		.and_then(|()| publish_staged_file_io(&temporary, dst));
+	// The shared primitive keeps the staged file on a lost race, so clean it up
+	// on anything short of a published destination.
+	match result {
+		Ok(true) => remove_staged(&temporary),
+		other => {
+			let _ = fs::remove_file(&temporary);
+			other
+		},
 	}
-	result
 }
 
 #[cfg(unix)]
@@ -662,11 +591,14 @@ fn snapshot_sqlite(dst: &Path, legacy: &Path) -> io::Result<bool> {
 		let _ = fs::remove_file(&temporary);
 		return Err(error);
 	}
-	let published = publish_file(&temporary, dst);
-	if published.is_err() {
-		let _ = fs::remove_file(&temporary);
+	let published = publish_staged_file_io(&temporary, dst);
+	match published {
+		Ok(true) => remove_staged(&temporary),
+		other => {
+			let _ = fs::remove_file(&temporary);
+			other
+		},
 	}
-	published
 }
 
 /// Copy one legacy file into `dst` when `dst` is absent.
@@ -880,29 +812,19 @@ mod tests {
 	}
 
 	#[test]
-	fn rename_noreplace_is_no_clobber_and_publishes_when_absent() {
-		let base = temp_dir("rename-noreplace");
+	fn publish_staged_file_io_is_no_clobber_and_publishes_when_absent() {
+		let base = temp_dir("publish-noreplace");
 		let source = base.join("source.txt");
 		let destination = base.join("destination.txt");
 		write(&source, "temp");
 		write(&destination, "current");
-		match rename_noreplace(&source, &destination).expect("existing") {
-			Some(false) => {
-				assert_eq!(fs::read_to_string(&destination).unwrap(), "current");
-				assert!(source.exists(), "EEXIST leaves the source in place");
-			},
-			Some(true) => panic!("RENAME_NOREPLACE must not overwrite"),
-			None => return,
-		}
+		assert!(!publish_staged_file_io(&source, &destination).expect("existing"));
+		assert_eq!(fs::read_to_string(&destination).unwrap(), "current");
+		assert!(source.exists(), "a lost race leaves the staged file in place");
 		fs::remove_file(&destination).expect("remove");
-		match rename_noreplace(&source, &destination).expect("publish") {
-			Some(true) => {
-				assert_eq!(fs::read_to_string(&destination).unwrap(), "temp");
-				assert!(!source.exists(), "renameat2 moves the temp");
-			},
-			Some(false) => panic!("the destination is absent"),
-			None => return,
-		}
+		assert!(publish_staged_file_io(&source, &destination).expect("publish"));
+		assert_eq!(fs::read_to_string(&destination).unwrap(), "temp");
+		assert!(!source.exists(), "publication consumes the staged file");
 	}
 
 	#[test]

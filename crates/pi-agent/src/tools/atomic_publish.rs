@@ -24,18 +24,27 @@ use std::path::Path;
 /// `Ok(false)` means another writer owns this destination; the caller must
 /// keep the existing file untouched and choose another identity or retry.
 pub fn publish_staged_file(staged: &Path, final_path: &Path) -> Result<bool, String> {
+	publish_staged_file_io(staged, final_path).map_err(|error| error.to_string())
+}
+
+/// [`publish_staged_file`] with the platform I/O error preserved, for callers
+/// that report `io::Error` instead of a formatted string.
+///
+/// The staged file survives an `Ok(false)` so the caller can retry it under
+/// another identity; it is only removed after a successful publication.
+pub fn publish_staged_file_io(staged: &Path, final_path: &Path) -> std::io::Result<bool> {
 	match std::fs::hard_link(staged, final_path) {
 		Ok(()) => {
 			let _ = std::fs::remove_file(staged);
 			Ok(true)
 		},
 		Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => Ok(false),
-		Err(error) => match rename_noreplace(staged, final_path) {
-			Ok(published) => Ok(published),
-			Err(fallback) => Err(format!(
-				"hard link failed ({error}); atomic no-clobber rename failed ({fallback})"
-			)),
-		},
+		Err(error) => rename_noreplace(staged, final_path).map_err(|fallback| {
+			std::io::Error::new(
+				fallback.kind(),
+				format!("hard link failed ({error}); atomic no-clobber rename failed ({fallback})"),
+			)
+		}),
 	}
 }
 

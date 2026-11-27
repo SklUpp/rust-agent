@@ -16,6 +16,7 @@ use std::{
 	time::Duration,
 };
 
+use pi_shell::process::{KILL_SIGNAL, TERM_SIGNAL};
 use tokio::{
 	io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
 	process::{Child, ChildStdin, Command},
@@ -39,14 +40,6 @@ use super::{
 const MAX_FRAME_BYTES: usize = 8 * 1024 * 1024;
 /// Retained runner stderr for diagnostics.
 const STDERR_TAIL_BYTES: usize = 4 * 1024;
-#[cfg(unix)]
-const TERM_SIGNAL: i32 = libc::SIGTERM;
-#[cfg(unix)]
-const KILL_SIGNAL: i32 = libc::SIGKILL;
-#[cfg(not(unix))]
-const TERM_SIGNAL: i32 = 15;
-#[cfg(not(unix))]
-const KILL_SIGNAL: i32 = 9;
 
 enum KernelEvent {
 	Frame(KernelFrame),
@@ -642,13 +635,10 @@ fn spawn_escalation(pid: Option<u32>, done: Arc<AtomicBool>, after: Duration) {
 }
 
 fn signal_group(pid: Option<u32>, signal: i32) {
-	#[cfg(unix)]
-	if let Some(pid) = pid.filter(|pid| *pid > 1) {
-		// SAFETY: negative pid targets the child session we created; 0/1 are
-		// rejected because they would signal our own group or everything.
-		unsafe {
-			libc::kill(-(pid as i32), signal);
-		}
+	if let Some(group) = pid.filter(|pid| *pid > 1).and_then(|pid| i32::try_from(pid).ok()) {
+		// 0/1 are rejected because they would signal our own group or
+		// everything; the shared primitive also refuses our own group.
+		let _ = pi_shell::process::kill_process_group(group, signal);
 	}
 }
 

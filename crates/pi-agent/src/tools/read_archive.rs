@@ -747,13 +747,10 @@ async fn read_bounded<R: AsyncRead + Unpin>(
 }
 
 async fn kill_group(child: &mut Child, pid: Option<u32>) {
-	#[cfg(unix)]
-	if let Some(pid) = pid.filter(|pid| *pid > 1) {
-		// SAFETY: signalling the process group this helper leads; guarded
-		// against the catastrophic 0/1 targets.
-		unsafe {
-			libc::kill(-(pid as i32), libc::SIGKILL);
-		}
+	if let Some(group) = pid.filter(|pid| *pid > 1).and_then(|pid| i32::try_from(pid).ok()) {
+		// Guarded against the catastrophic 0/1 targets; the shared primitive
+		// also refuses the harness's own process group.
+		let _ = pi_shell::process::kill_process_group(group, pi_shell::process::KILL_SIGNAL);
 	}
 	let _ = child.start_kill();
 	let _ = child.wait().await;

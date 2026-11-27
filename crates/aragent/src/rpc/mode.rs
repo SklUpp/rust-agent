@@ -398,9 +398,10 @@ fn exec_bash(command: &str, cwd: &Path, token: &CancellationToken) -> BashResult
 		}
 		if token.is_cancelled() {
 			cancelled = true;
-			// Negative pid targets the group created by `process_group(0)`.
-			unsafe {
-				libc::kill(-(child_pid as i32), libc::SIGKILL);
+			// Targets the group created by `process_group(0)`; the shared
+			// primitive also refuses the harness's own process group.
+			if let Ok(pgid) = i32::try_from(child_pid) {
+				let _ = pi_agent::kill_process_group(pgid, pi_agent::KILL_SIGNAL);
 			}
 			let _ = child.kill();
 			break child.wait().ok();

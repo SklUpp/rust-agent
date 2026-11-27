@@ -1496,15 +1496,11 @@ async fn read_capped<R: AsyncRead + Unpin>(mut reader: R) -> std::io::Result<Str
 }
 
 async fn kill_tree(child: &mut Child, pid: Option<u32>) {
-	#[cfg(unix)]
-	if let Some(pid) = pid.filter(|pid| *pid > 1) {
-		// SAFETY: signalling the process group we created; the negative pid is
-		// guarded against the catastrophic 0/1 targets. The leader has not been
-		// reaped at this point, so its pid (and thus the group id) is still ours
-		// to signal and cannot have been recycled.
-		unsafe {
-			libc::kill(-(pid as i32), libc::SIGKILL);
-		}
+	if let Some(group) = pid.filter(|pid| *pid > 1).and_then(|pid| i32::try_from(pid).ok()) {
+		// Guarded against the catastrophic 0/1 targets; the leader has not been
+		// reaped here, so its pid (and thus the group id) is still ours to
+		// signal. The shared primitive also refuses the harness's own group.
+		let _ = pi_shell::process::kill_process_group(group, pi_shell::process::KILL_SIGNAL);
 	}
 	let _ = child.start_kill();
 	// The group kill cannot reach a `setsid`-escaped descendant, so the leader

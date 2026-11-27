@@ -538,19 +538,13 @@ where
 /// remote command's group members are signalled instead of being left running;
 /// members that left the group, or a failed `kill(2)`, are outside this scope.
 fn kill_group(pid: Option<u32>) {
-	#[cfg(unix)]
-	if let Some(pid) = pid {
-		let group = i32::try_from(pid).unwrap_or(0);
-		if group > 1 {
-			// SAFETY: `kill(2)` has no memory effects; the negative pid targets the
-			// group this child created, and a dead group is a harmless ESRCH.
-			unsafe {
-				libc::kill(-group, libc::SIGKILL);
-			}
-		}
+	if let Some(group) = pid.and_then(|pid| i32::try_from(pid).ok())
+		&& group > 1
+	{
+		// The shared primitive targets the group this child created (via
+		// `process_group(0)`) and refuses the harness's own group.
+		let _ = pi_shell::process::kill_process_group(group, pi_shell::process::KILL_SIGNAL);
 	}
-	#[cfg(not(unix))]
-	let _ = pid;
 }
 
 /// POSIX `test` classification (portable across Linux/BSD/macOS).
