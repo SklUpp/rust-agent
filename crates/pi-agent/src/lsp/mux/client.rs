@@ -62,7 +62,17 @@ pub async fn connect(project_dir: &Path, params: &MuxConnectParams) -> Option<Sh
 	dial(&endpoint, params).await
 }
 
+/// Reject a mux endpoint that is a symlink or not a private, self-owned socket.
+fn verify_endpoint(endpoint: &Path) -> Option<()> {
+	let metadata = std::fs::symlink_metadata(endpoint).ok()?;
+	if metadata.file_type().is_symlink() {
+		return None;
+	}
+	protocol::verify_socket(endpoint).ok()
+}
+
 async fn dial(endpoint: &Path, params: &MuxConnectParams) -> Option<SharedTransport> {
+	verify_endpoint(endpoint)?;
 	let stream = timeout(CONNECT_TIMEOUT, UnixStream::connect(endpoint))
 		.await
 		.ok()?
@@ -117,6 +127,9 @@ async fn read_handshake(reader: &mut OwnedReadHalf) -> Option<(Value, Vec<u8>)> 
 
 /// True when a mux answers the ping handshake at `endpoint`.
 async fn probe(endpoint: &Path) -> bool {
+	if verify_endpoint(endpoint).is_none() {
+		return false;
+	}
 	let Ok(Ok(stream)) = timeout(PROBE_TIMEOUT, UnixStream::connect(endpoint)).await else {
 		return false;
 	};
@@ -217,4 +230,62 @@ async fn broker_for(project_dir: &Path) -> Option<Arc<BrokerClient>> {
 			.or_insert(client)
 			.clone(),
 	)
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+	use std::os::unix::fs::PermissionsExt as _;
+
+	use super::*;
+
+	fn temp_root(label: &str) -> PathBuf {
+		let nanos = std::time::SystemTime::now()
+			.duration_since(std::time::UNIX_EPOCH)
+			.map_or(0, |duration| duration.as_nanos());
+		let root = std::env::temp_dir().join(format!(
+			"omp-lsp-mux-client-{label}-{}-{nanos}",
+			std::process::id()
+		));
+		std::fs::create_dir_all(&root).expect("temp root");
+		root
+	}
+
+	fn params() -> MuxConnectParams {
+		MuxConnectParams {
+			command: "rust-analyzer".to_string(),
+			args: Vec::new(),
+			cwd: "/tmp/project".to_string(),
+			env: None,
+		}
+	}
+
+	fn chmod(path: &Path, mode: u32) {
+		std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).expect("chmod");
+	}
+
+	#[tokio::test]
+	async fn probe_and_dial_refuse_world_writable_socket() {
+		let root = temp_root("mode");
+		let endpoint = root.join("lsp-mux.sock");
+		let listener = tokio::net::UnixListener::bind(&endpoint).expect("bind");
+		chmod(&endpoint, 0o666);
+		assert!(!probe(&endpoint).await);
+		assert!(dial(&endpoint, &params()).await.is_none());
+		drop(listener);
+		let _ = std::fs::remove_dir_all(root);
+	}
+
+	#[tokio::test]
+	async fn probe_and_dial_refuse_symlinked_socket() {
+		let root = temp_root("symlink");
+		let target = root.join("real.sock");
+		let listener = tokio::net::UnixListener::bind(&target).expect("bind");
+		chmod(&target, 0o600);
+		let endpoint = root.join("lsp-mux.sock");
+		std::os::unix::fs::symlink(&target, &endpoint).expect("symlink");
+		assert!(!probe(&endpoint).await);
+		assert!(dial(&endpoint, &params()).await.is_none());
+		drop(listener);
+		let _ = std::fs::remove_dir_all(root);
+	}
 }

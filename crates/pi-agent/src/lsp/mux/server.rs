@@ -33,7 +33,7 @@ use super::{
 	MUX_CONNECT_METHOD, MUX_PING_METHOD, MUX_PING_RESULT, MUX_RESTART_METHOD, MuxConnectParams,
 	MuxConnectResult, frame, server_key,
 };
-use crate::lsp::framing::MessageFramer;
+use crate::{lsp::framing::MessageFramer, process_broker::protocol};
 
 /// How long an unbound server child survives for reuse by a later link.
 const SERVER_LINGER: Duration = Duration::from_secs(5 * 60);
@@ -271,7 +271,13 @@ impl LspMuxServer {
 		if lock(&self.endpoint).is_some() {
 			return Err("LSP mux is already listening".to_string());
 		}
-		if endpoint.exists() {
+		if let Ok(metadata) = std::fs::symlink_metadata(endpoint) {
+			if metadata.file_type().is_symlink() {
+				return Err(format!("refusing symlinked LSP mux endpoint {}", endpoint.display()));
+			}
+			protocol::verify_owner(endpoint).map_err(|error| {
+				format!("cannot verify LSP mux endpoint {}: {error}", endpoint.display())
+			})?;
 			if probe_endpoint(endpoint).await {
 				return Err(format!("LSP mux already listening on {}", endpoint.display()));
 			}
@@ -279,11 +285,18 @@ impl LspMuxServer {
 				.map_err(|error| format!("cannot remove stale LSP mux socket: {error}"))?;
 		}
 		if let Some(parent) = endpoint.parent() {
-			std::fs::create_dir_all(parent)
+			protocol::ensure_private_dir(parent)
 				.map_err(|error| format!("cannot create LSP mux runtime dir: {error}"))?;
 		}
 		let listener = UnixListener::bind(endpoint)
 			.map_err(|error| format!("cannot bind LSP mux socket {}: {error}", endpoint.display()))?;
+		#[cfg(unix)]
+		{
+			use std::os::unix::fs::PermissionsExt as _;
+			std::fs::set_permissions(endpoint, std::fs::Permissions::from_mode(0o600)).map_err(
+				|error| format!("cannot restrict LSP mux socket {}: {error}", endpoint.display()),
+			)?;
+		}
 		*lock(&self.endpoint) = Some(endpoint.to_path_buf());
 		let (stop_tx, mut stop_rx) = oneshot::channel();
 		let (done_tx, done_rx) = oneshot::channel();
@@ -296,7 +309,20 @@ impl LspMuxServer {
 				tokio::select! {
 					_ = &mut stop_rx => break,
 					accepted = listener.accept() => match accepted {
-						Ok((stream, _)) => server.start_session(stream),
+						Ok((stream, _)) => {
+							// Same-user only: the socket mode is 0600, but check the
+							// peer credential anyway so a leaked fd or a permissive
+							// filesystem cannot inject a session.
+							#[cfg(unix)]
+							let trusted = stream
+								.peer_cred()
+								.is_ok_and(|cred| cred.uid() == protocol::current_uid());
+							#[cfg(not(unix))]
+							let trusted = true;
+							if trusted {
+								server.start_session(stream);
+							}
+						},
 						Err(error) => {
 							if server.shutting_down.load(Ordering::SeqCst) {
 								break;
@@ -1130,4 +1156,62 @@ async fn probe_endpoint(endpoint: &std::path::Path) -> bool {
 	};
 	drop(stream);
 	true
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+	use std::os::unix::fs::PermissionsExt as _;
+
+	use super::*;
+
+	fn temp_root(label: &str) -> std::path::PathBuf {
+		let nanos = SystemTime::now()
+			.duration_since(UNIX_EPOCH)
+			.map_or(0, |duration| duration.as_nanos());
+		let root = std::env::temp_dir().join(format!(
+			"omp-lsp-mux-{label}-{}-{nanos}",
+			std::process::id()
+		));
+		std::fs::create_dir_all(&root).expect("temp root");
+		root
+	}
+
+	fn mode(path: &std::path::Path) -> u32 {
+		std::fs::symlink_metadata(path)
+			.expect("metadata")
+			.permissions()
+			.mode()
+			& 0o777
+	}
+
+	#[tokio::test]
+	async fn listen_creates_private_dir_and_socket() {
+		let root = temp_root("listen");
+		let endpoint = root.join("nested").join("lsp-mux.sock");
+		let mux = Arc::new(LspMuxServer::new());
+		mux.listen(&endpoint).await.expect("listen");
+		assert_eq!(mode(&endpoint), 0o600);
+		assert_eq!(mode(endpoint.parent().expect("parent")), 0o700);
+		mux.shutdown().await;
+		let _ = std::fs::remove_dir_all(root);
+	}
+
+	#[tokio::test]
+	async fn listen_refuses_symlinked_endpoint() {
+		let root = temp_root("symlink");
+		let target = root.join("target.sock");
+		std::fs::write(&target, b"").expect("target");
+		let endpoint = root.join("lsp-mux.sock");
+		std::os::unix::fs::symlink(&target, &endpoint).expect("symlink");
+		let mux = Arc::new(LspMuxServer::new());
+		let error = mux.listen(&endpoint).await.expect_err("symlink refused");
+		assert!(error.contains("symlink"), "{error}");
+		assert!(
+			std::fs::symlink_metadata(&endpoint)
+				.expect("still present")
+				.file_type()
+				.is_symlink()
+		);
+		let _ = std::fs::remove_dir_all(root);
+	}
 }

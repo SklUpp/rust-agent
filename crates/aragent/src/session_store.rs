@@ -33,7 +33,7 @@
 
 use std::{
 	collections::{BTreeMap, HashMap, HashSet},
-	path::{Path, PathBuf},
+	path::{Component, Path, PathBuf},
 	sync::atomic::{AtomicU64, Ordering},
 	time::{SystemTime, UNIX_EPOCH},
 };
@@ -265,7 +265,7 @@ pub enum StoreError {
 	UnknownOutcome(String),
 	/// A stored or supplied JSON payload could not be encoded/decoded.
 	Json(serde_json::Error),
-	/// Filesystem failure while creating the database parent directory.
+	/// Filesystem failure while preparing the database file or its parents.
 	Io(std::io::Error),
 	/// Caller supplied an incomplete or inconsistent record.
 	Validation(String),
@@ -2305,14 +2305,19 @@ impl SqliteStore {
 		if path.as_os_str().is_empty() {
 			return Err(StoreError::Validation("session store path must not be empty".to_string()));
 		}
-		if let Some(parent) = path
-			.parent()
-			.filter(|parent| !parent.as_os_str().is_empty())
-		{
-			std::fs::create_dir_all(parent)?;
-		}
+		let path = prepare_database_file(&path)?;
 		let connection = Connection::open(&path)?;
-		Self::from_connection(path, connection)
+		let store = Self::from_connection(path, connection)?;
+		// Sidecars appear once WAL is active; tighten each one that exists.
+		// `NotFound` is expected, every other chmod failure is reported.
+		for suffix in ["-wal", "-shm", "-journal"] {
+			match set_mode(&sidecar_path(&store.path, suffix), 0o600) {
+				Ok(()) => {},
+				Err(error) if error.kind() == std::io::ErrorKind::NotFound => {},
+				Err(error) => return Err(error.into()),
+			}
+		}
+		Ok(store)
 	}
 
 	/// In-memory store for tests and short-lived hosts. Same schema and
@@ -7914,6 +7919,449 @@ fn next_execution_id() -> String {
 	format!("exec-{:x}-{nanos:x}-{counter:x}", std::process::id())
 }
 
+/// Create a missing parent directory with mode 0700; existing dirs are left
+/// alone. Session history is per-user data, so new dirs must not be readable
+/// by others even when the umask is permissive.
+fn create_private_dir(dir: &Path) -> std::io::Result<()> {
+	if dir.exists() {
+		return Ok(());
+	}
+	let mut builder = std::fs::DirBuilder::new();
+	builder.recursive(true);
+	#[cfg(unix)]
+	{
+		use std::os::unix::fs::DirBuilderExt as _;
+		builder.mode(0o700);
+	}
+	builder.create(dir)
+}
+
+/// Path of a SQLite sidecar file (`-wal`, `-shm`, `-journal`).
+fn sidecar_path(path: &Path, suffix: &str) -> PathBuf {
+	let mut name = path.as_os_str().to_os_string();
+	name.push(suffix);
+	PathBuf::from(name)
+}
+
+/// Refuse an existing sidecar that another user could control: a symlink, a
+/// non-regular file, a multiply-linked inode, or a file owned by someone else.
+/// A missing sidecar is fine; SQLite creates it as this user.
+fn validate_sidecar(sidecar: &Path) -> StoreResult<()> {
+	let metadata = match std::fs::symlink_metadata(sidecar) {
+		Ok(metadata) => metadata,
+		Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+		Err(error) => return Err(error.into()),
+	};
+	#[cfg(unix)]
+	{
+		// SAFETY: geteuid has no preconditions.
+		let euid = unsafe { libc::geteuid() };
+		if let Err(reason) = validate_sidecar_metadata(&metadata, euid) {
+			return Err(StoreError::Validation(format!(
+				"session database sidecar {} {reason}",
+				sidecar.display()
+			)));
+		}
+	}
+	#[cfg(not(unix))]
+	if metadata.file_type().is_symlink() || !metadata.is_file() {
+		return Err(StoreError::Validation(format!(
+			"session database sidecar {} is not a regular file",
+			sidecar.display()
+		)));
+	}
+	Ok(())
+}
+
+/// Metadata policy for an existing sidecar, split from the filesystem call so
+/// tests can cover foreign ownership without a second uid.
+#[cfg(unix)]
+fn validate_sidecar_metadata(metadata: &std::fs::Metadata, euid: u32) -> Result<(), &'static str> {
+	use std::os::unix::fs::MetadataExt as _;
+	if metadata.file_type().is_symlink() || !metadata.is_file() {
+		return Err("is not a regular file");
+	}
+	if metadata.nlink() > 1 {
+		return Err("has multiple hard links");
+	}
+	if metadata.uid() != euid {
+		return Err("is owned by another user");
+	}
+	Ok(())
+}
+
+/// Validate and pre-create the session database path before SQLite opens it.
+///
+/// WAL setup and schema migrations write through this file, so it must not be
+/// a symlink (or a directory) and must already be `0600` when the connection
+/// is created. Missing parents are created `0700`; existing parents are only
+/// verified, never chmodded. Returns the canonical database path; callers must
+/// open that path so SQLite never re-traverses the original, possibly
+/// symlinked path.
+fn prepare_database_file(path: &Path) -> StoreResult<PathBuf> {
+	// A bare relative path has `parent() == Some("")`; validate `.` instead of
+	// silently skipping parent validation.
+	let parent = match path.parent() {
+		Some(parent) if !parent.as_os_str().is_empty() => parent,
+		_ => Path::new("."),
+	};
+	let resolved_parent = match std::fs::symlink_metadata(parent) {
+		Ok(_) => verify_parent_dir(parent)?,
+		Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+			create_private_dir(parent)?;
+			// Re-verify the path after creation so a creation race cannot hand
+			// us a swapped, world-writable, or foreign-owned directory.
+			let resolved = verify_parent_dir(parent)?;
+			verify_new_parent_dir(parent)?;
+			resolved
+		},
+		Err(error) => return Err(error.into()),
+	};
+	let file_name = path.file_name().ok_or_else(|| {
+		StoreError::Validation(format!("session database path {} must name a file", path.display()))
+	})?;
+	let resolved = resolved_parent.join(file_name);
+	// SQLite follows `<db>-wal`/`-shm`/`-journal` while switching journal modes,
+	// so a planted sidecar symlink, hard link, or foreign-owned file must be
+	// refused before the connection opens.
+	for suffix in ["-wal", "-shm", "-journal"] {
+		validate_sidecar(&sidecar_path(&resolved, suffix))?;
+	}
+	if let Ok(metadata) = std::fs::symlink_metadata(&resolved) {
+		if metadata.file_type().is_symlink() {
+			return Err(StoreError::Validation(format!(
+				"session database {} is a symlink",
+				path.display()
+			)));
+		}
+		// Validates regular file + owner, then fchmods that descriptor.
+		set_mode(&resolved, 0o600)?;
+		return Ok(resolved);
+	}
+	let mut options = std::fs::OpenOptions::new();
+	options.write(true).create_new(true);
+	#[cfg(unix)]
+	{
+		use std::os::unix::fs::OpenOptionsExt as _;
+		options.mode(0o600);
+	}
+	match options.open(&resolved) {
+		Ok(file) => {
+			#[cfg(unix)]
+			{
+				use std::os::unix::fs::PermissionsExt as _;
+				// `mode` is masked by the umask; fchmod the exact mode on the
+				// descriptor we just created.
+				file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+			}
+			#[cfg(not(unix))]
+			let _ = file;
+		},
+		// A racing opener created it first; validate and fchmod via O_NOFOLLOW.
+		Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+			set_mode(&resolved, 0o600)?;
+		},
+		Err(error) => return Err(error.into()),
+	}
+	Ok(resolved)
+}
+
+/// Owner we trust not to substitute entries: root, the current user, or
+/// (on Android) the platform `system` uid.
+#[cfg(unix)]
+fn trusted_owner(uid: u32, euid: u32) -> bool {
+	#[cfg(target_os = "android")]
+	{
+		if uid == 1000 {
+			return true;
+		}
+	}
+	uid == 0 || uid == euid
+}
+
+/// Prove a group-writable directory's writable group is exclusive to a trusted
+/// principal. GID 0 is not exclusive; only established Android identities
+/// qualify (platform `system`, or an app's own uid/gid pair).
+#[cfg(unix)]
+fn exclusive_group(uid: u32, euid: u32, gid: u32) -> bool {
+	#[cfg(target_os = "android")]
+	{
+		if gid == 1000 && (uid == 1000 || uid == 0) {
+			return true;
+		}
+		if euid >= 10_000 && uid == euid && gid == euid {
+			return true;
+		}
+	}
+	#[cfg(not(target_os = "android"))]
+	let _ = (uid, euid, gid);
+	false
+}
+
+/// Directory trust policy, split from metadata so tests can use synthetic
+/// ownership. Sticky (`0o1000`) only excuses world/group write for
+/// *ancestors* (`allow_sticky_world_writable = true`): as the parent itself
+/// another user could plant a sidecar there before SQLite opens it.
+#[cfg(unix)]
+fn trusted_dir_mode(
+	uid: u32,
+	euid: u32,
+	gid: u32,
+	mode: u32,
+	allow_sticky_world_writable: bool,
+) -> bool {
+	let sticky_allowed = allow_sticky_world_writable && mode & 0o1000 != 0;
+	if mode & 0o002 != 0 && !sticky_allowed {
+		return false;
+	}
+	if mode & 0o020 != 0 && !sticky_allowed && !exclusive_group(uid, euid, gid) {
+		return false;
+	}
+	trusted_owner(uid, euid)
+}
+
+#[cfg(unix)]
+fn trusted_dir(metadata: &std::fs::Metadata, euid: u32, allow_sticky_world_writable: bool) -> bool {
+	use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+	!metadata.file_type().is_symlink()
+		&& metadata.is_dir()
+		&& trusted_dir_mode(
+			metadata.uid(),
+			euid,
+			metadata.gid(),
+			metadata.permissions().mode(),
+			allow_sticky_world_writable,
+		)
+}
+
+/// Join a possibly-relative parent onto `base`, keeping `..` components
+/// intact: lexical folding turns `safe/link/..` into `safe`, while the kernel
+/// follows `link` first.
+fn join_parent(base: &Path, parent: &Path) -> PathBuf {
+	if parent.is_absolute() {
+		return parent.to_path_buf();
+	}
+	let mut joined = base.to_path_buf();
+	for component in parent.components() {
+		match component {
+			Component::CurDir => {},
+			Component::ParentDir => joined.push(".."),
+			Component::Normal(part) => joined.push(part),
+			Component::RootDir | Component::Prefix(_) => {},
+		}
+	}
+	joined
+}
+
+/// Resolve a parent path to the exact real directory SQLite will open.
+///
+/// The deepest existing prefix is canonicalized, so symlinks are followed
+/// exactly like the kernel and `link/..` cannot be folded lexically. Missing
+/// trailing components are re-appended; a `..` above a missing component is
+/// rejected because it cannot be resolved safely until that directory exists.
+fn resolve_parent(base: &Path, parent: &Path) -> StoreResult<PathBuf> {
+	resolve_joined_parent(&join_parent(base, parent), parent)
+}
+
+/// Every existing component of the original path must belong to a trusted
+/// principal, so an attacker-owned directory or symlink cannot redirect a
+/// trusted-looking canonical path. OS symlinks such as macOS `/var` are
+/// root-owned and pass [`trusted_owner`].
+fn verify_joined_components(joined: &Path) -> StoreResult<()> {
+	#[cfg(unix)]
+	{
+		use std::os::unix::fs::MetadataExt as _;
+		// SAFETY: geteuid has no preconditions.
+		let euid = unsafe { libc::geteuid() };
+		for component in joined.ancestors() {
+			if component.as_os_str().is_empty() {
+				continue;
+			}
+			let metadata = match std::fs::symlink_metadata(component) {
+				Ok(metadata) => metadata,
+				Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+				Err(error) => return Err(error.into()),
+			};
+			if !trusted_owner(metadata.uid(), euid) {
+				return Err(StoreError::Io(std::io::Error::new(
+					std::io::ErrorKind::PermissionDenied,
+					format!(
+						"session store path component {} is owned by uid {} not a trusted user",
+						component.display(),
+						metadata.uid()
+					),
+				)));
+			}
+		}
+	}
+	#[cfg(not(unix))]
+	let _ = joined;
+	Ok(())
+}
+
+fn resolve_joined_parent(joined: &Path, parent: &Path) -> StoreResult<PathBuf> {
+	verify_joined_components(joined)?;
+	let mut existing = joined;
+	let mut tail: Vec<std::ffi::OsString> = Vec::new();
+	loop {
+		match std::fs::symlink_metadata(existing) {
+			Ok(_) => break,
+			Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+				let Some(name) = existing.file_name() else {
+					return Err(StoreError::Validation(format!(
+						"session store parent {} has an unresolvable prefix",
+						parent.display()
+					)));
+				};
+				tail.push(name.to_os_string());
+				let Some(prefix) = existing.parent() else {
+					return Err(StoreError::Validation(format!(
+						"session store parent {} has an unresolvable prefix",
+						parent.display()
+					)));
+				};
+				existing = prefix;
+			},
+			Err(error) => return Err(error.into()),
+		}
+	}
+	let mut resolved = std::fs::canonicalize(existing)?;
+	for name in tail.iter().rev() {
+		resolved.push(name);
+	}
+	Ok(resolved)
+}
+
+/// Verify the parent (and, for relative paths, the cwd and its ancestors) is a
+/// directory this user can trust. Ancestors are followed through symlinks on
+/// purpose: on macOS `/var` is a symlink to `private/var`, which is not an
+/// attack; only the followed directory's type and mode are checked.
+fn verify_parent_dir(parent: &Path) -> StoreResult<PathBuf> {
+	verify_parent_dir_from(&std::env::current_dir()?, parent)
+}
+
+/// [`verify_parent_dir`] with an explicit resolution base, so tests can cover
+/// relative paths without changing the process cwd.
+fn verify_parent_dir_from(base: &Path, parent: &Path) -> StoreResult<PathBuf> {
+	// Refuse a symlink at the parent itself before canonicalization hides it.
+	let joined = join_parent(base, parent);
+	if let Ok(metadata) = std::fs::symlink_metadata(&joined)
+		&& metadata.file_type().is_symlink()
+	{
+		return Err(StoreError::Validation(format!(
+			"session store parent {} is a symlink",
+			parent.display()
+		)));
+	}
+	let resolved = resolve_parent(base, parent)?;
+	let metadata = std::fs::symlink_metadata(&resolved)?;
+	if metadata.file_type().is_symlink() || !metadata.is_dir() {
+		return Err(StoreError::Validation(format!(
+			"session store parent {} is not a directory",
+			parent.display()
+		)));
+	}
+	#[cfg(unix)]
+	// SAFETY: geteuid has no preconditions.
+	let euid = unsafe { libc::geteuid() };
+	#[cfg(unix)]
+	{
+		// Sticky world-writable is not safe as the parent itself.
+		if !trusted_dir(&metadata, euid, false) {
+			return Err(StoreError::Io(std::io::Error::new(
+				std::io::ErrorKind::PermissionDenied,
+				format!("session store parent {} is not a trusted directory", parent.display()),
+			)));
+		}
+	}
+	for ancestor in resolved.ancestors().skip(1) {
+		if ancestor.as_os_str().is_empty() {
+			continue;
+		}
+		let Ok(metadata) = std::fs::metadata(ancestor) else {
+			continue;
+		};
+		if !metadata.is_dir() {
+			return Err(StoreError::Validation(format!(
+				"session store ancestor {} is not a directory",
+				ancestor.display()
+			)));
+		}
+		#[cfg(unix)]
+		{
+			// Sticky world-writable ancestors (/tmp) stay allowed.
+			if !trusted_dir(&metadata, euid, true) {
+				return Err(StoreError::Io(std::io::Error::new(
+					std::io::ErrorKind::PermissionDenied,
+					format!("session store ancestor {} is not a trusted directory", ancestor.display()),
+				)));
+			}
+		}
+	}
+	Ok(resolved)
+}
+
+/// A parent we just created must be exactly `0700` and owned by this user.
+fn verify_new_parent_dir(parent: &Path) -> StoreResult<()> {
+	let metadata = std::fs::symlink_metadata(parent)?;
+	if metadata.file_type().is_symlink() || !metadata.is_dir() {
+		return Err(StoreError::Validation(format!(
+			"session store parent {} is not a directory",
+			parent.display()
+		)));
+	}
+	#[cfg(unix)]
+	{
+		use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+		// SAFETY: geteuid has no preconditions.
+		let uid = unsafe { libc::geteuid() };
+		if metadata.uid() != uid || metadata.permissions().mode() & 0o777 != 0o700 {
+			return Err(StoreError::Io(std::io::Error::new(
+				std::io::ErrorKind::PermissionDenied,
+				format!("session store parent {} is not a private 0700 directory", parent.display()),
+			)));
+		}
+	}
+	Ok(())
+}
+
+/// Verify `path` is a regular file owned by this user, then fchmod it to
+/// `mode`.
+///
+/// The descriptor is opened with `O_NOFOLLOW`, so a symlink fails with `ELOOP`
+/// and its target is never touched; `fchmod` then applies to the verified inode
+/// only. `O_NONBLOCK` keeps a FIFO from blocking the open (regular files ignore
+/// it).
+#[cfg(unix)]
+fn set_mode(path: &Path, mode: u32) -> std::io::Result<()> {
+	use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _, PermissionsExt as _};
+	let file = std::fs::OpenOptions::new()
+		.read(true)
+		.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+		.open(path)?;
+	let metadata = file.metadata()?;
+	if !metadata.is_file() {
+		return Err(std::io::Error::new(
+			std::io::ErrorKind::InvalidInput,
+			format!("{} is not a regular file", path.display()),
+		));
+	}
+	// SAFETY: geteuid has no preconditions.
+	let uid = unsafe { libc::geteuid() };
+	if metadata.uid() != uid {
+		return Err(std::io::Error::new(
+			std::io::ErrorKind::PermissionDenied,
+			format!("{} is owned by uid {} not the current user", path.display(), metadata.uid()),
+		));
+	}
+	file.set_permissions(std::fs::Permissions::from_mode(mode))
+}
+
+#[cfg(not(unix))]
+fn set_mode(_path: &Path, _mode: u32) -> std::io::Result<()> {
+	Ok(())
+}
+
 #[cfg(test)]
 mod tests {
 	use std::path::PathBuf;
@@ -7921,6 +8369,305 @@ mod tests {
 	use serde_json::json;
 
 	use super::*;
+
+	#[cfg(unix)]
+	fn mode(path: &std::path::Path) -> u32 {
+		use std::os::unix::fs::PermissionsExt as _;
+		std::fs::symlink_metadata(path)
+			.expect("metadata")
+			.permissions()
+			.mode()
+			& 0o777
+	}
+
+	#[cfg(unix)]
+	fn fresh_root(label: &str) -> PathBuf {
+		let nanos = std::time::SystemTime::now()
+			.duration_since(std::time::UNIX_EPOCH)
+			.map_or(0, |duration| duration.as_nanos());
+		let root = std::env::temp_dir().join(format!(
+			"omp-session-store-{label}-{}-{nanos}",
+			std::process::id()
+		));
+		// Create at 0700 directly: `create_dir_all` yields 0775 under
+		// `umask 0002`, which the parent policy correctly rejects.
+		create_private_dir(&root).expect("temp root");
+		root
+	}
+
+	#[cfg(unix)]
+	#[test]
+	fn open_creates_private_database() {
+		let root = fresh_root("private");
+		let parent = root.join("nested");
+		let path = parent.join("sessions.db");
+		let store = SqliteStore::open(&path).expect("open store");
+		assert_eq!(mode(&path), 0o600);
+		assert_eq!(mode(&parent), 0o700);
+		for suffix in ["-wal", "-shm"] {
+			let sidecar = sidecar_path(&path, suffix);
+			assert!(sidecar.exists(), "{suffix} missing while WAL is active");
+			assert_eq!(mode(&sidecar), 0o600, "{suffix} mode");
+		}
+		drop(store);
+		let _ = std::fs::remove_dir_all(root);
+	}
+
+	#[cfg(unix)]
+	#[test]
+	fn open_keeps_existing_parent_mode() {
+		use std::os::unix::fs::PermissionsExt as _;
+		let root = fresh_root("shared-parent");
+		std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o755)).expect("parent mode");
+		let path = root.join("sessions.db");
+		let store = SqliteStore::open(&path).expect("open store");
+		assert_eq!(mode(&path), 0o600);
+		assert_eq!(mode(&root), 0o755);
+		drop(store);
+		let _ = std::fs::remove_dir_all(root);
+	}
+
+	#[cfg(unix)]
+	#[test]
+	fn open_refuses_symlinked_database() {
+		let root = fresh_root("symlink");
+		let target = root.join("target.db");
+		std::fs::write(&target, b"").expect("target");
+		let path = root.join("sessions.db");
+		std::os::unix::fs::symlink(&target, &path).expect("symlink");
+		let Err(error) = SqliteStore::open(&path) else {
+			panic!("symlink accepted");
+		};
+		assert!(error.to_string().contains("symlink"), "{error}");
+		let _ = std::fs::remove_dir_all(root);
+	}
+
+	#[cfg(unix)]
+	#[test]
+	fn open_refuses_symlinked_sidecar() {
+		use std::os::unix::fs::PermissionsExt as _;
+		let root = fresh_root("sidecar-symlink");
+		let target = root.join("target.bin");
+		std::fs::write(&target, b"untouched").expect("target");
+		std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o644))
+			.expect("target mode");
+		let path = root.join("sessions.db");
+		std::os::unix::fs::symlink(&target, sidecar_path(&path, "-journal"))
+			.expect("sidecar symlink");
+		let Err(error) = SqliteStore::open(&path) else {
+			panic!("symlinked sidecar accepted");
+		};
+		assert!(error.to_string().contains("sidecar"), "{error}");
+		assert_eq!(mode(&target), 0o644);
+		let _ = std::fs::remove_dir_all(root);
+	}
+
+	#[cfg(unix)]
+	#[test]
+	fn open_refuses_non_regular_database() {
+		let root = fresh_root("non-regular");
+		let path = root.join("sessions.db");
+		std::fs::create_dir(&path).expect("directory at db path");
+		let Err(error) = SqliteStore::open(&path) else {
+			panic!("directory accepted as database");
+		};
+		assert!(error.to_string().contains("regular file"), "{error}");
+		let _ = std::fs::remove_dir_all(root);
+	}
+
+	#[cfg(unix)]
+	#[test]
+	fn open_refuses_world_writable_non_sticky_parent() {
+		use std::os::unix::fs::PermissionsExt as _;
+		let root = fresh_root("world-writable-parent");
+		let shared = root.join("shared");
+		std::fs::create_dir(&shared).expect("shared");
+		// Caller-owned but non-sticky world-writable: another user can rename
+		// our entries, so ownership must not short-circuit the check.
+		std::fs::set_permissions(&shared, std::fs::Permissions::from_mode(0o777))
+			.expect("shared mode");
+		let Err(error) = SqliteStore::open(shared.join("sessions.db")) else {
+			panic!("world-writable parent accepted");
+		};
+		assert!(error.to_string().contains("trusted directory"), "{error}");
+		let _ = std::fs::remove_dir_all(root);
+	}
+
+	#[cfg(unix)]
+	#[test]
+	fn open_refuses_world_writable_ancestor() {
+		use std::os::unix::fs::PermissionsExt as _;
+		let root = fresh_root("world-writable-ancestor");
+		let shared = root.join("shared");
+		std::fs::create_dir(&shared).expect("shared");
+		std::fs::set_permissions(&shared, std::fs::Permissions::from_mode(0o777))
+			.expect("shared mode");
+		let private = shared.join("private");
+		std::fs::create_dir(&private).expect("private");
+		std::fs::set_permissions(&private, std::fs::Permissions::from_mode(0o700))
+			.expect("private mode");
+		let Err(error) = SqliteStore::open(private.join("sessions.db")) else {
+			panic!("world-writable ancestor accepted");
+		};
+		assert!(error.to_string().contains("ancestor"), "{error}");
+		let _ = std::fs::remove_dir_all(root);
+	}
+
+	#[cfg(unix)]
+	#[test]
+	fn verify_parent_dir_rejects_world_writable_and_accepts_created() {
+		use std::os::unix::fs::PermissionsExt as _;
+		let root = fresh_root("parent-verify");
+		let shared = root.join("shared");
+		std::fs::create_dir(&shared).expect("shared");
+		std::fs::set_permissions(&shared, std::fs::Permissions::from_mode(0o777))
+			.expect("shared mode");
+		assert!(verify_parent_dir(&shared).is_err());
+		let created = root.join("created");
+		create_private_dir(&created).expect("create private dir");
+		verify_parent_dir(&created).expect("created parent is accepted");
+		verify_new_parent_dir(&created).expect("created parent is 0700 and ours");
+		let _ = std::fs::remove_dir_all(root);
+	}
+
+	#[cfg(unix)]
+	#[test]
+	fn trusted_dir_mode_rejects_group_writable_without_sticky() {
+		// Synthetic ids: `uid == euid`, so an owner short-circuit would accept
+		// these. GID 4242 is not an Android-exclusive identity, so the result is
+		// the same on Termux/Android and on Linux CI.
+		let euid = 20_000;
+		let gid = 4242;
+		assert!(!trusted_dir_mode(euid, euid, gid, 0o770, false));
+		assert!(!trusted_dir_mode(euid, euid, gid, 0o777, false));
+		// Sticky does not excuse group write as the parent itself, only above it.
+		assert!(!trusted_dir_mode(euid, euid, gid, 0o1770, false));
+		assert!(trusted_dir_mode(euid, euid, gid, 0o1770, true));
+		assert!(trusted_dir_mode(euid, euid, gid, 0o700, false));
+		assert!(trusted_dir_mode(euid, euid, gid, 0o750, false));
+		// Root-owned: plain mode is trusted; world-writable needs sticky and is
+		// only allowed above the parent.
+		assert!(!trusted_dir_mode(0, euid, gid, 0o757, false));
+		assert!(!trusted_dir_mode(0, euid, gid, 0o1777, false));
+		assert!(trusted_dir_mode(0, euid, gid, 0o1777, true));
+		assert!(!trusted_dir_mode(0, euid, gid, 0o777, true));
+	}
+
+	#[cfg(unix)]
+	#[test]
+	fn relative_parent_resolves_against_base_and_checks_ancestors() {
+		use std::os::unix::fs::PermissionsExt as _;
+		let root = fresh_root("relative-parent");
+		let shared = root.join("shared");
+		std::fs::create_dir(&shared).expect("shared");
+		std::fs::set_permissions(&shared, std::fs::Permissions::from_mode(0o777))
+			.expect("shared mode");
+		let private = shared.join("private");
+		std::fs::create_dir(&private).expect("private");
+		std::fs::set_permissions(&private, std::fs::Permissions::from_mode(0o700))
+			.expect("private mode");
+		// A bare `sessions.db` resolves its "." parent against the cwd; `..` is
+		// resolved on the real filesystem, not lexically. `resolve_parent`
+		// canonicalizes, so compare against the canonical paths (macOS `/var`
+		// is a symlink to `/private/var`).
+		let canonical_private = std::fs::canonicalize(&private).expect("canonicalize private");
+		assert_eq!(resolve_parent(&private, Path::new(".")).expect("resolve"), canonical_private);
+		assert_eq!(
+			resolve_parent(&private, Path::new("../private")).expect("resolve"),
+			canonical_private
+		);
+		// The 0o777 directory above the resolved parent fails the chain check.
+		assert!(verify_parent_dir_from(&private, Path::new(".")).is_err());
+		let _ = std::fs::remove_dir_all(root);
+	}
+
+	#[cfg(unix)]
+	#[test]
+	fn verify_parent_dir_rejects_sticky_world_writable_parent() {
+		use std::os::unix::fs::PermissionsExt as _;
+		let root = fresh_root("sticky-parent");
+		let sticky = root.join("sticky");
+		std::fs::create_dir(&sticky).expect("sticky");
+		std::fs::set_permissions(&sticky, std::fs::Permissions::from_mode(0o1777))
+			.expect("sticky mode");
+		// Sticky world-writable is only safe above the parent: directly as the
+		// parent another user could plant a sidecar there.
+		let Err(error) = verify_parent_dir(&sticky) else {
+			panic!("sticky world-writable parent accepted");
+		};
+		assert!(error.to_string().contains("trusted directory"), "{error}");
+		let private = sticky.join("private");
+		create_private_dir(&private).expect("private");
+		verify_parent_dir(&private).expect("0700 subdir inside sticky parent");
+		let _ = std::fs::remove_dir_all(root);
+	}
+
+	#[cfg(unix)]
+	#[test]
+	fn verify_parent_dir_follows_symlink_before_parent_dir() {
+		use std::os::unix::fs::PermissionsExt as _;
+		let root = fresh_root("symlink-dotdot");
+		let untrusted = root.join("untrusted");
+		std::fs::create_dir(&untrusted).expect("untrusted");
+		std::fs::set_permissions(&untrusted, std::fs::Permissions::from_mode(0o777))
+			.expect("untrusted mode");
+		let inner = untrusted.join("inner");
+		create_private_dir(&inner).expect("inner");
+		let safe = root.join("safe");
+		create_private_dir(&safe).expect("safe");
+		std::os::unix::fs::symlink(&inner, safe.join("link")).expect("link");
+		// `safe/link/..` is the real `untrusted` (0777), not `safe`; a lexical
+		// fold would wrongly trust it.
+		let Err(error) = verify_parent_dir_from(&root, Path::new("safe/link/..")) else {
+			panic!("symlinked .. folded lexically");
+		};
+		assert!(error.to_string().contains("trusted directory"), "{error}");
+		let _ = std::fs::remove_dir_all(root);
+	}
+
+	#[cfg(unix)]
+	#[test]
+	fn prepare_database_file_returns_canonical_path() {
+		let root = fresh_root("canonical");
+		let real = root.join("real");
+		create_private_dir(&real).expect("real");
+		let link = root.join("link");
+		std::os::unix::fs::symlink(&real, &link).expect("link");
+		// `link/..` resolves through the symlink to `root`, so the prepared DB
+		// path is the canonical one and never re-traverses `link`.
+		let resolved = prepare_database_file(&link.join("..").join("sessions.db")).expect("prepare");
+		let expected = std::fs::canonicalize(&root)
+			.expect("canonical root")
+			.join("sessions.db");
+		assert_eq!(resolved, expected);
+		assert_eq!(mode(&resolved), 0o600);
+		// Trusted-owner gate applied to the original components.
+		// SAFETY: geteuid has no preconditions.
+		let euid = unsafe { libc::geteuid() };
+		assert!(trusted_owner(0, euid));
+		assert!(trusted_owner(euid, euid));
+		assert!(!trusted_owner(euid.wrapping_add(1), euid));
+		let _ = std::fs::remove_dir_all(root);
+	}
+
+	#[cfg(unix)]
+	#[test]
+	fn validate_sidecar_metadata_rejects_foreign_owner_and_hard_links() {
+		let root = fresh_root("sidecar-owner");
+		let file = root.join("sidecar");
+		std::fs::write(&file, b"").expect("sidecar");
+		// SAFETY: geteuid has no preconditions.
+		let euid = unsafe { libc::geteuid() };
+		let metadata = std::fs::symlink_metadata(&file).expect("metadata");
+		assert!(validate_sidecar_metadata(&metadata, euid).is_ok());
+		// Simulate a sidecar owned by another user: our file vs. a foreign euid.
+		assert!(validate_sidecar_metadata(&metadata, euid.wrapping_add(1)).is_err());
+		std::fs::hard_link(&file, root.join("sidecar.link")).expect("hard link");
+		let linked = std::fs::symlink_metadata(&file).expect("metadata");
+		assert!(validate_sidecar_metadata(&linked, euid).is_err());
+		let _ = std::fs::remove_dir_all(root);
+	}
+
 	#[test]
 	fn fork_atomic_preserves_ancestry_and_projection() {
 		let mut store = SqliteStore::open_in_memory().expect("store");
@@ -8192,7 +8939,7 @@ mod tests {
 			std::process::id(),
 			now_ms()
 		));
-		std::fs::create_dir_all(&dir).expect("create temp dir");
+		create_private_dir(&dir).expect("create temp dir");
 		let path = dir.join("sessions.db");
 		(dir, path)
 	}
