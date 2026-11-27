@@ -6002,8 +6002,8 @@ mod tests {
 		let base = temp_dir();
 		let home = base.join("home");
 		let cwd = base.join("project");
-		fs::create_dir_all(&home).expect("home");
-		fs::create_dir_all(&cwd).expect("project");
+		crate::session_store::create_private_dir(&home).expect("home");
+		crate::session_store::create_private_dir(&cwd).expect("project");
 		let keys = [
 			"HOME",
 			"PI_CONFIG_DIR",
