@@ -623,7 +623,8 @@ mod tests {
 
 		let mut answered_truncated = Message::assistant("visible");
 		answered_truncated.stop_reason = Some(StopReason::Error);
-		let transformed = transform_messages(&[answered_truncated]);
+		let answered = [answered_truncated];
+		let transformed = transform_messages(&answered);
 		assert_eq!(transformed.len(), 1);
 	}
 }
