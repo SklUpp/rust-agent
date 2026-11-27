@@ -7,6 +7,8 @@
 //! one-shot fast-mode fallback, terminal `disabledFeatures`) and
 //! `error/flags.ts` `matchesFastModeUnsupported`.
 
+#![cfg(feature = "direct-providers")]
+
 use std::{
 	collections::BTreeMap,
 	io::{Read, Write},

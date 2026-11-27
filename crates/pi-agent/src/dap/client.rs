@@ -1179,7 +1179,7 @@ mod tests {
 
 		let mut env = HashMap::new();
 		env.insert("DAP_TEST_EXPLICIT".to_string(), "kept".to_string());
-		let command = base_command(&env_adapter(&env_binary()), &std::env::temp_dir(), &env, &[]);
+		let mut command = base_command(&env_adapter(&env_binary()), &std::env::temp_dir(), &env, &[]);
 		let output = command.output().await.expect("env child");
 		let stdout = String::from_utf8_lossy(&output.stdout);
 		assert!(
@@ -1198,7 +1198,7 @@ mod tests {
 		let mut env = HashMap::new();
 		env.insert("PATH".to_string(), "/dap-test-path".to_string());
 		env.insert("TERM".to_string(), "xterm-256color".to_string());
-		let command = base_command(&env_adapter(&env_binary()), &std::env::temp_dir(), &env, &[]);
+		let mut command = base_command(&env_adapter(&env_binary()), &std::env::temp_dir(), &env, &[]);
 		let output = command.output().await.expect("env child");
 		let stdout = String::from_utf8_lossy(&output.stdout);
 		assert!(stdout.contains("PATH=/dap-test-path"), "{stdout}");

@@ -376,11 +376,12 @@ pub enum SemanticOp {
 	LspRename,
 	LspDiagnostics,
 	LspFormat,
-}
+	LspCodeActions,
+ }
 
 impl SemanticOp {
 	/// Every operation in report order.
-	pub const ALL: [Self; 10] = [
+	pub const ALL: [Self; 11] = [
 		Self::ReadSymbols,
 		Self::AstQuery,
 		Self::AstReplace,
@@ -391,8 +392,8 @@ impl SemanticOp {
 		Self::LspRename,
 		Self::LspDiagnostics,
 		Self::LspFormat,
+		Self::LspCodeActions,
 	];
-
 	/// Stable key used in capability reports and tool output.
 	pub const fn as_str(self) -> &'static str {
 		match self {
@@ -406,6 +407,7 @@ impl SemanticOp {
 			Self::LspRename => "lspRename",
 			Self::LspDiagnostics => "lspDiagnostics",
 			Self::LspFormat => "lspFormat",
+			Self::LspCodeActions => "lspCodeActions",
 		}
 	}
 
@@ -419,6 +421,7 @@ impl SemanticOp {
 				| Self::LspRename
 				| Self::LspDiagnostics
 				| Self::LspFormat
+				| Self::LspCodeActions
 		)
 	}
 }
@@ -1072,6 +1075,7 @@ mod tests {
 		assert_eq!(rust.ast_full_grammar_only, false);
 		assert_eq!(rust.default_lsp_server, Some("rust-analyzer"));
 		assert!(rust.supported_ops.contains(&SemanticOp::LspDefinition));
+		assert!(rust.supported_ops.contains(&SemanticOp::LspCodeActions));
 		assert!(SupportLang::Rust.extensions().contains(&"rs"));
 	}
 

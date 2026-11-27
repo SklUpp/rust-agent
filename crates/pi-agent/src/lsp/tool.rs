@@ -2246,7 +2246,8 @@ mod semantic_matrix_tests {
 		assert_eq!(row["operations"]["readSymbols"]["supported"], true);
 		assert_eq!(row["operations"]["astQuery"]["supported"], true);
 		assert_eq!(row["operations"]["astReplace"]["supported"], true);
-		assert_eq!(row["operations"].as_object().expect("operations").len(), 10);
+		assert_eq!(row["operations"]["lspCodeActions"]["supported"], false);
+		assert_eq!(row["operations"].as_object().expect("operations").len(), 11);
 	}
 
 	#[tokio::test]

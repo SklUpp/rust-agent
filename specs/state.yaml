@@ -1,17 +1,17 @@
 active_flow: execute-plan
-active_epic_id: e10
+active_epic_id: e14
 active_story_id: null
 git:
   branch: feat/standalone-runtime
-  head: 54f0fb1
+  head: 297a9cc
 handoff:
-  last_step_completed: "R4+R5 polish (0b36bc7), R6 export/import/inspector (ebce4aa), and R8 D20 trust store (ec00906, 54f0fb1) closed on feat/standalone-runtime."
+  last_step_completed: "R4-R11 + SEC-TUI + web_search duckduckgo-free fallback (297a9cc) + CI E0596/D27 fixes and R12 0.2.0-dev.1 release prep."
   open_decisions:
     - "R0.4: live Termux filesystem MCP smoke written (cf1e673) behind ARAGENT_LIVE_FILESYSTEM_SMOKE; skipped in CI."
-    - "Live device proof of arag artifact on Termux/Android arm64 pending before R9/R10."
-    - "fastproot/Linux env, deferred R3 kernel sandbox, and macOS/Windows CI matrix excluded/deferred by user decision."
+    - "Live device proof of arag artifact on Termux/Android arm64 pending before final 0.2.0 tag (e10/e11 gate)."
+    - "fastproot/Linux env, deferred R3 kernel sandbox, macOS/Windows CI matrix, and 9Router supervisor integration excluded/deferred."
 next_skill: execute-plan
 next_work:
-  - "Green CI verification for 0b36bc7..54f0fb1."
-  - "Live device smoke on Termux/Android arm64 (R0.4–R8)."
-  - "R9–R12 (or fastproot/lkl/OMP sync per user roadmap)."
+  - "Commit and push current R12 prep + dap/eval/D27 fixes to verify green CI."
+  - "Live device smoke on Termux/Android arm64 (R0.4, R1-R3, R9-R11, web_search fallback)."
+  - "Tag v0.2.0-dev.1 / v0.2.0 release once CI + live device proof pass."

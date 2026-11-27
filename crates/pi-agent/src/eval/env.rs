@@ -57,8 +57,6 @@ const COMMON_ALLOW: &[&str] = &[
 	"XDG_CONFIG_HOME",
 	"XDG_DATA_HOME",
 	"XDG_RUNTIME_DIR",
-	"SSH_AUTH_SOCK",
-	"SSH_AGENT_PID",
 	"SSH_CONNECTION",
 	"SSH_CLIENT",
 	"SSH_TTY",
@@ -348,6 +346,21 @@ mod tests {
 		assert!(!filtered.contains_key("PI_TOOL_BRIDGE_TOKEN"));
 		assert!(!filtered.contains_key("OPENAI_API_KEY"));
 		assert!(!filtered.contains_key("CUSTOM_TOKEN"));
+	}
+
+	#[test]
+	fn ssh_agent_credentials_never_cross_into_eval_cells() {
+		let filtered = filter_env(
+			EvalLanguage::Py,
+			&env(&[
+				("PATH", "/bin"),
+				("SSH_AUTH_SOCK", "/tmp/ssh-agent.sock"),
+				("SSH_AGENT_PID", "4242"),
+			]),
+		);
+		assert_eq!(filtered.get("PATH").map(String::as_str), Some("/bin"));
+		assert!(!filtered.contains_key("SSH_AUTH_SOCK"));
+		assert!(!filtered.contains_key("SSH_AGENT_PID"));
 	}
 
 	#[test]

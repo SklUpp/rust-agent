@@ -93,8 +93,9 @@ epics:
     scope_ref: R9
     wsjf: 2.5
     capsule_dir: epics/e10-r9-storage-path-migration
-    status: planned
+    status: in_progress
     dependencies: ["e02", "e03", "e04"]
+    note: "Code + offline E2E green (7c77191, d188c2f, CI 45956391946): copy-only ~/.omp -> ~/.aragent migration, XDG merge, read-only legacy doctor check. Live Termux proof still pending."
     gates:
       - "live_device_proof: R1-R3 (e02, e03, e04) proven on live device (Termux/Android arm64) per SCOPE_LATEST.yaml:18 and docs/agent-preliminary-implementation-plan.md:52"
   - id: e11
@@ -102,8 +103,9 @@ epics:
     scope_ref: R10
     wsjf: 2.4
     capsule_dir: epics/e11-r10-manual-user-retry
-    status: planned
+    status: in_progress
     dependencies: ["e02", "e03", "e04"]
+    note: "Code + offline E2E green (8b120d3, dcf8e27, CI 45956391946): /retry + Alt+R manual retry, UnknownOutcome [y/N] confirmation gate, interruption warning retained in context. Live Termux proof pending."
     gates:
       - "live_device_proof: R1-R3 (e02, e03, e04) proven on live device (Termux/Android arm64) per SCOPE_LATEST.yaml:18 and docs/agent-preliminary-implementation-plan.md:52"
   - id: e12
@@ -111,19 +113,22 @@ epics:
     scope_ref: R11
     wsjf: 2.2
     capsule_dir: epics/e12-r11-diagnostics-doctor
-    status: planned
+    status: done
     dependencies: []
+    note: "Closed (0b482f0, ee6a738, CI 45956391946): 9 diagnostic sections, --json, exit codes 0/1/2, --fix, --prune-artifacts --yes, --redact-legacy --backup --yes, tests/doctor.rs + E2E smoke."
   - id: e13
     title: "Tool Credential Boundary & Termux TUI Reflow (SEC-TUI)"
     scope_ref: SEC-TUI
     wsjf: 2.5
     capsule_dir: epics/e13-sec-tui-reflow
-    status: planned
+    status: done
     dependencies: []
+    note: "Closed (8b120d3 + ssh/eval/main D27 hardening): SSH_AUTH_SOCK stripped in agent/ssh/eval envs, ForwardAgent=no, SEARXNG_* startup redaction registration, SIGWINCH ResizeWake + Termux narrow/short viewport wrapping in tui.rs (alt-screen)."
   - id: e14
     title: "Release Qualification & Artifact Verification (R12)"
     scope_ref: R12
     wsjf: 2.0
     capsule_dir: epics/e14-r12-release-qualification
-    status: planned
+    status: in_progress
     dependencies: ["e01", "e02", "e03", "e04", "e05", "e06", "e07", "e08", "e09", "e10", "e11", "e12", "e13"]
+    note: "0.2.0-dev.1 bump, profile.ci, COMMIT_SHA.txt, THIRD-PARTY-NOTICES.generated.txt, and tagged GitHub Release job wired; awaiting green CI + live device proof before v0.2.0 tag."

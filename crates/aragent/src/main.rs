@@ -147,6 +147,14 @@ fn register_startup_credentials_at(
 			}
 		}
 	}
+	for var in ["SEARXNG_TOKEN", "SEARXNG_BASIC_PASSWORD"] {
+		if let Ok(value) = std::env::var(var) {
+			let value = value.trim();
+			if !value.is_empty() {
+				aragent::auth::known_secrets::register(value);
+			}
+		}
+	}
 	// `peek_api_key` also reads declared environment variables. Use an
 	// in-memory store when no database exists so provider keys are still
 	// registered without creating an unrelated `agent.db`.
@@ -5999,6 +6007,37 @@ mod tests {
 		let redacted = aragent::auth::error::redact_free_text(&format!("value={secret}"));
 		assert!(!redacted.contains(secret), "env credential hidden by corrupt agent.db");
 		assert!(redacted.contains("[REDACTED]"));
+		let _ = std::fs::remove_dir_all(&dir);
+	}
+
+	#[test]
+	fn startup_credentials_register_searxng_env_secrets() {
+		let dir = std::env::temp_dir().join(format!(
+			"aragent-cli-searxng-env-{}-{}",
+			std::process::id(),
+			line!()
+		));
+		let _ = std::fs::remove_dir_all(&dir);
+		std::fs::create_dir_all(&dir).expect("create searxng temp dir");
+		let agent_db = dir.join("agent.db");
+		let token = "searxng-env-token-7f3a1b";
+		let basic_pw = "searxng-env-pass-9e2c4d";
+		// SAFETY: unique test-only values for SearXNG env vars.
+		unsafe {
+			std::env::set_var("SEARXNG_TOKEN", token);
+			std::env::set_var("SEARXNG_BASIC_PASSWORD", basic_pw);
+		}
+		register_startup_credentials_at(None, None, &agent_db);
+		// SAFETY: as above.
+		unsafe {
+			std::env::remove_var("SEARXNG_TOKEN");
+			std::env::remove_var("SEARXNG_BASIC_PASSWORD");
+		}
+		for secret in [token, basic_pw] {
+			let redacted = aragent::auth::error::redact_free_text(&format!("value={secret}"));
+			assert!(!redacted.contains(secret), "searxng env secret was not registered");
+			assert!(redacted.contains("[REDACTED]"));
+		}
 		let _ = std::fs::remove_dir_all(&dir);
 	}
 }

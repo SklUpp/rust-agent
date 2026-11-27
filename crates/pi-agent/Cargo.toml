@@ -44,6 +44,9 @@ test-support = ["rmcp/test-support"]
 # kimi_k2, glm5; ~3.4 MB compressed). Default builds embed o200k_base and the
 # two Claude ctok blobs only.
 utok-all-families = []
+# Opt-in direct provider adapters (`provider_anthropic`, `provider_ollama`).
+# Default builds keep only the OpenAI-compatible adapter.
+direct-providers = []
 
 [dev-dependencies]
 fancy-regex = "0.17" # utok scanner differential oracle

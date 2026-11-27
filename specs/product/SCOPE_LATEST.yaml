@@ -2,7 +2,8 @@ core_value: "Autonomous coding-first Rust runtime for Linux and Termux/Android B
 
 summary: >
   Defines the authoritative product scope for aragent based on the approved
-  preliminary implementation plan (R0–R12), architecture decisions (D01–D96),
+  preliminary implementation plan (R0–R12), architecture decisions (D01–D83, D97;
+  D84–D93 remain triage directions only, D94–D96 do not exist),
   and modular reuse blueprint. The scope bounds the core runtime capabilities,
   durable state machine, execution isolation, language analysis, memory,
   subagent delivery, and diagnostics while strictly excluding unapproved package
@@ -35,7 +36,7 @@ in_scope:
   - id: R1
     name: "Durable Task Admission & Crash Recovery (S4)"
     summary: >
-      Task admission persisted in SQLite v6 before effect, survivor generation
+      Task admission persisted in SQLite v7 (task_admissions v6 + producer_generation v7)
       recovery, FIFO writer barrier, and cached revive logic preventing duplicate
       or lost child tasks across process kills (kill -9 between accept and persist
       does not lose or duplicate task; resume plays back exactly once).
@@ -58,8 +59,8 @@ in_scope:
       Android-safe process lifecycle in pi-shell without pidfd SIGSYS, cross-process
       flock lease coordinator, crash handler, Termux wake-lock integration, cwd
       restoration, prefix_rule/host_executable policy gate without starlark,
-      built-in destructive command rules on brush-parser AST, seccomp-BPF network
-      kill-switch on Linux and Android, and Linux-only landlock/bwrap isolation.
+      built-in destructive rules on brush-parser AST; kernel sandboxing
+      (seccomp-BPF, landlock/bwrap) and process-wrap deferred post-R8.
     dependencies: ["R2"]
     epic: "epic-03-process-bash-protection"
 
@@ -68,10 +69,10 @@ in_scope:
     summary: >
       utok tokenizer extraction with feature gating (utok-all-families), Aider
       RepoMap port over pi-ast split across core-grammars (12) and full-grammars (+44),
-      and lazy LSP with idle kill and graceful text/AST degradation (LSP is optional,
-      disabled by default, requires explicit owner enablement). Full semantic operations
-      (rename, refactor, resolve) across language/backend coverage matrix; requirements
-      are strictly preserved and not reduced to tags or syntax heuristics.
+      and lazy LSP with idle kill and graceful text/AST degradation (target decision
+      makes LSP optional/off by default; current code keeps LSP enabled by default).
+      Semantic operations cover readSymbols, astQuery, astReplace, repoMapTags,
+      and LSP definition/references/hover/rename/diagnostics/format/code_actions.
     dependencies: ["R3"]
     epic: "epic-04-semantic-code-matrix"
 
@@ -104,7 +105,7 @@ in_scope:
     name: "Subagent Isolation & Parallel Worktree Merge (S11)"
     summary: >
       Subagent isolated workspaces via pure-Rust pi-vcs git integration (without
-      jj-lib), diffy 3-way merge, explicit size cap on non-git Rcopy, and
+      jj-lib), similar 3-way merge, explicit size cap on non-git Rcopy, and
       [PENDING_APPLY] marker over conflict:// virtual URLs. Enforces conflict-without-file-writes
       (conflict writes zero files to target), successful [AUTO-APPLIED] state, xxh3
       verification of merged content, and preservation of dirty/uncommitted workspace changes.
@@ -116,8 +117,9 @@ in_scope:
     summary: >
       Neutral subprocess JSON hooks over stdin/stdout triggered at turn, tool,
       and delivery seams with mandatory re-approval on modified arguments;
-      Cargo feature profiles; and packaging contract ensuring artifacts of four platforms
-      build successfully in CI platform matrix. Zero embedded JS/script runtimes.
+      selected Cargo feature gates (local-embeddings, core/full-grammars, utok-all-families);
+      Linux x86_64 and Android arm64 CI builds active, while macOS/Windows/musl matrix
+      and remaining feature profiles (direct-providers, dap, security-scan) are deferred.
     dependencies: ["R3"]
     epic: "epic-08-subprocess-hooks-packaging"
 
@@ -203,10 +205,10 @@ out_of_scope:
     reason: >
       Excessive binary overhead and maintenance burden; neutral subprocess JSON
       hooks fulfill all extension needs.
-  - item: "Local ONNX / fastembed Neural Inference on Device"
+  - item: "Unbounded or Default-Linked Local ONNX Inference on Device"
     reason: >
-      High memory and binary footprint on Termux/Android; remote 9Router embeddings
-      and SQLite FTS5 fulfill memory retrieval.
+      Default build keeps zero ONNX/C++ runtime footprint; opt-in `local-embeddings`
+      feature (fastembed + dynamic ort) is permitted for all targets when explicitly enabled.
   - item: "Multi-Tenant Server Architecture"
     reason: >
       Single-user runtime design per architecture decision D02.
@@ -228,8 +230,7 @@ out_of_scope:
 constraints:
   - "Target OS: Linux (glibc/musl) and Android Termux (Bionic arm64)."
   - "Workspace: Donor repository at ~/omp-work is strictly read-only."
-  - "Process Safety: No pidfd on Android (avoids SIGSYS); Landlock and bwrap strictly on Linux."
-  - "Network: seccomp-BPF network kill-switch allowed on both Android and Linux."
+  - "Process Safety: No pidfd on Android (avoids SIGSYS); Landlock/bwrap (Linux-only) and seccomp-BPF deferred post-R8."
   - "Persistence: SQLite single-writer task, WAL mode, synchronous=NORMAL, fail-closed on persistence failure."
   - "Policy: Deny precedes ask/allow; unknown tool outcome never retried automatically; intent persisted before effect."
   - "Build & Dependencies: Workspace migration to unified reqwest 0.13 + rustls ring provider (eliminates aws-lc-sys and cmake); feature gates for heavy grammars and providers."

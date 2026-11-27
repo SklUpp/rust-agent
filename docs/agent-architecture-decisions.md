@@ -266,6 +266,8 @@ Headless по умолчанию автоматически возобновля
 
 Принято три уровня LLM-инструкций: общие для родителя и всех субагентов; проектные с настраиваемой областью «все агенты проекта» либо «только родитель», включая вложенные правила для соответствующего подкаталога; частные — профиль роли и инструкции конкретного агента/задачи. Родитель отдельно передаёт задачу и выбранный контекст. Ни один уровень не расширяет runtime permissions. Форматы, discovery, разрешение противоречий и default области проектных инструкций пока не определены; исключение AGENTS.md из workers по имени, как у original OMP, не принято.
 
+**Уточнение реализации (2026-11-27, D48):** в `crates/aragent/src/prompts.rs` (`resolve`) для `SYSTEM.md`/`APPEND_SYSTEM.md` выбирается первый найденный файл по приоритету `--system-prompt` > проект (`.omp/`) > пользователь (`~/.aragent/agent/`, fallback `~/.omp/agent/`) > `share/`; для контекстных файлов (`PERSONALITY.md`, `RULES.md`, `AGENTS.md`) в промпт загружаются оба уровня в порядке `[проект, пользователь]` (пользовательский слой идёт последним).
+
 ### D49. Сообщения между агентами
 
 Принято: родитель уточняет задачу работающему worker; worker сообщает результат/проблему или задаёт вопрос; прямые peer messages разрешаются настройками. Сообщения сохраняются в БД; работающему агенту поступают между шагами без прерывания инструмента. Ожидающего можно разбудить по настройке; отменённому нужен явный resume, одного сообщения недостаточно. Отправка не означает отмену работы или расширение прав. Детали durable delivery и подтверждений требуют детализации; принятие сообщения runtime не означает, что модель уже обработала его.
@@ -547,7 +549,7 @@ Headless по умолчанию автоматически возобновля
 
 Исследования содержат предложения и source-факты; этот журнал фиксирует статус пользовательского согласования отдельно. Проверка наличия: `test -s docs/agent-architecture-decisions.md` из checkout. Реализация в рамках согласования не создавалась.
 
-### D80. Ограничение атомарности fork
+### D97. Ограничение атомарности fork (ранее второй D80)
 
 Принято: SQLite fork transaction remains atomic within shared `sessions.db`; artifact directory uses exclusive directory claims and owned-path cleanup. Filesystem publish and SQLite commit cannot be one atomic operation. Crash between operations MAY leave owned orphan artifacts or a committed session without artifacts. No implementation MUST claim cross-store atomicity; later reconciliation handles orphan and missing-artifact states.
 

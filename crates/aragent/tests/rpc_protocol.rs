@@ -2433,8 +2433,10 @@ fn rpc_thinking_change_keeps_explicit_cache_key() {
 /// Anthropic fast-mode rejection body (`matchesFastModeUnsupported` matches a
 /// 400 mentioning `invalid_request_error`, the `speed` parameter and `not
 /// support`).
+#[cfg(feature = "direct-providers")]
 const FAST_REJECTION: &str = r#"{"type":"error","error":{"type":"invalid_request_error","message":"speed is not supported for this model"}}"#;
 
+#[cfg(feature = "direct-providers")]
 const ANTHROPIC_TURN: &str = concat!(
 	"event: message_start\n",
 	"data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"usage\":{\"input_tokens\":3,\"output_tokens\":0}}}\n\n",
@@ -2452,6 +2454,7 @@ const ANTHROPIC_TURN: &str = concat!(
 
 /// Serve two Anthropic turns. Each turn starts with a fast-mode 400 followed by
 /// the downgraded 200 retry, so the even requests carry `speed: "fast"`.
+#[cfg(feature = "direct-providers")]
 fn spawn_anthropic_fast_rejection(requests: Arc<Mutex<Vec<Vec<u8>>>>) -> u16 {
 	let listener = TcpListener::bind("127.0.0.1:0").expect("bind anthropic");
 	let port = listener.local_addr().expect("addr").port();
@@ -2484,6 +2487,7 @@ fn spawn_anthropic_fast_rejection(requests: Arc<Mutex<Vec<Vec<u8>>>>) -> u16 {
 	port
 }
 
+#[cfg(feature = "direct-providers")]
 fn anthropic_launch(port: u16) -> RpcLaunch {
 	let mut launch = launch(port, "claude-priority", "anthropic");
 	launch.config.providers.insert(
@@ -2508,6 +2512,7 @@ fn anthropic_launch(port: u16) -> RpcLaunch {
 	launch
 }
 
+#[cfg(feature = "direct-providers")]
 #[test]
 fn fast_mode_toggle_rearms_priority_after_an_anthropic_downgrade() {
 	let requests = Arc::new(Mutex::new(Vec::new()));

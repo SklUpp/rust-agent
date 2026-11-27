@@ -11,8 +11,8 @@
 //!
 //! Host-key policy is the user's own: no `StrictHostKeyChecking` override is
 //! ever added, so an unknown host fails exactly as the user's config says. The
-//! child inherits the parent environment (user `PATH`, agent socket, config),
-//! with no hardcoded prefix.
+//! child starts from a cleared environment (`env_clear` + platform allowlist,
+//! dropping `SSH_AUTH_SOCK` and provider keys) and passes `ForwardAgent=no`.
 //!
 //! Special files (FIFO/socket/device) are refused by a POSIX `test` preflight,
 //! but that preflight and the read are separate remote commands against the
@@ -110,6 +110,8 @@ impl SshConnection {
 			"-n".into(),
 			"-o".into(),
 			"BatchMode=yes".into(),
+			"-o".into(),
+			"ForwardAgent=no".into(),
 		];
 		if let Some(port) = self.port {
 			argv.push("-p".into());
@@ -1362,6 +1364,7 @@ mod tests {
 		let argv: Vec<String> = argv.iter().map(|arg| arg.to_string_lossy().into_owned()).collect();
 		assert_eq!(argv[0], "ssh");
 		assert!(argv.contains(&"BatchMode=yes".to_string()));
+		assert!(argv.windows(2).any(|pair| pair == ["-o", "ForwardAgent=no"]));
 		assert!(!argv.iter().any(|arg| arg.contains("StrictHostKeyChecking")));
 		assert!(!argv.iter().any(|arg| arg == "-c"));
 		assert_eq!(argv[argv.len() - 2], "u@h");

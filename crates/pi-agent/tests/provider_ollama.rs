@@ -10,6 +10,8 @@
 //! The fixtures are local TCP servers: no Ollama daemon, model or account is
 //! required.
 
+#![cfg(feature = "direct-providers")]
+
 use std::time::Duration;
 
 use futures::StreamExt;

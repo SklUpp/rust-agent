@@ -40,3 +40,19 @@
 5. **Единый владелец retry (`provider/timeout.rs`):** вложенные retry на уровне шлюза и `arag` умножают запросы и биллинг (отсутствие SSE-чанка не гарантирует, что upstream не выполнил запрос). Отключать повторы на одном из слоёв (`maxRetries = 0` в `arag` или `request-retry: 0` в шлюзе).
 6. **D27 redaction и denied paths:** регистрировать gateway/management/master ключи в `known_secrets`; включить в D27 denylist все настраиваемые `DATA_DIR` роутера (включая `WAL`/`SHM`, backups, `.cli-proxy-api`, `.9routerx`, `.omniroute`). Помнить: D27 не защищает от прямого чтения SQLite из `bash`.
 7. **Go DNS/TLS на Android:** `gw2a.sh` показывает рабочий обход через `proot` (`resolv.conf` + `SSL_CERT_FILE`), но поведение конкретной CGO/static сборки нужно тестировать на устройстве, а не экстраполировать на все Go-бинарники.
+
+---
+
+## 4. Поддержка `web_search` у исследованных роутеров (2026-11-27)
+
+Проверено по локальным чекаутам (`~/9router-src`, `~/OmniRoute`) и исходникам/документации апстримов (`CLIProxyAPI`, `CLIProxyAPI-Rust`, `9routerx`):
+
+| Роутер | Самостоятельный search endpoint | Контракт и детали | Итог для `arag` |
+|---|---|---|---|
+| **`9router`** (`0.5.123`) | Да: `POST /v1/search` (`src/app/api/v1/search/route.js:15-17`, `src/sse/handlers/search.js:20`) | Требует `provider` или `model` + `query`; 14 адаптеров (`exa`, `tavily`, `searxng`, `brave-search`, `perplexity`, …) + `chatSearch` + `combos`; унифицированный `{provider, query, results[], answer, usage, metrics, errors}`; 15 s timeout + внутренний fallback | Полный `POST /v1/search` |
+| **`OmniRoute`** (`v3.8.55`) | Да: `POST /v1/search`, `GET /v1/search`, `POST /v1/web/fetch` (`src/app/api/v1/search/route.ts:71-89,205-229`) | Принимает `query` без обязательного `provider`/`model` (auto-select), 24 адаптера включая keyless `duckduckgo-free` (`open-sse/services/freeWebSearch.ts`); тот же унифицированный формат `results[]` + `id`/`cached` | Полный `POST /v1/search` + донор `duckduckgo-free` fallback |
+| **`9routerx`** (`yanstd888/9routerx`) | Да: `POST /search` и `POST /v1/search` (`internal/handlers/router.go:114-116`, `media.go:733-741`) | Требует `model` или `provider`, `query`/`prompt`, `max_results`; унифицированный формат для Antigravity/Xquik (`antigravity_search.go:64-110`), остальные провайдеры реестра — raw `io.Copy` passthrough; free-fallback отсутствует | Частично совместим (ответ зависит от провайдера) |
+| **`CLIProxyAPI`** (`router-for-me/CLIProxyAPI`) | Только Codex/Muse: `POST /v1/alpha/search` (`internal/api/server_routes.go`) | Пробрасывает payload как есть в `chatgpt.com/backend-api/codex/alpha/search`; универсального `/v1/search` нет; `web_search` tool passthrough только в `/v1/responses` для Codex/GPT-5 | Нет общего search API |
+| **`CLIProxyAPI-Rust`** (`IuCC123/CLIProxyAPI-Rust` v0.3.2) | Нет | Только LLM endpoints (`/v1/chat/completions`, `/v1/responses`, `/v1/messages`, `/v1beta/models/*`) | Поиск отсутствует |
+
+**Следствие:** `arag` не должен зависеть от search API роутера как от единственного канала. Базовый клиент в `crates/pi-agent/src/tools/web_search.rs` сохраняет `SearxngConfig`, добавляет бесплатный keyless fallback (`duckduckgo-free` на `https://lite.duckduckgo.com/lite/`), а роутерный адаптер `POST /v1/search` подключается после окончательного выбора роутера.

@@ -206,6 +206,7 @@ async fn success_first_try_never_refreshes() {
 	server.stop();
 }
 
+#[cfg(feature = "direct-providers")]
 #[tokio::test]
 async fn anthropic_refreshes_once_per_request_and_redacts_used_tokens() {
 	use pi_agent::provider_anthropic::AnthropicMessagesProvider;
@@ -248,6 +249,7 @@ async fn anthropic_refreshes_once_per_request_and_redacts_used_tokens() {
 	server.stop();
 }
 
+#[cfg(feature = "direct-providers")]
 #[tokio::test]
 async fn anthropic_non_auth_error_body_hides_the_token_actually_used() {
 	use pi_agent::provider_anthropic::AnthropicMessagesProvider;
@@ -276,6 +278,7 @@ async fn anthropic_non_auth_error_body_hides_the_token_actually_used() {
 	server.stop();
 }
 
+#[cfg(feature = "direct-providers")]
 #[tokio::test]
 async fn anthropic_fast_fallback_error_uses_the_retry_token() {
 	use pi_agent::provider_anthropic::AnthropicMessagesProvider;
@@ -317,6 +320,7 @@ async fn anthropic_fast_fallback_error_uses_the_retry_token() {
 	server.stop();
 }
 
+#[cfg(feature = "direct-providers")]
 #[tokio::test]
 async fn anthropic_fast_fallback_sse_error_redacts_the_retry_token() {
 	use futures::StreamExt;

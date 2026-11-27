@@ -11,7 +11,9 @@ pub mod mcp;
 pub mod loop_module;
 pub mod process_broker;
 pub mod provider;
+#[cfg(feature = "direct-providers")]
 pub mod provider_anthropic;
+#[cfg(feature = "direct-providers")]
 pub mod provider_ollama;
 pub mod state;
 pub mod subagent_advisor;

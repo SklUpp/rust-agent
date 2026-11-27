@@ -3,11 +3,10 @@
 Standalone Rust workspace for the coding-agent runtime: one Linux/Termux
 (Bionic, arm64) binary (`arag`) plus embedded text assets. The project was
 previously carried under the name `omp`; this tree renames the first-party
-crates and CLI surface but keeps the existing data locations (`~/.omp`, XDG
-`omp` roots, `OMP_*` variables, stored sessions and credentials) so upgrades do
-not migrate or orphan user state. This tree is an extraction baseline, not a
-finished product. Android release artifact at `d9c6078` was built in CI and its
-CLI tool roundtrip passed on Termux.
+crates, CLI surface, and canonical storage root (`~/.aragent` and XDG
+`aragent` roots) with one-time, non-destructive copy-only migration and
+read-only fallback compatibility for existing `~/.omp` / `OMP_*` state. Android
+artifacts are built in CI and smoke-tested on Termux.
 
 ## Provenance
 
@@ -25,20 +24,21 @@ CLI tool roundtrip passed on Termux.
   the donor has them, crate-local files: `crates/pi-ast/LICENSE`,
   `crates/pi-builtins/LICENSE` + `LICENSE-MIT`, `crates/pi-iso/LICENSE`,
   `crates/pi-shell/LICENSE` + `NOTICE`, `crates/pi-walker/LICENSE`,
-  `crates/vendor/brush-core/LICENSE`. `packages/coding-agent/LICENSE` covers
-  the prompt assets. `aragent`, `pi-agent`, and `pi-grep-pattern` have no
+  `crates/vendor/brush-core/LICENSE`, `crates/vendor/rmcp/LICENSE`. `packages/coding-agent/LICENSE`
+  covers the prompt assets. `aragent`, `pi-agent`, `pi-grep-pattern`, and `pi-vcs` have no
   crate-local license file and rely on the root `LICENSE`.
 
 ## Extracted closure
 
 Workspace members: `crates/aragent`, `crates/pi-agent`, `crates/pi-ast`,
 `crates/pi-builtins`, `crates/pi-grep-pattern`, `crates/pi-iso`,
-`crates/pi-shell`, `crates/pi-walker`, `crates/vendor/brush-core`.
+`crates/pi-shell`, `crates/pi-vcs`, `crates/pi-walker`,
+`crates/vendor/brush-core`.
 
 Only the compile-time closure of `aragent` and its local path dependencies is
 present: Rust sources, tests, build script, embedded assets, licenses, root
-`Cargo.lock`, `rustfmt.toml`, `rust-toolchain.toml`. `pi-vcs`, `pi-voice`, and
-`pi-natives` (NAPI) are not part of this closure. TypeScript sources,
+`Cargo.lock`, `rustfmt.toml`, `rust-toolchain.toml`. `pi-voice` and
+`pi-natives` (NAPI) are not part of this closure. TypeScript runtime sources,
 `node_modules`, `target/`, Bazel files, Android assets, and the donor Git
 metadata were not copied.
 
@@ -121,16 +121,10 @@ No claim is made that the build or tests pass until they are actually run.
 
 ## Observed verification
 
-- CI run `42240498060`: Linux `cargo check` and Android release build passed;
-  host test compilation failed and was fixed separately. Full suite not yet green.
-- Android artifact SHA-256:
-  `423aff2912245478d94ba44bd0a93ae0d093562f1ed144bd4c0630e56ca01e79`.
-- On Termux, the pre-rename `omp --version` returned `omp 18.0.9` (exit 0);
-  the renamed `arag` binary reports its own version, now `arag 0.1.0` (the
-  donor's `18.0.9` is no longer this product's version).
-- `python scripts/standalone-smoke.py --binary <downloaded-pre-rename-omp>
-  --timeout 120` passed (exit 0): two local fixture API requests, streamed
-  `read` call, real tool result, final response. No external provider
-  credentials used.
-- Newer shell/writer changes are not covered by that artifact; they require
-  a new CI build and device smoke.
+- CI workflow `.github/workflows/standalone-runtime.yml` runs host checks/tests/smoke
+  (`x86_64-unknown-linux-gnu`), Android Bionic build (`aarch64-linux-android`, NDK `r27c`,
+  API 24), and `cargo-deny` / `cargo-about` license/notice verification (`45956391946`: all 3 jobs passed).
+- On Termux (`45956391946/arag`), `arag --version` reports `arag 0.1.0`;
+  `scripts/e2e-runtime-smoke.py` (4 suites including `-h`/`-V` and read-only `doctor --json`)
+  and `scripts/live-9router-smoke.py --require-mcp-fs` passed against live `9Router`.
+- Newer patches on top of `ee6a738` require a fresh CI run and device smoke.

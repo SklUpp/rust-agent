@@ -7,6 +7,7 @@ name: Standalone runtime
 on:
   push:
     branches: [main, feat/standalone-runtime]
+    tags: ["v*"]
   pull_request:
     branches: [main]
   workflow_dispatch:
@@ -63,8 +64,10 @@ jobs:
           cargo update --ignore-rust-version -p url -p form_urlencoded
       - name: Check agent core and CLI
         run: cargo check --locked -p pi-agent -p aragent
-      - name: Test agent core and CLI
+      - name: Test agent core and CLI (default OpenAI-compatible)
         run: cargo test --locked -p pi-agent -p aragent
+      - name: Test opt-in direct-providers feature
+        run: cargo test --locked -p pi-agent -p aragent --features direct-providers
       - name: Check opt-in local embeddings feature
         run: cargo check --locked -p aragent --features local-embeddings
       - name: Test in-process git backend
@@ -73,21 +76,24 @@ jobs:
         run: cargo test --locked -p aragent --features test-support --test mcp_filesystem_smoke
       - name: Test persistent shell session, env allowlist, policy, and tree kill
         run: cargo test --locked -p pi-shell --lib policy --test persistent_session --test session_env_allowlist --test process_tree_kill
-      - name: Build CLI for the smoke run
-        run: cargo build --locked -p aragent
+      - name: Build CLI for smoke and artifact (profile.ci)
+        run: cargo build --profile ci --locked -p aragent
       - name: Run real CLI against local OpenAI-compatible fixture
-        run: python3 scripts/standalone-smoke.py --binary target/debug/arag --timeout 120
+        run: python3 scripts/standalone-smoke.py --binary target/ci/arag --timeout 120
       - name: Run offline E2E runtime smoke suite (R9, R10, R11)
-        run: python3 scripts/e2e-runtime-smoke.py --binary target/debug/arag --timeout 60
-      - name: Record host binary digest
-        run: sha256sum target/debug/arag > target/debug/arag.sha256
+        run: python3 scripts/e2e-runtime-smoke.py --binary target/ci/arag --timeout 60
+      - name: Record host binary digest and commit SHA
+        run: |
+          (cd target/ci && sha256sum arag > arag.sha256)
+          git rev-parse HEAD > target/ci/COMMIT_SHA.txt
       - name: Upload host binary
         uses: actions/upload-artifact@v4
         with:
           name: arag-x86_64-unknown-linux-gnu
           path: |
-            target/debug/arag
-            target/debug/arag.sha256
+            target/ci/arag
+            target/ci/arag.sha256
+            target/ci/COMMIT_SHA.txt
           if-no-files-found: error
 
   build-android:
@@ -147,12 +153,14 @@ jobs:
           # Opt-in feature must compile for bionic too; ort loads libonnxruntime
           # dynamically at runtime, so no native ONNX library is linked here.
           cargo check --locked -p aragent --target aarch64-linux-android --features local-embeddings
+          cargo check --locked -p aragent --target aarch64-linux-android --features direct-providers
           cargo build --release --locked -p aragent --target aarch64-linux-android
           BIN="target/aarch64-linux-android/release/arag"
           "$TOOLCHAIN/llvm-strip" "$BIN"
           file -b "$BIN" | tee /dev/stderr | grep -q 'ELF 64-bit.*aarch64'
           ls -lh "$BIN"
-          sha256sum "$BIN" > "$BIN.sha256"
+          (cd target/aarch64-linux-android/release && sha256sum arag > arag.sha256)
+          git rev-parse HEAD > target/aarch64-linux-android/release/COMMIT_SHA.txt
       - name: Upload Android binary
         uses: actions/upload-artifact@v4
         with:
@@ -160,6 +168,7 @@ jobs:
           path: |
             target/aarch64-linux-android/release/arag
             target/aarch64-linux-android/release/arag.sha256
+            target/aarch64-linux-android/release/COMMIT_SHA.txt
           if-no-files-found: error
 
   license-notices:
@@ -282,3 +291,37 @@ jobs:
           name: refreshed-cargo-lock
           path: Cargo.lock
           if-no-files-found: error
+
+  release:
+    name: Publish GitHub Release (tagged builds only)
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    needs: [test-host, build-android, license-notices]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist-artifacts
+      - name: Package and publish release assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          mkdir -p release-assets
+          cp dist-artifacts/arag-x86_64-unknown-linux-gnu/arag release-assets/arag-x86_64-unknown-linux-gnu
+          sed 's/  arag$/  arag-x86_64-unknown-linux-gnu/' dist-artifacts/arag-x86_64-unknown-linux-gnu/arag.sha256 > release-assets/arag-x86_64-unknown-linux-gnu.sha256
+          cp dist-artifacts/arag-aarch64-linux-android/arag release-assets/arag-aarch64-linux-android
+          sed 's/  arag$/  arag-aarch64-linux-android/' dist-artifacts/arag-aarch64-linux-android/arag.sha256 > release-assets/arag-aarch64-linux-android.sha256
+          (cd release-assets && sha256sum -c arag-x86_64-unknown-linux-gnu.sha256 && sha256sum -c arag-aarch64-linux-android.sha256)
+          cp dist-artifacts/arag-aarch64-linux-android/COMMIT_SHA.txt release-assets/COMMIT_SHA.txt
+          cp dist-artifacts/third-party-notices/THIRD-PARTY-NOTICES.generated.txt release-assets/THIRD-PARTY-NOTICES.txt
+          prerelease_flag=""
+          if [[ "$GITHUB_REF_NAME" == *-* ]]; then
+            prerelease_flag="--prerelease"
+          fi
+          gh release create "$GITHUB_REF_NAME" release-assets/* \
+            --title "$GITHUB_REF_NAME" \
+            --generate-notes \
+            $prerelease_flag

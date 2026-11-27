@@ -6,7 +6,7 @@
 ## Порядок чтения
 
 1. [План работ](agent-preliminary-implementation-plan.md) — что делаем сейчас и что осталось.
-2. [Решения](agent-architecture-decisions.md) — принятые границы, D01–D83 и уточнения.
+2. [Решения](agent-architecture-decisions.md) — принятые границы, D01–D83, D97 и уточнения.
 3. [Handoff](agent-work-handoff.md) — снимок HEAD, проверки и ближайший шаг.
 4. [Архитектура](agent-architecture.md) — общая картина и границы продукта.
 

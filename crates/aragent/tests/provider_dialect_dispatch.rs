@@ -10,11 +10,15 @@
 
 use std::{
 	collections::BTreeMap,
+	path::PathBuf,
+	sync::Arc,
+	time::Duration,
+};
+#[cfg(feature = "direct-providers")]
+use std::{
 	io::{Read, Write},
 	net::{TcpListener, TcpStream},
-	path::PathBuf,
-	sync::{Arc, mpsc},
-	time::Duration,
+	sync::mpsc,
 };
 
 use aragent::{
@@ -125,6 +129,7 @@ fn wire_request(catalog: Catalog, provider: &str, model: &str, api_key: Option<&
 	}
 }
 
+#[cfg(feature = "direct-providers")]
 /// Capture one blocking HTTP/1.1 request: head text and decoded body.
 fn read_http_request(socket: &mut TcpStream) -> (String, String) {
 	let mut buffer = Vec::new();
@@ -158,6 +163,7 @@ fn read_http_request(socket: &mut TcpStream) -> (String, String) {
 	)
 }
 
+#[cfg(feature = "direct-providers")]
 fn write_http_response(socket: &mut TcpStream, content_type: &str, body: &str) {
 	let response = format!(
 		"HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\n\
@@ -168,6 +174,7 @@ fn write_http_response(socket: &mut TcpStream, content_type: &str, body: &str) {
 	socket.flush().expect("flush response");
 }
 
+#[cfg(feature = "direct-providers")]
 const ANTHROPIC_TURN_ONE: &str = concat!(
 	"event: message_start\n",
 	"data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"usage\":{\"input_tokens\":5,\"output_tokens\":0}}}\n\n",
@@ -197,6 +204,7 @@ const ANTHROPIC_TURN_ONE: &str = concat!(
 	"data: {\"type\":\"message_stop\"}\n\n"
 );
 
+#[cfg(feature = "direct-providers")]
 const ANTHROPIC_TURN_TWO: &str = concat!(
 	"event: message_start\n",
 	"data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_2\"}}\n\n",
@@ -217,6 +225,7 @@ const ANTHROPIC_TURN_TWO: &str = concat!(
 /// non-official endpoint gets a bearer credential (never `x-api-key`), the
 /// catalog `maxTokens` caps the request, and the signed
 /// thinking block is replayed on the next turn.
+#[cfg(feature = "direct-providers")]
 #[test]
 fn root_anthropic_dispatch_posts_messages_and_replays_signatures() {
 	let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
@@ -281,6 +290,7 @@ fn root_anthropic_dispatch_posts_messages_and_replays_signatures() {
 
 /// `ollama-chat` models post to `/api/chat`; the adapter strips the configured
 /// `/api` suffix and parses the NDJSON stream back into the turn.
+#[cfg(feature = "direct-providers")]
 #[test]
 fn root_ollama_dispatch_posts_api_chat_and_reads_ndjson() {
 	const NDJSON: &str = concat!(
@@ -363,7 +373,36 @@ fn unknown_provider_api_fails_before_contact() {
 	let message = error.to_string();
 	assert!(message.contains("unsupported provider api `openai-responses`"), "{message}");
 }
+#[cfg(not(feature = "direct-providers"))]
+#[test]
+fn direct_provider_dialects_fail_closed_when_feature_is_disabled() {
+	for (provider, api) in [
+		("anthropic-proxy", "anthropic-messages"),
+		("ollama-proxy", "ollama-chat"),
+	] {
+		let catalog = catalog_with_model(
+			provider,
+			"m",
+			ModelInfo {
+				provider: provider.to_string(),
+				api: Some(api.to_string()),
+				base_url: Some("http://127.0.0.1:9".to_string()),
+				..ModelInfo::default()
+			},
+			None,
+		);
+		let request = wire_request(catalog, provider, "m", None);
+		let runner = PiAgentRunner::new().expect("runner");
+		let error = match runner.run(&request) {
+			Ok(_) => panic!("{api} must fail before contact when direct-providers is off"),
+			Err(error) => error,
+		};
+		let message = error.to_string();
+		assert!(message.contains("direct-providers"), "{message}");
+	}
+}
 
+#[cfg(feature = "direct-providers")]
 /// Bound a mock endpoint: serve `expected` requests, then give up so a broken
 /// scenario fails the assertions instead of hanging the join.
 fn serve_bounded(
@@ -397,16 +436,19 @@ fn serve_bounded(
 	}
 }
 
+#[cfg(feature = "direct-providers")]
 const OLLAMA_TASK_TURN: &str = concat!(
 	"{\"model\":\"qwen3\",\"message\":{\"role\":\"assistant\",\"content\":\"\",\"tool_calls\":[{\"type\":\"function\",\"function\":{\"name\":\"task\",\"arguments\":{\"name\":\"cli-child\",\"agent\":\"cli-child\",\"task\":\"CLI_CHILD_WORK\"}}}]},\"done\":false}\n",
 	"{\"model\":\"qwen3\",\"message\":{\"role\":\"assistant\",\"content\":\"\"},\"done\":true,\"done_reason\":\"tool_calls\",\"prompt_eval_count\":5,\"eval_count\":3}\n"
 );
 
+#[cfg(feature = "direct-providers")]
 const OLLAMA_FINAL_TURN: &str = concat!(
 	"{\"model\":\"qwen3\",\"message\":{\"role\":\"assistant\",\"content\":\"root done\"},\"done\":false}\n",
 	"{\"model\":\"qwen3\",\"message\":{\"role\":\"assistant\",\"content\":\"\"},\"done\":true,\"done_reason\":\"stop\"}\n"
 );
 
+#[cfg(feature = "direct-providers")]
 const CHILD_TOOL_TURN: &str = concat!(
 	"event: message_start\n",
 	"data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_child_1\",\"usage\":{\"input_tokens\":5,\"output_tokens\":0}}}\n\n",
@@ -429,6 +471,7 @@ const CHILD_TOOL_TURN: &str = concat!(
 /// the child key, and the task result carries the child's real output. The child
 /// makes exactly one provider request: `yield` is its terminal tool, so no
 /// follow-up assistant turn follows the tool result.
+#[cfg(feature = "direct-providers")]
 #[test]
 fn child_spawn_inherits_the_priority_fast_mode() {
 	let root_listener = TcpListener::bind("127.0.0.1:0").expect("bind root");

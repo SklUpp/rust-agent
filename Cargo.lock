@@ -113,7 +113,7 @@ checksum = "330a5ed07fa54e4702c9d6c4174f74427fc0ef6e214bbd677ae50a5099946470"
 
 [[package]]
 name = "aragent"
-version = "0.1.0"
+version = "0.2.0-dev.1"
 dependencies = [
  "aho-corasick",
  "async-trait",
@@ -4210,7 +4210,7 @@ dependencies = [
 
 [[package]]
 name = "pi-agent"
-version = "0.1.0"
+version = "0.2.0-dev.1"
 dependencies = [
  "async-trait",
  "fancy-regex",
@@ -4242,7 +4242,7 @@ dependencies = [
 
 [[package]]
 name = "pi-ast"
-version = "0.1.0"
+version = "0.2.0-dev.1"
 dependencies = [
  "anyhow",
  "ast-grep-core",
@@ -4313,7 +4313,7 @@ dependencies = [
 
 [[package]]
 name = "pi-builtins"
-version = "0.1.0"
+version = "0.2.0-dev.1"
 dependencies = [
  "ansi-width",
  "anyhow",
@@ -4400,7 +4400,7 @@ dependencies = [
 
 [[package]]
 name = "pi-grep-pattern"
-version = "0.1.0"
+version = "0.2.0-dev.1"
 dependencies = [
  "grep-matcher",
  "grep-pcre2",
@@ -4410,7 +4410,7 @@ dependencies = [
 
 [[package]]
 name = "pi-iso"
-version = "0.1.0"
+version = "0.2.0-dev.1"
 dependencies = [
  "async-trait",
  "libc",
@@ -4424,7 +4424,7 @@ dependencies = [
 
 [[package]]
 name = "pi-shell"
-version = "0.1.0"
+version = "0.2.0-dev.1"
 dependencies = [
  "anyhow",
  "brush-core",
@@ -4452,7 +4452,7 @@ dependencies = [
 
 [[package]]
 name = "pi-vcs"
-version = "0.1.0"
+version = "0.2.0-dev.1"
 dependencies = [
  "gix",
  "libc",
@@ -4464,7 +4464,7 @@ dependencies = [
 
 [[package]]
 name = "pi-walker"
-version = "0.1.0"
+version = "0.2.0-dev.1"
 dependencies = [
  "dashmap",
  "globset",

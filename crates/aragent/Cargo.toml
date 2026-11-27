@@ -52,6 +52,7 @@ xxhash-rust.workspace = true
 [features]
 default = []
 local-embeddings = ["dep:fastembed"]
+direct-providers = ["pi-agent/direct-providers"]
 test-support = ["pi-agent/test-support"]
 
 [dev-dependencies]

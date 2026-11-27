@@ -5,6 +5,8 @@
 //!
 //! These tests use local loopback servers only; no external endpoint is called.
 
+#![cfg(feature = "direct-providers")]
+
 use std::time::Duration;
 
 use futures::StreamExt;
