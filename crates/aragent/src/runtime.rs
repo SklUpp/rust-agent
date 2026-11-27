@@ -292,15 +292,19 @@ struct RunnerSession {
 	workspace_lease: Mutex<Option<Arc<pi_agent::workspace_writer::WorkspaceScopeLease>>>,
 }
 
-/// Shared LSP ownership scope plus the transport preference it was built with.
+/// Shared LSP ownership scope plus the transport and trust policy it was built
+/// with.
 struct LspSlot {
 	shared:  bool,
 	session: Arc<LspSession>,
 }
 
 impl LspSlot {
-	fn new(shared: bool) -> Self {
-		Self { shared, session: LspSession::new(shared) }
+	fn new(shared: bool, allow_project_config: bool) -> Self {
+		Self {
+			shared,
+			session: LspSession::with_project_config(shared, allow_project_config),
+		}
 	}
 }
 
@@ -319,7 +323,7 @@ impl RunnerSession {
 			session_file: Mutex::new(None),
 			eval: Mutex::new(None),
 			dap: Arc::new(DapSessionManager::new()),
-			lsp: Mutex::new(LspSlot::new(true)),
+			lsp: Mutex::new(LspSlot::new(true, false)),
 			debug_timeout: Mutex::new(None),
 			internal_urls: Mutex::new(None),
 			url_scope: Mutex::new(Arc::new(pi_agent::tools::internal_urls::UrlScope::default())),
@@ -423,19 +427,32 @@ impl RunnerSession {
 		Arc::clone(&self.lsp.lock().unwrap_or_else(|poison| poison.into_inner()).session)
 	}
 
-	/// Follow `lsp.shared`, replacing (and releasing) the previous scope when it
-	/// changes so clients created under the old transport are not left open.
-	fn set_lsp_shared(&self, shared: bool, runtime: &tokio::runtime::Runtime) {
+	/// Follow `lsp.shared` and the workspace trust verdict, replacing (and
+	/// releasing) the previous scope when the transport changes. A pure trust
+	/// flip updates the session in place: clients and configs are keyed by the
+	/// verdict, so nothing trusted can be observed by an untrusted lookup.
+	fn set_lsp_policy(
+		&self,
+		shared: bool,
+		allow_project_config: bool,
+		runtime: &tokio::runtime::Runtime,
+	) {
 		let previous = {
 			let mut slot = self.lsp.lock().unwrap_or_else(|poison| poison.into_inner());
-			if slot.shared == shared {
-				return;
+			if slot.shared != shared {
+				let replaced =
+					std::mem::replace(&mut *slot, LspSlot::new(shared, allow_project_config));
+				Some(replaced.session)
+			} else {
+				slot.session.set_allow_project_config(allow_project_config);
+				None
 			}
-			std::mem::replace(&mut *slot, LspSlot::new(shared))
+		};
+		let Some(session) = previous else {
+			return;
 		};
 		// Close the superseded scope off the caller's thread; release is
 		// ownership-scoped, so clients another session still uses survive.
-		let session = previous.session;
 		runtime.spawn(async move {
 			session.release().await;
 		});
@@ -1793,8 +1810,18 @@ impl AgentRunner for PiAgentRunner {
 		session.set_acp_bridge(request.acp_bridge.as_ref().map(|handle| Arc::clone(&handle.0)));
 		let acp_bridge = session.acp_bridge();
 		// `lsp.shared`/`tools.maxTimeout` are applied before the registry is built
-		// so the root tool instances carry this turn's transport and cap.
-		session.set_lsp_shared(request.config.lsp.shared(), &self.runtime);
+		// so the root tool instances carry this turn's transport and cap. D20:
+		// project LSP config is honored only for a workspace whose trust grant
+		// still verifies; every other verdict fails closed.
+		let lsp_allow_project_config =
+			crate::trust::TrustStore::load_from_agent_dir(&crate::dirs::agent_dir())
+				.status(&request.cwd)
+				.is_trusted();
+		session.set_lsp_policy(
+			request.config.lsp.shared(),
+			lsp_allow_project_config,
+			&self.runtime,
+		);
 		session.set_debug_timeout(request.config.max_tool_timeout_secs);
 		// `ask` needs the root context's UI: register it after the supervisor has
 		// cloned its child template, so children never receive the tool.
@@ -1831,7 +1858,8 @@ impl AgentRunner for PiAgentRunner {
 		// endpoint and credentials come from settings plus the `SEARXNG_*`
 		// environment fallback; the model can never supply them.
 		if plan.tools.contains(&"web_search") {
-			let env: std::collections::HashMap<String, String> = std::env::vars().collect();
+			let env: std::collections::HashMap<String, String> =
+				pi_agent::state::utf8_env_vars().into_iter().collect();
 			base_registry.register(Arc::new(pi_agent::tools::WebSearchTool::new(
 				request.config.searxng.clone().with_env_overrides(&env),
 			)));
@@ -2052,8 +2080,9 @@ impl AgentRunner for PiAgentRunner {
 			// turn without ACP clears it again.
 			supervisor.set_acp_bridge(acp_bridge.clone());
 			supervisor.set_child_tool_settings(ChildToolSettings {
-				lsp_shared: request.config.lsp.shared(),
-				debug_max_timeout: request.config.max_tool_timeout_secs,
+				lsp_shared:               request.config.lsp.shared(),
+				lsp_allow_project_config: lsp_allow_project_config,
+				debug_max_timeout:        request.config.max_tool_timeout_secs,
 			});
 			supervisor.set_active_model(active_model.clone());
 			supervisor.set_lsp_read_only(request.security_worker);
@@ -5311,6 +5340,8 @@ fn build_registry_with_display(
 			// is rebuilt every prompt while servers/debuggees must survive turns.
 			"lsp" => match session {
 				Some(session) => Arc::new(LspTool::with_session(session.lsp_session())),
+				// No ownership scope (builder outside a runner): the default
+				// session keeps project LSP config disabled.
 				None => Arc::new(LspTool::new()),
 			},
 			"debug" => match session {
@@ -6347,6 +6378,10 @@ pub async fn filter_and_spawn_mcp_servers_with_paths_detailed(
 		if project_source {
 			crate::config::expand_mcp_server_config_env(&mut server_config);
 		}
+		// Trusted host configs expand during parsing, project configs above, so
+		// every header/env credential is now resolved. Register it for exact
+		// redaction before any error path can echo it.
+		crate::config::register_mcp_server_secrets(&server_config);
 		if let MCPServerConfig::Stdio(stdio) = &mut server_config {
 			if stdio.cwd.is_none() {
 				stdio.cwd = Some(cwd.to_string_lossy().to_string());
@@ -7420,6 +7455,18 @@ mod tests {
 
 	fn yolo() -> Approvals {
 		Approvals::new(ApprovalMode::Yolo, Vec::new())
+	}
+
+	#[test]
+	fn run_request_debug_redacts_api_key_and_provider_secrets() {
+		let mut request = request(Approvals::default());
+		request.api_key = Some("sk-request-secret-9ab".to_string());
+		request.config.searxng.token = Some("searxng-token-9ab".to_string());
+		let debug = format!("{request:?}");
+		for secret in ["sk-request-secret-9ab", "sk-test", "searxng-token-9ab"] {
+			assert!(!debug.contains(secret), "leaked {secret} in {debug}");
+		}
+		assert!(debug.contains("local"), "provider name stays visible: {debug}");
 	}
 
 	/// Test credential store returning one fixed key (or a miss).

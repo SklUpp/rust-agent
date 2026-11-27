@@ -358,7 +358,13 @@ impl AcpRuntime {
 		});
 		let host_tools = Arc::new(HostToolBridge::new(Arc::clone(&sink)));
 		let host_uris = Arc::new(HostUriBridge::new(Arc::clone(&sink)));
-		let internal_urls = Arc::new(pi_agent::tools::internal_urls::InternalUrlRouter::new());
+		// D20: project `ssh.json` follows a live trust verdict per request cwd,
+		// so revocation or a delegated child cwd fails closed immediately.
+		let internal_urls = Arc::new(
+			pi_agent::tools::internal_urls::InternalUrlRouter::with_ssh_trust_policy(Arc::new(
+				crate::trust::workspace_is_trusted,
+			)),
+		);
 		host_uris.bind(Arc::clone(&internal_urls));
 		let registry = Arc::new(SubagentRegistry::new());
 		let observer = registry.observer(Arc::clone(&sink));
@@ -398,15 +404,26 @@ impl AcpRuntime {
 		// Native `read`/`write`/`bash` calls route through the client only for
 		// the capabilities this session advertised; the bridge is copied into
 		// every `RunRequest` and onto the root/child tool instances.
-		session.set_acp_bridge(Some(Arc::new(super::bridge::AcpToolBridge::new(
-			AcpReverseClient::new(
-				id.clone(),
+		//
+		// ACP `session/new` cwd is the client's workspace root. The agent may
+		// hold the canonical path instead (symlinked workspace), so map it back
+		// for `fs/read_text_file`; reads outside that root fail closed while
+		// an identical root keeps the historical identity behavior.
+		let agent_root = std::fs::canonicalize(&cwd).unwrap_or_else(|_| cwd.clone());
+		let read_path_map =
+			(agent_root != cwd).then(|| pi_agent::state::PathMap::new(agent_root, cwd.clone()));
+		session.set_acp_bridge(Some(Arc::new(
+			super::bridge::AcpToolBridge::new(
+				AcpReverseClient::new(
+					id.clone(),
+					caps.clone(),
+					self.reverse.clone(),
+					self.transport.clone(),
+				),
 				caps.clone(),
-				self.reverse.clone(),
-				self.transport.clone(),
-			),
-			caps.clone(),
-		))));
+			)
+			.with_path_map(read_path_map),
+		)));
 		session.set_mcp_servers(mcp_servers);
 		// Cached before the record takes the session lock: the approval tool
 		// runs while the turn holds that lock and cannot read it again.

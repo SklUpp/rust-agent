@@ -12,20 +12,29 @@
 //! supervisor's child registries.
 
 use async_trait::async_trait;
-use pi_agent::{AcpClientBridge, AcpClientError, CancellationToken};
+use pi_agent::{AcpClientBridge, AcpClientError, CancellationToken, state::PathMap};
 
 use super::{protocol::ClientCapabilities, reverse::ReverseError, session::AcpReverseClient};
 
 /// Reverse sender bound to one ACP session's capabilities.
 pub struct AcpToolBridge {
-	client: AcpReverseClient,
-	caps: ClientCapabilities,
+	client:   AcpReverseClient,
+	caps:     ClientCapabilities,
+	path_map: Option<PathMap>,
 }
 
 impl AcpToolBridge {
 	#[must_use]
 	pub fn new(client: AcpReverseClient, caps: ClientCapabilities) -> Self {
-		Self { client, caps }
+		Self { client, caps, path_map: None }
+	}
+
+	/// Attach the agent-root → ACP-client-root map used by `read_text_file`.
+	/// `None` keeps the historical identity behavior.
+	#[must_use]
+	pub fn with_path_map(mut self, path_map: Option<PathMap>) -> Self {
+		self.path_map = path_map;
+		self
 	}
 }
 
@@ -57,6 +66,15 @@ fn map_reverse(error: ReverseError) -> AcpClientError {
 impl AcpClientBridge for AcpToolBridge {
 	fn supports_fs_read(&self) -> bool {
 		self.caps.fs.read_text_file
+	}
+
+	fn map_read_path(&self, path: &std::path::Path) -> Result<String, AcpClientError> {
+		match &self.path_map {
+			Some(map) => map
+				.to_client_path(path)
+				.map(|mapped| mapped.to_string_lossy().into_owned()),
+			None => Ok(path.to_string_lossy().into_owned()),
+		}
 	}
 
 	fn supports_fs_write(&self) -> bool {

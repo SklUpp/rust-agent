@@ -100,6 +100,13 @@ async fn check_server_running(binary_path: &Path) -> bool {
 		.stdout(std::process::Stdio::null())
 		.stderr(std::process::Stdio::null())
 		.kill_on_drop(true);
+	// D20 env isolation: the wrapper probe must not inherit ambient provider
+	// keys or agent sockets. Keep only the platform allowlist (the lspmux
+	// client has no explicit overrides at probe time).
+	command.env_clear();
+	for (name, value) in crate::state::platform_env(crate::state::utf8_env_vars()) {
+		command.env(name, value);
+	}
 	#[cfg(unix)]
 	command.process_group(0);
 	let Ok(mut child) = command.spawn() else {

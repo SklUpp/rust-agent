@@ -742,7 +742,9 @@ done"#;
 	#[cfg(unix)]
 	#[tokio::test]
 	async fn non_protocol_lines_surface_as_cell_output() {
-		let env = std::env::vars().collect::<HashMap<_, _>>();
+		let env = crate::state::utf8_env_vars()
+			.into_iter()
+			.collect::<HashMap<_, _>>();
 		let mut kernel = Kernel::spawn_process(
 			EvalLanguage::Py,
 			&["sh".to_string(), "-c".to_string(), FAKE_WIRE_RAW.to_string()],
@@ -779,7 +781,9 @@ done"#;
 	#[cfg(unix)]
 	#[tokio::test]
 	async fn fake_wire_cancel_escalates_and_reports_kernel_killed() {
-		let env = std::env::vars().collect::<HashMap<_, _>>();
+		let env = crate::state::utf8_env_vars()
+			.into_iter()
+			.collect::<HashMap<_, _>>();
 		let mut kernel = Kernel::spawn_process(
 			EvalLanguage::Py,
 			&["sh".to_string(), "-c".to_string(), FAKE_WIRE.to_string()],
@@ -829,7 +833,9 @@ done"#;
 	#[cfg(unix)]
 	#[tokio::test]
 	async fn shutdown_bounds_a_stalled_stdin_stage_and_still_kills() {
-		let env = std::env::vars().collect::<HashMap<_, _>>();
+		let env = crate::state::utf8_env_vars()
+			.into_iter()
+			.collect::<HashMap<_, _>>();
 		let kernel = Arc::new(
 			Kernel::spawn_process(
 				EvalLanguage::Py,
@@ -885,7 +891,9 @@ done"#;
 
 	#[cfg(unix)]
 	fn fake_kernel(script: &str) -> Kernel {
-		let env = std::env::vars().collect::<HashMap<_, _>>();
+		let env = crate::state::utf8_env_vars()
+			.into_iter()
+			.collect::<HashMap<_, _>>();
 		Kernel::spawn_process(
 			EvalLanguage::Py,
 			&["sh".to_string(), "-c".to_string(), script.to_string()],

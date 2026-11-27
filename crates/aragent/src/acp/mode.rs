@@ -108,6 +108,8 @@ impl AcpAgent {
 					.and_then(|params| params.get("cwd"))
 					.and_then(Value::as_str)
 					.ok_or_else(RequestError::invalid_params)?;
+				// This cwd is the ACP client's workspace root; `AcpSession::open`
+				// owns mapping the agent's canonical paths back onto it.
 				let cwd = absolute_cwd(cwd)?;
 				let mcp = mcp_servers(params)?;
 				let session = self.runtime().new_session(cwd, &self.caps(), mcp)?;

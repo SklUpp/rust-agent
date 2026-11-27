@@ -463,3 +463,82 @@ fn run_trust_command_covers_grant_list_status_revoke() {
 			.is_err()
 	);
 }
+
+#[test]
+fn ssh_and_lsp_surfaces_invalidate_a_grant() {
+	let temp = TempDir::new("ssh-lsp");
+	let agent = temp.path().join("agent");
+	let project = temp.path().join("project");
+	fs::create_dir_all(&project).expect("project dir");
+	let ssh_config = project.join(".omp/ssh.json");
+	write_file(&ssh_config, r#"{"hosts":{"prod":{"host":"10.0.0.1"}}}"#);
+
+	let mut store = TrustStore::load_from_agent_dir(&agent);
+	let report = store.grant(&project).expect("grant");
+	assert!(
+		report.config_hashes.contains_key(".omp/ssh.json"),
+		"project ssh.json must be fingerprinted: {:?}",
+		report.config_hashes.keys().collect::<Vec<_>>()
+	);
+	assert!(store.is_trusted(&project));
+
+	// Changing the SSH destination after the grant must fail closed.
+	write_file(&ssh_config, r#"{"hosts":{"prod":{"host":"10.0.0.9"}}}"#);
+	match store.status(&project) {
+		TrustStatus::Invalidated { reason } => {
+			assert!(reason.contains(".omp/ssh.json"), "reason: {reason}");
+		},
+		other => panic!("expected invalidation after ssh.json edit, got {other:?}"),
+	}
+
+	store.grant(&project).expect("re-grant");
+	// LSP configs launch server commands, so a new project LSP file invalidates.
+	write_file(&project.join(".omp/lsp.json"), r#"{"servers":{}}"#);
+	match store.status(&project) {
+		TrustStatus::Invalidated { reason } => {
+			assert!(reason.contains("added .omp/lsp.json"), "reason: {reason}");
+		},
+		other => panic!("expected invalidation after adding lsp.json, got {other:?}"),
+	}
+}
+
+#[test]
+fn untrusted_router_hides_project_ssh_hosts() {
+	use pi_agent::{
+		CancellationToken,
+		tools::internal_urls::{InternalUrlRouter, UrlScope},
+	};
+
+	let temp = TempDir::new("ssh-router");
+	let project = temp.path().join("project");
+	write_file(
+		&project.join(".omp/ssh.json"),
+		r#"{"hosts":{"omp-trust-ssh-fixture":{"host":"10.0.0.1"}}}"#,
+	);
+	let runtime = tokio::runtime::Builder::new_current_thread()
+		.enable_all()
+		.build()
+		.expect("runtime");
+	let scope = UrlScope::default();
+	let context = scope.resolve_context(&project, &CancellationToken::new());
+
+	let untrusted = InternalUrlRouter::with_ssh_project_config(false);
+	let index = runtime
+		.block_on(untrusted.resolve("ssh://", &context))
+		.expect("index");
+	assert!(
+		!index.content.contains("omp-trust-ssh-fixture"),
+		"untrusted router must not list project ssh hosts: {}",
+		index.content
+	);
+
+	let trusted = InternalUrlRouter::with_ssh_project_config(true);
+	let index = runtime
+		.block_on(trusted.resolve("ssh://", &context))
+		.expect("index");
+	assert!(
+		index.content.contains("omp-trust-ssh-fixture"),
+		"trusted router must list project ssh hosts: {}",
+		index.content
+	);
+}

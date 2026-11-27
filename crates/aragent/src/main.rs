@@ -918,7 +918,14 @@ fn run() -> std::result::Result<(), CliError> {
 	skill_snapshot.set(loaded_skills.entries);
 	// One router per top-level session: the `skill://` handler resolves against
 	// this session's snapshot only, never a process-global skill registry.
-	let internal_urls = Arc::new(pi_agent::tools::internal_urls::InternalUrlRouter::new());
+	// D20: workspace-controlled `ssh.json` is a transport-redirect surface.
+	// The handler re-evaluates the trust verdict on every request cwd, so
+	// revocation and delegated child cwds take effect immediately.
+	let internal_urls = Arc::new(
+		pi_agent::tools::internal_urls::InternalUrlRouter::with_ssh_trust_policy(Arc::new(
+			aragent::trust::workspace_is_trusted,
+		)),
+	);
 	let _ = internal_urls
 		.register(Arc::new(SkillUrlHandler::new(skill_snapshot.clone())))
 		.map_err(Error::new)?;
@@ -4205,7 +4212,8 @@ fn run_search_command(
 	}
 	use pi_agent::Tool as _;
 	use serde_json::json;
-	let env: std::collections::HashMap<String, String> = std::env::vars().collect();
+	let env: std::collections::HashMap<String, String> =
+		pi_agent::state::utf8_env_vars().into_iter().collect();
 	let tool = pi_agent::tools::WebSearchTool::new(config.searxng.clone().with_env_overrides(&env));
 	let mut args = json!({ "query": query });
 	if let Some(recency) = recency {

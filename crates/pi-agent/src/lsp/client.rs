@@ -106,6 +106,9 @@ pub struct LspClient {
 	pub name: String,
 	pub cwd: PathBuf,
 	pub config: ServerConfig,
+	/// Trust verdict this client was spawned under; idle config resolution and
+	/// stale-client cleanup stay scoped to the same verdict.
+	pub allow_project_config: bool,
 	pub pid: u32,
 	pub shared_mux: bool,
 	stdin: tokio::sync::Mutex<Option<ClientWriter>>,
@@ -503,7 +506,12 @@ fn registry() -> &'static Registry {
 	&REGISTRY
 }
 
-fn client_key(config: &ServerConfig, cwd: &Path, shared_mux: bool) -> String {
+fn client_key(
+	config: &ServerConfig,
+	cwd: &Path,
+	shared_mux: bool,
+	allow_project_config: bool,
+) -> String {
 	let spawn_command = config
 		.resolved_command
 		.as_ref()
@@ -516,9 +524,10 @@ fn client_key(config: &ServerConfig, cwd: &Path, shared_mux: bool) -> String {
 		config.language_id,
 	]);
 	format!(
-		"{spawn_command}:{}:{}:{}",
+		"{spawn_command}:{}:{}:{}:{}",
 		normalize_cwd(cwd),
 		if shared_mux { "shared" } else { "private" },
+		if allow_project_config { "trusted" } else { "untrusted" },
 		serde_json::to_string(&identity).unwrap_or_default()
 	)
 }
@@ -579,6 +588,10 @@ enum Claim {
 pub struct LspSession {
 	id:         u64,
 	shared_mux: bool,
+	/// Workspace trust verdict for LSP project config. `false` (the default)
+	/// makes every config lookup skip `<cwd>` sources; the runtime sets it from
+	/// the persistent trust store per turn.
+	allow_project_config: AtomicBool,
 	state:      Mutex<SessionState>,
 }
 
@@ -588,11 +601,19 @@ struct SessionState {
 }
 
 impl LspSession {
+	/// Session with project LSP config disabled (fail closed).
 	#[must_use]
 	pub fn new(shared_mux: bool) -> Arc<Self> {
+		Self::with_project_config(shared_mux, false)
+	}
+
+	/// Session with an explicit workspace trust verdict for project config.
+	#[must_use]
+	pub fn with_project_config(shared_mux: bool, allow_project_config: bool) -> Arc<Self> {
 		Arc::new(Self {
 			id: NEXT_OWNER.fetch_add(1, Ordering::Relaxed),
 			shared_mux,
+			allow_project_config: AtomicBool::new(allow_project_config),
 			state: Mutex::new(SessionState { released: false, held: HashSet::new() }),
 		})
 	}
@@ -600,6 +621,17 @@ impl LspSession {
 	#[must_use]
 	pub fn shared_mux(&self) -> bool {
 		self.shared_mux
+	}
+
+	/// Update the trust policy in place. Clients are keyed by policy, so a
+	/// flipped verdict never resolves another verdict's config or server.
+	pub fn set_allow_project_config(&self, allow_project_config: bool) {
+		self.allow_project_config.store(allow_project_config, Ordering::SeqCst);
+	}
+
+	#[must_use]
+	pub fn allow_project_config(&self) -> bool {
+		self.allow_project_config.load(Ordering::SeqCst)
 	}
 
 	#[must_use]
@@ -726,7 +758,7 @@ pub async fn get_or_create_client_for(
 	init_timeout: Option<Duration>,
 	cancel: &CancellationToken,
 ) -> Result<Arc<LspClient>, LspError> {
-	let key = client_key(config, cwd, session.shared_mux());
+	let key = client_key(config, cwd, session.shared_mux(), session.allow_project_config());
 	if session.is_released() {
 		return Err(LspError::Cancelled);
 	}
@@ -770,7 +802,17 @@ pub async fn get_or_create_client_for(
 		return Err(LspError::Cancelled);
 	}
 
-	match spawn_and_initialize(config, cwd, init_timeout, cancel, &key, session.shared_mux()).await {
+	match spawn_and_initialize(
+		config,
+		cwd,
+		init_timeout,
+		cancel,
+		&key,
+		session.shared_mux(),
+		session.allow_project_config(),
+	)
+	.await
+	{
 		Ok(client) => {
 			lock(&registry().failures).remove(&key);
 			let claim = session.claim(&key, &client, true);
@@ -810,6 +852,12 @@ pub async fn get_or_create_client_for(
 	}
 }
 
+/// A shared mux server may only be used when the run does not hold project
+/// config (trusted) and no external wrapper already owns the transport.
+fn can_share_mux(shared_mux: bool, allow_project_config: bool, wrapped_shared: bool) -> bool {
+	shared_mux && !allow_project_config && !wrapped_shared
+}
+
 async fn spawn_and_initialize(
 	config: &ServerConfig,
 	cwd: &Path,
@@ -817,17 +865,32 @@ async fn spawn_and_initialize(
 	cancel: &CancellationToken,
 	key: &str,
 	shared_mux: bool,
+	allow_project_config: bool,
 ) -> Result<Arc<LspClient>, LspError> {
 	let base_command = config
 		.resolved_command
 		.as_ref()
 		.map(|path| path.to_string_lossy().into_owned())
 		.unwrap_or_else(|| config.command.clone());
-	let wrapped = lspmux::get_lspmux_command(&base_command, &config.args).await;
+	// D20: a muxed server is keyed by command/cwd/env, not by trust policy. A
+	// trusted run carries project-supplied initializationOptions/args, so it
+	// must never attach to a server an untrusted run created (or vice versa).
+	// Trusted runs therefore bypass the external `lspmux` wrapper and the native
+	// broker and always spawn privately; only untrusted runs may share a mux.
+	let wrapped = if allow_project_config {
+		lspmux::LspmuxWrappedCommand {
+			command: base_command.clone(),
+			args: config.args.clone(),
+			env: Vec::new(),
+			shared: false,
+		}
+	} else {
+		lspmux::get_lspmux_command(&base_command, &config.args).await
+	};
 	// Prefer the broker-shared server unless an external `lspmux` wrapper is
 	// already multiplexing this command. Any shared-path failure falls back to a
 	// private spawn so LSP never regresses on broker trouble.
-	let shared = if shared_mux && !wrapped.shared {
+	let shared = if can_share_mux(shared_mux, allow_project_config, wrapped.shared) {
 		let env = if wrapped.env.is_empty() {
 			None
 		} else {
@@ -865,6 +928,13 @@ async fn spawn_and_initialize(
 			.stdout(std::process::Stdio::piped())
 			.stderr(std::process::Stdio::piped())
 			.kill_on_drop(true);
+		// D20 env isolation: a project or wrapper command must not inherit
+		// provider keys, SSH agent sockets, or every ambient credential. Keep
+		// only the platform allowlist, then the wrapper's explicit overrides.
+		command.env_clear();
+		for (name, value) in crate::state::platform_env(crate::state::utf8_env_vars()) {
+			command.env(name, value);
+		}
 		for (key, value) in &wrapped.env {
 			command.env(key, value);
 		}
@@ -903,6 +973,7 @@ async fn spawn_and_initialize(
 		name: key.to_string(),
 		cwd: cwd.to_path_buf(),
 		config: config.clone(),
+		allow_project_config,
 		pid,
 		shared_mux,
 		stdin: tokio::sync::Mutex::new(Some(writer)),
@@ -2002,13 +2073,21 @@ pub async fn shutdown_stale_clients(
 	configs: &[ServerConfig],
 	cancel: &CancellationToken,
 	shared_mux: bool,
+	allow_project_config: bool,
 ) -> Result<Vec<String>, LspError> {
-	let fresh: HashSet<String> = configs.iter().map(|config| client_key(config, cwd, shared_mux)).collect();
+	let fresh: HashSet<String> = configs
+		.iter()
+		.map(|config| client_key(config, cwd, shared_mux, allow_project_config))
+		.collect();
 	let workspace = normalize_cwd(cwd);
 	let stale: Vec<Arc<LspClient>> = lock(&registry().links)
 		.values()
 		.map(|link| Arc::clone(&link.client))
-		.filter(|client| normalize_cwd(&client.cwd) == workspace && !fresh.contains(&client.name))
+		.filter(|client| {
+			client.allow_project_config == allow_project_config
+				&& normalize_cwd(&client.cwd) == workspace
+				&& !fresh.contains(&client.name)
+		})
 		.collect();
 	let mut stopped = Vec::new();
 	for client in stale {
@@ -2027,8 +2106,18 @@ pub async fn shutdown_stale_clients(
 	Ok(stopped)
 }
 
-pub fn clear_initialization_failure(config: &ServerConfig, cwd: &Path, shared_mux: bool) {
-	lock(&registry().failures).remove(&client_key(config, cwd, shared_mux));
+pub fn clear_initialization_failure(
+	config: &ServerConfig,
+	cwd: &Path,
+	shared_mux: bool,
+	allow_project_config: bool,
+) {
+	lock(&registry().failures).remove(&client_key(
+		config,
+		cwd,
+		shared_mux,
+		allow_project_config,
+	));
 }
 
 #[must_use]
@@ -2120,7 +2209,7 @@ fn ensure_idle_checker(timeout_ms: Option<u64>) {
 				if client.pending_count() > 0 {
 					continue;
 				}
-				let timeout = workspace_idle_timeout(&client.cwd);
+				let timeout = workspace_idle_timeout(&client.cwd, client.allow_project_config);
 				if timeout > 0 && client.idle_for() > Duration::from_millis(timeout) {
 					let _ = shutdown_client_instance(&client).await;
 				}
@@ -2130,33 +2219,38 @@ fn ensure_idle_checker(timeout_ms: Option<u64>) {
 }
 
 /// Per-workspace idle-kill timeout; `0` disables it for that workspace only.
-fn workspace_idle_timeout(cwd: &Path) -> u64 {
-	get_config(cwd).idle_timeout_ms.unwrap_or(0)
+fn workspace_idle_timeout(cwd: &Path, allow_project_config: bool) -> u64 {
+	get_config(cwd, allow_project_config).idle_timeout_ms.unwrap_or(0)
 }
 
-static CONFIG_CACHE: LazyLock<Mutex<HashMap<String, Arc<LspConfig>>>> =
+/// `(normalized cwd, allow_project_config)` -> merged config. The trust bit is
+/// part of the key so an untrusted lookup can never observe a cached trusted
+/// project config (or vice versa).
+static CONFIG_CACHE: LazyLock<Mutex<HashMap<(String, bool), Arc<LspConfig>>>> =
 	LazyLock::new(|| Mutex::new(HashMap::new()));
 
-fn config_cache() -> &'static Mutex<HashMap<String, Arc<LspConfig>>> {
+fn config_cache() -> &'static Mutex<HashMap<(String, bool), Arc<LspConfig>>> {
 	&CONFIG_CACHE
 }
 
-/// Load and cache configuration per cwd. Workspace `reload` invalidates it.
+/// Load and cache configuration per `(cwd, trust verdict)`. Workspace
+/// `reload` invalidates every verdict for that cwd.
 #[must_use]
-pub fn get_config(cwd: &Path) -> Arc<LspConfig> {
-	let key = normalize_cwd(cwd);
+pub fn get_config(cwd: &Path, allow_project_config: bool) -> Arc<LspConfig> {
+	let key = (normalize_cwd(cwd), allow_project_config);
 	if let Some(config) = lock(config_cache()).get(&key).cloned() {
 		ensure_idle_checker(config.idle_timeout_ms);
 		return config;
 	}
-	let config = Arc::new(load_config(cwd));
+	let config = Arc::new(load_config(cwd, allow_project_config));
 	lock(config_cache()).insert(key, config.clone());
 	ensure_idle_checker(config.idle_timeout_ms);
 	config
 }
 
 pub fn invalidate_config(cwd: &Path) {
-	lock(config_cache()).remove(&normalize_cwd(cwd));
+	let normalized = normalize_cwd(cwd);
+	lock(config_cache()).retain(|(path, _), _| path != &normalized);
 }
 
 /// Select the primary non-custom server for `file_path` under the cached config.
@@ -2195,7 +2289,21 @@ mod idle_timeout_tests {
 		.expect("fast config");
 		std::fs::write(off.join("lsp.json"), r#"{"idleTimeoutMs":0,"servers":{}}"#)
 			.expect("off config");
-		assert_eq!(workspace_idle_timeout(&fast), 300_000);
-		assert_eq!(workspace_idle_timeout(&off), 0);
+		assert_eq!(workspace_idle_timeout(&fast, true), 300_000);
+		assert_eq!(workspace_idle_timeout(&off, true), 0);
+		// The trust verdict is part of the cache key; the untrusted lookup is a
+		// distinct entry and never reuses the trusted project config.
+		assert!(!Arc::ptr_eq(&get_config(&off, true), &get_config(&off, false)));
+	}
+
+	#[test]
+	fn shared_mux_is_scoped_to_untrusted_runs() {
+		// Untrusted runs may share the broker; trusted project-config runs and
+		// external-wrapper transports must always spawn privately.
+		assert!(can_share_mux(true, false, false));
+		assert!(!can_share_mux(true, true, false), "trusted run must not share");
+		assert!(!can_share_mux(true, false, true), "external wrapper owns mux");
+		assert!(!can_share_mux(false, false, false), "shared mux disabled");
+		assert!(!can_share_mux(true, true, true));
 	}
 }

@@ -1,7 +1,7 @@
 use std::{
 	collections::HashMap,
 	ffi::OsStr,
-	path::PathBuf,
+	path::{Component, Path, PathBuf},
 	sync::{Arc, OnceLock},
 };
 
@@ -1350,6 +1350,133 @@ impl std::fmt::Display for AcpClientError {
 
 impl std::error::Error for AcpClientError {}
 
+/// Maps the agent's canonical workspace paths onto the ACP client's workspace
+/// root.
+///
+/// ACP `session/new` supplies the client's workspace cwd, which is also the
+/// agent's working directory. The two can still differ on disk: the agent may
+/// see a canonical root while the client knows the symlinked path it sent, or
+/// an embedder may run the agent under a mounted/sandboxed root. A configured
+/// map rewrites reads inside the agent root to the client root and **fails
+/// closed** for paths outside it, so a remote editor never receives a path it
+/// did not advertise as its workspace.
+///
+/// When both roots resolve to the same directory, mapping is the identity and
+/// absolute paths pass through unchanged (backward-compatible behavior).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PathMap {
+	agent_root:  PathBuf,
+	client_root: PathBuf,
+}
+
+impl PathMap {
+	#[must_use]
+	pub fn new(agent_root: impl Into<PathBuf>, client_root: impl Into<PathBuf>) -> Self {
+		Self { agent_root: agent_root.into(), client_root: client_root.into() }
+	}
+
+	/// True when both roots are the same literal path; translation then passes
+	/// paths through unchanged instead of enforcing containment.
+	#[must_use]
+	pub fn is_identity(&self) -> bool {
+		lexical_normalize(&self.agent_root) == lexical_normalize(&self.client_root)
+	}
+
+	/// Translate one absolute agent path to the ACP client's workspace path.
+	///
+	/// Identity maps return the input untouched. Otherwise the input and the
+	/// agent root are canonicalized for containment (so a symlink target
+	/// outside the workspace is refused), while the relative suffix is joined
+	/// onto the client root exactly as advertised — the client may know a
+	/// symlinked workspace the agent sees canonically. A path outside the agent
+	/// root returns an explicit [`AcpClientError::Remote`] instead of leaking a
+	/// host path to the client.
+	pub fn to_client_path(&self, path: &Path) -> Result<PathBuf, AcpClientError> {
+		if self.is_identity() {
+			return Ok(path.to_path_buf());
+		}
+		let client_root = lexical_normalize(&self.client_root);
+		let agent_root = resolve_root(&self.agent_root);
+		let absolute = if path.is_absolute() {
+			path.to_path_buf()
+		} else {
+			agent_root.join(path)
+		};
+		let outside = |path: &Path| {
+			AcpClientError::Remote(format!(
+				"path {} is outside the mapped workspace root {}",
+				path.display(),
+				self.agent_root.display()
+			))
+		};
+		// Existing paths are canonicalized so a symlink whose target leaves the
+		// workspace fails closed instead of leaking the host target.
+		if let Ok(canonical) = std::fs::canonicalize(&absolute) {
+			let relative = canonical.strip_prefix(&agent_root).map_err(|_| outside(path))?;
+			return Ok(client_root.join(relative));
+		}
+		// A missing file must still reach the client so it can answer with its
+		// own not-found for a path it knows. Before the lexical rewrite, verify
+		// the deepest existing ancestor is inside the canonical agent root: a
+		// missing leaf below an escaping symlink (`workspace/escape/new.txt`)
+		// must fail closed even though no component of the leaf exists. A
+		// dangling symlink ancestor can never be resolved, so it fails closed
+		// instead of being skipped on the way up.
+		let mut probe = absolute.as_path();
+		let mut anchor = None;
+		// The leaf itself reached the missing branch, so a symlink here cannot
+		// have resolved; any symlink leaf is either dangling or was already
+		// rejected by the canonical containment check above.
+		if std::fs::symlink_metadata(&absolute).is_ok_and(|meta| meta.file_type().is_symlink()) {
+			return Err(outside(path));
+		}
+		while let Some(parent) = probe.parent() {
+			if parent.as_os_str().is_empty() {
+				break;
+			}
+			match std::fs::symlink_metadata(parent) {
+				Ok(_) => {
+					let canonical = std::fs::canonicalize(parent).map_err(|_| outside(path))?;
+					anchor = Some(canonical);
+					break;
+				},
+				Err(error) if error.kind() == std::io::ErrorKind::NotFound => probe = parent,
+				Err(_) => return Err(outside(path)),
+			}
+		}
+		if !anchor.is_some_and(|canonical| canonical.starts_with(&agent_root)) {
+			return Err(outside(path));
+		}
+		let lexical = lexical_normalize(&absolute);
+		if let Ok(relative) = lexical
+			.strip_prefix(&lexical_normalize(&self.agent_root))
+			.or_else(|_| lexical.strip_prefix(&client_root))
+		{
+			return Ok(client_root.join(relative));
+		}
+		Err(outside(path))
+	}
+}
+
+/// Canonical path when it exists, otherwise a lexical cleanup (`..`, `.`).
+fn resolve_root(path: &Path) -> PathBuf {
+	std::fs::canonicalize(path).unwrap_or_else(|_| lexical_normalize(path))
+}
+
+fn lexical_normalize(path: &Path) -> PathBuf {
+	let mut normalized = PathBuf::new();
+	for component in path.components() {
+		match component {
+			Component::CurDir => {},
+			Component::ParentDir => {
+				normalized.pop();
+			},
+			other => normalized.push(other.as_os_str()),
+		}
+	}
+	normalized
+}
+
 /// Reverse calls the ACP client advertised for one session.
 ///
 /// Mounted on the native `read`/`write`/`bash` tool instances by the host
@@ -1371,6 +1498,13 @@ pub trait AcpClientBridge: Send + Sync {
 	/// `clientCapabilities.terminal`.
 	fn supports_terminal(&self) -> bool {
 		false
+	}
+
+	/// Translate an absolute agent-visible path to the path the ACP client
+	/// expects. Bridges with a configured [`PathMap`] rewrite it and fail closed
+	/// outside the mapped roots; the default is identity for compatibility.
+	fn map_read_path(&self, path: &Path) -> Result<String, AcpClientError> {
+		Ok(path.to_string_lossy().into_owned())
 	}
 
 	async fn read_text_file(
@@ -1499,6 +1633,16 @@ fn is_inherited_env(name: &str) -> bool {
 	name.starts_with("LC_") || AGENT_ENV_ALLOWLIST.contains(&name)
 }
 
+/// UTF-8 view of the process environment. Non-UTF-8 names/values are dropped
+/// instead of panicking like [`std::env::vars`], so Termux/exotic locale
+/// environments cannot abort a spawn.
+#[must_use]
+pub fn utf8_env_vars() -> Vec<(String, String)> {
+	std::env::vars_os()
+		.filter_map(|(name, value)| Some((name.into_string().ok()?, value.into_string().ok()?)))
+		.collect()
+}
+
 /// Filter host variables down to the platform allowlist.
 ///
 /// Pure over its iterator so callers and tests never mutate the process-global
@@ -1607,7 +1751,7 @@ impl AgentContext {
 	pub fn new(cwd: PathBuf) -> Self {
 		Self {
 			cwd,
-			env: platform_env(std::env::vars()),
+			env: platform_env(utf8_env_vars()),
 			cancellation_token: CancellationToken::new(),
 			approver: None,
 			ask: None,
@@ -1621,7 +1765,7 @@ impl AgentContext {
 	pub fn with_cancellation(cwd: PathBuf, cancellation_token: CancellationToken) -> Self {
 		Self {
 			cwd,
-			env: platform_env(std::env::vars()),
+			env: platform_env(utf8_env_vars()),
 			cancellation_token,
 			approver: None,
 			ask: None,
@@ -1640,7 +1784,7 @@ impl AgentContext {
 		let ask = approver.as_ref().and_then(|approver| approver.ask_channel());
 		Self {
 			cwd,
-			env: platform_env(std::env::vars()),
+			env: platform_env(utf8_env_vars()),
 			cancellation_token,
 			approver,
 			ask,
@@ -1942,5 +2086,155 @@ mod env_allowlist_tests {
 		let env = platform_env([("LC_MESSAGES", "C.UTF-8"), ("NOT_LC_ALLOWED", "x")]);
 		assert_eq!(env.get("LC_MESSAGES").map(String::as_str), Some("C.UTF-8"));
 		assert!(!env.contains_key("NOT_LC_ALLOWED"));
+	}
+}
+
+#[cfg(test)]
+mod path_map_tests {
+	use super::*;
+
+	fn temp_dir(name: &str) -> PathBuf {
+		let dir = std::env::temp_dir().join(format!("omp-pathmap-{name}-{}", std::process::id()));
+		std::fs::create_dir_all(&dir).expect("temp dir");
+		std::fs::canonicalize(&dir).expect("canonical temp dir")
+	}
+
+	#[test]
+	fn identity_map_passes_absolute_paths_through() {
+		let root = temp_dir("identity");
+		let map = PathMap::new(root.clone(), root.clone());
+		assert!(map.is_identity());
+		let outside = Path::new("/etc/hosts");
+		assert_eq!(
+			map.to_client_path(outside).expect("identity"),
+			outside.to_path_buf()
+		);
+		let inside = root.join("nested/file.rs");
+		assert_eq!(map.to_client_path(&inside).expect("identity"), inside);
+	}
+
+	#[test]
+	fn mapped_roots_rewrite_inside_and_fail_closed_outside() {
+		let agent = temp_dir("agent");
+		let client = temp_dir("client");
+		let map = PathMap::new(agent.clone(), client.clone());
+		assert!(!map.is_identity());
+		let mapped = map
+			.to_client_path(&agent.join("src/lib.rs"))
+			.expect("inside maps");
+		assert_eq!(mapped, client.join("src/lib.rs"));
+		// A nonexistent path under the agent root still maps lexically so the
+		// client can report its own "not found" for the right file.
+		let missing = map
+			.to_client_path(&agent.join("src/../src/missing.rs"))
+			.expect("inside maps lexically");
+		assert_eq!(missing, client.join("src/missing.rs"));
+		// Anything outside the agent root is refused with an explicit error.
+		let error = map
+			.to_client_path(Path::new("/etc/hosts"))
+			.expect_err("outside fails closed");
+		let message = error.to_string();
+		assert!(message.contains("outside the mapped workspace root"), "{message}");
+		assert!(!message.contains(&client.display().to_string()), "{message}");
+	}
+
+	#[test]
+	fn missing_leaf_beneath_escaping_symlink_is_rejected() {
+		#[cfg(unix)]
+		{
+			use std::os::unix::fs::symlink;
+
+			let agent = temp_dir("missing-escape-agent");
+			let client = temp_dir("missing-escape-client");
+			let outside = temp_dir("missing-escape-outside");
+			let escape = agent.join("escape");
+			let _ = std::fs::remove_file(&escape);
+			symlink(&outside, &escape).expect("escape symlink");
+			let map = PathMap::new(agent, client);
+			// The leaf does not exist, but its parent is a symlink leaving the
+			// workspace: containment must be checked before the lexical rewrite.
+			let error = map
+				.to_client_path(&escape.join("new.txt"))
+				.expect_err("escaping ancestor must fail closed");
+			assert!(error.to_string().contains("outside the mapped workspace root"));
+		}
+	}
+
+	#[test]
+	fn missing_leaf_beneath_dangling_symlink_is_rejected() {
+		#[cfg(unix)]
+		{
+			use std::os::unix::fs::symlink;
+
+			let agent = temp_dir("dangling-escape-agent");
+			let client = temp_dir("dangling-escape-client");
+			let outside = temp_dir("dangling-escape-outside");
+			let escape = agent.join("escape");
+			let _ = std::fs::remove_file(&escape);
+			// Target deliberately does not exist: `canonicalize` fails, so the
+			// ancestor cannot be proven inside the workspace.
+			symlink(outside.join("missing"), &escape).expect("dangling symlink");
+			let map = PathMap::new(agent, client);
+			let error = map
+				.to_client_path(&escape.join("file"))
+				.expect_err("dangling symlink ancestor must fail closed");
+			assert!(error.to_string().contains("outside the mapped workspace root"));
+			assert!(
+				map.to_client_path(&escape).is_err(),
+				"a dangling symlink leaf must fail closed"
+			);
+		}
+	}
+
+	#[test]
+	fn symlink_escaping_the_agent_root_is_rejected() {
+		#[cfg(unix)]
+		{
+			use std::os::unix::fs::symlink;
+
+			let agent = temp_dir("symlink-agent");
+			let client = temp_dir("symlink-client");
+			let outside = temp_dir("symlink-outside");
+			std::fs::write(outside.join("secret.txt"), "secret").expect("outside file");
+			let _ = std::fs::remove_file(agent.join("link.txt"));
+			symlink(outside.join("secret.txt"), agent.join("link.txt")).expect("symlink");
+			let map = PathMap::new(agent.clone(), client);
+			let error = map
+				.to_client_path(&agent.join("link.txt"))
+				.expect_err("symlink target outside root");
+			assert!(error.to_string().contains("outside the mapped workspace root"));
+		}
+	}
+}
+
+#[cfg(test)]
+mod path_map_symlink_tests {
+	use super::*;
+
+	#[test]
+	fn symlinked_client_root_keeps_client_visible_path() {
+		#[cfg(unix)]
+		{
+			use std::os::unix::fs::symlink;
+
+			let real = std::env::temp_dir()
+				.join(format!("omp-pathmap-real-{}", std::process::id()));
+			std::fs::create_dir_all(&real).expect("real dir");
+			let real = std::fs::canonicalize(&real).expect("canonical real dir");
+			let base = std::env::temp_dir()
+				.join(format!("omp-pathmap-alias-{}", std::process::id()));
+			std::fs::create_dir_all(&base).expect("alias dir");
+			let base = std::fs::canonicalize(&base).expect("canonical alias dir");
+			let link = base.join("workspace");
+			let _ = std::fs::remove_file(&link);
+			symlink(&real, &link).expect("workspace symlink");
+			std::fs::write(real.join("file.rs"), "fn main() {}").expect("file");
+
+			// Agent sees the canonical root; the client advertised the symlink.
+			let map = PathMap::new(real.clone(), link.clone());
+			assert!(!map.is_identity());
+			let mapped = map.to_client_path(&real.join("file.rs")).expect("maps");
+			assert_eq!(mapped, link.join("file.rs"));
+		}
 	}
 }

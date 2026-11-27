@@ -33,9 +33,13 @@ const SCHEMA_VERSION: u32 = 1;
 /// File name inside the agent directory.
 const TRUST_FILE_NAME: &str = "trust.json";
 
-/// Project files that can register subprocesses or launch commands. Changes
-/// to any of these invalidate a grant.
-const TRACKED_SURFACES: [&str; 7] = [
+/// Project files that can register subprocesses, launch commands, or redirect
+/// a transport. Changes to any of these invalidate a grant.
+///
+/// `ssh.json` entries choose an SSH destination/identity for `ssh://` reads and
+/// LSP files launch arbitrary server commands, so both are workspace-controlled
+/// execution surfaces just like the hook/MCP files above.
+const TRACKED_SURFACES: [&str; 40] = [
 	".claude/settings.json",
 	".claude/settings.local.json",
 	".codex/hooks.json",
@@ -43,6 +47,39 @@ const TRACKED_SURFACES: [&str; 7] = [
 	".omp/.mcp.json",
 	"mcp.json",
 	".mcp.json",
+	".omp/ssh.json",
+	"ssh.json",
+	".ssh.json",
+	"lsp.json",
+	".lsp.json",
+	"lsp.yaml",
+	".lsp.yaml",
+	"lsp.yml",
+	".lsp.yml",
+	".omp/lsp.json",
+	".omp/.lsp.json",
+	".omp/lsp.yaml",
+	".omp/.lsp.yaml",
+	".omp/lsp.yml",
+	".omp/.lsp.yml",
+	".claude/lsp.json",
+	".claude/.lsp.json",
+	".claude/lsp.yaml",
+	".claude/.lsp.yaml",
+	".claude/lsp.yml",
+	".claude/.lsp.yml",
+	".codex/lsp.json",
+	".codex/.lsp.json",
+	".codex/lsp.yaml",
+	".codex/.lsp.yaml",
+	".codex/lsp.yml",
+	".codex/.lsp.yml",
+	".gemini/lsp.json",
+	".gemini/.lsp.json",
+	".gemini/lsp.yaml",
+	".gemini/.lsp.yaml",
+	".gemini/lsp.yml",
+	".gemini/.lsp.yml",
 ];
 
 /// Project files whose `hooks` block is fingerprinted on its own; unrelated
@@ -582,5 +619,17 @@ fn describe_drift(recorded: &BTreeMap<String, String>, current: &BTreeMap<String
 	if parts.is_empty() {
 		parts.push("fingerprint mismatch".to_string());
 	}
-	format!("project hook/MCP configuration changed ({})", parts.join("; "))
+	format!("project hook/MCP/ssh/LSP configuration changed ({})", parts.join("; "))
+}
+
+/// Live trust verdict for `cwd` under the default agent directory.
+///
+/// Hosts pass this as the SSH trust policy so every resolution observes a
+/// revoked/regranted grant, surfaces tampered after the grant, and delegated
+/// child cwds that were never granted.
+#[must_use]
+pub fn workspace_is_trusted(cwd: &Path) -> bool {
+	TrustStore::load_from_agent_dir(&crate::dirs::agent_dir())
+		.status(cwd)
+		.is_trusted()
 }

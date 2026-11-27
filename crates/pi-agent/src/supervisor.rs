@@ -52,13 +52,20 @@ use crate::{
 pub struct ChildToolSettings {
 	/// `lsp.shared`: children use the same broker transport preference.
 	pub lsp_shared:       bool,
+	/// Workspace trust verdict for project LSP config: children inherit the
+	/// root turn's fail-closed `false` unless the workspace is trusted.
+	pub lsp_allow_project_config: bool,
 	/// `tools.maxTimeout` ceiling handed to the child debug tool.
 	pub debug_max_timeout: Option<u64>,
 }
 
 impl Default for ChildToolSettings {
 	fn default() -> Self {
-		Self { lsp_shared: true, debug_max_timeout: None }
+		Self {
+			lsp_shared:              true,
+			lsp_allow_project_config: false,
+			debug_max_timeout:       None,
+		}
 	}
 }
 
@@ -571,8 +578,8 @@ pub struct Supervisor {
 	/// as the root; `None` keeps every descendant local.
 	acp_bridge: Mutex<Option<Arc<dyn AcpClientBridge>>>,
 	/// Settings for child-scoped `lsp`/`debug` instances (see
-	/// [`ChildToolSettings`]). Set by the host from `lsp.shared` and
-	/// `tools.maxTimeout` on every root turn.
+	/// [`ChildToolSettings`]). Set by the host from `lsp.shared`, the workspace
+	/// trust verdict, and `tools.maxTimeout` on every root turn.
 	child_tool_settings: Mutex<ChildToolSettings>,
 	/// C6 security-scan action ceiling: children get read-only `lsp` instances
 	/// so a delegated worker cannot rename/edit through the language server.
@@ -2202,8 +2209,9 @@ impl Supervisor {
 		let child_tools = self.child_tool_settings();
 		if reg.get("lsp").is_some() {
 			reg.remove("lsp");
-			reg.register(Arc::new(LspTool::with_shared_read_only(
+			reg.register(Arc::new(LspTool::with_shared_policy(
 				child_tools.lsp_shared,
+				child_tools.lsp_allow_project_config,
 				self.lsp_read_only.load(Ordering::SeqCst),
 			)));
 		}
@@ -3770,8 +3778,9 @@ mod process_wiring_tests {
 			true,
 		);
 		supervisor.set_child_tool_settings(ChildToolSettings {
-			lsp_shared:     true,
-			debug_max_timeout: Some(45),
+			lsp_shared:               true,
+			lsp_allow_project_config: true,
+			debug_max_timeout:        Some(45),
 		});
 
 		let root_lsp = template.get("lsp").expect("template lsp");

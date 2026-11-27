@@ -1015,7 +1015,7 @@ async fn lsp_tool_hover_rename_and_owned_release() {
 		std::fs::write(&source, "value = 1\n").expect("source file");
 		let file = format!("sample{extension}");
 
-		let session = LspSession::new(false);
+		let session = LspSession::with_project_config(false, true);
 		let tool = LspTool::with_session(Arc::clone(&session));
 		let ctx = AgentContext::new(dir.path().to_path_buf());
 
@@ -1106,7 +1106,7 @@ async fn lsp_tool_references_and_diagnostics_report_fixture_locations() {
 		)
 		.expect("diagnostics source");
 
-		let session = LspSession::new(false);
+		let session = LspSession::with_project_config(false, true);
 		let tool = LspTool::with_session(Arc::clone(&session));
 		let ctx = AgentContext::new(dir.path().to_path_buf());
 
@@ -1164,8 +1164,8 @@ async fn lsp_scope_keeps_a_client_another_owner_still_uses() {
 		let file = format!("sample{extension}");
 		std::fs::write(dir.path().join(&file), "value = 1\n").expect("source file");
 
-		let root = LspSession::new(false);
-		let child = LspSession::new(false);
+		let root = LspSession::with_project_config(false, true);
+		let child = LspSession::with_project_config(false, true);
 		let root_tool = LspTool::with_session(Arc::clone(&root));
 		let child_tool = LspTool::with_session(Arc::clone(&child));
 		let ctx = AgentContext::new(dir.path().to_path_buf());

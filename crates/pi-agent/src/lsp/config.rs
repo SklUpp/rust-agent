@@ -64,9 +64,15 @@ struct NormalizedConfig {
 /// config dirs, project root files, then auto-detection when no readable source
 /// contributed a server map. Within one location the filename precedence is
 /// `lsp.json` > `.lsp.json` > `lsp.yaml` > `.lsp.yaml` > `lsp.yml` > `.lsp.yml`.
+///
+/// `allow_project_config` is the workspace trust verdict: when `false` the
+/// project-controlled sources (`<cwd>/{lsp,.lsp}.{json,yaml,yml}` and
+/// `<cwd>/{.omp,.claude,.codex,.gemini}/...`) are skipped entirely, so an
+/// untrusted checkout cannot launch its own language server. User and home
+/// configuration still apply.
 #[must_use]
-pub fn load_config(cwd: &Path) -> LspConfig {
-	let merged_config = merge_config(cwd);
+pub fn load_config(cwd: &Path, allow_project_config: bool) -> LspConfig {
+	let merged_config = merge_config(cwd, allow_project_config);
 	let merged = merged_config.servers;
 	let idle_timeout_ms = merged_config.idle_timeout_ms;
 	let has_overrides = merged_config.has_overrides;
@@ -116,12 +122,12 @@ struct MergedConfig {
 	has_overrides: bool,
 }
 
-fn merge_config(cwd: &Path) -> MergedConfig {
+fn merge_config(cwd: &Path, allow_project_config: bool) -> MergedConfig {
 	let defaults = parse_defaults();
 	let mut servers = defaults.servers;
 	let mut idle_timeout_ms = defaults.idle_timeout_ms.flatten();
 	let mut has_overrides = false;
-	for source in config_sources(cwd).into_iter().rev() {
+	for source in config_sources(cwd, allow_project_config).into_iter().rev() {
 		let Some(parsed) = read_config_file(&source) else {
 			continue;
 		};
@@ -158,8 +164,8 @@ pub struct UnavailableServer {
 /// their command cannot be resolved. Entries whose root markers do not match the
 /// workspace, invalid entries, and custom linters are omitted.
 #[must_use]
-pub fn unavailable_servers(cwd: &Path) -> Vec<UnavailableServer> {
-	let merged = merge_config(cwd);
+pub fn unavailable_servers(cwd: &Path, allow_project_config: bool) -> Vec<UnavailableServer> {
+	let merged = merge_config(cwd, allow_project_config);
 	let mut unavailable = Vec::new();
 	for (name, raw) in &merged.servers {
 		if matches!(name.as_str(), "biome" | "swiftlint") {
@@ -294,11 +300,17 @@ fn normalize_string_array(value: Option<&Value>) -> Option<Vec<String>> {
 // =============================================================================
 
 /// Config paths in highest-to-lowest precedence order.
-fn config_sources(cwd: &Path) -> Vec<PathBuf> {
+///
+/// Project root and project config-dir files are included only when
+/// `allow_project_config` is set; user agent dirs and the home root are always
+/// operator-owned and stay eligible.
+fn config_sources(cwd: &Path, allow_project_config: bool) -> Vec<PathBuf> {
 	let mut sources = Vec::new();
-	push_location(&mut sources, cwd);
-	for dir in project_config_dirs(cwd) {
-		push_location(&mut sources, &dir);
+	if allow_project_config {
+		push_location(&mut sources, cwd);
+		for dir in project_config_dirs(cwd) {
+			push_location(&mut sources, &dir);
+		}
 	}
 	for dir in user_config_dirs() {
 		push_location(&mut sources, &dir);
@@ -723,8 +735,46 @@ mod tests {
 		.expect("fast config");
 		std::fs::write(off.join("lsp.json"), r#"{"idleTimeoutMs":0,"servers":{}}"#)
 			.expect("off config");
-		assert_eq!(load_config(&fast).idle_timeout_ms, Some(300_000));
-		assert_eq!(load_config(&off).idle_timeout_ms, None);
+		assert_eq!(load_config(&fast, true).idle_timeout_ms, Some(300_000));
+		assert_eq!(load_config(&off, true).idle_timeout_ms, None);
+	}
+
+	#[test]
+	fn untrusted_workspace_ignores_project_lsp_files() {
+		let root = std::env::temp_dir()
+			.join(format!("omp-lsp-untrusted-{}", std::process::id()));
+		let project = root.join("project");
+		std::fs::create_dir_all(project.join(".omp")).expect("project dirs");
+		let command = std::env::current_exe()
+			.expect("test executable")
+			.to_string_lossy()
+			.into_owned();
+		let server = "project-only-probe";
+		let config = |name: &str| {
+			format!(
+				r#"{{"servers":{{"{name}":{{"command":{},"fileTypes":[".probe"],"rootMarkers":["."]}}}}}}"#,
+				serde_json::to_string(&command).expect("command json")
+			)
+		};
+		std::fs::write(project.join("lsp.json"), config(server)).expect("root lsp.json");
+		std::fs::write(project.join(".omp/lsp.json"), config(&format!("{server}-omp")))
+			.expect(".omp lsp.json");
+		let names = |trusted: bool| -> Vec<String> {
+			get_lsp_servers(&load_config(&project, trusted))
+				.into_iter()
+				.map(|(name, _)| name)
+				.collect()
+		};
+		// Trusted: project files apply (root server plus the `.omp` layer).
+		let trusted = names(true);
+		assert!(trusted.contains(&server.to_string()), "{trusted:?}");
+		assert!(trusted.contains(&format!("{server}-omp")), "{trusted:?}");
+		// Untrusted: both project locations are skipped.
+		let untrusted = names(false);
+		assert!(
+			!untrusted.iter().any(|name| name.starts_with(server)),
+			"untrusted config must not include project servers: {untrusted:?}"
+		);
 	}
 
 	#[test]
@@ -740,7 +790,7 @@ mod tests {
 			}}"#,
 		)
 		.expect("lsp config");
-		let servers = unavailable_servers(&dir);
+		let servers = unavailable_servers(&dir, true);
 		let off = servers.iter().find(|server| server.name == "off-ruby").expect("disabled server");
 		assert_eq!(off.state, ServerState::Disabled);
 		let missing = servers

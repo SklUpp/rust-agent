@@ -216,7 +216,10 @@ pub fn run_read_with_memory(
 		.build()
 		.map_err(|err| format!("Failed to start runtime: {err}"))?;
 	let ctx = pi_agent::AgentContext::new(cwd.to_path_buf());
-	let router = pi_agent::tools::InternalUrlRouter::default();
+	// D20: `arag read ssh://` consults the live trust verdict per request cwd.
+	let router = pi_agent::tools::internal_urls::InternalUrlRouter::with_ssh_trust_policy(
+		Arc::new(crate::trust::workspace_is_trusted),
+	);
 	if let Some(agent_dir) = memory_agent_dir {
 		router
 			.register(Arc::new(crate::memory_protocol::MemoryUrlHandler::new(

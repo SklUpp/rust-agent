@@ -202,6 +202,21 @@ impl LspTool {
 		Self { session: LspSession::new(shared_mux), read_only }
 	}
 
+	/// Child/delegation variant: transport, workspace trust verdict, and the
+	/// read-only action ceiling chosen by the parent turn. A `false` policy
+	/// (the fail-closed default) makes this instance ignore project LSP files.
+	#[must_use]
+	pub fn with_shared_policy(
+		shared_mux: bool,
+		allow_project_config: bool,
+		read_only: bool,
+	) -> Self {
+		Self {
+			session: LspSession::with_project_config(shared_mux, allow_project_config),
+			read_only,
+		}
+	}
+
 	/// Read-only variant joining an existing ownership scope.
 	#[must_use]
 	pub fn with_session_read_only(session: Arc<LspSession>, read_only: bool) -> Self {
@@ -312,7 +327,7 @@ impl Tool for LspTool {
 
 		match action.as_str() {
 			"status" => {
-				let config = get_config(&cwd);
+				let config = get_config(&cwd, self.session.allow_project_config());
 				let mut lines = Vec::new();
 				let started = get_active_clients();
 				if config.is_empty() {
@@ -413,7 +428,7 @@ impl LspTool {
 			SINGLE_DIAGNOSTICS_WAIT_TIMEOUT_MS
 		}
 		.min(run.timeout_secs as u64 * 1000);
-		let config = get_config(cwd);
+		let config = get_config(cwd, self.session.allow_project_config());
 		let mut results = Vec::new();
 		let mut all_servers = Vec::new();
 		let mut attempts = 0usize;
@@ -623,7 +638,7 @@ impl LspTool {
 			));
 		}
 		let resolved = resolve_to_cwd(file, cwd);
-		let config = get_config(cwd);
+		let config = get_config(cwd, self.session.allow_project_config());
 		let Some((server_name, server_config)) = get_lsp_server_for_file(&config, &resolved) else {
 			return Ok(text_result(
 				"No language server found for this action".to_string(),
@@ -632,7 +647,12 @@ impl LspTool {
 			));
 		};
 		if normalized == "reload" {
-			clear_initialization_failure(&server_config, cwd, self.session.shared_mux());
+			clear_initialization_failure(
+				&server_config,
+				cwd,
+				self.session.shared_mux(),
+				self.session.allow_project_config(),
+			);
 		}
 
 		let client = match get_or_create_client_for(&self.session, &server_config, cwd, None, &run.cancel).await {
@@ -1029,7 +1049,7 @@ impl LspTool {
 				details(action, false, None, params),
 			));
 		}
-		let config = get_config(cwd);
+		let config = get_config(cwd, self.session.allow_project_config());
 		let servers = get_servers_for_file(&config, &resolved);
 		let (status, _formatted) = diagnostics::format_file(&resolved, cwd, &servers, &run.cancel, &self.session)
 			.await
@@ -1140,7 +1160,7 @@ impl LspTool {
 				details(action, false, None, params),
 			));
 		}
-		let config = get_config(cwd);
+		let config = get_config(cwd, self.session.allow_project_config());
 		let mut relevant_paths = vec![source.clone(), dest.clone()];
 		for (old_uri, new_uri) in &pairs {
 			relevant_paths.push(uri_to_file(old_uri));
@@ -1394,8 +1414,8 @@ impl LspTool {
 			.as_deref()
 			.and_then(pi_ast::SupportLang::from_path_unconditional);
 
-		let config = get_config(cwd);
-		let unavailable = unavailable_servers(cwd);
+		let config = get_config(cwd, self.session.allow_project_config());
+		let unavailable = unavailable_servers(cwd, self.session.allow_project_config());
 		let active_names: Vec<String> = get_active_clients()
 			.into_iter()
 			.map(|status| status.name)
@@ -1535,7 +1555,7 @@ impl LspTool {
 		run: &RunGuard,
 		action: &str,
 	) -> Result<ToolResult, ToolError> {
-		let config = get_config(cwd);
+		let config = get_config(cwd, self.session.allow_project_config());
 		let server_list: Vec<(String, ServerConfig)> = match params.file.as_deref() {
 			Some(file) if file != "*" => {
 				let resolved = resolve_to_cwd(file, cwd);
@@ -1595,7 +1615,7 @@ impl LspTool {
 				details(action, false, None, params),
 			));
 		};
-		let config = get_config(cwd);
+		let config = get_config(cwd, self.session.allow_project_config());
 		let resolved_target = params
 			.file
 			.as_deref()
@@ -1722,7 +1742,7 @@ impl LspTool {
 				details(action, false, None, params),
 			));
 		};
-		let config = get_config(cwd);
+		let config = get_config(cwd, self.session.allow_project_config());
 		let servers: Vec<(String, ServerConfig)> = get_lsp_servers(&config);
 		if servers.is_empty() {
 			return Ok(text_result(
@@ -1819,10 +1839,17 @@ impl LspTool {
 		action: &str,
 	) -> Result<ToolResult, ToolError> {
 		client::invalidate_config(cwd);
-		let config = get_config(cwd);
+		let config = get_config(cwd, self.session.allow_project_config());
 		let servers: Vec<(String, ServerConfig)> = get_lsp_servers(&config);
 		let server_configs: Vec<ServerConfig> = servers.iter().map(|(_, server)| server.clone()).collect();
-		let stopped = shutdown_stale_clients(cwd, &server_configs, &run.cancel, self.session.shared_mux()).await;
+		let stopped = shutdown_stale_clients(
+			cwd,
+			&server_configs,
+			&run.cancel,
+			self.session.shared_mux(),
+			self.session.allow_project_config(),
+		)
+		.await;
 		let stopped = match stopped {
 			Ok(stopped) => stopped,
 			Err(LspError::Cancelled) => return Err(run.abort_error(action, None)),
@@ -1847,7 +1874,12 @@ impl LspTool {
 			if run.cancel.is_cancelled() {
 				return Err(run.abort_error(action, Some(&server_name)));
 			}
-			clear_initialization_failure(&server_config, cwd, self.session.shared_mux());
+			clear_initialization_failure(
+				&server_config,
+				cwd,
+				self.session.shared_mux(),
+				self.session.allow_project_config(),
+			);
 			match get_or_create_client_for(&self.session, &server_config, cwd, None, &run.cancel).await {
 				Ok(client) => match reload_server(&client, &server_name, &run.cancel).await {
 					Ok(line) => outputs.push(line),
@@ -2196,7 +2228,7 @@ mod semantic_matrix_tests {
 
 	#[tokio::test]
 	async fn matrix_declares_supported_language_operations() {
-		let tool = LspTool::with_shared(false);
+		let tool = LspTool::with_shared_policy(false, true, false);
 		let ctx = AgentContext::new(std::env::temp_dir());
 		let result = tool
 			.execute(&json!({"action": "matrix", "file": "main.rs"}), &ctx)
@@ -2219,7 +2251,7 @@ mod semantic_matrix_tests {
 
 	#[tokio::test]
 	async fn matrix_reports_unknown_extension_as_unsupported() {
-		let tool = LspTool::with_shared(false);
+		let tool = LspTool::with_shared_policy(false, true, false);
 		let ctx = AgentContext::new(std::env::temp_dir());
 		let result = tool
 			.execute(&json!({"action": "matrix", "file": "notes.unknownext"}), &ctx)
@@ -2235,7 +2267,7 @@ mod semantic_matrix_tests {
 
 	#[tokio::test]
 	async fn capabilities_reports_unknown_extension_without_starting_a_server() {
-		let tool = LspTool::with_shared(false);
+		let tool = LspTool::with_shared_policy(false, true, false);
 		let ctx = AgentContext::new(std::env::temp_dir());
 		let result = tool
 			.execute(&json!({"action": "capabilities", "file": "notes.unknownext"}), &ctx)
@@ -2294,7 +2326,7 @@ mod semantic_matrix_tests {
 		})
 		.to_string();
 		let dir = project(&config);
-		let tool = LspTool::with_shared(false);
+		let tool = LspTool::with_shared_policy(false, true, false);
 		let ctx = AgentContext::new(dir);
 
 		let python = tool
@@ -2332,7 +2364,7 @@ mod semantic_matrix_tests {
 				"off-py":{"command":"sh","fileTypes":[".py"],"rootMarkers":["."],"disabled":true}
 			}}"#,
 		);
-		let tool = LspTool::with_shared(false);
+		let tool = LspTool::with_shared_policy(false, true, false);
 		let ctx = AgentContext::new(dir);
 
 		// `script.pyi` does not match the disabled `.py` server's file types, so
@@ -2375,7 +2407,7 @@ mod semantic_matrix_tests {
 		})
 		.to_string();
 		let dir = project(&config);
-		let tool = LspTool::with_shared(false);
+		let tool = LspTool::with_shared_policy(false, true, false);
 		let ctx = AgentContext::new(dir);
 
 		let result = tool
@@ -2418,7 +2450,7 @@ mod semantic_matrix_tests {
 		})
 		.to_string();
 		let dir = project(&config);
-		let tool = LspTool::with_shared(false);
+		let tool = LspTool::with_shared_policy(false, true, false);
 		let ctx = AgentContext::new(dir);
 
 		let result = tool
@@ -2441,7 +2473,7 @@ mod semantic_matrix_tests {
 				"missing-diff":{"command":"definitely-not-real-lsp-binary-xyz","fileTypes":[".diff"],"rootMarkers":["."]}
 			}}"#,
 		);
-		let tool = LspTool::with_shared(false);
+		let tool = LspTool::with_shared_policy(false, true, false);
 		let ctx = AgentContext::new(dir);
 		for (file, language, state, configured) in [
 			("config.ini", "ini", "disabled", true),

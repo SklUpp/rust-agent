@@ -139,7 +139,7 @@ pub type EventStream = Box<dyn Iterator<Item = Result<Event>> + Send>;
 
 /// Everything one turn needs. The runner owns retries, network and tools; the
 /// CLI only resolves files into this request.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct RunRequest {
 	pub prompt: String,
 	pub parts: Vec<crate::session::ContentPart>,
@@ -394,6 +394,26 @@ impl std::fmt::Debug for ExtraTool {
 impl From<std::sync::Arc<dyn pi_agent::tool::Tool>> for ExtraTool {
 	fn from(tool: std::sync::Arc<dyn pi_agent::tool::Tool>) -> Self {
 		Self(tool)
+	}
+}
+
+/// Credentials, headers, prompt/transcript bodies, and host callbacks are
+/// omitted; the shape below is enough to identify a turn in a crash report.
+impl std::fmt::Debug for RunRequest {
+	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		f.debug_struct("RunRequest")
+			.field("cwd", &self.cwd)
+			.field("output_mode", &self.output_mode)
+			.field("model", &self.model)
+			.field("provider", &self.provider)
+			.field("api_key", &self.api_key.as_ref().map(|_| "[REDACTED]"))
+			.field("config", &self.config)
+			.field("max_time", &self.max_time)
+			.field("max_turns", &self.max_turns)
+			.field("tools_enabled", &self.tools_enabled)
+			.field("session_persisted", &self.session_persisted)
+			.field("continuation", &self.continuation)
+			.finish_non_exhaustive()
 	}
 }
 

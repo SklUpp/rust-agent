@@ -31,7 +31,7 @@ use std::{
 	ffi::OsString,
 	path::{Path, PathBuf},
 	process::Stdio,
-	sync::Mutex,
+	sync::{Arc, Mutex},
 	time::Duration,
 };
 
@@ -165,10 +165,14 @@ enum RemoteKind {
 /// Built-in `ssh://` read handler.
 pub struct SshProtocolHandler {
 	/// Targets that already answered the POSIX probe.
-	probes:  Mutex<BTreeSet<String>>,
+	probes:       Mutex<BTreeSet<String>>,
 	/// Extra argv/env for fixtures or embedders; empty in production.
-	options: Vec<OsString>,
-	env:     Vec<(OsString, OsString)>,
+	options:      Vec<OsString>,
+	env:          Vec<(OsString, OsString)>,
+	/// Dynamic workspace trust verdict evaluated on `context.cwd` for every
+	/// `ssh://` resolution. Defaults to fail-closed so a revoked grant or an
+	/// isolated child cwd stops project `ssh.json` immediately.
+	trust_policy: Arc<dyn Fn(&Path) -> bool + Send + Sync>,
 }
 
 impl Default for SshProtocolHandler {
@@ -181,17 +185,51 @@ impl SshProtocolHandler {
 	#[must_use]
 	pub fn new() -> Self {
 		Self {
-			probes:  Mutex::new(BTreeSet::new()),
-			options: Vec::new(),
-			env:     Vec::new(),
+			probes:       Mutex::new(BTreeSet::new()),
+			options:      Vec::new(),
+			env:          Vec::new(),
+			// Fail closed: project `ssh.json` files are opt-in, and the policy
+			// re-checks the workspace trust verdict on every resolution.
+			trust_policy: Arc::new(|_| false),
 		}
+	}
+
+	/// Install the dynamic workspace trust policy.
+	///
+	/// The callback runs for every `ssh://` resolution with the request cwd, so
+	/// a revoked grant, a tampered `ssh.json`, or a delegated child in another
+	/// cwd cannot keep using an earlier trusted decision.
+	#[must_use]
+	pub fn with_trust_policy(
+		mut self,
+		policy: Arc<dyn Fn(&Path) -> bool + Send + Sync>,
+	) -> Self {
+		self.trust_policy = policy;
+		self
+	}
+
+	/// Constant-policy convenience for unit tests/embedders; production should
+	/// use [`Self::with_trust_policy`] so revocation is observed live.
+	#[must_use]
+	pub fn with_project_config(self, allow: bool) -> Self {
+		self.with_trust_policy(Arc::new(move |_| allow))
 	}
 
 	/// Fixture/embedder hook: prepend `options` to every `ssh` argv and add
 	/// `env` to every child. Production always uses [`SshProtocolHandler::new`].
+	///
+	/// `env` is applied on top of [`crate::state::platform_env`] after
+	/// `env_clear`; ambient variables (including `SSH_AUTH_SOCK` and provider
+	/// keys) are never inherited. A fixture that needs the ssh agent must pass
+	/// `SSH_AUTH_SOCK` explicitly here.
 	#[cfg(test)]
 	fn with_launch(options: Vec<OsString>, env: Vec<(OsString, OsString)>) -> Self {
-		Self { probes: Mutex::new(BTreeSet::new()), options, env }
+		Self {
+			probes:       Mutex::new(BTreeSet::new()),
+			options,
+			env,
+			trust_policy: Arc::new(|_| false),
+		}
 	}
 
 	fn connection(&self, target: &SshTarget) -> SshConnection {
@@ -247,7 +285,8 @@ impl SshProtocolHandler {
 
 	/// Listing of configured hosts and `~/.ssh/config` aliases for bare `ssh://`.
 	async fn host_index(&self, url: &InternalUrl, cwd: &Path) -> InternalResource {
-		let configured = load_configured_hosts(cwd);
+		let allow_project_config = (self.trust_policy)(cwd);
+		let configured = load_configured_hosts(cwd, allow_project_config);
 		let content = if configured.is_empty() {
 			format_host_index(&ssh_config_hosts())
 		} else {
@@ -282,7 +321,8 @@ impl ProtocolHandler for SshProtocolHandler {
 			}
 			return Ok(self.host_index(url, &context.cwd).await);
 		}
-		let target = resolve_target(&url.host, &context.cwd)?;
+		let allow_project_config = (self.trust_policy)(&context.cwd);
+		let target = resolve_target(&url.host, &context.cwd, allow_project_config)?;
 		let remote_path = remote_path_from_url(url)?;
 		let connection = self.connection(&target);
 		self.ensure_posix(&connection, &context.signal).await?;
@@ -360,6 +400,15 @@ async fn run_ssh(
 		.stdout(Stdio::piped())
 		.stderr(Stdio::piped())
 		.kill_on_drop(true);
+	// D20 env isolation: never hand ambient provider keys or agent sockets to a
+	// remote-triggering child. Only the platform allowlist survives, plus the
+	// caller's explicit fixture overrides. `SSH_AUTH_SOCK` is intentionally
+	// dropped (it is a credential capability); a future in-process agent-backed
+	// connection must forward it explicitly on `connection.env`.
+	command.env_clear();
+	for (key, value) in crate::state::platform_env(crate::state::utf8_env_vars()) {
+		command.env(key, value);
+	}
 	for (key, value) in &connection.env {
 		command.env(key, value);
 	}
@@ -690,8 +739,12 @@ fn percent_decode(input: &str) -> Result<String, String> {
 
 /// Resolve the raw authority (`[user@]host[:port]`) to a target, rejecting
 /// everything OpenSSH would otherwise interpret as an option or password.
-fn resolve_target(authority: &str, cwd: &Path) -> Result<SshTarget, String> {
-	let target = resolve_authority(authority, cwd)?;
+fn resolve_target(
+	authority: &str,
+	cwd: &Path,
+	allow_project_config: bool,
+) -> Result<SshTarget, String> {
+	let target = resolve_authority(authority, cwd, allow_project_config)?;
 	// Validate the FINAL destination, configured `ssh.json` entries included, with
 	// the same rules the URI path uses. Configured values never pass through the
 	// URI parsing above, so without this an `ssh.json` host of `user@host` or an
@@ -714,7 +767,11 @@ fn resolve_target(authority: &str, cwd: &Path) -> Result<SshTarget, String> {
 }
 
 /// Raw authority parsing behind [`resolve_target`].
-fn resolve_authority(authority: &str, cwd: &Path) -> Result<SshTarget, String> {
+fn resolve_authority(
+	authority: &str,
+	cwd: &Path,
+	allow_project_config: bool,
+) -> Result<SshTarget, String> {
 	let (userinfo, host_port) = match authority.split_once('@') {
 		Some((user, rest)) if !rest.contains('@') => (Some(user), rest),
 		Some(_) => {
@@ -758,7 +815,7 @@ fn resolve_authority(authority: &str, cwd: &Path) -> Result<SshTarget, String> {
 		None => None,
 	};
 
-	let configured = load_configured_hosts(cwd);
+	let configured = load_configured_hosts(cwd, allow_project_config);
 	if username.is_some() || port.is_some() {
 		if configured.iter().any(|entry| entry.name == host) {
 			return Err(format!(
@@ -863,13 +920,23 @@ struct ConfiguredHost {
 
 /// Configured hosts: `.omp/ssh.json` (project), the user agent dir, then legacy
 /// `ssh.json`/`.ssh.json`; the first definition of a name wins.
-fn load_configured_hosts(cwd: &Path) -> Vec<ConfiguredHost> {
-	let mut candidates = vec![cwd.join(".omp").join("ssh.json")];
+///
+/// When `allow_project_config` is `false` the three workspace files are
+/// ignored entirely, leaving only `<agent_dir>/ssh.json` and (via the host
+/// index) `~/.ssh/config`. The trust gate passes `true` only for a workspace
+/// whose recorded grant still matches.
+fn load_configured_hosts(cwd: &Path, allow_project_config: bool) -> Vec<ConfiguredHost> {
+	let mut candidates = Vec::new();
+	if allow_project_config {
+		candidates.push(cwd.join(".omp").join("ssh.json"));
+	}
 	if let Some(agent) = agent_dir() {
 		candidates.push(agent.join("ssh.json"));
 	}
-	candidates.push(cwd.join("ssh.json"));
-	candidates.push(cwd.join(".ssh.json"));
+	if allow_project_config {
+		candidates.push(cwd.join("ssh.json"));
+		candidates.push(cwd.join(".ssh.json"));
+	}
 	let mut seen: BTreeSet<String> = BTreeSet::new();
 	let mut hosts: Vec<ConfiguredHost> = Vec::new();
 	for path in candidates {
@@ -1192,7 +1259,7 @@ mod tests {
 		assert_eq!(parsed.path, "");
 		let error = remote_path_from_url(&parsed).expect_err("no path");
 		assert!(error.contains("requires an absolute path"), "{error}");
-		let target = resolve_target(&parsed.host, Path::new("/nonexistent-omp-cwd"))
+		let target = resolve_target(&parsed.host, Path::new("/nonexistent-omp-cwd"), false)
 			.expect("target");
 		assert_eq!(target.host, "omp-ssh-test-host");
 		assert_eq!(target.port, Some(2222));
@@ -1223,7 +1290,7 @@ mod tests {
 		] {
 			let parsed = url(bad);
 			assert!(
-				resolve_target(&parsed.host, Path::new("/nonexistent-omp-cwd")).is_err(),
+				resolve_target(&parsed.host, Path::new("/nonexistent-omp-cwd"), false).is_err(),
 				"{bad} must be rejected"
 			);
 		}
@@ -1232,7 +1299,8 @@ mod tests {
 	#[test]
 	fn bracketed_ipv6_and_user_parse() {
 		let parsed = url("ssh://alice@[::1]:2222/x");
-		let target = resolve_target(&parsed.host, Path::new("/nonexistent-omp-cwd")).expect("target");
+		let target = resolve_target(&parsed.host, Path::new("/nonexistent-omp-cwd"), false)
+			.expect("target");
 		assert_eq!(target.host, "::1");
 		assert_eq!(target.username.as_deref(), Some("alice"));
 		assert_eq!(target.port, Some(2222));
@@ -1296,7 +1364,7 @@ mod tests {
 			r#"{"hosts":{"prod":{"host":"10.0.0.1","username":"deploy","port":2222,"keyPath":"~/k"},"info":{"host":"user@evil"},"opt":{"host":"-oProxyCommand=sh"},"baduser":{"host":"10.0.0.2","username":"de:ploy"}}}"#,
 		)
 		.expect("ssh.json");
-		let configured = load_configured_hosts(&dir.0);
+		let configured = load_configured_hosts(&dir.0, true);
 		let prod = configured
 			.iter()
 			.find(|host| host.name == "prod")
@@ -1304,20 +1372,48 @@ mod tests {
 		assert_eq!(prod.host, "10.0.0.1");
 		assert_eq!(prod.username.as_deref(), Some("deploy"));
 		assert_eq!(prod.port, Some(2222));
-		let target = resolve_target("prod", &dir.0).expect("target");
+		let target = resolve_target("prod", &dir.0, true).expect("target");
 		assert_eq!(target.host, "10.0.0.1");
 		assert_eq!(target.port, Some(2222));
-		assert!(resolve_target("deploy@prod", &dir.0).is_err());
-		assert!(resolve_target("prod:22", &dir.0).is_err());
+		assert!(resolve_target("deploy@prod", &dir.0, true).is_err());
+		assert!(resolve_target("prod:22", &dir.0, true).is_err());
 		// Configured entries get the same final validation as URI components: no
 		// embedded userinfo, option-like prefix, or ':'/'@' in a username.
-		assert!(resolve_target("info", &dir.0).is_err());
-		assert!(resolve_target("opt", &dir.0).is_err());
-		assert!(resolve_target("baduser", &dir.0).is_err());
+		assert!(resolve_target("info", &dir.0, true).is_err());
+		assert!(resolve_target("opt", &dir.0, true).is_err());
+		assert!(resolve_target("baduser", &dir.0, true).is_err());
 		// An unknown host stays an opaque OpenSSH destination.
-		let opaque = resolve_target("other", &dir.0).expect("opaque");
+		let opaque = resolve_target("other", &dir.0, true).expect("opaque");
 		assert_eq!(opaque.host, "other");
 		assert_eq!(opaque.port, None);
+	}
+
+	#[test]
+	fn untrusted_workspace_ssh_json_is_ignored() {
+		let dir = TempDir::new("untrusted");
+		fs::create_dir_all(dir.0.join(".omp")).expect("config dir");
+		fs::write(
+			dir.0.join(".omp").join("ssh.json"),
+			r#"{"hosts":{"prod":{"host":"10.0.0.1"}}}"#,
+		)
+		.expect("ssh.json");
+		fs::write(dir.0.join("ssh.json"), r#"{"hosts":{"legacy":{"host":"10.0.0.2"}}}"#)
+			.expect("ssh.json");
+		fs::write(dir.0.join(".ssh.json"), r#"{"hosts":{"dot":{"host":"10.0.0.3"}}}"#)
+			.expect(".ssh.json");
+		let ignored = load_configured_hosts(&dir.0, false);
+		assert!(
+			!ignored.iter().any(|host| matches!(host.name.as_str(), "prod" | "legacy" | "dot")),
+			"untrusted project ssh.json must contribute no hosts"
+		);
+		let trusted = load_configured_hosts(&dir.0, true);
+		for (name, host) in [("prod", "10.0.0.1"), ("legacy", "10.0.0.2"), ("dot", "10.0.0.3")] {
+			assert_eq!(
+				trusted.iter().find(|entry| entry.name == name).map(|entry| entry.host.as_str()),
+				Some(host),
+				"trusted workspace must load {name}"
+			);
+		}
 	}
 
 	#[test]
@@ -1667,5 +1763,46 @@ mod tests {
 	fn current_user() -> String {
 		let output = StdCommand::new("id").arg("-un").output().expect("id -un");
 		String::from_utf8_lossy(&output.stdout).trim().to_string()
+	}
+
+	#[test]
+	fn trust_policy_is_re_evaluated_for_each_cwd_and_revocation() {
+		use std::sync::{
+			Arc,
+			atomic::{AtomicBool, Ordering},
+		};
+
+		let trusted = TempDir::new("policy-trusted");
+		fs::create_dir_all(trusted.0.join(".omp")).expect("config dir");
+		fs::write(
+			trusted.0.join(".omp").join("ssh.json"),
+			r#"{"hosts":{"prod":{"host":"10.0.0.1"}}}"#,
+		)
+		.expect("ssh.json");
+		let delegated = TempDir::new("policy-delegated");
+		let trusted_path = trusted.0.clone();
+		let live = Arc::new(AtomicBool::new(true));
+		let flag = Arc::clone(&live);
+		let handler = SshProtocolHandler::new().with_trust_policy(Arc::new(move |cwd: &Path| {
+			cwd == trusted_path.as_path() && flag.load(Ordering::SeqCst)
+		}));
+		let rt = runtime();
+		let index = |cwd: &Path| rt.block_on(handler.host_index(&url("ssh://"), cwd));
+
+		assert!(
+			index(&trusted.0).content.contains("10.0.0.1"),
+			"trusted cwd must load project ssh.json"
+		);
+		// A delegated child in another cwd never inherits the grant.
+		assert!(
+			!index(&delegated.0).content.contains("10.0.0.1"),
+			"a different cwd must fail closed"
+		);
+		// Revocation applies to the next resolution of the same cwd.
+		live.store(false, Ordering::SeqCst);
+		assert!(
+			!index(&trusted.0).content.contains("10.0.0.1"),
+			"revoked grant must take effect immediately"
+		);
 	}
 }

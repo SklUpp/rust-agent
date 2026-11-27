@@ -695,23 +695,34 @@ impl Tool for ReadTool {
 			&& !matches!(&parsed, Sel::Image | Sel::Conflicts)
 			&& !is_map
 		{
-			let path = target.display().to_string();
+			let agent_path = target.display().to_string();
+			// Translate the agent's canonical path to the client's workspace
+			// root before the reverse call. A configured map refuses paths
+			// outside its roots; user-facing messages keep the agent path.
+			let remote_path = match bridge.map_read_path(&target) {
+				Ok(path) => path,
+				Err(error) => {
+					return Ok(tool_result(format!("Failed to read {agent_path}: {error}"), true));
+				},
+			};
 			let remote = match bridge
-				.read_text_file(&path, None, None, &ctx.cancellation_token)
+				.read_text_file(&remote_path, None, None, &ctx.cancellation_token)
 				.await
 			{
 				Ok(content) => Some(content),
 				Err(AcpClientError::Unsupported) => None,
 				Err(AcpClientError::Cancelled) => {
-					return Ok(tool_result(format!("Read {path} cancelled"), true));
+					return Ok(tool_result(format!("Read {agent_path} cancelled"), true));
 				},
 				Err(error) => {
-					return Ok(tool_result(format!("Failed to read {path}: {error}"), true));
+					return Ok(tool_result(format!(
+						"Failed to read {agent_path}: {error}"
+					), true));
 				},
 			};
 			if let Some(source_bytes) = remote {
 				let source = TextSource::Memory {
-					url:   &path,
+					url:   &agent_path,
 					bytes: source_bytes.as_bytes(),
 					path:  None,
 					writable: false,

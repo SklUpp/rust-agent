@@ -236,7 +236,9 @@ impl SecurityRunSession {
 		append.push_str(COORDINATOR_PROMPT.trim());
 		let provider = self.request.model.provider.clone();
 		let model_id = self.request.model.model_id.clone();
-		let router = pi_agent::tools::internal_urls::InternalUrlRouter::new();
+		let router = pi_agent::tools::internal_urls::InternalUrlRouter::with_ssh_trust_policy(
+			Arc::new(crate::trust::workspace_is_trusted),
+		);
 		pi_agent::tools::internal_urls::register_security(
 			&router,
 			crate::security::security_url_handler(true, self.state_root.clone()),

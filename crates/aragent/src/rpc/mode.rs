@@ -730,7 +730,10 @@ impl RpcMode {
 		let host_uris = Arc::new(HostUriBridge::new(Arc::clone(&sink)));
 		// One router for the whole session: the bridge mounts the host schemes it
 		// validated, and the runner resolves them through the same handle.
-		let internal_urls = Arc::new(InternalUrlRouter::new());
+		// D20: `ssh://` project config follows a live trust verdict per cwd.
+		let internal_urls = Arc::new(InternalUrlRouter::with_ssh_trust_policy(Arc::new(
+			crate::trust::workspace_is_trusted,
+		)));
 		host_uris.bind(Arc::clone(&internal_urls));
 		let registry = Arc::new(SubagentRegistry::new());
 		let observer = registry.observer(Arc::clone(&sink));

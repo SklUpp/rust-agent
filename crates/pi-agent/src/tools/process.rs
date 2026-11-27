@@ -2858,7 +2858,7 @@ mod tests {
 			name: name.to_string(),
 			application: "sh".to_string(),
 			args: vec!["-c".to_string(), command.to_string()],
-			env: std::env::vars().collect(),
+			env: crate::state::utf8_env_vars().into_iter().collect(),
 			cwd: std::env::temp_dir().to_string_lossy().into_owned(),
 			pty: false,
 			ready: None,

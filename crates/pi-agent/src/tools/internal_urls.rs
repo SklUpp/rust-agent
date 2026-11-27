@@ -272,6 +272,10 @@ impl Default for InternalUrlRouter {
 	/// handlers, so a session scope root, a spilled artifact, a saved subagent
 	/// output, a remote read, an MCP resource or prompt, and a GitHub issue or
 	/// PR resolve without an extra mount step.
+	///
+	/// The built-in `ssh://` handler fails closed: it ignores workspace
+	/// `ssh.json` files unless [`InternalUrlRouter::with_ssh_project_config`]
+	/// receives a `Trusted` verdict.
 	fn default() -> Self {
 		let mut handlers: BTreeMap<String, Arc<dyn ProtocolHandler>> = BTreeMap::new();
 		handlers.insert(LOCAL_SCHEME.to_string(), Arc::new(LocalRootHandler));
@@ -316,6 +320,32 @@ impl InternalUrlRouter {
 	#[must_use]
 	pub fn new() -> Self {
 		Self::default()
+	}
+
+	/// Build the default router with a dynamic workspace trust policy for
+	/// `ssh://`.
+	///
+	/// The policy runs on every resolution with the request cwd. Returning
+	/// `false` (untrusted, invalidated, delegated child, or fail-closed) makes
+	/// the handler ignore `<cwd>/.omp/ssh.json`, `<cwd>/ssh.json`, and
+	/// `<cwd>/.ssh.json`, so revocation and cwd changes take effect immediately.
+	#[must_use]
+	pub fn with_ssh_trust_policy(
+		policy: Arc<dyn Fn(&std::path::Path) -> bool + Send + Sync>,
+	) -> Self {
+		let router = Self::default();
+		router.lock_handlers().insert(
+			super::ssh::SSH_SCHEME.to_string(),
+			Arc::new(super::ssh::SshProtocolHandler::new().with_trust_policy(policy)),
+		);
+		router
+	}
+
+	/// Constant-policy convenience for unit tests/embedders. Production should
+	/// use [`Self::with_ssh_trust_policy`].
+	#[must_use]
+	pub fn with_ssh_project_config(allow_project_config: bool) -> Self {
+		Self::with_ssh_trust_policy(Arc::new(move |_| allow_project_config))
 	}
 
 	/// Reserved namespaces are built in and refuse replacement, so a host can

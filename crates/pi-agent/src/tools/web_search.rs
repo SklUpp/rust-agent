@@ -62,7 +62,7 @@ static ENGINE_NAMES: Mutex<BTreeMap<String, Arc<HashMap<String, String>>>> = Mut
 /// configured, so a half-configured pair is an error rather than a silent
 /// downgrade to Bearer). `categories`/`language`/`safesearch` have no
 /// environment fallback upstream.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Clone, Default, PartialEq, Eq)]
 pub struct SearxngConfig {
 	pub endpoint:       Option<String>,
 	pub token:          Option<String>,
@@ -72,6 +72,26 @@ pub struct SearxngConfig {
 	pub engines:        Option<String>,
 	pub language:       Option<String>,
 	pub safesearch:     Option<i32>,
+}
+
+/// Credentials are masked (presence only); endpoint/engine selection remains
+/// visible for diagnostics.
+impl std::fmt::Debug for SearxngConfig {
+	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		f.debug_struct("SearxngConfig")
+			.field("endpoint", &self.endpoint)
+			.field("token", &self.token.as_ref().map(|_| "[REDACTED]"))
+			.field("basic_username", &self.basic_username)
+			.field(
+				"basic_password",
+				&self.basic_password.as_ref().map(|_| "[REDACTED]"),
+			)
+			.field("categories", &self.categories)
+			.field("engines", &self.engines)
+			.field("language", &self.language)
+			.field("safesearch", &self.safesearch)
+			.finish()
+	}
 }
 
 impl SearxngConfig {

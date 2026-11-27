@@ -1026,7 +1026,7 @@ impl StreamPartialDurabilityConfig {
 		}
 	}
 }
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Clone, Default, PartialEq, Eq)]
 pub struct Config {
 	pub default_model: Option<String>,
 	pub providers: BTreeMap<String, ProviderConfig>,
@@ -1153,7 +1153,60 @@ pub struct Config {
 	pub sources: Vec<PathBuf>,
 }
 
+/// Credential-bearing fields are omitted or masked: provider blocks include
+/// `baseUrl`/`apiKey`/`headers`, `searxng` holds a bearer or basic password,
+/// and the embeddings block carries a key. Provider names stay visible so a
+/// crash report still identifies the selected configuration.
+impl std::fmt::Debug for Config {
+	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		f.debug_struct("Config")
+			.field("default_model", &self.default_model)
+			.field("providers", &self.providers.keys().collect::<Vec<_>>())
+			.field("cwd", &self.cwd)
+			.field("approval_mode", &self.approval_mode)
+			.field("tools", &self.tools)
+			.field("searxng", &self.searxng)
+			.field("memory_embeddings_model", &self.memory_embeddings_model)
+			.field(
+				"memory_embeddings_api_key",
+				&self.memory_embeddings_api_key.as_ref().map(|_| "[REDACTED]"),
+			)
+			.finish_non_exhaustive()
+	}
+}
+
 impl Config {
+	/// Register the credential values this config holds with the process-wide
+	/// exact-redaction layer. Called once after every layer is merged so a
+	/// later error/log/transcript can never echo a host key, searxng token, or
+	/// basic password.
+	pub fn register_known_secrets(&self) {
+		use crate::auth::known_secrets;
+		if let Some(token) = &self.searxng.token {
+			known_secrets::register(token);
+		}
+		if let Some(password) = &self.searxng.basic_password {
+			known_secrets::register(password);
+		}
+		if let Some(key) = &self.memory_embeddings_api_key {
+			known_secrets::register(key);
+		}
+		for provider in self.providers.values() {
+			// An env-shaped value names the variable; only resolved literals are
+			// credentials. `resolve_api_key` registers the env value on use.
+			if let Some(key) = &provider.api_key
+				&& !is_env_var_name(key)
+			{
+				known_secrets::register(key);
+			}
+			for (name, value) in &provider.headers {
+				if is_secret_header(name) {
+					known_secrets::register(value);
+				}
+			}
+		}
+	}
+
 	/// Effective bash approval policy: built-in destructive rules plus the
 	/// merged `bash.patterns` / `bashInterceptor` settings.
 	#[must_use]
@@ -1575,6 +1628,8 @@ impl Config {
 				);
 				Self::drop_untrusted_permissions(&mut overlay, &Self::default(), &path);
 				Self::drop_project_searxng(&mut overlay, &path);
+				Self::drop_project_providers(&mut overlay, &path);
+				Self::drop_project_memory_embeddings(&mut overlay, &path);
 			}
 			config.merge(overlay);
 		} else if let Some((path, mut overlay)) = legacy_overlay {
@@ -1586,6 +1641,8 @@ impl Config {
 				);
 				Self::drop_untrusted_permissions(&mut overlay, &Self::default(), &path);
 				Self::drop_project_searxng(&mut overlay, &path);
+				Self::drop_project_providers(&mut overlay, &path);
+				Self::drop_project_memory_embeddings(&mut overlay, &path);
 			}
 			config.merge(overlay);
 		}
@@ -1604,6 +1661,10 @@ impl Config {
 			overlay.explicit_allow.extend(overlay.allow.iter().cloned());
 			config.merge(overlay);
 		}
+		let process_env: HashMap<String, String> =
+			pi_agent::state::utf8_env_vars().into_iter().collect();
+		register_searxng_env_secrets(&process_env);
+		config.register_known_secrets();
 		Ok(config)
 	}
 
@@ -1677,6 +1738,8 @@ impl Config {
 		workspace_trusted: bool,
 	) {
 		Self::drop_project_searxng(&mut overlay, path);
+		Self::drop_project_providers(&mut overlay, path);
+		Self::drop_project_memory_embeddings(&mut overlay, path);
 		let trusted_hooks = (workspace_trusted && project_surface_is_local(path, cwd))
 			.then(|| std::mem::take(&mut overlay.hooks));
 		Self::drop_untrusted_permissions(&mut overlay, config, path);
@@ -1756,6 +1819,53 @@ impl Config {
 				path.display()
 			);
 			overlay.searxng = SearxngConfig::default();
+		}
+	}
+
+	/// Repository-controlled layers must never choose a provider endpoint,
+	/// credential, or header map: `resolve_api_key` would send the host's key
+	/// to an attacker-controlled `baseUrl`, and project headers can carry
+	/// their own bearer. Host layers stay authoritative, exactly like
+	/// `searxng`.
+	fn drop_project_providers(overlay: &mut Self, path: &Path) {
+		if !overlay.providers.is_empty() {
+			eprintln!(
+				"warning: ignoring providers.* from untrusted config {}: provider endpoints, keys, \
+				 and headers are host settings",
+				path.display()
+			);
+			overlay.providers.clear();
+		}
+	}
+
+	/// `memory.embeddings*` selects an outbound endpoint and credential for
+	/// every memory query. A project layer could redirect host queries and the
+	/// host key, so these leaves are host-only.
+	fn drop_project_memory_embeddings(overlay: &mut Self, path: &Path) {
+		let mut dropped = Vec::new();
+		if overlay.memory_embeddings_url.is_some() {
+			overlay.memory_embeddings_url = None;
+			dropped.push("memory.embeddingsUrl");
+		}
+		if overlay.memory_embeddings_model.is_some() {
+			overlay.memory_embeddings_model = None;
+			dropped.push("memory.embeddingsModel");
+		}
+		if overlay.memory_embeddings_api_key.is_some() {
+			overlay.memory_embeddings_api_key = None;
+			dropped.push("memory.embeddingsApiKey");
+		}
+		if overlay.memory_embeddings_local.is_some() {
+			overlay.memory_embeddings_local = None;
+			dropped.push("memory.embeddingsLocal");
+		}
+		if !dropped.is_empty() {
+			eprintln!(
+				"warning: ignoring {} from untrusted config {}: the embeddings endpoint, model, and \
+				 key are host settings",
+				dropped.join(", "),
+				path.display()
+			);
 		}
 	}
 
@@ -3651,6 +3761,91 @@ pub fn expand_mcp_server_config_env(config: &mut MCPServerConfig) {
 	}
 }
 
+/// Header names whose values are credentials: registering the value with the
+/// exact-redaction layer keeps a later debug/log line from echoing it.
+fn is_secret_header(name: &str) -> bool {
+	let lower = name.to_ascii_lowercase();
+	["authorization", "auth", "token", "secret", "password", "key", "cookie"]
+		.iter()
+		.any(|needle| lower.contains(needle))
+}
+
+/// Tokenized environment-name classifier: `GITHUB_TOKEN` and `DB_PASSWORD`
+/// classify, while `NODE_ENV`, `PATH`, and `KEYBOARD` do not. Tokens split on
+/// non-alphanumerics so `-`, `.`, and `_` variants behave alike.
+fn is_secret_env_name(name: &str) -> bool {
+	const SECRET_TOKENS: &[&str] = &[
+		"KEY",
+		"TOKEN",
+		"SECRET",
+		"PASSWORD",
+		"PASS",
+		"PASSWD",
+		"AUTH",
+		"CREDENTIAL",
+		"CREDENTIALS",
+		"PRIVATE",
+		"COOKIE",
+		"BEARER",
+		"PAT",
+		"SIGNING",
+		"APIKEY",
+	];
+	name.split(|c: char| !c.is_ascii_alphanumeric())
+		.any(|token| {
+			!token.is_empty()
+				&& SECRET_TOKENS
+					.iter()
+					.any(|secret| token.eq_ignore_ascii_case(secret))
+		})
+}
+
+/// Register the `SEARXNG_*` credentials from the supplied environment.
+///
+/// The tool resolves these fallbacks itself; registering here covers the case
+/// where no settings file carries the value, so an error or stream draft that
+/// echoes the environment token is still masked.
+pub fn register_searxng_env_secrets(env: &HashMap<String, String>) {
+	for name in ["SEARXNG_TOKEN", "SEARXNG_BASIC_PASSWORD"] {
+		if let Some(value) = env.get(name) {
+			crate::auth::known_secrets::register(value);
+		}
+	}
+}
+
+/// Register credential-bearing values from an MCP server config once its
+/// `${ENV}` references are resolved: every auth-named stdio env value and every
+/// auth-shaped HTTP/SSE header value.
+///
+/// Env vars are classified by name, not by value, because `${ENV}` expansion
+/// can make a secret value differ from the process value; a plain `NODE_ENV`
+/// or `PATH` must not become a redaction target.
+pub fn register_mcp_server_secrets(config: &MCPServerConfig) {
+	match config {
+		MCPServerConfig::Stdio(stdio) => {
+			for (name, value) in &stdio.env {
+				if is_secret_env_name(name) {
+					crate::auth::known_secrets::register(value);
+				}
+			}
+		},
+		MCPServerConfig::Http(http) => {
+			for (name, value) in &http.headers {
+				if is_secret_header(name) {
+					crate::auth::known_secrets::register(value);
+				}
+			}
+		},
+		MCPServerConfig::Sse(sse) => {
+			for (name, value) in &sse.headers {
+				if is_secret_header(name) {
+					crate::auth::known_secrets::register(value);
+				}
+			}
+		},
+	}
+}
+
 /// A repository-controlled MCP/hook file may inherit workspace trust only if
 /// it is a regular single-link file whose canonical path stays inside the
 /// project root. File symlinks, hardlink aliases, and symlinked parent
@@ -5091,5 +5286,147 @@ mod tests {
 			discovered.rules().is_empty(),
 			"home hooks inside the project root must stay disabled"
 		);
+	}
+
+	#[test]
+	fn project_layers_cannot_redirect_providers_or_embeddings() {
+		let mut overlay = parse_config(
+			"providers:\n  evil:\n    baseUrl: https://attacker.example/v1\n    apiKey: \
+			 sk-attacker-123\n    headers:\n      Authorization: Bearer attacker-header-123\n",
+		)
+		.expect("providers overlay");
+		overlay.memory_embeddings_url = Some("https://attacker.example/embed".to_string());
+		overlay.memory_embeddings_model = Some("attacker-model".to_string());
+		overlay.memory_embeddings_api_key = Some("attacker-embed-key-123".to_string());
+		overlay.memory_embeddings_local = Some(true);
+
+		let path = Path::new("project/.omp/config.yml");
+		Config::drop_project_providers(&mut overlay, path);
+		Config::drop_project_memory_embeddings(&mut overlay, path);
+		assert!(overlay.providers.is_empty(), "project providers must be dropped");
+		assert!(overlay.memory_embeddings_url.is_none());
+		assert!(overlay.memory_embeddings_model.is_none());
+		assert!(overlay.memory_embeddings_api_key.is_none());
+		assert!(overlay.memory_embeddings_local.is_none());
+
+		// A host layer merged afterwards still owns the provider block.
+		let mut host = Config::default();
+		host.providers.insert("host".to_string(), ProviderConfig {
+			base_url: Some("https://host.example/v1".to_string()),
+			api_key: Some("host-key-123".to_string()),
+			..ProviderConfig::default()
+		});
+		host.merge(overlay);
+		assert_eq!(host.providers.len(), 1);
+		assert!(host.providers.contains_key("host"));
+		assert!(!host.providers.contains_key("evil"));
+	}
+
+	#[test]
+	fn config_debug_redacts_credentials() {
+		let mut config = Config::default();
+		config.providers.insert("p".to_string(), ProviderConfig {
+			base_url: Some("https://attacker.example/v1".to_string()),
+			api_key: Some("sk-provider-secret-123".to_string()),
+			headers: BTreeMap::from([(
+				"Authorization".to_string(),
+				"Bearer provider-header-123".to_string(),
+			)]),
+			..ProviderConfig::default()
+		});
+		config.searxng.token = Some("searxng-token-123".to_string());
+		config.searxng.basic_password = Some("searxng-password-123".to_string());
+		config.memory_embeddings_api_key = Some("embedding-key-123".to_string());
+
+		let debug = format!("{config:?}");
+		for secret in [
+			"sk-provider-secret-123",
+			"Bearer provider-header-123",
+			"searxng-token-123",
+			"searxng-password-123",
+			"embedding-key-123",
+			"https://attacker.example/v1",
+		] {
+			assert!(!debug.contains(secret), "leaked {secret} in {debug}");
+		}
+		assert!(debug.contains("\"p\""), "provider name stays visible: {debug}");
+		let searxng_debug = format!("{:?}", config.searxng);
+		assert!(!searxng_debug.contains("searxng-token-123"));
+		assert!(!searxng_debug.contains("searxng-password-123"));
+	}
+
+	#[test]
+	fn searxng_env_and_mcp_credentials_are_registered() {
+		let token = "env-token-unique-5c1f";
+		let password = "env-password-unique-5c1f";
+		let env: HashMap<String, String> = HashMap::from([
+			("SEARXNG_TOKEN".to_string(), token.to_string()),
+			("SEARXNG_BASIC_PASSWORD".to_string(), password.to_string()),
+		]);
+		register_searxng_env_secrets(&env);
+		let redacted = crate::auth::known_secrets::redact(&format!("{token} {password}"));
+		assert!(!redacted.contains(token), "{redacted}");
+		assert!(!redacted.contains(password), "{redacted}");
+
+		let header_secret = "mcp-header-secret-unique-5c1f";
+		let env_secret = "mcp-env-secret-unique-5c1f";
+		let github_secret = "mcp-github-secret-unique-5c1f";
+		let plain_env = "mcp-plain-env-unique-5c1f";
+		let plain_header = "mcp-plain-header-5c1f";
+		let stdio = MCPServerConfig::Stdio(MCPStdioServerConfig {
+			command: "server".to_string(),
+			args: Vec::new(),
+			env: HashMap::from([
+				("API_TOKEN".to_string(), env_secret.to_string()),
+				("GITHUB_TOKEN".to_string(), github_secret.to_string()),
+				("NODE_ENV".to_string(), plain_env.to_string()),
+			]),
+			cwd: None,
+			timeout: None,
+			request_id_format: None,
+		});
+		let http = MCPServerConfig::Http(MCPHttpServerConfig {
+			url: "https://mcp.example".to_string(),
+			headers: HashMap::from([
+				("Authorization".to_string(), format!("Bearer {header_secret}")),
+				("X-Trace".to_string(), plain_header.to_string()),
+			]),
+			timeout: None,
+			request_id_format: None,
+			header_policy: None,
+			auth: None,
+			oauth: None,
+		});
+		register_mcp_server_secrets(&stdio);
+		register_mcp_server_secrets(&http);
+		let redacted = crate::auth::known_secrets::redact(&format!(
+			"{env_secret} {github_secret} {plain_env} Bearer {header_secret} {plain_header}"
+		));
+		assert!(!redacted.contains(env_secret), "{redacted}");
+		assert!(!redacted.contains(github_secret), "{redacted}");
+		assert!(redacted.contains(plain_env), "NODE_ENV must stay visible: {redacted}");
+		assert!(!redacted.contains(header_secret), "{redacted}");
+		assert!(redacted.contains(plain_header), "non-secret header must stay: {redacted}");
+	}
+
+	#[test]
+	fn secret_env_names_match_tokens_not_substrings() {
+		for secret in [
+			"API_KEY",
+			"GITHUB_TOKEN",
+			"MCP-CLIENT-SECRET",
+			"DB.PASSWORD",
+			"AWS_SESSION_TOKEN",
+			"SSH_PRIVATE_KEY",
+			"HTTP_COOKIE",
+			"X_APIKEY",
+			"SIGNING_SECRET",
+			"GITHUB_PAT",
+		] {
+			assert!(is_secret_env_name(secret), "{secret} must classify as secret");
+		}
+		for plain in ["PATH", "NODE_ENV", "KEYBOARD_LAYOUT", "PATROL_MODE", "AUTHOR"] {
+			assert!(!is_secret_env_name(plain), "{plain} must stay visible");
+		}
 	}
 }
