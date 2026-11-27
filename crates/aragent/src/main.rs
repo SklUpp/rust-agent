@@ -722,15 +722,15 @@ fn run() -> std::result::Result<(), CliError> {
 				None => std::env::current_dir()?,
 			};
 			let options = commit::CommitOptions {
-				message,
-				files,
-				all,
-				dry_run,
-				push,
-				no_changelog,
-				legacy,
-				context,
-				model,
+				message: message.clone(),
+				files: files.clone(),
+				all: *all,
+				dry_run: *dry_run,
+				push: *push,
+				no_changelog: *no_changelog,
+				legacy: *legacy,
+				context: context.clone(),
+				model: model.clone(),
 			};
 			commit::run_commit(&options, &base).map_err(CliError::fail)?;
 			return Ok(());
