@@ -58,7 +58,9 @@ jobs:
           key: standalone-runtime-host
       - name: Refresh patch-level security crates in Cargo.lock (manual dispatch only)
         if: github.event_name == 'workflow_dispatch' && inputs.refresh_patch_lock
-        run: cargo update -p rustls -p rustls-webpki -p tokio -p url -p rustix
+        run: |
+          cargo update -p rustls -p rustls-webpki -p tokio -p rustix
+          cargo update --ignore-rust-version -p url
       - name: Check agent core and CLI
         run: cargo check --locked -p pi-agent -p aragent
       - name: Test agent core and CLI
@@ -122,7 +124,9 @@ jobs:
           key: standalone-runtime-android
       - name: Refresh patch-level security crates in Cargo.lock (manual dispatch only)
         if: github.event_name == 'workflow_dispatch' && inputs.refresh_patch_lock
-        run: cargo update -p rustls -p rustls-webpki -p tokio -p url -p rustix
+        run: |
+          cargo update -p rustls -p rustls-webpki -p tokio -p rustix
+          cargo update --ignore-rust-version -p url
       - name: Build arag for aarch64-linux-android
         env:
           NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
@@ -172,7 +176,9 @@ jobs:
           tool: cargo-deny@0.20.2,cargo-about@0.8.2
       - name: Refresh patch-level security crates in Cargo.lock (manual dispatch only)
         if: github.event_name == 'workflow_dispatch' && inputs.refresh_patch_lock
-        run: cargo update -p rustls -p rustls-webpki -p tokio -p url -p rustix
+        run: |
+          cargo update -p rustls -p rustls-webpki -p tokio -p rustix
+          cargo update --ignore-rust-version -p url
       - name: Check advisories, licenses, and sources
         run: cargo deny check
       - name: Generate dependency license data
