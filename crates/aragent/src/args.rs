@@ -663,10 +663,10 @@ const MISSING_VERBS: [&str; 15] = [
 	"token",
 ];
 
-/// The two Rust surfaces that are not TypeScript registry verbs. Every other
-/// clap subcommand also exists upstream (`packages/coding-agent/src/cli-commands.ts`),
+/// Rust surfaces that are not TypeScript registry verbs. Every other clap
+/// subcommand also exists upstream (`packages/coding-agent/src/cli-commands.ts`),
 /// where `resolveCliArgv` hoists it ahead of the default `launch` command.
-const RUST_ONLY_VERBS: [&str; 2] = ["repl", "export"];
+const RUST_ONLY_VERBS: [&str; 3] = ["repl", "export", "check"];
 
 /// Whether the first operand names a verb the TypeScript runner dispatches.
 ///
@@ -1364,6 +1364,25 @@ pub enum Command {
 		/// Required safety gate; without it the command refuses to rewrite.
 		#[arg(long)]
 		confirm: bool,
+	},
+
+	/// Detect project diagnostics and exit without repairing them.
+	///
+	/// Usage: `arag check [PATH] [--tests] [--checker ID]... [--json]`. Exits 0
+	/// when no diagnostics are reported and 1 when any are found.
+	Check {
+		/// Project directory to check (default: the current directory).
+		#[arg(value_name = "PATH")]
+		path:    Option<PathBuf>,
+		/// Include test files and test-target checkers.
+		#[arg(long)]
+		tests:   bool,
+		/// Restrict execution to this checker id (repeatable).
+		#[arg(long, value_name = "ID")]
+		checker: Vec<String>,
+		/// Print the machine-readable report instead of the text summary.
+		#[arg(long)]
+		json:    bool,
 	},
 
 	/// Stage and commit safely: never sweeps unrelated dirty or untracked files.
@@ -2413,6 +2432,39 @@ mod tests {
 				legacy:       false,
 				context:      None,
 				model:        None,
+			})
+		);
+	}
+
+	#[test]
+	fn check_subcommand_parses() {
+		assert_eq!(
+			parse(&["arag", "check"]).command,
+			Some(Command::Check {
+				path:    None,
+				tests:   false,
+				checker: Vec::new(),
+				json:    false,
+			})
+		);
+		assert_eq!(
+			parse(&[
+				"arag",
+				"check",
+				"crates/aragent",
+				"--tests",
+				"--checker",
+				"rust",
+				"--checker",
+				"clippy",
+				"--json",
+			])
+			.command,
+			Some(Command::Check {
+				path:    Some(PathBuf::from("crates/aragent")),
+				tests:   true,
+				checker: vec!["rust".to_string(), "clippy".to_string()],
+				json:    true,
 			})
 		);
 	}

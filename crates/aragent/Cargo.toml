@@ -37,6 +37,7 @@ pi-agent = { path = "../pi-agent" }
 pi-ast = { path = "../pi-ast" }
 pi-grep-pattern = { path = "../pi-grep-pattern" }
 pi-walker.workspace = true
+regex.workspace = true
 reqwest = { workspace = true }
 rustls = { workspace = true }
 serde.workspace = true

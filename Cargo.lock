@@ -129,6 +129,7 @@ dependencies = [
  "pi-ast",
  "pi-grep-pattern",
  "pi-walker",
+ "regex",
  "reqwest 0.13.5",
  "rusqlite",
  "rustls",

@@ -18,6 +18,7 @@ use aragent::{
 	},
 	autolearn::{self, LocalLearnTool, ManageSkillTool, MemoryBackend},
 	catalog::Catalog,
+	check::{self, CleanseDiagnostic, CleanseDiagnosticReport, CleanseSeverity},
 	commit,
 	completions,
 	config::Config,
@@ -339,10 +340,10 @@ fn run() -> std::result::Result<(), CliError> {
 		}
 		return Ok(());
 	}
-	// `agents`, `models`, read/grep, and completion commands run before the agent
-	// runtime, config, and sessions are loaded: unpacking definitions, listing
-	// the catalog, or generating a script must never boot a session, read config,
-	// or touch the network.
+	// `agents`, `models`, read/grep, `check`, and completion commands run before
+	// the agent runtime, config, and sessions are loaded: unpacking definitions,
+	// listing the catalog, running project checkers, or generating a script must
+	// never boot a session, read config, or touch the network.
 	match &cli.command {
 		Some(Command::Agents { action, dir, user, project, force, json }) => {
 			let base = match &cli.cwd {
@@ -705,6 +706,20 @@ fn run() -> std::result::Result<(), CliError> {
 			register_startup_credentials_for(&cli, &base);
 			run_cleanse_command(session.as_deref(), *confirm, &base, cli.session_dir.as_deref())?;
 			return Ok(());
+		},
+		Some(Command::Check { path, tests, checker, json }) => {
+			let base = base_dir(&cli)?;
+			let project = path
+				.as_deref()
+				.map_or_else(|| base.clone(), |path| dirs::absolute(&base, path));
+			let stdout = io::stdout();
+			let mut out = io::BufWriter::new(stdout.lock());
+			let found = run_check_command(&project, *tests, checker, *json, &mut out)?;
+			return local_exit(if found {
+				aragent::EXIT_FAILURE
+			} else {
+				aragent::EXIT_SUCCESS
+			});
 		},
 		Some(Command::Commit {
 			message,
@@ -5479,6 +5494,100 @@ fn run_cleanse_command(
 		if changed == 1 { "" } else { "s" }
 	);
 	Ok(())
+}
+
+/// Headless `arag check`: discover and run project checkers without repairing.
+///
+/// Returns whether any diagnostics were found.
+fn run_check_command(
+	project: &Path,
+	include_tests: bool,
+	checker_ids: &[String],
+	json: bool,
+	out: &mut dyn Write,
+) -> std::result::Result<bool, CliError> {
+	if !project.is_dir() {
+		return Err(CliError::usage(format!(
+			"check path is not a directory: {}",
+			project.display()
+		)));
+	}
+	let runtime = tokio::runtime::Builder::new_current_thread()
+		.enable_all()
+		.build()
+		.map_err(|err| CliError::fail(format!("Failed to start runtime: {err}")))?;
+	let mut suite = runtime.block_on(check::discover_cleanse_diagnostic_suite(
+		project,
+		check::CleanseDiagnosticSuiteOptions { include_tests },
+	));
+	if !checker_ids.is_empty() {
+		let selected: Vec<&str> = checker_ids.iter().map(String::as_str).collect();
+		suite.select(&selected).map_err(CliError::usage)?;
+	}
+	let report = runtime.block_on(suite.run());
+	if json {
+		serde_json::to_writer_pretty(&mut *out, &report)
+			.map_err(|err| CliError::fail(format!("cannot write check report: {err}")))?;
+		writeln!(out).map_err(|err| CliError::fail(err.to_string()))?;
+	} else {
+		write_check_report_text(&report, &mut *out)
+			.map_err(|err| CliError::fail(err.to_string()))?;
+	}
+	out.flush().map_err(|err| CliError::fail(err.to_string()))?;
+	Ok(!report.diagnostics.is_empty())
+}
+
+fn write_check_report_text(
+	report: &CleanseDiagnosticReport,
+	out: &mut dyn Write,
+) -> std::io::Result<()> {
+	for skipped in &report.skipped {
+		let label = &skipped.label;
+		let reason = &skipped.reason;
+		writeln!(out, "- {label}: skipped ({reason})")?;
+	}
+	if report.checks.is_empty() && report.diagnostics.is_empty() {
+		writeln!(out, "No supported checker with an available executable was found.")?;
+		return Ok(());
+	}
+	for diagnostic in &report.diagnostics {
+		let location = check_diagnostic_location(diagnostic);
+		let severity = check_severity_label(diagnostic.severity);
+		let checker = &diagnostic.checker;
+		let message = &diagnostic.message;
+		write!(out, "{location}: {severity} [{checker}] {message}")?;
+		if let Some(code) = &diagnostic.code {
+			write!(out, " [{code}]")?;
+		}
+		writeln!(out)?;
+	}
+	let count = report.diagnostics.len();
+	if count == 0 {
+		let checks = report.checks.len();
+		let noun = if checks == 1 { "checker" } else { "checkers" };
+		writeln!(out, "Clean: {checks} {noun} passed.")?;
+	} else {
+		let noun = if count == 1 { "diagnostic" } else { "diagnostics" };
+		writeln!(out, "Unresolved: {count} {noun}.")?;
+	}
+	Ok(())
+}
+
+fn check_diagnostic_location(diagnostic: &CleanseDiagnostic) -> String {
+	let file = diagnostic.file.as_deref().unwrap_or("<project>");
+	match (diagnostic.line, diagnostic.column) {
+		(Some(line), Some(column)) => format!("{file}:{line}:{column}"),
+		(Some(line), None) => format!("{file}:{line}"),
+		(None, _) => file.to_owned(),
+	}
+}
+
+const fn check_severity_label(severity: CleanseSeverity) -> &'static str {
+	match severity {
+		CleanseSeverity::Error => "error",
+		CleanseSeverity::Warning => "warning",
+		CleanseSeverity::Info => "info",
+	}
 }
 
 #[cfg(test)]
