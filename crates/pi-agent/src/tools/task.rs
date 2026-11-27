@@ -25,7 +25,6 @@ use super::{
 	},
 };
 use crate::{
-	compaction::CompactionReport,
 	durable::ChildDurability,
 	loop_module::{AgentError, AgentEvent, AgentLoop, SteeringEvent},
 	state::{
@@ -938,12 +937,9 @@ impl TaskTool {
 				child_loop = child_loop.with_durable(Some(durable.boundary()));
 			}
 			if let Some(journal) = &journal {
-				let journal = Arc::clone(journal);
-				child_loop = child_loop.with_turn_observer(Some(Arc::new(
-					move |messages: &[Message], prune: Option<CompactionReport>| {
-						journal.flush(messages, prune)
-					},
-				) as crate::loop_module::TurnObserver));
+				child_loop = child_loop.with_turn_observer(Some(
+					Arc::clone(journal) as crate::loop_module::TurnObserver
+				));
 			}
 			let mut child_state = AgentState { messages: autoload_msgs, total_turns: 0 };
 			let child_cancelled = child_cancel_for_loop.clone();
@@ -967,8 +963,12 @@ impl TaskTool {
 			// request and every steering message the hub already receipted as
 			// `injected`, and a later revive replays them. A durable child scope
 			// already persisted the same tail through the loop boundary.
-			if let Some(journal) = &journal {
-				journal.flush(&child_state.messages, None);
+			if let Some(journal) = &journal
+				&& !journal.flush(&child_state.messages, None)
+			{
+				eprintln!(
+					"warning: child transcript for {live_child_id} is not fully durable before handover"
+				);
 			}
 			// Hand the final authoritative state back for the post-drain
 			// reconcile (successful or rolled back).
@@ -979,6 +979,9 @@ impl TaskTool {
 			// the actor only after it has decided the terminal state. A failed,
 			// aborted or cancelled run keeps no live bundle: its tail is partial
 			// and must go through the cold replay sanitizer instead.
+			let pending_rewrite = journal.as_ref().is_some_and(|journal| journal.pending_rewrite());
+			let prefix_positions =
+				journal.as_ref().and_then(|journal| journal.prefix_positions());
 			let live = match &outcome {
 				Ok(turns)
 					if live_keep_alive
@@ -992,6 +995,8 @@ impl TaskTool {
 						child_loop,
 						child_state,
 						durable.is_some(),
+						pending_rewrite,
+						prefix_positions,
 					)
 				},
 				_ => None,
@@ -2254,12 +2259,9 @@ async fn run_background_child(
 		))
 	});
 	if let Some(journal) = &journal {
-		let journal = Arc::clone(journal);
-		child_loop = child_loop.with_turn_observer(Some(Arc::new(
-			move |messages: &[Message], prune: Option<CompactionReport>| {
-				journal.flush(messages, prune)
-			},
-		) as crate::loop_module::TurnObserver));
+		child_loop = child_loop.with_turn_observer(Some(
+			Arc::clone(journal) as crate::loop_module::TurnObserver
+		));
 	}
 	let (event_tx, event_rx) = tokio::sync::mpsc::channel(256);
 	if let Some(hook) = supervisor.child_advisor_hook() {
@@ -2322,8 +2324,12 @@ async fn run_background_child(
 	// Final flush before any live handover: the adopted actor appends its next
 	// turn to the same file, and a replay that omits tool results emits dangling
 	// `tool_calls`. A durable child scope already persisted the same tail.
-	if let Some(journal) = &journal {
-		journal.flush(&child_state.messages, None);
+	if let Some(journal) = &journal
+		&& !journal.flush(&child_state.messages, None)
+	{
+		eprintln!(
+			"warning: child transcript for {child_id} is not fully durable before handover"
+		);
 	}
 	let (base, aborted, _) = summarize_turns(&turns);
 	let succeeded = !aborted && !finalize_output(&item, &turns, &base, false).failed;
@@ -2355,6 +2361,8 @@ async fn run_background_child(
 	// A cancelled or yield-aborted child is settled as aborted (tombstone) by the
 	// caller, so it never gets a wakeable actor; everything else keeps its real
 	// loop/state, which the caller publishes only after the terminal decision.
+	let pending_rewrite = journal.as_ref().is_some_and(|journal| journal.pending_rewrite());
+	let prefix_positions = journal.as_ref().and_then(|journal| journal.prefix_positions());
 	let live = if adoptable && !cancelled && !aborted {
 		live_child_bundle(
 			&supervisor,
@@ -2363,6 +2371,8 @@ async fn run_background_child(
 			child_loop,
 			child_state,
 			child_durable.is_some(),
+			pending_rewrite,
+			prefix_positions,
 		)
 	} else {
 		None
@@ -3393,12 +3403,22 @@ fn live_child_bundle(
 	agent_loop: AgentLoop,
 	state: AgentState,
 	durable: bool,
+	pending_rewrite: bool,
+	prefix_positions: Option<Vec<Option<usize>>>,
 ) -> Option<RevivedChild> {
 	let root = supervisor
 		.child_session_file(child_id)
 		.and_then(|path| path.parent().map(std::path::Path::to_path_buf))?;
 	let contract = PersistedChildSession::load(&root, child_id)?;
-	Some(RevivedChild { agent_loop, state, agent: Some(agent.clone()), contract, durable })
+	Some(RevivedChild {
+		agent_loop,
+		state,
+		agent: Some(agent.clone()),
+		contract,
+		durable,
+		pending_rewrite,
+		prefix_positions,
+	})
 }
 
 /// Append the messages the child loop actually accepted to its transcript.

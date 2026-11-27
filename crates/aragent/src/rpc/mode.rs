@@ -1684,11 +1684,17 @@ impl RpcMode {
 	}
 }
 
+/// The action `maybe_auto_compact` actually runs: `RpcSession::compact` is the
+/// context-full model summary, not the configured local `shake`/`soft` pass.
+const AUTO_SUMMARY_ACTION: &str = "context-full";
+
 /// Post-turn auto-compaction against persisted context usage.
 ///
-/// ponytail: 90% of the advertised window until the compaction-settings seam
-/// (threshold tokens/percent) lands; the summary itself is the real model path
-/// (`RpcSession::compact`), never a stub.
+/// Threshold resolution is the donor's (`compaction.ts` `shouldCompact` +
+/// `resolveThresholdTokens`): a fixed `thresholdTokens` wins, a positive
+/// `thresholdPercent` is next, and the legacy `-1`/absent sentinel falls back
+/// to the context window minus the effective reserve. The summary itself is the
+/// real model path (`RpcSession::compact`), never a stub.
 fn maybe_auto_compact(
 	session: &Arc<Mutex<RpcSession>>,
 	sink: &Arc<dyn FrameSink>,
@@ -1701,23 +1707,26 @@ fn maybe_auto_compact(
 	if auth.is_logging_in() {
 		return;
 	}
-	let (enabled, percent, busy) = {
+	let (enabled, busy, should_compact) = {
 		let guard = session.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-		(
-			guard.auto_compaction,
-			guard
-				.context_usage()
-				.and_then(|usage| usage["percent"].as_f64()),
-			guard.is_compacting,
-		)
+		let compaction = &guard.config.compaction;
+		let should_compact = guard.context_usage().is_some_and(|usage| {
+			let tokens = usage["tokens"].as_u64().unwrap_or(0) as usize;
+			let window = usage["contextWindow"].as_u64().unwrap_or(0) as usize;
+			compaction.should_compact(tokens, window)
+		});
+		(guard.auto_compaction, guard.is_compacting, should_compact)
 	};
-	if !enabled || busy || percent.map_or(true, |percent| percent < 90.0) {
+	if !enabled || busy || !should_compact {
 		return;
 	}
+	// This path always performs `RpcSession::compact`, the context-full model
+	// summary. A configured `shake`/`soft` order is not executed here, so the
+	// frame must name the action actually run rather than the preference.
 	sink.send(json!({
 		"type": "auto_compaction_start",
 		"reason": "threshold",
-		"action": "context-full",
+		"action": AUTO_SUMMARY_ACTION,
 	}));
 	let result = {
 		let mut guard = session.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -1726,7 +1735,7 @@ fn maybe_auto_compact(
 	match result {
 		Ok(value) => sink.send(json!({
 			"type": "auto_compaction_end",
-			"action": "context-full",
+			"action": AUTO_SUMMARY_ACTION,
 			"result": value,
 			"aborted": false,
 			"willRetry": false,
@@ -1734,7 +1743,7 @@ fn maybe_auto_compact(
 		})),
 		Err(error) => sink.send(json!({
 			"type": "auto_compaction_end",
-			"action": "context-full",
+			"action": AUTO_SUMMARY_ACTION,
 			"result": null,
 			"aborted": false,
 			"willRetry": false,
@@ -2397,6 +2406,24 @@ mod run_control_tests {
 		assert!(!control.abandon_run(generation));
 		assert!(!control.stream());
 		assert!(control.begin_run().is_err());
+	}
+}
+
+#[cfg(test)]
+mod auto_compaction_action_tests {
+	use super::*;
+
+	#[test]
+	fn frames_name_the_action_actually_performed() {
+		let config = crate::config::CompactionConfig {
+			method_order: Some(vec!["shake".to_string()]),
+			..crate::config::CompactionConfig::default()
+		};
+		assert_eq!(config.auto_action(), "shake");
+		assert_eq!(
+			AUTO_SUMMARY_ACTION, "context-full",
+			"the local pass is not executed by maybe_auto_compact"
+		);
 	}
 }
 

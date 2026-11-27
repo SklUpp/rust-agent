@@ -1947,20 +1947,55 @@ impl SqliteStore {
 				)? {
 				return Err(StoreError::Validation("fork projection lineage is invalid".into()));
 			}
-			let mut runtime_replay =
-				Vec::with_capacity(projection.synthetic.len() + kept_entries.len());
-			for synthetic in &projection.synthetic {
-				runtime_replay.push(
-					serde_json::from_value::<pi_agent::state::Message>(synthetic.clone()).map_err(
-						|e| StoreError::Corrupt(format!("invalid projection synthetic message: {e}")),
-					)?,
+			if projection.preserve_branch {
+				if !projection.kept.is_empty()
+					|| !projection.synthetic.is_empty()
+					|| projection.anchor.is_some()
+				{
+					return Err(StoreError::Validation(
+						"preserve_branch projection must not carry kept/synthetic/anchor".into(),
+					));
+				}
+				let mut branch = Vec::with_capacity(branch_messages.len());
+				for row in &branch_messages {
+					let entry: crate::session::SessionEntry =
+						serde_json::from_value(row.payload.clone()).map_err(|e| {
+							StoreError::Corrupt(format!(
+								"preserved branch entry {} is invalid: {e}",
+								row.id
+							))
+						})?;
+					if entry.kind == "message" {
+						branch.push(serde_json::from_value::<crate::session::MessageEntry>(
+							row.payload.clone(),
+						).map_err(|e| {
+							StoreError::Corrupt(format!(
+								"preserved branch message {} is invalid: {e}",
+								row.id
+							))
+						})?);
+					}
+				}
+				crate::durable_session::apply_projection_rewrites(&mut branch, &projection.rewrites);
+				let replay = crate::runtime::history_messages_from_entries(&branch)
+					.map_err(|e| StoreError::Corrupt(format!("invalid preserved replay: {e}")))?;
+				crate::durable_session::validate_runtime_replay(&replay)?;
+			} else {
+				let mut runtime_replay =
+					Vec::with_capacity(projection.synthetic.len() + kept_entries.len());
+				for synthetic in &projection.synthetic {
+					runtime_replay.push(
+						serde_json::from_value::<pi_agent::state::Message>(synthetic.clone()).map_err(
+							|e| StoreError::Corrupt(format!("invalid projection synthetic message: {e}")),
+						)?,
+					);
+				}
+				runtime_replay.extend(
+					crate::runtime::history_messages_from_entries(&kept_entries)
+						.map_err(|e| StoreError::Corrupt(format!("invalid projected replay: {e}")))?,
 				);
+				crate::durable_session::validate_runtime_replay(&runtime_replay)?;
 			}
-			runtime_replay.extend(
-				crate::runtime::history_messages_from_entries(&kept_entries)
-					.map_err(|e| StoreError::Corrupt(format!("invalid projected replay: {e}")))?,
-			);
-			crate::durable_session::validate_runtime_replay(&runtime_replay)?;
 			if let Some(anchor) = &projection.anchor {
 				let owner: Option<String> = tx
 					.query_row("SELECT session_id FROM messages WHERE id = ?1", params![anchor], |r| {
@@ -6672,6 +6707,16 @@ fn update_projection_kept_tx(
 	let mut session_payload: Value = decode_json(&session_payload_json)?;
 	let mut updated = false;
 	if let Some(map) = session_payload.as_object_mut() {
+		if map
+			.get("durableProjection")
+			.and_then(|projection| projection.get("preserve_branch"))
+			.and_then(Value::as_bool)
+			== Some(true)
+		{
+			// Content-only rewrite replays the whole branch; there is no `kept`
+			// selection to extend, and adding one would invalidate the projection.
+			return Ok(());
+		}
 		if let Some(proj_val) = map.get_mut("durableProjection") {
 			if let Some(proj_obj) = proj_val.as_object_mut() {
 				if let Some(kept_val) = proj_obj.get_mut("kept") {
@@ -6940,6 +6985,18 @@ pub(crate) fn parse_stored_projection(value: &Value) -> StoreResult<StoredProjec
 		synthetic.as_array().ok_or_else(|| {
 			StoreError::Corrupt("durableProjection.synthetic must be an array".to_string())
 		})?;
+	}
+	if let Some(rewrites) = object.get("rewrites") {
+		let rewrites = rewrites.as_object().ok_or_else(|| {
+			StoreError::Corrupt("durableProjection.rewrites must be an object".to_string())
+		})?;
+		for (id, content) in rewrites {
+			if id.is_empty() || content.as_str().is_none() {
+				return Err(StoreError::Corrupt(
+					"durableProjection.rewrites must map non-empty ids to strings".to_string(),
+				));
+			}
+		}
 	}
 	for key in ["anchor", "firstKeptEntryId"] {
 		if let Some(found) = object.get(key) {
@@ -8677,7 +8734,7 @@ mod tests {
 		store.create_fork_atomic(ForkWrite {
 			session: NewSession { id: "fork".into(), parent_session_id: Some("source".into()), payload: json!({"type":"session","id":"fork","timestamp":"2026-01-01T00:00:00Z","cwd":"/tmp","parentSession":"source"}), initial_branch_id: "branch".into(), initial_branch_payload: json!({}) },
 			branches: vec![NewBranch { id: "branch".into(), session_id: "fork".into(), parent_branch_id: None, parent_message_id: None, payload: json!({}) }], active_branch_id: "branch".into(), active_leaf_message_id: Some("m2".into()),
-			messages: vec![NewMessage { id: "m1".into(), session_id: "fork".into(), branch_id: "branch".into(), parent_message_id: None, payload: json!({"type":"message","id":"m1","timestamp":"2026-01-01T00:00:00Z","message":{"role":"user","content":"one","timestamp":1}}) }, NewMessage { id: "m2".into(), session_id: "fork".into(), branch_id: "branch".into(), parent_message_id: Some("m1".into()), payload: json!({"type":"message","id":"m2","parentId":"m1","timestamp":"2026-01-01T00:00:01Z","message":{"role":"assistant","content":"two","timestamp":2,"api":"openai","provider":"test","model":"model"}}) }], projection: Some(StoredProjection { kept: vec!["m1".into(), "m2".into()], synthetic: vec![json!({"role":"user","content":"summary","timestamp":3})], anchor: Some("m1".into()) }),
+			messages: vec![NewMessage { id: "m1".into(), session_id: "fork".into(), branch_id: "branch".into(), parent_message_id: None, payload: json!({"type":"message","id":"m1","timestamp":"2026-01-01T00:00:00Z","message":{"role":"user","content":"one","timestamp":1}}) }, NewMessage { id: "m2".into(), session_id: "fork".into(), branch_id: "branch".into(), parent_message_id: Some("m1".into()), payload: json!({"type":"message","id":"m2","parentId":"m1","timestamp":"2026-01-01T00:00:01Z","message":{"role":"assistant","content":"two","timestamp":2,"api":"openai","provider":"test","model":"model"}}) }], projection: Some(StoredProjection { kept: vec!["m1".into(), "m2".into()], synthetic: vec![json!({"role":"user","content":"summary","timestamp":3})], anchor: Some("m1".into()), rewrites: Default::default(), preserve_branch: false }),
 		}).expect("fork");
 		let branch = store.branch("branch").expect("branch").expect("exists");
 		assert_eq!(branch.leaf_message_id.as_deref(), Some("m2"));
@@ -8850,7 +8907,7 @@ mod tests {
 	#[test]
 	fn fork_atomic_rejects_reverse_projection_order() {
 		let mut store = SqliteStore::open_in_memory().expect("store");
-		let result = store.create_fork_atomic(ForkWrite { session: NewSession { id: "order".into(), parent_session_id: None, payload: json!({"type":"session","id":"order","timestamp":"2026-01-01T00:00:00Z","cwd":"/tmp"}), initial_branch_id: "b".into(), initial_branch_payload: json!({}) }, branches: vec![NewBranch { id: "b".into(), session_id: "order".into(), parent_branch_id: None, parent_message_id: None, payload: json!({}) }], active_branch_id: "b".into(), active_leaf_message_id: Some("m2".into()), messages: vec![NewMessage { id: "m1".into(), session_id: "order".into(), branch_id: "b".into(), parent_message_id: None, payload: json!({"type":"message","id":"m1","timestamp":"2026-01-01T00:00:00Z","message":{"role":"user","content":"one","timestamp":1}}) }, NewMessage { id: "m2".into(), session_id: "order".into(), branch_id: "b".into(), parent_message_id: Some("m1".into()), payload: json!({"type":"message","id":"m2","parentId":"m1","timestamp":"2026-01-01T00:00:01Z","message":{"role":"assistant","content":"two","timestamp":2,"api":"openai","provider":"test","model":"model"}}) }], projection: Some(StoredProjection { kept: vec!["m2".into(), "m1".into()], synthetic: vec![], anchor: None }) });
+		let result = store.create_fork_atomic(ForkWrite { session: NewSession { id: "order".into(), parent_session_id: None, payload: json!({"type":"session","id":"order","timestamp":"2026-01-01T00:00:00Z","cwd":"/tmp"}), initial_branch_id: "b".into(), initial_branch_payload: json!({}) }, branches: vec![NewBranch { id: "b".into(), session_id: "order".into(), parent_branch_id: None, parent_message_id: None, payload: json!({}) }], active_branch_id: "b".into(), active_leaf_message_id: Some("m2".into()), messages: vec![NewMessage { id: "m1".into(), session_id: "order".into(), branch_id: "b".into(), parent_message_id: None, payload: json!({"type":"message","id":"m1","timestamp":"2026-01-01T00:00:00Z","message":{"role":"user","content":"one","timestamp":1}}) }, NewMessage { id: "m2".into(), session_id: "order".into(), branch_id: "b".into(), parent_message_id: Some("m1".into()), payload: json!({"type":"message","id":"m2","parentId":"m1","timestamp":"2026-01-01T00:00:01Z","message":{"role":"assistant","content":"two","timestamp":2,"api":"openai","provider":"test","model":"model"}}) }], projection: Some(StoredProjection { kept: vec!["m2".into(), "m1".into()], synthetic: vec![], anchor: None, rewrites: Default::default(), preserve_branch: false }) });
 		assert!(result.is_err());
 	}
 
@@ -8864,14 +8921,14 @@ mod tests {
 	#[test]
 	fn fork_atomic_projection_order_filters_offbranch_entries() {
 		let mut store = SqliteStore::open_in_memory().expect("store");
-		let result = store.create_fork_atomic(ForkWrite { session: NewSession { id: "filtered".into(), parent_session_id: None, payload: json!({"type":"session","id":"filtered","timestamp":"2026-01-01T00:00:00Z","cwd":"/tmp"}), initial_branch_id: "active".into(), initial_branch_payload: json!({}) }, branches: vec![NewBranch { id: "active".into(), session_id: "filtered".into(), parent_branch_id: None, parent_message_id: None, payload: json!({}) }, NewBranch { id: "other".into(), session_id: "filtered".into(), parent_branch_id: None, parent_message_id: None, payload: json!({}) }], active_branch_id: "active".into(), active_leaf_message_id: Some("a2".into()), messages: vec![NewMessage { id: "a1".into(), session_id: "filtered".into(), branch_id: "active".into(), parent_message_id: None, payload: json!({"type":"message","id":"a1","timestamp":"2026-01-01T00:00:00Z","message":{"role":"user","content":"a"}}) }, NewMessage { id: "o1".into(), session_id: "filtered".into(), branch_id: "other".into(), parent_message_id: None, payload: json!({"type":"message","id":"o1","timestamp":"2026-01-01T00:00:00Z","message":{"role":"user","content":"o"}}) }, NewMessage { id: "a2".into(), session_id: "filtered".into(), branch_id: "active".into(), parent_message_id: Some("a1".into()), payload: json!({"type":"message","id":"a2","parentId":"a1","timestamp":"2026-01-01T00:00:01Z","message":{"role":"assistant","content":"a2"}}) }], projection: Some(StoredProjection { kept: vec!["a1".into(), "o1".into(), "a2".into()], synthetic: vec![], anchor: None }) });
+		let result = store.create_fork_atomic(ForkWrite { session: NewSession { id: "filtered".into(), parent_session_id: None, payload: json!({"type":"session","id":"filtered","timestamp":"2026-01-01T00:00:00Z","cwd":"/tmp"}), initial_branch_id: "active".into(), initial_branch_payload: json!({}) }, branches: vec![NewBranch { id: "active".into(), session_id: "filtered".into(), parent_branch_id: None, parent_message_id: None, payload: json!({}) }, NewBranch { id: "other".into(), session_id: "filtered".into(), parent_branch_id: None, parent_message_id: None, payload: json!({}) }], active_branch_id: "active".into(), active_leaf_message_id: Some("a2".into()), messages: vec![NewMessage { id: "a1".into(), session_id: "filtered".into(), branch_id: "active".into(), parent_message_id: None, payload: json!({"type":"message","id":"a1","timestamp":"2026-01-01T00:00:00Z","message":{"role":"user","content":"a"}}) }, NewMessage { id: "o1".into(), session_id: "filtered".into(), branch_id: "other".into(), parent_message_id: None, payload: json!({"type":"message","id":"o1","timestamp":"2026-01-01T00:00:00Z","message":{"role":"user","content":"o"}}) }, NewMessage { id: "a2".into(), session_id: "filtered".into(), branch_id: "active".into(), parent_message_id: Some("a1".into()), payload: json!({"type":"message","id":"a2","parentId":"a1","timestamp":"2026-01-01T00:00:01Z","message":{"role":"assistant","content":"a2"}}) }], projection: Some(StoredProjection { kept: vec!["a1".into(), "o1".into(), "a2".into()], synthetic: vec![], anchor: None, rewrites: Default::default(), preserve_branch: false }) });
 		assert!(result.is_err());
 	}
 
 	#[test]
 	fn fork_atomic_accepts_sibling_tool_result() {
 		let mut store = SqliteStore::open_in_memory().expect("store");
-		let result = store.create_fork_atomic(ForkWrite { session: NewSession { id: "tool-sibling".into(), parent_session_id: None, payload: json!({"type":"session","id":"tool-sibling","timestamp":"2026-01-01T00:00:00Z","cwd":"/tmp"}), initial_branch_id: "active".into(), initial_branch_payload: json!({}) }, branches: vec![NewBranch { id: "sibling".into(), session_id: "tool-sibling".into(), parent_branch_id: Some("active".into()), parent_message_id: Some("a1".into()), payload: json!({}) }, NewBranch { id: "active".into(), session_id: "tool-sibling".into(), parent_branch_id: None, parent_message_id: None, payload: json!({}) }], active_branch_id: "active".into(), active_leaf_message_id: Some("r1".into()), messages: vec![NewMessage { id: "a1".into(), session_id: "tool-sibling".into(), branch_id: "active".into(), parent_message_id: None, payload: json!({"type":"message","id":"a1","timestamp":"2026-01-01T00:00:00Z","message":{"role":"assistant","content":[{"type":"toolCall","id":"call-1","name":"echo","arguments":{}},{"type":"toolCall","id":"call-2","name":"echo","arguments":{}}],"timestamp":1,"api":"openai","provider":"test","model":"model"}}) }, NewMessage { id: "r1".into(), session_id: "tool-sibling".into(), branch_id: "active".into(), parent_message_id: Some("a1".into()), payload: json!({"type":"message","id":"r1","parentId":"a1","timestamp":"2026-01-01T00:00:01Z","message":{"role":"toolResult","content":"one","toolCallId":"call-1","toolName":"echo","isError":false,"timestamp":2}}) }, NewMessage { id: "r2".into(), session_id: "tool-sibling".into(), branch_id: "sibling".into(), parent_message_id: Some("a1".into()), payload: json!({"type":"message","id":"r2","parentId":"a1","timestamp":"2026-01-01T00:00:02Z","message":{"role":"toolResult","content":"two","toolCallId":"call-2","toolName":"echo","isError":false,"timestamp":3}}) }], projection: Some(StoredProjection { kept: vec!["a1".into(), "r1".into(), "r2".into()], synthetic: vec![], anchor: Some("a1".into()) }) });
+		let result = store.create_fork_atomic(ForkWrite { session: NewSession { id: "tool-sibling".into(), parent_session_id: None, payload: json!({"type":"session","id":"tool-sibling","timestamp":"2026-01-01T00:00:00Z","cwd":"/tmp"}), initial_branch_id: "active".into(), initial_branch_payload: json!({}) }, branches: vec![NewBranch { id: "sibling".into(), session_id: "tool-sibling".into(), parent_branch_id: Some("active".into()), parent_message_id: Some("a1".into()), payload: json!({}) }, NewBranch { id: "active".into(), session_id: "tool-sibling".into(), parent_branch_id: None, parent_message_id: None, payload: json!({}) }], active_branch_id: "active".into(), active_leaf_message_id: Some("r1".into()), messages: vec![NewMessage { id: "a1".into(), session_id: "tool-sibling".into(), branch_id: "active".into(), parent_message_id: None, payload: json!({"type":"message","id":"a1","timestamp":"2026-01-01T00:00:00Z","message":{"role":"assistant","content":[{"type":"toolCall","id":"call-1","name":"echo","arguments":{}},{"type":"toolCall","id":"call-2","name":"echo","arguments":{}}],"timestamp":1,"api":"openai","provider":"test","model":"model"}}) }, NewMessage { id: "r1".into(), session_id: "tool-sibling".into(), branch_id: "active".into(), parent_message_id: Some("a1".into()), payload: json!({"type":"message","id":"r1","parentId":"a1","timestamp":"2026-01-01T00:00:01Z","message":{"role":"toolResult","content":"one","toolCallId":"call-1","toolName":"echo","isError":false,"timestamp":2}}) }, NewMessage { id: "r2".into(), session_id: "tool-sibling".into(), branch_id: "sibling".into(), parent_message_id: Some("a1".into()), payload: json!({"type":"message","id":"r2","parentId":"a1","timestamp":"2026-01-01T00:00:02Z","message":{"role":"toolResult","content":"two","toolCallId":"call-2","toolName":"echo","isError":false,"timestamp":3}}) }], projection: Some(StoredProjection { kept: vec!["a1".into(), "r1".into(), "r2".into()], synthetic: vec![], anchor: Some("a1".into()), rewrites: Default::default(), preserve_branch: false }) });
 		assert!(result.is_ok());
 		assert_eq!(
 			store
@@ -8887,7 +8944,7 @@ mod tests {
 	#[test]
 	fn fork_atomic_rejects_anchor_on_sibling_branch() {
 		let mut store = SqliteStore::open_in_memory().expect("store");
-		let result = store.create_fork_atomic(ForkWrite { session: NewSession { id: "anchor-sibling".into(), parent_session_id: None, payload: json!({"type":"session","id":"anchor-sibling","timestamp":"2026-01-01T00:00:00Z","cwd":"/tmp"}), initial_branch_id: "active".into(), initial_branch_payload: json!({}) }, branches: vec![NewBranch { id: "active".into(), session_id: "anchor-sibling".into(), parent_branch_id: None, parent_message_id: None, payload: json!({}) }, NewBranch { id: "sibling".into(), session_id: "anchor-sibling".into(), parent_branch_id: None, parent_message_id: None, payload: json!({}) }], active_branch_id: "active".into(), active_leaf_message_id: Some("a".into()), messages: vec![NewMessage { id: "a".into(), session_id: "anchor-sibling".into(), branch_id: "active".into(), parent_message_id: None, payload: json!({"type":"message","id":"a","timestamp":"2026-01-01T00:00:00Z","message":{"role":"user","content":"a","timestamp":1}}) }, NewMessage { id: "s".into(), session_id: "anchor-sibling".into(), branch_id: "sibling".into(), parent_message_id: None, payload: json!({"type":"message","id":"s","timestamp":"2026-01-01T00:00:00Z","message":{"role":"user","content":"s","timestamp":2}}) }], projection: Some(StoredProjection { kept: vec!["a".into()], synthetic: vec![], anchor: Some("s".into()) }) });
+		let result = store.create_fork_atomic(ForkWrite { session: NewSession { id: "anchor-sibling".into(), parent_session_id: None, payload: json!({"type":"session","id":"anchor-sibling","timestamp":"2026-01-01T00:00:00Z","cwd":"/tmp"}), initial_branch_id: "active".into(), initial_branch_payload: json!({}) }, branches: vec![NewBranch { id: "active".into(), session_id: "anchor-sibling".into(), parent_branch_id: None, parent_message_id: None, payload: json!({}) }, NewBranch { id: "sibling".into(), session_id: "anchor-sibling".into(), parent_branch_id: None, parent_message_id: None, payload: json!({}) }], active_branch_id: "active".into(), active_leaf_message_id: Some("a".into()), messages: vec![NewMessage { id: "a".into(), session_id: "anchor-sibling".into(), branch_id: "active".into(), parent_message_id: None, payload: json!({"type":"message","id":"a","timestamp":"2026-01-01T00:00:00Z","message":{"role":"user","content":"a","timestamp":1}}) }, NewMessage { id: "s".into(), session_id: "anchor-sibling".into(), branch_id: "sibling".into(), parent_message_id: None, payload: json!({"type":"message","id":"s","timestamp":"2026-01-01T00:00:00Z","message":{"role":"user","content":"s","timestamp":2}}) }], projection: Some(StoredProjection { kept: vec!["a".into()], synthetic: vec![], anchor: Some("s".into()), rewrites: Default::default(), preserve_branch: false }) });
 		let error = result.expect_err("sibling anchor must fail");
 		assert!(error.to_string().contains("anchor"), "unexpected error: {error}");
 	}
@@ -8907,7 +8964,7 @@ mod tests {
 	#[test]
 	fn fork_atomic_rejects_reverse_active_order_with_valid_sibling() {
 		let mut store = SqliteStore::open_in_memory().expect("store");
-		let result = store.create_fork_atomic(ForkWrite { session: NewSession { id: "order-sibling".into(), parent_session_id: None, payload: json!({"type":"session","id":"order-sibling","timestamp":"2026-01-01T00:00:00Z","cwd":"/tmp"}), initial_branch_id: "active".into(), initial_branch_payload: json!({}) }, branches: vec![NewBranch { id: "active".into(), session_id: "order-sibling".into(), parent_branch_id: None, parent_message_id: None, payload: json!({}) }, NewBranch { id: "sibling".into(), session_id: "order-sibling".into(), parent_branch_id: None, parent_message_id: None, payload: json!({}) }], active_branch_id: "active".into(), active_leaf_message_id: Some("r1".into()), messages: vec![NewMessage { id: "a".into(), session_id: "order-sibling".into(), branch_id: "active".into(), parent_message_id: None, payload: json!({"type":"message","id":"a","timestamp":"2026-01-01T00:00:00Z","message":{"role":"assistant","content":[{"type":"toolCall","id":"c1","name":"echo","arguments":{}}],"timestamp":1,"api":"openai","provider":"test","model":"model"}}) }, NewMessage { id: "r1".into(), session_id: "order-sibling".into(), branch_id: "active".into(), parent_message_id: Some("a".into()), payload: json!({"type":"message","id":"r1","parentId":"a","timestamp":"2026-01-01T00:00:01Z","message":{"role":"toolResult","content":"ok","toolCallId":"c1","toolName":"echo","isError":false,"timestamp":2}}) }, NewMessage { id: "s".into(), session_id: "order-sibling".into(), branch_id: "sibling".into(), parent_message_id: None, payload: json!({"type":"message","id":"s","timestamp":"2026-01-01T00:00:02Z","message":{"role":"user","content":"s","timestamp":3}}) }], projection: Some(StoredProjection { kept: vec!["r1".into(), "s".into(), "a".into()], synthetic: vec![], anchor: Some("a".into()) }) });
+		let result = store.create_fork_atomic(ForkWrite { session: NewSession { id: "order-sibling".into(), parent_session_id: None, payload: json!({"type":"session","id":"order-sibling","timestamp":"2026-01-01T00:00:00Z","cwd":"/tmp"}), initial_branch_id: "active".into(), initial_branch_payload: json!({}) }, branches: vec![NewBranch { id: "active".into(), session_id: "order-sibling".into(), parent_branch_id: None, parent_message_id: None, payload: json!({}) }, NewBranch { id: "sibling".into(), session_id: "order-sibling".into(), parent_branch_id: None, parent_message_id: None, payload: json!({}) }], active_branch_id: "active".into(), active_leaf_message_id: Some("r1".into()), messages: vec![NewMessage { id: "a".into(), session_id: "order-sibling".into(), branch_id: "active".into(), parent_message_id: None, payload: json!({"type":"message","id":"a","timestamp":"2026-01-01T00:00:00Z","message":{"role":"assistant","content":[{"type":"toolCall","id":"c1","name":"echo","arguments":{}}],"timestamp":1,"api":"openai","provider":"test","model":"model"}}) }, NewMessage { id: "r1".into(), session_id: "order-sibling".into(), branch_id: "active".into(), parent_message_id: Some("a".into()), payload: json!({"type":"message","id":"r1","parentId":"a","timestamp":"2026-01-01T00:00:01Z","message":{"role":"toolResult","content":"ok","toolCallId":"c1","toolName":"echo","isError":false,"timestamp":2}}) }, NewMessage { id: "s".into(), session_id: "order-sibling".into(), branch_id: "sibling".into(), parent_message_id: None, payload: json!({"type":"message","id":"s","timestamp":"2026-01-01T00:00:02Z","message":{"role":"user","content":"s","timestamp":3}}) }], projection: Some(StoredProjection { kept: vec!["r1".into(), "s".into(), "a".into()], synthetic: vec![], anchor: Some("a".into()), rewrites: Default::default(), preserve_branch: false }) });
 		let error = result.expect_err("reverse active order must fail");
 		assert!(error.to_string().contains("order"), "unexpected error: {error}");
 	}
@@ -8975,6 +9032,8 @@ mod tests {
 			kept: Vec::new(),
 			synthetic: vec![json!({"role": "user", "content": "summary"})],
 			anchor: Some("m_compact".to_string()),
+			rewrites: Default::default(),
+			preserve_branch: false,
 		};
 
 		let res = store.compact_session(compact_msg, proj);
@@ -14371,6 +14430,8 @@ mod tests {
 				})
 			],
 			anchor: Some(src_compact_id.to_string()),
+			rewrites: Default::default(),
+			preserve_branch: false,
 		};
 		store
 			.compact_session(
@@ -14509,6 +14570,8 @@ mod tests {
 					})
 				],
 				anchor: Some(fork_compact_id.to_string()),
+				rewrites: Default::default(),
+				preserve_branch: false,
 			}),
 		};
 

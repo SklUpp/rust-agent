@@ -732,7 +732,7 @@ async fn compaction_remaps_by_stable_revision_not_by_length() {
 	// A compaction notice is a new leading message; the retained tail is the
 	// same assistant revision at its new index.
 	let compacted = vec![Message::user("notice"), Message::assistant("second")];
-	let report = pi_agent::CompactionReport { old_len: 2, kept_from: 1, kept_at: 1 };
+	let report = pi_agent::CompactionReport { old_len: 2, leading_system: 0, kept_from: 1, kept_at: 1 };
 	session
 		.compacted(&compacted, &report)
 		.await
@@ -774,7 +774,7 @@ async fn compaction_remaps_by_stable_revision_not_by_length() {
 	// shape and length guards pass, so only the retained-revision check can
 	// refuse it, before any write.
 	let diverged = vec![Message::user("notice"), Message::assistant("rewritten")];
-	let current = pi_agent::CompactionReport { old_len: 3, kept_from: 2, kept_at: 1 };
+	let current = pi_agent::CompactionReport { old_len: 3, leading_system: 0, kept_from: 2, kept_at: 1 };
 	session
 		.compacted(&diverged, &current)
 		.await
@@ -2587,7 +2587,7 @@ async fn reopened_session_with_compaction_recovers_unmessaged_outcome_and_preser
 		pi_agent::compaction::COMPACTION_NOTICE_PREFIX
 	));
 	let compacted = vec![notice.clone(), Message::assistant("first answer")];
-	let report = pi_agent::CompactionReport { old_len: 2, kept_from: 1, kept_at: 1 };
+	let report = pi_agent::CompactionReport { old_len: 2, leading_system: 0, kept_from: 1, kept_at: 1 };
 	session.compacted(&compacted, &report).await.expect("compacted");
 	session.persist_messages(&compacted).await.expect("persist compacted");
 	// 3. New assistant turn with a tool call after compaction
@@ -2678,7 +2678,7 @@ async fn reopened_session_with_compaction_backfills_unprojected_branch_suffix() 
 	session.persist_messages(&original).await.expect("persist original");
 
 	let compacted = vec![notice.clone(), Message::assistant("first answer")];
-	let report = pi_agent::CompactionReport { old_len: 2, kept_from: 1, kept_at: 1 };
+	let report = pi_agent::CompactionReport { old_len: 2, leading_system: 0, kept_from: 1, kept_at: 1 };
 	session.compacted(&compacted, &report).await.expect("compacted");
 	session.persist_messages(&compacted).await.expect("persist compacted");
 
@@ -2820,7 +2820,7 @@ async fn branch_cut_via_append_entry_clears_projection_in_sqlite_and_in_memory()
 		pi_agent::compaction::COMPACTION_NOTICE_PREFIX
 	));
 	let compacted = vec![notice, Message::assistant("first answer")];
-	let report = pi_agent::CompactionReport { old_len: 2, kept_from: 1, kept_at: 1 };
+	let report = pi_agent::CompactionReport { old_len: 2, leading_system: 0, kept_from: 1, kept_at: 1 };
 	session.compacted(&compacted, &report).await.expect("compacted");
 	session.persist_messages(&compacted).await.expect("persist compacted");
 	let loaded_before = session.load().expect("load");
@@ -2864,7 +2864,7 @@ async fn clear_projection_clears_both_sqlite_and_in_memory_state() {
 		pi_agent::compaction::COMPACTION_NOTICE_PREFIX
 	));
 	let compacted = vec![notice, Message::assistant("first answer")];
-	let report = pi_agent::CompactionReport { old_len: 2, kept_from: 1, kept_at: 1 };
+	let report = pi_agent::CompactionReport { old_len: 2, leading_system: 0, kept_from: 1, kept_at: 1 };
 	session.compacted(&compacted, &report).await.expect("compacted");
 	session.persist_messages(&compacted).await.expect("persist compacted");
 
@@ -2985,7 +2985,7 @@ async fn reopened_session_preserves_compaction_with_offbranch_sibling_tool_resul
 		Message::tool_with_status("call-1", "effect", "result 1", false),
 		Message::tool_with_status("call-2", "effect", "result 2", false),
 	];
-	let report = pi_agent::CompactionReport { old_len: 4, kept_from: 1, kept_at: 1 };
+	let report = pi_agent::CompactionReport { old_len: 4, leading_system: 0, kept_from: 1, kept_at: 1 };
 	session.compacted(&compacted, &report).await.expect("compacted");
 	session.persist_messages(&compacted).await.expect("persist compacted");
 	let proj_before = session.load().expect("load").projection.expect("has projection");
@@ -3364,7 +3364,7 @@ async fn durable_worker_projection_saved_and_survives_crash_before_assistant() {
 		pi_agent::compaction::COMPACTION_NOTICE_PREFIX
 	));
 	let compacted = vec![notice.clone(), Message::assistant("ans 1")];
-	let report = pi_agent::CompactionReport { old_len: 2, kept_from: 1, kept_at: 1 };
+	let report = pi_agent::CompactionReport { old_len: 2, leading_system: 0, kept_from: 1, kept_at: 1 };
 	session.compacted(&compacted, &report).await.expect("compacted");
 	session.persist_messages(&compacted).await.expect("persist compacted");
 
@@ -3927,7 +3927,7 @@ async fn durable_session_resume_after_compaction_preserves_projection_and_masks_
 		pi_agent::compaction::COMPACTION_NOTICE_PREFIX
 	));
 	let compacted = vec![notice.clone(), Message::assistant("turn 1 reply")];
-	let report = pi_agent::CompactionReport { old_len: 2, kept_from: 1, kept_at: 1 };
+	let report = pi_agent::CompactionReport { old_len: 2, leading_system: 0, kept_from: 1, kept_at: 1 };
 	session.compacted(&compacted, &report).await.expect("compacted");
 	session.persist_messages(&compacted).await.expect("persist compacted");
 

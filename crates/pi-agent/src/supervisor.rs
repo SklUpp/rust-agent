@@ -1,7 +1,7 @@
 use std::{
 	cell::Cell,
 	collections::{BTreeMap, HashMap, HashSet, VecDeque},
-	io::Write,
+	io::{BufRead, BufReader, Write},
 	path::{Path, PathBuf},
 	sync::{
 		Arc, Mutex, MutexGuard, Weak,
@@ -15,6 +15,7 @@ use tokio::sync::{Notify, Semaphore, mpsc};
 use tokio_util::sync::CancellationToken;
 
 use crate::{
+	compaction::COMPACTION_NOTICE_PREFIX,
 	dap::DapTool,
 	delivery::{BackgroundDelivery, BackgroundResultSink},
 	durable::{ChildDurability, ChildDurabilityFactory},
@@ -23,7 +24,7 @@ use crate::{
 	lsp::LspTool,
 	mailbox::Mailbox,
 	provider::ModelProvider,
-	state::{AcpClientBridge, Message, StagedPreviewPolicy, TokenUsage, ToolApprover},
+	state::{AcpClientBridge, Message, Role, StagedPreviewPolicy, TokenUsage, ToolApprover},
 	task_persisted_revive::{init_path, tombstone_path, transcript_path},
 	tools::{
 		AstGrepTool, BashTool, EditTool, HubTool, PendingStore, TaskTool, ThinkTool, WriteTool,
@@ -706,6 +707,18 @@ impl Drop for AdmissionLease<'_> {
 		}
 	}
 }
+/// One JSONL line for a child transcript; `None` reports a serialization error.
+fn child_transcript_line(message: &Message) -> Option<String> {
+	let message = match serde_json::to_value(message) {
+		Ok(message) => message,
+		Err(error) => {
+			eprintln!("warning: cannot serialize child transcript message: {error}");
+			return None;
+		},
+	};
+	Some(serde_json::json!({ "type": "message", "message": message }).to_string())
+}
+
 impl Supervisor {
 	pub fn new(
 		template: ToolRegistry,
@@ -2756,15 +2769,11 @@ impl Supervisor {
 		};
 		let mut written = 0;
 		for message in messages {
-			let line = match serde_json::to_value(message) {
-				Ok(message) => serde_json::json!({ "type": "message", "message": message }),
-				Err(error) => {
-					// A message that cannot serialize is unrecoverable by retrying:
-					// report it and keep going so the rest of the tail lands.
-					eprintln!("warning: cannot serialize child transcript message: {error}");
-					written += 1;
-					continue;
-				},
+			let Some(line) = child_transcript_line(message) else {
+				// A message that cannot serialize is unrecoverable by retrying:
+				// count it so the caller retries from the next index.
+				written += 1;
+				continue;
 			};
 			if let Err(error) = writeln!(file, "{line}") {
 				eprintln!(
@@ -2776,6 +2785,109 @@ impl Supervisor {
 			written += 1;
 		}
 		written
+	}
+
+	/// Read the initial autoload/prompt prefix of a child's on-disk transcript.
+	///
+	/// Stops before the first assistant/tool turn even when `limit` reaches into
+	/// it: a revived journal's base spans the whole conversation, and prepending
+	/// old assistant/tool turns would duplicate them during a rewrite.
+	pub fn child_transcript_prefix(
+		&self,
+		id: &str,
+		limit: usize,
+	) -> std::io::Result<Vec<Message>> {
+		let Some(path) = self.child_session_file(id) else {
+			return Ok(Vec::new());
+		};
+		let file = match std::fs::File::open(&path) {
+			Ok(file) => file,
+			// A missing file has no prefix yet; any other open error must fail
+			// closed so a rewrite cannot erase history it failed to read.
+			Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+			Err(error) => return Err(error),
+		};
+		let mut prefix = Vec::new();
+		for line in BufReader::new(file).lines() {
+			if prefix.len() >= limit {
+				break;
+			}
+			let line = line.map_err(|error| {
+				std::io::Error::new(
+					std::io::ErrorKind::InvalidData,
+					format!("cannot read child transcript {}: {error}", path.display()),
+				)
+			})?;
+			let line = line.trim();
+			if line.is_empty() {
+				continue;
+			}
+			let value: serde_json::Value = serde_json::from_str(line).map_err(|error| {
+				std::io::Error::new(
+					std::io::ErrorKind::InvalidData,
+					format!("cannot parse child transcript {}: {error}", path.display()),
+				)
+			})?;
+			let candidate = value.get("message").cloned().unwrap_or(value);
+			let message: Message = serde_json::from_value(candidate).map_err(|error| {
+				std::io::Error::new(
+					std::io::ErrorKind::InvalidData,
+					format!("cannot decode child transcript {}: {error}", path.display()),
+				)
+			})?;
+			// The prefix is only the initial system/autoload/prompt segment.
+			// A revived journal's `base` spans the whole conversation, so
+			// stopping here is what keeps old assistant/tool turns and a
+			// synthetic compaction summary from being re-prepended.
+			if message.content.starts_with(COMPACTION_NOTICE_PREFIX)
+				|| matches!(message.role, Role::Assistant | Role::Tool)
+			{
+				break;
+			}
+			prefix.push(message);
+		}
+		Ok(prefix)
+	}
+
+	/// Replace a child's transcript with `messages`, atomically.
+	///
+	/// Content-only compaction rewrites have no append-only representation: the
+	/// revised tool output must replace the line already on disk or a revived
+	/// child would replay the stale text. A temporary file in the same directory
+	/// is renamed over the original only after every line serialized.
+	pub fn rewrite_child_transcript(&self, id: &str, messages: &[&Message]) -> usize {
+		let Some(path) = self.child_session_file(id) else {
+			eprintln!("warning: no child session file for {id}; transcript rewrite skipped");
+			return 0;
+		};
+		let mut contents = String::new();
+		for message in messages {
+			let Some(line) = child_transcript_line(message) else {
+				return 0;
+			};
+			contents.push_str(&line);
+			contents.push('\n');
+		}
+		let temp = path.with_extension(format!("jsonl.tmp-{}", std::process::id()));
+		let write = (|| -> std::io::Result<()> {
+			let mut file = std::fs::OpenOptions::new()
+				.write(true)
+				.create(true)
+				.truncate(true)
+				.open(&temp)?;
+			file.write_all(contents.as_bytes())?;
+			file.sync_all()?;
+			std::fs::rename(&temp, &path)
+		})();
+		if let Err(error) = write {
+			let _ = std::fs::remove_file(&temp);
+			eprintln!(
+				"warning: cannot rewrite child transcript {}: {error}",
+				path.display()
+			);
+			return 0;
+		}
+		messages.len()
 	}
 
 	fn allocate_child_session(&self, id: &str) -> Option<PathBuf> {

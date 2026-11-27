@@ -3647,6 +3647,8 @@ impl RpcSession {
 				kept: Vec::new(),
 				synthetic: vec![synthetic_val],
 				anchor: None,
+				rewrites: Default::default(),
+				preserve_branch: false,
 			};
 			first_kept = self
 				.store

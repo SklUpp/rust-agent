@@ -5,7 +5,7 @@ use tokio::sync::{mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 
 use crate::{
-	compaction::{CompactionReport, Compactor},
+	compaction::{CompactionOptions, CompactionOutcome, CompactionReport, Compactor},
 	delivery::BackgroundResultSink,
 	durable::{
 		DURABILITY_ADMISSION_FAILURE_CODE, DURABILITY_FAILURE_CODE, DURABILITY_UNKNOWN_OUTCOME_CODE,
@@ -866,6 +866,9 @@ pub struct AgentLoop {
 	/// after a prune, with the index mapping it applied. Owners journal there,
 	/// so a compaction can only drop turns that are already on disk.
 	turn_observer: Option<TurnObserver>,
+	/// Compaction policy for this run: recent-token floor, supersede/shake
+	/// passes, and the soft-cut fallback. Hosts replace it from settings.
+	compaction: CompactionOptions,
 	/// Boot nanos for stream-attempt identity (`{boot_nanos}-{counter}`).
 	/// Attempts stay unique across process restarts reusing a branch, so a
 	/// new stream can never alias a recovered fragment's attempt.
@@ -878,13 +881,41 @@ pub struct AgentLoop {
 
 /// Host hook for [`AgentLoop::with_turn_observer`].
 ///
-/// `prune` is `Some` only for the call right after [`Compactor::compact_report`]
-/// rewrote the conversation: the messages are the compacted ones and the owner
-/// must remap its write cursor with [`CompactionReport::remap`].
+/// `flush` is called at every turn boundary and, after a prune, with the
+/// compaction report: the messages are the compacted ones and the owner must
+/// remap its write cursor with [`CompactionReport::remap`].
 ///
 /// The return value is durability: `false` means accepted messages are not yet
 /// on disk, so the loop must not compact (an unwritten turn would be lost).
-pub type TurnObserver = Arc<dyn Fn(&[Message], Option<CompactionReport>) -> bool + Send + Sync>;
+pub trait TurnObserverHook: Send + Sync {
+	fn flush(&self, messages: &[Message], prune: Option<CompactionReport>) -> bool;
+
+	/// Persist in-place tool-result rewrites that carried no soft-cut report.
+	///
+	/// The default is honest for observers that only append: they have no way
+	/// to rewrite already-journaled lines and the loop's durable boundary is
+	/// expected to handle its own copy.
+	fn compacted_rewrites(
+		&self,
+		messages: &[Message],
+		prune: Option<CompactionReport>,
+		_rewritten_indices: &[usize],
+	) -> bool {
+		// Append-only observers still need the soft-cut cursor remap.
+		self.flush(messages, prune)
+	}
+}
+
+impl<F> TurnObserverHook for F
+where F: Fn(&[Message], Option<CompactionReport>) -> bool + Send + Sync
+{
+	fn flush(&self, messages: &[Message], prune: Option<CompactionReport>) -> bool {
+		self(messages, prune)
+	}
+}
+
+/// Shared hook installed on an [`AgentLoop`].
+pub type TurnObserver = Arc<dyn TurnObserverHook>;
 
 impl AgentLoop {
 	pub fn new(
@@ -911,6 +942,7 @@ impl AgentLoop {
 			assistant_guard: None,
 			hooks: None,
 			turn_observer: None,
+			compaction: CompactionOptions::default(),
 			stream_boot_nanos: std::time::SystemTime::now()
 				.duration_since(std::time::UNIX_EPOCH)
 				.map(|d| d.as_nanos() as u64)
@@ -944,6 +976,7 @@ impl AgentLoop {
 			assistant_guard: None,
 			hooks: None,
 			turn_observer: None,
+			compaction: CompactionOptions::default(),
 			stream_boot_nanos: std::time::SystemTime::now()
 				.duration_since(std::time::UNIX_EPOCH)
 				.map(|d| d.as_nanos() as u64)
@@ -1055,6 +1088,14 @@ impl AgentLoop {
 	#[must_use]
 	pub fn with_turn_observer(mut self, observer: Option<TurnObserver>) -> Self {
 		self.turn_observer = observer;
+		self
+	}
+
+	/// Replace the compaction policy for this run (settings-derived thresholds
+	/// and passes). Defaults keep the donor's recent-token floor and shake step.
+	#[must_use]
+	pub fn with_compaction(mut self, compaction: CompactionOptions) -> Self {
+		self.compaction = compaction;
 		self
 	}
 
@@ -1183,16 +1224,16 @@ impl AgentLoop {
 			.map_err(AgentError::from)
 	}
 
-	async fn compact_conversation(
+	async fn persist_compaction(
 		&self,
 		messages: &[Message],
-		report: &CompactionReport,
+		outcome: &CompactionOutcome,
 	) -> Result<(), AgentError> {
 		let Some(durable) = &self.durable else {
 			return Ok(());
 		};
 		durable
-			.compacted(messages, report)
+			.compacted_rewrites(messages, outcome.report.as_ref(), &outcome.rewritten_indices)
 			.await
 			.map_err(AgentError::from)
 	}
@@ -1506,24 +1547,40 @@ impl AgentLoop {
 			let durable = self
 				.turn_observer
 				.as_ref()
-				.is_none_or(|observer| observer(&state.messages, None));
-			if durable {
+				.is_none_or(|observer| observer.flush(&state.messages, None));
+			if durable && self.compaction.enabled && self.compaction.mid_turn_enabled {
 				let model = self.provider.model().unwrap_or("");
-				let (compacted, report) = Compactor::compact_report_for_model(
-					model,
-					&state.messages,
-					context_limit,
-					MIN_RECENT_MESSAGES,
-				);
+				let options = CompactionOptions {
+					min_recent_messages: MIN_RECENT_MESSAGES,
+					..self.compaction.clone()
+				};
+				let (compacted, outcome) =
+					Compactor::compact_outcome_for_model_with_options(
+						model,
+						&state.messages,
+						context_limit,
+						&options,
+					);
 				state.messages = compacted;
 				// The rewrite is destructive even though its input is durable: the
 				// owner must remap its write cursor to the new index space, never
-				// infer the rewrite from lengths (they can match again).
-				if let (Some(observer), Some(report)) = (&self.turn_observer, report) {
-					observer(&state.messages, Some(report));
+				// infer the rewrite from lengths (they can match again). Content-only
+				// rewrites carry no report but still need journaling.
+				if let Some(observer) = &self.turn_observer
+					&& (outcome.report.is_some() || !outcome.rewritten_indices.is_empty())
+					&& !observer.compacted_rewrites(
+						&state.messages,
+						outcome.report,
+						&outcome.rewritten_indices,
+					)
+				{
+					eprintln!(
+						"warning: compaction rewrite was not durable; the owner must retry it \
+						 before the next destructive pass"
+					);
 				}
-				if let Some(report) = report.as_ref() {
-					self.compact_conversation(&state.messages, report).await?;
+				if outcome.report.is_some() || !outcome.rewritten_indices.is_empty() {
+					self.persist_compaction(&state.messages, &outcome).await?;
 				}
 			}
 

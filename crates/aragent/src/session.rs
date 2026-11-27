@@ -5331,9 +5331,14 @@ fn fork_durable_atomic(db_path: &Path, source_id: &str, new_cwd: Option<&Path>, 
 	let mut projected_entries = Vec::new();
 	let mut synthetic_messages = Vec::new();
 	if let Some(projection) = &snapshot.projection {
-		for synthetic in &projection.synthetic { synthetic_messages.push(serde_json::from_value::<pi_agent::Message>(synthetic.clone()).map_err(|error| format!("cannot fork session {source_id}: invalid synthetic projection: {error}"))?); }
-		let by_id: HashMap<&str, &crate::session_store::MessageRecord> = snapshot.session_messages.iter().map(|row| (row.id.as_str(), row)).collect();
-		for id in &projection.kept { let row = by_id.get(id.as_str()).ok_or_else(|| format!("cannot fork session {source_id}: projection references missing message {id}"))?; let entry: SessionEntry = serde_json::from_value(row.payload.clone()).map_err(|error| format!("cannot fork session {source_id}: invalid projected entry {id}: {error}"))?; if entry.kind == "message" { projected_entries.push(serde_json::from_value::<MessageEntry>(row.payload.clone()).map_err(|error| format!("cannot fork session {source_id}: invalid projected message {id}: {error}"))?); } }
+		if projection.preserve_branch {
+			for row in &snapshot.branch_messages { let entry: SessionEntry = serde_json::from_value(row.payload.clone()).map_err(|error| format!("cannot fork session {source_id}: invalid entry {}: {error}", row.id))?; if entry.kind == "message" { projected_entries.push(serde_json::from_value::<MessageEntry>(row.payload.clone()).map_err(|error| format!("cannot fork session {source_id}: invalid message {}: {error}", row.id))?); } }
+			crate::durable_session::apply_projection_rewrites(&mut projected_entries, &projection.rewrites);
+		} else {
+			for synthetic in &projection.synthetic { synthetic_messages.push(serde_json::from_value::<pi_agent::Message>(synthetic.clone()).map_err(|error| format!("cannot fork session {source_id}: invalid synthetic projection: {error}"))?); }
+			let by_id: HashMap<&str, &crate::session_store::MessageRecord> = snapshot.session_messages.iter().map(|row| (row.id.as_str(), row)).collect();
+			for id in &projection.kept { let row = by_id.get(id.as_str()).ok_or_else(|| format!("cannot fork session {source_id}: projection references missing message {id}"))?; let entry: SessionEntry = serde_json::from_value(row.payload.clone()).map_err(|error| format!("cannot fork session {source_id}: invalid projected entry {id}: {error}"))?; if entry.kind == "message" { projected_entries.push(serde_json::from_value::<MessageEntry>(row.payload.clone()).map_err(|error| format!("cannot fork session {source_id}: invalid projected message {id}: {error}"))?); } }
+		}
 	} else {
 		for row in &snapshot.branch_messages { let entry: SessionEntry = serde_json::from_value(row.payload.clone()).map_err(|error| format!("cannot fork session {source_id}: invalid entry {}: {error}", row.id))?; if entry.kind == "message" { projected_entries.push(serde_json::from_value::<MessageEntry>(row.payload.clone()).map_err(|error| format!("cannot fork session {source_id}: invalid message {}: {error}", row.id))?); } }
 	}
@@ -5362,7 +5367,7 @@ fn fork_durable_atomic(db_path: &Path, source_id: &str, new_cwd: Option<&Path>, 
 		}
 		NewMessage { id, session_id: new_id.clone(), branch_id: branch_map[&m.branch_id].clone(), parent_message_id: m.parent_message_id.as_ref().map(|id| remap(id)), payload }
 	}).collect();
-	let projection = snapshot.projection.map(|mut p| { p.kept = p.kept.into_iter().map(|id| remap(&id)).collect(); p.anchor = p.anchor.map(|id| remap(&id)); p });
+	let projection = snapshot.projection.map(|mut p| { p.kept = p.kept.into_iter().map(|id| remap(&id)).collect(); p.anchor = p.anchor.map(|id| remap(&id)); p.rewrites = p.rewrites.into_iter().map(|(id, content)| (remap(&id), content)).collect(); p });
 	let active_branch_id = branch_map[&snapshot.branch_id].clone();
 	let active_leaf_message_id = effective_leaf.as_ref().map(|id| remap(id));
 	let mut fork_provenance = Vec::new();

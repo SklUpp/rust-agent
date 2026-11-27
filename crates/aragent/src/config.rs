@@ -595,6 +595,282 @@ impl EvalConfig {
 	}
 }
 
+/// `compaction.thresholdTokens` value with the donor's explicit `-1` sentinel.
+///
+/// `Auto` and absent are deliberately distinct: an overlay must be able to
+/// reset an inherited fixed threshold to the reserve/percentage path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ThresholdTokens {
+	/// Explicit `-1`: use `thresholdPercent` or the reserve fallback.
+	Auto,
+	/// Positive fixed token limit (non-positive values behave as auto).
+	Fixed(usize),
+}
+
+/// `compaction.*` settings group: when maintenance runs and which local passes
+/// execute. Mirrors `packages/agent/src/compaction/compaction.ts`
+/// (`CompactionSettings`, `DEFAULT_COMPACTION_SETTINGS`) and the settings
+/// schema paths in `settings-schema.snapshot.json`.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct CompactionConfig {
+	/// `compaction.enabled`; absent means [`Self::DEFAULT_ENABLED`].
+	pub enabled: Option<bool>,
+	/// `compaction.midTurnEnabled`; absent means true.
+	pub mid_turn_enabled: Option<bool>,
+	/// `compaction.methodOrder` raw names. Unknown methods stay here for
+	/// `auto_action`; [`Self::agent_compaction_options`] drops those this
+	/// crate cannot run.
+	pub method_order: Option<Vec<String>>,
+	/// `compaction.thresholdPercent`; `-1`/absent means the reserve-based
+	/// legacy behavior, matching the donor sentinel.
+	pub threshold_percent: Option<f64>,
+	/// `compaction.thresholdTokens`; positive values override the percentage.
+	/// `Some(Auto)` is the explicit `-1` sentinel and must survive merging.
+	pub threshold_tokens: Option<ThresholdTokens>,
+	/// `compaction.reserveTokens`; absent means [`Self::DEFAULT_RESERVE_TOKENS`].
+	pub reserve_tokens: Option<usize>,
+	/// `compaction.keepRecentTokens`; absent means 20 000.
+	pub keep_recent_tokens: Option<usize>,
+	/// `compaction.handoffSaveToDisk`.
+	pub handoff_save_to_disk: Option<bool>,
+	/// `compaction.remoteStreamingV2Enabled`.
+	pub remote_streaming_v2_enabled: Option<bool>,
+	/// `compaction.asyncEnabled`.
+	pub async_enabled: Option<bool>,
+	/// `compaction.autoContinue`.
+	pub auto_continue: Option<bool>,
+	/// `compaction.remoteEndpoint`.
+	pub remote_endpoint: Option<String>,
+	/// `compaction.v2RetainedMessageBudget`.
+	pub v2_retained_message_budget: Option<usize>,
+	/// `compaction.idleEnabled`.
+	pub idle_enabled: Option<bool>,
+	/// `compaction.idleThresholdTokens`.
+	pub idle_threshold_tokens: Option<usize>,
+	/// `compaction.idleTimeoutSeconds`.
+	pub idle_timeout_seconds: Option<u64>,
+	/// `compaction.supersedeReads`.
+	pub supersede_reads: Option<bool>,
+	/// `compaction.dropUseless`.
+	pub drop_useless: Option<bool>,
+}
+
+impl CompactionConfig {
+	/// Upstream `compaction.enabled` default.
+	pub const DEFAULT_ENABLED: bool = true;
+	/// Reserve applied when `compaction.reserveTokens` is unset
+	/// (`DEFAULT_RESERVE_TOKENS` in the donor).
+	pub const DEFAULT_RESERVE_TOKENS: usize = 16_384;
+	/// `compaction.keepRecentTokens` default.
+	pub const DEFAULT_KEEP_RECENT_TOKENS: usize = 20_000;
+	/// `compaction.idleTimeoutSeconds` default.
+	pub const DEFAULT_IDLE_TIMEOUT_SECONDS: u64 = 300;
+	/// `compaction.idleThresholdTokens` default.
+	pub const DEFAULT_IDLE_THRESHOLD_TOKENS: usize = 200_000;
+	/// Schema `compaction.methodOrder` default, base-first.
+	pub const DEFAULT_METHOD_ORDER: [&'static str; 5] =
+		["remote", "snapcompact", "handoff", "shake", "soft"];
+
+	#[must_use]
+	pub fn enabled(&self) -> bool {
+		self.enabled.unwrap_or(Self::DEFAULT_ENABLED)
+	}
+
+	#[must_use]
+	pub fn mid_turn_enabled(&self) -> bool {
+		self.mid_turn_enabled.unwrap_or(true)
+	}
+
+	#[must_use]
+	pub fn keep_recent_tokens(&self) -> usize {
+		self
+			.keep_recent_tokens
+			.unwrap_or(Self::DEFAULT_KEEP_RECENT_TOKENS)
+	}
+
+	#[must_use]
+	pub fn idle_timeout_seconds(&self) -> u64 {
+		self
+			.idle_timeout_seconds
+			.unwrap_or(Self::DEFAULT_IDLE_TIMEOUT_SECONDS)
+	}
+
+	#[must_use]
+	pub fn idle_threshold_tokens(&self) -> usize {
+		self
+			.idle_threshold_tokens
+			.unwrap_or(Self::DEFAULT_IDLE_THRESHOLD_TOKENS)
+	}
+
+	/// Positive fixed token threshold, or `None` for auto / sentinel `-1`.
+	#[must_use]
+	pub fn threshold_tokens(&self) -> Option<usize> {
+		match self.threshold_tokens {
+			Some(ThresholdTokens::Fixed(tokens)) if tokens > 0 => Some(tokens),
+			_ => None,
+		}
+	}
+
+	/// Positive percentage threshold, or `None` for the legacy reserve path
+	/// (`-1`, `0`, or absent, exactly like the donor).
+	#[must_use]
+	pub fn threshold_percent(&self) -> Option<f64> {
+		self
+			.threshold_percent
+			.filter(|percent| percent.is_finite() && *percent > 0.0)
+	}
+
+	/// Effective trigger threshold for a context window, ported from
+	/// `resolveThresholdTokens` (`compaction.ts`).
+	///
+	/// A fixed token limit wins and is clamped to `[1, window - 1]`. A positive
+	/// percentage is clamped to `[1, 99]` and floored. Otherwise the threshold
+	/// is the window minus the effective reserve: at least 15% of the window,
+	/// plus the configured floor (defaulting to 16 384 when unset), with the
+	/// donor's small-window recovery to the proportional reserve.
+	#[must_use]
+	pub fn resolve_threshold_tokens(&self, context_window: usize) -> usize {
+		if context_window == 0 {
+			return 0;
+		}
+		if let Some(tokens) = self.threshold_tokens() {
+			return tokens.max(1).min(context_window - 1);
+		}
+		if let Some(percent) = self.threshold_percent() {
+			let clamped = percent.clamp(1.0, 99.0);
+			return ((context_window as f64) * (clamped / 100.0)).floor() as usize;
+		}
+		// `floor(contextWindow * 0.15)`, clamped to >= 1 like the donor.
+		let proportional = (context_window.saturating_mul(15) / 100).max(1);
+		// Donor `effectiveReserveTokens`: at least 15% of the window, plus the
+		// configured floor (defaulting to `DEFAULT_RESERVE_TOKENS` when unset).
+		let configured = self.reserve_tokens.unwrap_or(Self::DEFAULT_RESERVE_TOKENS);
+		let reserve = configured.max(proportional);
+		let defaulted = self.reserve_tokens.is_none();
+		// Donor `resolveBudgetReserveTokens`: a defaulted reserve that leaves no
+		// practical prompt budget, or any reserve at/above the window, falls back
+		// to the proportional floor. Explicit reserves keep their provenance.
+		let impossible = defaulted && reserve >= context_window.saturating_sub(proportional);
+		let reserve = if impossible || reserve >= context_window {
+			proportional
+		} else {
+			reserve
+		};
+		context_window
+			.saturating_sub(reserve)
+			.min(context_window - 1)
+	}
+
+	/// Donor `shouldCompact`: enabled, a real window, and usage strictly above
+	/// the resolved threshold.
+	#[must_use]
+	pub fn should_compact(&self, context_tokens: usize, context_window: usize) -> bool {
+		self.enabled()
+			&& context_window > 0
+			&& context_tokens > self.resolve_threshold_tokens(context_window)
+	}
+
+	/// `"action"` value for `auto_compaction_start/end`. The default order
+	/// stays `"context-full"` (legacy payload); a configured first local method
+	/// names itself. `remote` is the context-full transport, not a new action.
+	#[must_use]
+	pub fn auto_action(&self) -> &str {
+		let Some(first) = self
+			.method_order
+			.as_deref()
+			.and_then(|order| order.first().map(String::as_str))
+		else {
+			return "context-full";
+		};
+		match first {
+			"remote" | "context-full" | "" => "context-full",
+			other => other,
+		}
+	}
+
+	/// Map settings onto the core compaction policy. Methods this crate cannot
+	/// run (`snapcompact`) are dropped; an explicitly empty order stays empty
+	/// so `compaction.methodOrder: []` disables local maintenance.
+	#[must_use]
+	pub fn agent_compaction_options(&self) -> pi_agent::compaction::CompactionOptions {
+		let defaults = pi_agent::compaction::CompactionOptions::default();
+		let method_order = match &self.method_order {
+			Some(order) => order
+				.iter()
+				.filter_map(|name| pi_agent::compaction::CompactionMethod::parse(name))
+				.collect(),
+			None => defaults.method_order,
+		};
+		pi_agent::compaction::CompactionOptions {
+			enabled: self.enabled(),
+			mid_turn_enabled: self.mid_turn_enabled(),
+			threshold_tokens: self.threshold_tokens(),
+			threshold_percent: self.threshold_percent(),
+			keep_recent_tokens: self.keep_recent_tokens(),
+			reserve_tokens: self
+				.reserve_tokens
+				.unwrap_or(Self::DEFAULT_RESERVE_TOKENS),
+			min_recent_messages: defaults.min_recent_messages,
+			prune_superseded_reads: self.supersede_reads.unwrap_or(true),
+			shake_tool_outputs: defaults.shake_tool_outputs,
+			shake_max_chars: defaults.shake_max_chars,
+			method_order,
+		}
+	}
+
+	fn merge(&mut self, overlay: Self) {
+		for (target, value) in [
+			(&mut self.enabled, overlay.enabled),
+			(&mut self.mid_turn_enabled, overlay.mid_turn_enabled),
+			(&mut self.handoff_save_to_disk, overlay.handoff_save_to_disk),
+			(
+				&mut self.remote_streaming_v2_enabled,
+				overlay.remote_streaming_v2_enabled,
+			),
+			(&mut self.async_enabled, overlay.async_enabled),
+			(&mut self.auto_continue, overlay.auto_continue),
+			(&mut self.idle_enabled, overlay.idle_enabled),
+			(&mut self.supersede_reads, overlay.supersede_reads),
+			(&mut self.drop_useless, overlay.drop_useless),
+		] {
+			if value.is_some() {
+				*target = value;
+			}
+		}
+		if overlay.threshold_tokens.is_some() {
+			self.threshold_tokens = overlay.threshold_tokens;
+		}
+		for (target, value) in [
+			(&mut self.reserve_tokens, overlay.reserve_tokens),
+			(&mut self.keep_recent_tokens, overlay.keep_recent_tokens),
+			(
+				&mut self.v2_retained_message_budget,
+				overlay.v2_retained_message_budget,
+			),
+			(
+				&mut self.idle_threshold_tokens,
+				overlay.idle_threshold_tokens,
+			),
+		] {
+			if value.is_some() {
+				*target = value;
+			}
+		}
+		if overlay.idle_timeout_seconds.is_some() {
+			self.idle_timeout_seconds = overlay.idle_timeout_seconds;
+		}
+		if overlay.method_order.is_some() {
+			self.method_order = overlay.method_order;
+		}
+		if overlay.remote_endpoint.is_some() {
+			self.remote_endpoint = overlay.remote_endpoint;
+		}
+		if overlay.threshold_percent.is_some() {
+			self.threshold_percent = overlay.threshold_percent;
+		}
+	}
+}
+
 /// `bash.*` / `bashInterceptor.*` settings groups.
 ///
 /// `bash.patterns` is an ordered array of `{match, approval}` rule objects;
@@ -1026,7 +1302,7 @@ impl StreamPartialDurabilityConfig {
 		}
 	}
 }
-#[derive(Clone, Default, PartialEq, Eq)]
+#[derive(Clone, Default, PartialEq)]
 pub struct Config {
 	pub default_model: Option<String>,
 	pub providers: BTreeMap<String, ProviderConfig>,
@@ -1087,6 +1363,8 @@ pub struct Config {
 	pub stream_partial: StreamPartialDurabilityConfig,
 	/// `eval.*` backend enablement and interpreter groups.
 	pub eval_config: EvalConfig,
+	/// `compaction.*` trigger thresholds and local method order.
+	pub compaction: CompactionConfig,
 	/// `bash.*` approval patterns and the dedicated-tool interceptor.
 	pub bash: BashConfig,
 	/// Trusted subprocess hooks from `config.yml` and Claude/Codex settings.
@@ -1438,6 +1716,7 @@ impl Config {
 			.merge(overlay.model_request_timeout);
 		self.stream_partial.merge(overlay.stream_partial);
 		self.eval_config.merge(overlay.eval_config);
+		self.compaction.merge(overlay.compaction);
 		self.bash.merge(overlay.bash);
 		self.hooks.merge(overlay.hooks);
 		// `searxng.*` merges per leaf so an explicit host overlay can add
@@ -2657,6 +2936,127 @@ fn apply_nested_settings(config: &mut Config, value: &Value, path: &Path) -> Res
 		config.eval_config.auto_background_threshold_ms =
 			expect_millis(threshold, "eval.autoBackground.thresholdMs", path)?;
 	}
+	if let Some(enabled) = settings_leaf(value, "compaction", "enabled", "compaction.enabled") {
+		config.compaction.enabled = expect_bool(enabled, "compaction.enabled", path)?;
+	}
+	if let Some(enabled) = settings_leaf(
+		value,
+		"compaction",
+		"midTurnEnabled",
+		"compaction.midTurnEnabled",
+	) {
+		config.compaction.mid_turn_enabled =
+			expect_bool(enabled, "compaction.midTurnEnabled", path)?;
+	}
+	if let Some(order) = settings_leaf(value, "compaction", "methodOrder", "compaction.methodOrder")
+	{
+		config.compaction.method_order =
+			Some(expect_list_of_text(order, "compaction.methodOrder", path)?);
+	}
+	if let Some(percent) =
+		settings_leaf(value, "compaction", "thresholdPercent", "compaction.thresholdPercent")
+	{
+		config.compaction.threshold_percent =
+			expect_f64(percent, "compaction.thresholdPercent", path)?;
+	}
+	if let Some(tokens) =
+		settings_leaf(value, "compaction", "thresholdTokens", "compaction.thresholdTokens")
+	{
+		config.compaction.threshold_tokens =
+			expect_threshold_tokens(tokens, "compaction.thresholdTokens", path)?;
+	}
+	if let Some(reserve) =
+		settings_leaf(value, "compaction", "reserveTokens", "compaction.reserveTokens")
+	{
+		config.compaction.reserve_tokens =
+			expect_usize(reserve, "compaction.reserveTokens", path)?;
+	}
+	if let Some(keep) = settings_leaf(
+		value,
+		"compaction",
+		"keepRecentTokens",
+		"compaction.keepRecentTokens",
+	) {
+		config.compaction.keep_recent_tokens =
+			expect_usize(keep, "compaction.keepRecentTokens", path)?;
+	}
+	for (key, field, dotted) in [
+		(
+			"handoffSaveToDisk",
+			&mut config.compaction.handoff_save_to_disk,
+			"compaction.handoffSaveToDisk",
+		),
+		(
+			"remoteStreamingV2Enabled",
+			&mut config.compaction.remote_streaming_v2_enabled,
+			"compaction.remoteStreamingV2Enabled",
+		),
+		(
+			"asyncEnabled",
+			&mut config.compaction.async_enabled,
+			"compaction.asyncEnabled",
+		),
+		(
+			"autoContinue",
+			&mut config.compaction.auto_continue,
+			"compaction.autoContinue",
+		),
+		(
+			"idleEnabled",
+			&mut config.compaction.idle_enabled,
+			"compaction.idleEnabled",
+		),
+		(
+			"supersedeReads",
+			&mut config.compaction.supersede_reads,
+			"compaction.supersedeReads",
+		),
+		(
+			"dropUseless",
+			&mut config.compaction.drop_useless,
+			"compaction.dropUseless",
+		),
+	] {
+		if let Some(value) = settings_leaf(value, "compaction", key, dotted) {
+			*field = expect_bool(value, dotted, path)?;
+		}
+	}
+	if let Some(endpoint) =
+		settings_leaf(value, "compaction", "remoteEndpoint", "compaction.remoteEndpoint")
+	{
+		config.compaction.remote_endpoint =
+			expect_text(endpoint, "compaction.remoteEndpoint", path)?
+				.filter(|value| !value.trim().is_empty());
+	}
+	for (key, field, dotted) in [
+		(
+			"v2RetainedMessageBudget",
+			&mut config.compaction.v2_retained_message_budget,
+			"compaction.v2RetainedMessageBudget",
+		),
+		(
+			"idleThresholdTokens",
+			&mut config.compaction.idle_threshold_tokens,
+			"compaction.idleThresholdTokens",
+		),
+	] {
+		if let Some(value) = settings_leaf(value, "compaction", key, dotted) {
+			*field = expect_usize(value, dotted, path)?;
+		}
+	}
+	if let Some(timeout) = settings_leaf(
+		value,
+		"compaction",
+		"idleTimeoutSeconds",
+		"compaction.idleTimeoutSeconds",
+	) {
+		config.compaction.idle_timeout_seconds = expect_f64(
+			timeout,
+			"compaction.idleTimeoutSeconds",
+			path,
+		)?
+		.map(|seconds| seconds.round().max(0.0) as u64);
+	}
 	if let Some(patterns) = settings_leaf(value, "bash", "patterns", "bash.patterns") {
 		config.bash.patterns = Some(parse_bash_patterns(patterns, path)?);
 	}
@@ -3351,7 +3751,49 @@ fn expect_usize(value: &Value, key: &str, path: &Path) -> Result<Option<usize>> 
 		Value::Int(value) => usize::try_from(*value)
 			.map(Some)
 			.map_err(|_| invalid(path, key, "expected a non-negative integer")),
+		Value::Float(value) if value.is_finite() && *value >= 0.0 => {
+			Ok(Some(value.round() as usize))
+		},
+		Value::Float(_) => Err(invalid(path, key, "expected a finite non-negative number")),
 		_ => Err(invalid(path, key, "expected an integer")),
+	}
+}
+
+/// `compaction.thresholdTokens`: a finite JSON number with the donor's `-1`
+/// auto sentinel preserved across layers. Fractions round to the nearest token.
+fn expect_threshold_tokens(
+	value: &Value,
+	key: &str,
+	path: &Path,
+) -> Result<Option<ThresholdTokens>> {
+	match value {
+		Value::Null => Ok(None),
+		Value::Int(-1) => Ok(Some(ThresholdTokens::Auto)),
+		Value::Int(value) if *value >= 0 => usize::try_from(*value)
+			.map(|tokens| Some(ThresholdTokens::Fixed(tokens)))
+			.map_err(|_| invalid(path, key, "expected a non-negative integer")),
+		Value::Int(_) => Err(invalid(path, key, "expected -1 or a non-negative integer")),
+		Value::Float(value) if value.is_finite() && *value == -1.0 => {
+			Ok(Some(ThresholdTokens::Auto))
+		},
+		Value::Float(value) if value.is_finite() && *value >= 0.0 => {
+			Ok(Some(ThresholdTokens::Fixed(value.round() as usize)))
+		},
+		Value::Float(_) => Err(invalid(path, key, "expected -1 or a finite non-negative number")),
+		_ => Err(invalid(path, key, "expected a number")),
+	}
+}
+
+/// Schema `number` leaves that may carry a fractional percentage. Integers and
+/// finite floats load; negative sentinels (`-1`) are preserved for callers to
+/// interpret exactly like the donor settings.
+fn expect_f64(value: &Value, key: &str, path: &Path) -> Result<Option<f64>> {
+	match value {
+		Value::Null => Ok(None),
+		Value::Int(value) => Ok(Some(*value as f64)),
+		Value::Float(value) if value.is_finite() => Ok(Some(*value)),
+		Value::Float(_) => Err(invalid(path, key, "expected a finite number")),
+		_ => Err(invalid(path, key, "expected a number")),
 	}
 }
 
@@ -4681,6 +5123,186 @@ mod tests {
 		// Dotted `tools.maxTimeout` is the schema path form of the nested key.
 		let dotted_timeout = parse_config("\"tools.maxTimeout\": 30\n").expect("dotted maxTimeout");
 		assert_eq!(dotted_timeout.max_tool_timeout_secs, Some(30));
+	}
+
+	#[test]
+	fn compaction_settings_parse_thresholds_and_method_order() {
+		let defaults = Config::default();
+		assert!(defaults.compaction.enabled());
+		assert!(defaults.compaction.mid_turn_enabled());
+		assert_eq!(defaults.compaction.keep_recent_tokens(), 20_000);
+		assert_eq!(
+			defaults.compaction.resolve_threshold_tokens(100_000),
+			100_000 - CompactionConfig::DEFAULT_RESERVE_TOKENS,
+			"absent percent/tokens uses the donor reserve path"
+		);
+		assert_eq!(
+			defaults.compaction.resolve_threshold_tokens(9_999),
+			9_999 - 1_499,
+			"proportional reserve floors like the donor"
+		);
+		assert_eq!(defaults.compaction.auto_action(), "context-full");
+		assert_eq!(defaults.compaction.idle_timeout_seconds(), 300);
+
+		let parsed = parse_config(concat!(
+			"compaction:\n",
+			"  enabled: false\n",
+			"  midTurnEnabled: false\n",
+			"  methodOrder: [shake, soft, snapcompact]\n",
+			"  thresholdPercent: 87.5\n",
+			"  thresholdTokens: 50000\n",
+			"  reserveTokens: 1000\n",
+			"  keepRecentTokens: 1234\n",
+			"  idleEnabled: true\n",
+			"  idleThresholdTokens: 100000\n",
+			"  idleTimeoutSeconds: 45\n",
+			"  supersedeReads: false\n",
+			"  dropUseless: false\n",
+			"  handoffSaveToDisk: true\n",
+			"  asyncEnabled: false\n",
+			"  autoContinue: false\n",
+			"  v2RetainedMessageBudget: 9000\n",
+			"  remoteEndpoint: https://compact.example.test\n",
+		))
+		.expect("compaction settings");
+		assert!(!parsed.compaction.enabled());
+		assert!(!parsed.compaction.mid_turn_enabled());
+		assert_eq!(parsed.compaction.threshold_percent, Some(87.5));
+		assert_eq!(parsed.compaction.threshold_tokens(), Some(50_000));
+		assert_eq!(
+			parsed.compaction.resolve_threshold_tokens(100_000),
+			50_000,
+			"fixed tokens win over percent"
+		);
+		assert_eq!(parsed.compaction.keep_recent_tokens(), 1234);
+		assert_eq!(parsed.compaction.idle_timeout_seconds(), 45);
+		assert_eq!(parsed.compaction.idle_threshold_tokens(), 100_000);
+		assert_eq!(parsed.compaction.auto_action(), "shake");
+		assert_eq!(
+			parsed.compaction.handoff_save_to_disk,
+			Some(true)
+		);
+		assert_eq!(parsed.compaction.v2_retained_message_budget, Some(9_000));
+		assert_eq!(
+			parsed.compaction.remote_endpoint.as_deref(),
+			Some("https://compact.example.test")
+		);
+		let options = parsed.compaction.agent_compaction_options();
+		assert!(!options.enabled);
+		assert!(!options.mid_turn_enabled);
+		assert_eq!(options.threshold_tokens, Some(50_000));
+		assert_eq!(options.threshold_percent, Some(87.5));
+		assert_eq!(options.keep_recent_tokens, 1234);
+		assert_eq!(options.reserve_tokens, 1000);
+		assert!(!options.prune_superseded_reads);
+		assert_eq!(
+			options.method_order,
+			vec![
+				pi_agent::compaction::CompactionMethod::Shake,
+				pi_agent::compaction::CompactionMethod::Soft,
+			],
+			"unknown methods are dropped for the local engine"
+		);
+
+		// Donor sentinels: `-1` means fall back to the percentage/reserve path
+		// rather than a literal negative threshold.
+		let sentinels = parse_config(concat!(
+			"compaction:\n",
+			"  thresholdPercent: -1\n",
+			"  thresholdTokens: -1\n",
+		))
+		.expect("sentinel thresholds");
+		assert_eq!(sentinels.compaction.threshold_percent(), None);
+		assert_eq!(sentinels.compaction.threshold_tokens(), None);
+		assert_eq!(
+			sentinels.compaction.resolve_threshold_tokens(100_000),
+			100_000 - CompactionConfig::DEFAULT_RESERVE_TOKENS
+		);
+
+	// Dotted schema paths and per-layer merge work like every other group.
+		let dotted = parse_config(concat!(
+			"\"compaction.thresholdPercent\": 50\n",
+			"\"compaction.keepRecentTokens\": 777\n",
+		))
+		.expect("dotted compaction");
+		assert_eq!(
+			dotted.compaction.resolve_threshold_tokens(100_000),
+			50_000
+		);
+		assert_eq!(dotted.compaction.keep_recent_tokens(), 777);
+		let mut layered = parse_config("compaction:\n  enabled: true\n  reserveTokens: 2000\n")
+			.expect("base");
+		layered.merge(
+			parse_config("compaction:\n  thresholdPercent: 60\n").expect("overlay"),
+		);
+		assert!(layered.compaction.enabled());
+		assert_eq!(layered.compaction.reserve_tokens, Some(2000));
+		assert_eq!(layered.compaction.threshold_percent, Some(60.0));
+
+		for text in [
+			"compaction:\n  enabled: yes\n",
+			"compaction:\n  thresholdPercent: soon\n",
+			"compaction:\n  methodOrder: shake\n",
+		] {
+			let error = parse_config(text).expect_err(text);
+			assert!(error.to_string().contains("test.yml"), "{error}");
+		}
+	}
+
+	#[test]
+	fn threshold_auto_sentinel_resets_inherited_layer_and_fractional_idle_loads() {
+		let mut layered = parse_config("compaction:\n  thresholdTokens: 50000\n")
+			.expect("fixed base");
+		layered.merge(
+			parse_config("compaction:\n  thresholdTokens: -1\n").expect("-1 overlay"),
+		);
+		assert_eq!(
+			layered.compaction.threshold_tokens,
+			Some(ThresholdTokens::Auto),
+			"explicit -1 must overwrite an inherited fixed threshold"
+		);
+		assert_eq!(layered.compaction.threshold_tokens(), None);
+		assert_eq!(
+			layered.compaction.resolve_threshold_tokens(100_000),
+			100_000 - CompactionConfig::DEFAULT_RESERVE_TOKENS,
+			"reset layer falls back to the reserve path"
+		);
+		layered.merge(parse_config("compaction:\n  enabled: true\n").expect("unrelated overlay"));
+		assert_eq!(
+			layered.compaction.threshold_tokens,
+			Some(ThresholdTokens::Auto),
+			"an overlay without thresholdTokens keeps the sentinel"
+		);
+
+		let fractional = parse_config("compaction:\n  idleTimeoutSeconds: 1.5\n")
+			.expect("fractional idle timeout");
+		assert_eq!(
+			fractional.compaction.idle_timeout_seconds,
+			Some(2),
+			"fractional seconds round to a whole second"
+		);
+		let token_fractions = parse_config(concat!(
+			"compaction:\n",
+			"  reserveTokens: 1.5\n",
+			"  keepRecentTokens: 2.5\n",
+			"  v2RetainedMessageBudget: 3.5\n",
+			"  idleThresholdTokens: 4.5\n",
+		))
+		.expect("fractional token settings");
+		assert_eq!(token_fractions.compaction.reserve_tokens, Some(2));
+		assert_eq!(token_fractions.compaction.keep_recent_tokens, Some(3));
+		assert_eq!(
+			token_fractions.compaction.v2_retained_message_budget,
+			Some(4)
+		);
+		assert_eq!(token_fractions.compaction.idle_threshold_tokens, Some(5));
+		for text in [
+			"compaction:\n  thresholdTokens: -2\n",
+			"compaction:\n  idleTimeoutSeconds: 1e999\n",
+		] {
+			let error = parse_config(text).expect_err(text);
+			assert!(error.to_string().contains("test.yml"), "{error}");
+		}
 	}
 
 	#[test]

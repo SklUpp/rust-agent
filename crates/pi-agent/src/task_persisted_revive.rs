@@ -419,6 +419,12 @@ pub struct RevivedChild {
 	/// True when this loop already owns a durable child boundary; the actor must
 	/// not add a second JSONL journal in that case.
 	pub durable:   bool,
+	/// A handover whose previous journal still had a rewrite pending on disk.
+	/// The next actor marks its fresh journal dirty so its first flush retries.
+	pub pending_rewrite: bool,
+	/// Current message indices of the persisted prefix, carried across a live
+	/// handover so the next journal does not re-derive them from content.
+	pub prefix_positions: Option<Vec<Option<usize>>>,
 }
 
 /// Fail closed unless a durable contract carries an epoch its supervisor can
@@ -780,6 +786,8 @@ impl PersistedChildReviverFactory for DefaultPersistedReviverFactory {
 			agent,
 			contract: effective_contract,
 			durable,
+			pending_rewrite: false,
+			prefix_positions: None,
 			state: AgentState {
 				messages:    replayed,
 				total_turns: replayed_turns,

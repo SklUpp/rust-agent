@@ -452,7 +452,7 @@ impl CheckpointHost {
 			.iter()
 			.map(|message| (message.id.as_str(), message))
 			.collect();
-		if let Some(projection) = store.projection() {
+		if let Some(projection) = store.projection().filter(|projection| !projection.preserve_branch) {
 			// The selected compacted view: synthetic runtime-only notices plus
 			// the retained archive rows, in projection order. The original
 			// system prompt is re-injected by the runner.
@@ -473,6 +473,10 @@ impl CheckpointHost {
 				};
 				entries.push((*entry).clone());
 			}
+			crate::durable_session::apply_projection_rewrites(
+				&mut entries,
+				&projection.rewrites,
+			);
 			messages.extend(
 				crate::runtime::history_messages_from_entries(&entries)
 					.map_err(|error| error.to_string())?,
@@ -482,6 +486,18 @@ impl CheckpointHost {
 		let mut messages = Vec::new();
 		let mut run: Vec<MessageEntry> = Vec::new();
 		let mut emitted: std::collections::HashSet<&str> = std::collections::HashSet::new();
+		let rewrites = store
+			.projection()
+			.map(|projection| projection.rewrites.clone())
+			.unwrap_or_default();
+		let rewrite_entry = |entry: &MessageEntry| {
+			let mut entry = entry.clone();
+			crate::durable_session::apply_projection_rewrites(
+				std::slice::from_mut(&mut entry),
+				&rewrites,
+			);
+			entry
+		};
 		let branch = store.branch_entries();
 		for (index, entry) in branch.iter().enumerate() {
 			if entry.kind == "message" {
@@ -494,6 +510,7 @@ impl CheckpointHost {
 				if !emitted.insert(message.id.as_str()) {
 					continue;
 				}
+				let message = rewrite_entry(message);
 				if message.message.role == "developer" {
 					// Host-injected guidance is not a user turn: keep it verbatim
 					// so later requests still carry the plan reminder.
@@ -504,11 +521,15 @@ impl CheckpointHost {
 					}
 					continue;
 				}
-				run.push((*message).clone());
+				let is_assistant = message.message.role == "assistant";
+				run.push(message);
 				// Same assistant batch, sibling results are not branch
 				// ancestors; replay them right after the call message.
-				if message.message.role == "assistant" {
-					let parts = message.message.content.parts();
+				if is_assistant {
+					let Some(original) = by_id.get(entry.id.as_str()) else {
+						continue;
+					};
+					let parts = original.message.content.parts();
 					let call_ids: std::collections::HashSet<String> = parts
 						.iter()
 						.filter(|part| part.kind == "toolCall")
@@ -529,11 +550,11 @@ impl CheckpointHost {
 							&& crate::session::chains_to_assistant(
 								&by_id,
 								sibling.parent_id.as_deref(),
-								message.id.as_str(),
+								original.id.as_str(),
 							)
 					}) {
 						if emitted.insert(sibling.id.as_str()) {
-							run.push(sibling.clone());
+							run.push(rewrite_entry(sibling));
 						}
 					}
 				}

@@ -2322,6 +2322,7 @@ impl AgentRunner for PiAgentRunner {
 		let session_hooks = request.approvals.hooks();
 		let mut agent = AgentLoop::with_approver(config, provider, registry, approvals)
 			.with_hooks(session_hooks.clone())
+			.with_compaction(request.config.compaction.agent_compaction_options())
 			.with_plan(request.plan_mode.guard.clone())
 			.with_conflicts(Some(Arc::clone(&session.conflicts)))
 			.with_shell(Some(Arc::clone(&session.shell)))
@@ -4232,6 +4233,7 @@ async fn run_advisor_call(
 		prompt:    spec.prompt.clone(),
 	});
 	let agent = AgentLoop::with_approver(config, provider, registry, approvals)
+		.with_compaction(spec.config.compaction.agent_compaction_options())
 		.with_assistant_guard(Some(assistant_guard));
 	let loop_config = spec.config.tool_call_loop_guard.clone();
 	let (steer_tx, mut steer_rx) = tokio::sync::mpsc::channel(16);

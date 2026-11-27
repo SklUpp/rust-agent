@@ -112,6 +112,27 @@ pub trait DurableBoundary: Send + Sync + std::fmt::Debug {
 		report: &CompactionReport,
 	) -> Result<(), DurableError>;
 
+	/// Persist compaction that may have rewritten tool results in place.
+	///
+	/// `rewritten_indices` name final tool-result positions whose content was
+	/// replaced by supersede pruning or shake, with no message added or removed
+	/// relative to the index mapping `report` describes. Boundaries that only
+	/// understand soft cuts use the default: defer to [`Self::compacted`] when a
+	/// report exists, otherwise persist nothing.
+	async fn compacted_rewrites(
+		&self,
+		messages: &[Message],
+		report: Option<&CompactionReport>,
+		rewritten_indices: &[usize],
+	) -> Result<(), DurableError> {
+		if let Some(report) = report {
+			self.compacted(messages, report).await
+		} else {
+			let _ = rewritten_indices;
+			Ok(())
+		}
+	}
+
 	/// The host replaced the live conversation from durable state (checkpoint
 	/// rewind / branch cut). Re-anchor the cursor; do not append a second copy.
 	async fn resync_messages(&self, messages: &[Message]) -> Result<(), DurableError>;

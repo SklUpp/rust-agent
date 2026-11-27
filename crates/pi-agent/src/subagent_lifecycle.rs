@@ -347,9 +347,14 @@ pub struct TranscriptJournal {
 	child_id:   String,
 	/// Conversation index where the accepted tail starts on the first flush,
 	/// before the loop may insert a system message at index 0.
-	base:       usize,
-	had_system: bool,
-	written:    Mutex<Option<usize>>,
+	base:            usize,
+	had_system:      bool,
+	written:         Mutex<Option<usize>>,
+	/// Current message indices of the persisted initial prefix. `None` entries
+	/// were dropped by a soft cut; surviving entries must not be re-appended.
+	prefix_positions: Mutex<Option<Vec<Option<usize>>>>,
+	/// A prior rewrite reached memory but not disk; the next flush retries it.
+	pending_rewrite: Mutex<bool>,
 }
 
 impl TranscriptJournal {
@@ -360,7 +365,91 @@ impl TranscriptJournal {
 		base: usize,
 		had_system: bool,
 	) -> Self {
-		Self { supervisor, child_id, base, had_system, written: Mutex::new(None) }
+		Self {
+			supervisor,
+			child_id,
+			base,
+			had_system,
+			written: Mutex::new(None),
+			prefix_positions: Mutex::new(None),
+			pending_rewrite: Mutex::new(false),
+		}
+	}
+
+	/// Whether a previous rewrite is still waiting to reach disk.
+	pub fn pending_rewrite(&self) -> bool {
+		*lock(&self.pending_rewrite)
+	}
+
+	/// Carry a pending rewrite across a live handover into a fresh journal.
+	pub fn mark_pending_rewrite(&self) {
+		*lock(&self.pending_rewrite) = true;
+	}
+
+	/// Current indices of the persisted prefix, for a live handover.
+	pub fn prefix_positions(&self) -> Option<Vec<Option<usize>>> {
+		lock(&self.prefix_positions).clone()
+	}
+
+	/// Resume a handover without re-deriving prefix positions from content.
+	pub fn set_prefix_positions(&self, positions: Option<Vec<Option<usize>>>) {
+		*lock(&self.prefix_positions) = positions;
+	}
+
+	fn initialize_prefix_positions(&self, messages: &[Message]) -> bool {
+		if lock(&self.prefix_positions).is_some() {
+			return true;
+		}
+		let start = crate::tools::task::journal_start(messages, self.base, self.had_system);
+		let skip = start.saturating_sub(self.base);
+		let prefix_len = match self.supervisor.child_transcript_prefix(&self.child_id, self.base) {
+			Ok(prefix) => prefix.len(),
+			Err(error) => {
+				eprintln!(
+					"warning: cannot read child transcript prefix for {}: {error}; \
+					 refusing compaction",
+					self.child_id
+				);
+				return false;
+			},
+		};
+		if skip.saturating_add(prefix_len) > messages.len() {
+			eprintln!(
+				"warning: child transcript prefix for {} does not fit its conversation; \
+				 refusing compaction",
+				self.child_id
+			);
+			return false;
+		}
+		*lock(&self.prefix_positions) = Some(
+			(0..prefix_len)
+				.map(|offset| Some(skip + offset))
+				.collect(),
+		);
+		true
+	}
+
+	fn remap_prefix_positions(&self, report: &CompactionReport) {
+		let mut guard = lock(&self.prefix_positions);
+		let Some(positions) = guard.as_mut() else {
+			return;
+		};
+		for position in positions.iter_mut() {
+			let current = *position;
+			*position = current.and_then(|index| {
+				if index < report.leading_system {
+					Some(index)
+				} else if index < report.kept_from {
+					None
+				} else {
+					Some(
+						report
+							.kept_at
+							.saturating_add(index - report.kept_from),
+					)
+				}
+			});
+		}
 	}
 
 	/// Append every accepted message not yet on disk, or remap the cursor after
@@ -371,11 +460,31 @@ impl TranscriptJournal {
 	/// (compaction) that would drop an unwritten message; the next call retries
 	/// from that index.
 	pub fn flush(&self, messages: &[Message], prune: Option<CompactionReport>) -> bool {
+		if let Some(report) = prune {
+			self.remap_prefix_positions(&report);
+		} else if !self.initialize_prefix_positions(messages) {
+			return false;
+		}
+		let retried = if *lock(&self.pending_rewrite) {
+			if !self.persist_rewrites(messages) {
+				eprintln!(
+					"warning: child transcript for {} still holds stale tool output; \
+					 retrying at the next flush",
+					self.child_id
+				);
+				return false;
+			}
+			*lock(&self.pending_rewrite) = false;
+			true
+		} else {
+			false
+		};
 		let mut cursor = lock(&self.written);
 		if let Some(report) = prune {
 			// The pre-compaction call journaled the old head; this view is only
-			// a different index space for the same conversation.
-			if let Some(written) = *cursor {
+			// a different index space for the same conversation. A pending
+			// rewrite above already refreshed the cursor in the compacted space.
+			if !retried && let Some(written) = *cursor {
 				*cursor = Some(report.remap(written).min(messages.len()));
 			}
 			return true;
@@ -388,9 +497,9 @@ impl TranscriptJournal {
 			// cannot be placed after it without duplicating the superseded lines,
 			// so the journal cannot claim the conversation is durable: report it
 			// and keep the cursor so every later flush refuses a compaction that
-			// would drop a message. The owner never rewrites the tail (`subagent_
-			// lifecycle` journals the state exactly as the loop left it), so this
-			// is an invariant violation, not a routine path.
+			// would drop a message. Content rewrites go through `compacted_rewrites`;
+			// a plain flush never shortens the accepted log, so this is an invariant
+			// violation, not a routine path.
 			Some(written) => {
 				eprintln!(
 					"warning: child transcript for {} was rewritten shorter ({} < {written}); \
@@ -414,6 +523,88 @@ impl TranscriptJournal {
 		}
 		*cursor = Some(messages.len());
 		true
+	}
+
+	/// Replace the on-disk tail after supersede/shake rewrote tool results in
+	/// place. The transcript has no append-only representation for that: a
+	/// revived child would otherwise replay the original output.
+	fn persist_rewrites(&self, messages: &[Message]) -> bool {
+		let start = crate::tools::task::journal_start(messages, self.base, self.had_system);
+		let skip = start.saturating_sub(self.base);
+		let prefix = match self.supervisor.child_transcript_prefix(&self.child_id, self.base) {
+			Ok(prefix) => prefix,
+			Err(error) => {
+				eprintln!(
+					"warning: cannot read child transcript prefix for {}: {error}; \
+					 refusing rewrite",
+					self.child_id
+				);
+				return false;
+			},
+		};
+		let positions = match self.prefix_positions() {
+			Some(positions) => positions,
+			None => {
+				eprintln!(
+					"warning: child transcript prefix for {} has no tracked positions; \
+					 refusing rewrite",
+					self.child_id
+				);
+				return false;
+			},
+		};
+		// The persisted prefix is strictly the first `positions.len()` entries.
+		// A prior soft cut may have written a summary right after it; that
+		// summary must not inflate the prefix on later rewrites.
+		if prefix.len() < positions.len() {
+			eprintln!(
+				"warning: child transcript prefix for {} changed shape; \
+				 refusing rewrite",
+				self.child_id
+			);
+			return false;
+		}
+		let mut prefix = prefix;
+		prefix.truncate(positions.len());
+		let body = messages.get(skip..).unwrap_or(messages);
+		let mut rewritten = prefix;
+		rewritten.reserve(body.len());
+		for (offset, message) in body.iter().enumerate() {
+			if !positions.contains(&Some(skip + offset)) {
+				rewritten.push(message.clone());
+			}
+		}
+		let refs: Vec<&Message> = rewritten.iter().collect();
+		let written = self.supervisor.rewrite_child_transcript(&self.child_id, &refs);
+		if written != refs.len() {
+			return false;
+		}
+		*lock(&self.written) = Some(messages.len());
+		true
+	}
+}
+
+impl crate::loop_module::TurnObserverHook for TranscriptJournal {
+	fn flush(&self, messages: &[Message], prune: Option<CompactionReport>) -> bool {
+		TranscriptJournal::flush(self, messages, prune)
+	}
+
+	fn compacted_rewrites(
+		&self,
+		messages: &[Message],
+		prune: Option<CompactionReport>,
+		rewritten_indices: &[usize],
+	) -> bool {
+		let retried = *lock(&self.pending_rewrite);
+		if !TranscriptJournal::flush(self, messages, prune) {
+			return false;
+		}
+		if rewritten_indices.is_empty() || retried {
+			return true;
+		}
+		let persisted = self.persist_rewrites(messages);
+		*lock(&self.pending_rewrite) = !persisted;
+		persisted
 	}
 }
 
@@ -936,7 +1127,15 @@ impl SubagentLifecycleManager {
 		if tokio::runtime::Handle::try_current().is_err() {
 			return Err("adopting a live agent requires a tokio runtime".to_string());
 		}
-		let RevivedChild { agent_loop, state: child_state, agent, contract, durable } = child;
+		let RevivedChild {
+			agent_loop,
+			state: child_state,
+			agent,
+			contract,
+			durable,
+			pending_rewrite,
+			prefix_positions,
+		} = child;
 		if contract.id != id {
 			return Err(format!(
 				"contract id {:?} does not match child \"{id}\"",
@@ -1078,6 +1277,8 @@ impl SubagentLifecycleManager {
 				agent,
 				contract: persisted_contract,
 				durable,
+				pending_rewrite,
+				prefix_positions,
 			},
 			receiver,
 			steering_rx,
@@ -1893,6 +2094,8 @@ async fn run_actor(
 		agent,
 		contract,
 		durable,
+		pending_rewrite,
+		prefix_positions,
 	} = revived;
 	// One journal for the whole actor: the loop reports every turn boundary, so
 	// accepted messages reach the file before compaction can prune them, and the
@@ -1903,24 +2106,24 @@ async fn run_actor(
 				.upgrade()
 				.and_then(|manager| manager.supervisor.upgrade())
 				.map(|supervisor| {
-					Arc::new(TranscriptJournal::new(
+					let journal = TranscriptJournal::new(
 						supervisor,
 						id.clone(),
 						state.messages.len(),
 						state.messages.first().is_some_and(|m| m.role == Role::System),
-					))
+					);
+					if pending_rewrite {
+						journal.mark_pending_rewrite();
+					}
+					journal.set_prefix_positions(prefix_positions);
+					Arc::new(journal)
 				})
 		})
 		.flatten();
 	if let Some(journal) = journal.clone() {
-		agent_loop = agent_loop.with_turn_observer(Some({
-			let journal = Arc::clone(&journal);
-			Arc::new(
-				move |messages: &[Message], prune: Option<CompactionReport>| {
-					journal.flush(messages, prune)
-				},
-			) as crate::loop_module::TurnObserver
-		}));
+		agent_loop = agent_loop.with_turn_observer(Some(
+			journal as crate::loop_module::TurnObserver
+		));
 	}
 	// Asides that missed their last step boundary, resolved as wake turns.
 	let mut pending: VecDeque<PendingTurn> = VecDeque::new();
@@ -2110,3 +2313,381 @@ async fn run_actor(
 	exit_guard.disarm();
 }
 
+
+#[cfg(test)]
+mod tests {
+	use std::sync::Arc;
+
+	use async_trait::async_trait;
+
+	use super::*;
+	use crate::{
+		compaction::COMPACTION_NOTICE_PREFIX,
+		loop_module::TurnObserverHook,
+		provider::{ChunkStream, ModelProvider, ProviderError, ToolChoice},
+		state::ToolCall,
+		supervisor::DelegationLimits,
+		task_persisted_revive::load_transcript,
+		tools::registry::ToolRegistry,
+	};
+
+	struct QuietProvider;
+
+	#[async_trait]
+	impl ModelProvider for QuietProvider {
+		async fn complete(
+			&self,
+			_messages: &[Message],
+			_tools: &[serde_json::Value],
+			_tool_choice: &ToolChoice,
+		) -> Result<Message, ProviderError> {
+			Err(ProviderError::Protocol("unused".to_string()))
+		}
+
+		async fn stream(
+			&self,
+			_messages: &[Message],
+			_tools: &[serde_json::Value],
+			_tool_choice: &ToolChoice,
+		) -> Result<ChunkStream, ProviderError> {
+			Err(ProviderError::Protocol("unused".to_string()))
+		}
+	}
+
+	#[test]
+	fn rewrite_after_soft_cut_keeps_initial_prefix_and_replaces_tool_output() {
+		let dir = std::env::temp_dir().join(format!(
+			"omp-journal-prefix-{}-{}",
+			std::process::id(),
+			std::time::SystemTime::now()
+				.duration_since(std::time::UNIX_EPOCH)
+				.map_or(0, |duration| duration.as_nanos())
+		));
+		std::fs::create_dir_all(&dir).expect("mkdir");
+		let session_file = dir.join("child.jsonl");
+		let supervisor = Supervisor::with_selection(
+			ToolRegistry::new(),
+			Arc::new(QuietProvider),
+			None,
+			DelegationLimits::default(),
+			false,
+			false,
+		);
+		assert!(supervisor.restore_child_record(
+			"child",
+			"child",
+			Some("task"),
+			None,
+			&session_file,
+			None
+		));
+
+		let prefix = vec![
+			Message::system("autoload system"),
+			Message::user("initial assignment"),
+		];
+		let prefix_refs: Vec<&Message> = prefix.iter().collect();
+		assert_eq!(
+			supervisor.append_child_transcript("child", &prefix_refs),
+			prefix.len()
+		);
+		let journal = TranscriptJournal::new(
+			Arc::clone(&supervisor),
+			"child".to_string(),
+			prefix.len(),
+			true,
+		);
+		let read_call = || {
+			Message::assistant_with_tools(
+				"reading",
+				vec![ToolCall {
+					id:        "call_old".to_string(),
+					name:      "read".to_string(),
+					arguments: serde_json::json!({ "path": "src/foo.ts" }),
+				}],
+			)
+		};
+		let live = vec![
+			prefix[0].clone(),
+			prefix[1].clone(),
+			read_call(),
+			Message::tool("call_old", "old file body"),
+			Message::user("continue"),
+			Message::assistant("done"),
+		];
+		assert!(journal.flush(&live, None), "initial journaling must be durable");
+
+		// A soft cut dropped the initial prefix; the retained tool result is
+		// rewritten in place. Persist that combined outcome.
+		let compacted = vec![
+			Message::system("[System notice: 2 earlier turn(s) were pruned to fit the context limit]"),
+			read_call(),
+			Message::tool("call_old", "REWRITTEN file body"),
+			Message::user("continue"),
+			Message::assistant("done"),
+		];
+		let report = CompactionReport {
+			old_len:        live.len(),
+			leading_system: 0,
+			kept_from:      2,
+			kept_at:        1,
+		};
+		assert!(journal.compacted_rewrites(&compacted, Some(report), &[2]));
+
+		let revived = load_transcript(&session_file).expect("read transcript");
+		assert_eq!(revived[0].content, "autoload system");
+		assert_eq!(revived[1].content, "initial assignment");
+		assert!(
+			revived.iter().any(|message| message.content == "REWRITTEN file body"),
+			"the rewritten tool output must be replayed"
+		);
+		assert!(
+			!revived.iter().any(|message| message.content == "old file body"),
+			"the stale tool output must be gone"
+		);
+		std::fs::remove_dir_all(&dir).ok();
+	}
+
+	#[test]
+	fn rewrite_after_revive_does_not_reprepend_old_assistant_and_tool_turns() {
+		let dir = std::env::temp_dir().join(format!(
+			"omp-journal-revived-prefix-{}-{}",
+			std::process::id(),
+			std::time::SystemTime::now()
+				.duration_since(std::time::UNIX_EPOCH)
+				.map_or(0, |duration| duration.as_nanos())
+		));
+		std::fs::create_dir_all(&dir).expect("mkdir");
+		let session_file = dir.join("child.jsonl");
+		let supervisor = Supervisor::with_selection(
+			ToolRegistry::new(),
+			Arc::new(QuietProvider),
+			None,
+			DelegationLimits::default(),
+			false,
+			false,
+		);
+		assert!(supervisor.restore_child_record(
+			"child",
+			"child",
+			Some("task"),
+			None,
+			&session_file,
+			None
+		));
+
+		let transcript = vec![
+			Message::system("autoload system"),
+			Message::user("initial assignment"),
+			Message::assistant_with_tools(
+				"reading",
+				vec![ToolCall {
+					id:        "call_old".to_string(),
+					name:      "read".to_string(),
+					arguments: serde_json::json!({ "path": "src/foo.ts" }),
+				}],
+			),
+			Message::tool("call_old", "STALE big"),
+		];
+		let refs: Vec<&Message> = transcript.iter().collect();
+		assert_eq!(
+			supervisor.append_child_transcript("child", &refs),
+			transcript.len()
+		);
+		// A revived actor starts its journal at the end of the replayed
+		// conversation. The prefix read must stop before its assistant/tool
+		// turns, or a content rewrite re-prepends those stale turns.
+		let journal = TranscriptJournal::new(
+			Arc::clone(&supervisor),
+			"child".to_string(),
+			transcript.len(),
+			true,
+		);
+		assert!(journal.flush(&transcript, None), "replayed transcript must be durable");
+
+		let rewritten = vec![
+			transcript[0].clone(),
+			transcript[1].clone(),
+			transcript[2].clone(),
+			Message::tool("call_old", "FRESH big"),
+		];
+		assert!(journal.compacted_rewrites(&rewritten, None, &[3]));
+
+		let revived = load_transcript(&session_file).expect("read transcript");
+		assert_eq!(
+			contents(&revived),
+			vec!["autoload system", "initial assignment", "reading", "FRESH big"],
+			"only the rewritten tool output may survive, not both turns"
+		);
+		assert!(
+			!revived.iter().any(|message| message.content == "STALE big"),
+			"the stale tool output must be gone"
+		);
+
+		// Handover: the outgoing journal's pending rewrite must be retried by
+		// the fresh journal even though the on-disk transcript is still stale.
+		assert_eq!(
+			supervisor.rewrite_child_transcript("child", &refs),
+			transcript.len()
+		);
+		let handover = TranscriptJournal::new(
+			Arc::clone(&supervisor),
+			"child".to_string(),
+			transcript.len(),
+			true,
+		);
+		handover.mark_pending_rewrite();
+		assert!(handover.flush(&rewritten, None), "handover must retry the rewrite");
+		let after_handover = load_transcript(&session_file).expect("read transcript");
+		assert_eq!(
+			contents(&after_handover),
+			vec!["autoload system", "initial assignment", "reading", "FRESH big"]
+		);
+		assert!(
+			!after_handover.iter().any(|message| message.content == "STALE big"),
+			"the stale tool output must be gone after handover"
+		);
+		std::fs::remove_dir_all(&dir).ok();
+	}
+
+	fn contents(messages: &[Message]) -> Vec<&str> {
+		messages.iter().map(|message| message.content.as_str()).collect()
+	}
+
+	#[test]
+	fn soft_cut_keeps_initial_prompt_and_repeated_steering_message() {
+		let dir = std::env::temp_dir().join(format!(
+			"omp-journal-cut-duplicate-{}-{}",
+			std::process::id(),
+			std::time::SystemTime::now()
+				.duration_since(std::time::UNIX_EPOCH)
+				.map_or(0, |duration| duration.as_nanos())
+		));
+		std::fs::create_dir_all(&dir).expect("mkdir");
+		let session_file = dir.join("child.jsonl");
+		let supervisor = Supervisor::with_selection(
+			ToolRegistry::new(),
+			Arc::new(QuietProvider),
+			None,
+			DelegationLimits::default(),
+			false,
+			false,
+		);
+		assert!(supervisor.restore_child_record(
+			"child",
+			"child",
+			Some("task"),
+			None,
+			&session_file,
+			None
+		));
+
+		let prefix = vec![Message::system("A"), Message::user("X")];
+		let prefix_refs: Vec<&Message> = prefix.iter().collect();
+		assert_eq!(
+			supervisor.append_child_transcript("child", &prefix_refs),
+			prefix.len()
+		);
+		let journal = TranscriptJournal::new(
+			Arc::clone(&supervisor),
+			"child".to_string(),
+			prefix.len(),
+			true,
+		);
+		let summary1 = format!("{COMPACTION_NOTICE_PREFIX}one earlier turn was pruned]");
+		let read_call = || {
+			Message::assistant_with_tools(
+				"done",
+				vec![ToolCall {
+					id:        "call".to_string(),
+					name:      "read".to_string(),
+					arguments: serde_json::json!({ "path": "src/foo.ts" }),
+				}],
+			)
+		};
+		let live = vec![
+			prefix[0].clone(),
+			prefix[1].clone(),
+			Message::user("X"),
+			read_call(),
+			Message::tool("call", "big"),
+		];
+		assert!(journal.flush(&live, None));
+		let report = CompactionReport {
+			old_len:   live.len(),
+			leading_system: 1,
+			kept_from: 2,
+			kept_at:   2,
+		};
+		let compacted = vec![
+			Message::system("A"),
+			Message::system(summary1.clone()),
+			Message::user("X"),
+			read_call(),
+			Message::tool("call", "fresh big"),
+		];
+		assert!(journal.compacted_rewrites(&compacted, Some(report), &[4]));
+
+		let revived = load_transcript(&session_file).expect("read transcript");
+		assert_eq!(
+			contents(&revived),
+			vec!["A", "X", summary1.as_str(), "X", "done", "fresh big"],
+			"the cut initial prompt and the retained steering prompt must both survive"
+		);
+		assert_eq!(
+			revived
+				.iter()
+				.filter(|message| message.role == Role::User && message.content == "X")
+				.count(),
+			2
+		);
+
+		// A second soft cut starts from the replayed summary-bearing transcript.
+		// The prefix read must stop at `summary1`, and its tracked length must
+		// exclude the summary rather than fail the rewrite.
+		let revived_journal = TranscriptJournal::new(
+			Arc::clone(&supervisor),
+			"child".to_string(),
+			revived.len(),
+			true,
+		);
+		assert!(revived_journal.flush(&revived, None));
+		let summary2 = format!("{COMPACTION_NOTICE_PREFIX}two earlier turns were pruned]");
+		let second_report = CompactionReport {
+			old_len:   revived.len(),
+			leading_system: 1,
+			kept_from: 3,
+			kept_at:   2,
+		};
+		let second_compacted = vec![
+			Message::system("A"),
+			Message::system(summary2.clone()),
+			Message::user("X"),
+			read_call(),
+			Message::tool("call", "fresh big 2"),
+		];
+		assert!(
+			revived_journal.compacted_rewrites(&second_compacted, Some(second_report), &[4])
+		);
+		let after_second = load_transcript(&session_file).expect("read transcript");
+		assert_eq!(
+			contents(&after_second),
+			vec!["A", "X", summary2.as_str(), "X", "done", "fresh big 2"],
+			"the second cut must retain both prompts without treating the summary as prefix"
+		);
+		assert_eq!(
+			after_second
+				.iter()
+				.filter(|message| message.role == Role::User && message.content == "X")
+				.count(),
+			2
+		);
+		assert!(
+			after_second
+				.iter()
+				.any(|message| message.content == "fresh big 2"),
+			"the matching tool call must keep its rewritten result"
+		);
+		std::fs::remove_dir_all(&dir).ok();
+	}
+}

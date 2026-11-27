@@ -453,6 +453,8 @@ fn live_child(
 		agent: None,
 		contract,
 		durable: false,
+		pending_rewrite: false,
+		prefix_positions: None,
 	}
 }
 

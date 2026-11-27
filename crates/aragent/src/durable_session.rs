@@ -13,7 +13,7 @@
 //! beside it.
 
 use std::{
-	collections::{HashMap, HashSet, VecDeque},
+	collections::{BTreeMap, HashMap, HashSet, VecDeque},
 	fs::{File, OpenOptions},
 	io,
 	path::{Path, PathBuf},
@@ -643,6 +643,49 @@ pub struct StoredProjection {
 	pub synthetic: Vec<Value>,
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub anchor: Option<String>,
+	/// Tool-result content rewritten in place (supersede prune / shake), keyed
+	/// by durable message id. Archive rows stay immutable; replay overlays these.
+	#[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+	pub rewrites: BTreeMap<String, String>,
+	/// Content-only rewrite retained the full branch replay (guidance, branch
+	/// summaries, custom entries) instead of selecting `kept` messages.
+	#[serde(default, skip_serializing_if = "std::ops::Not::not")]
+	pub preserve_branch: bool,
+}
+
+/// Overlay in-place compaction rewrites onto archived entries.
+///
+/// Archive rows stay immutable, so replay applies the selected projection's
+/// rewrite map by durable id. Inline images survive: a tool result that already
+/// carried image parts keeps them and gains the rewritten text part, matching
+/// the live loop's shake output.
+pub(crate) fn apply_projection_rewrites(
+	entries: &mut [MessageEntry],
+	rewrites: &BTreeMap<String, String>,
+) {
+	if rewrites.is_empty() {
+		return;
+	}
+	for entry in entries {
+		let Some(content) = rewrites.get(&entry.id) else {
+			continue;
+		};
+		let images: Vec<SessionPart> = entry
+			.message
+			.content
+			.parts()
+			.into_iter()
+			.filter(SessionPart::is_image)
+			.collect();
+		entry.message.content = if images.is_empty() {
+			MessageContent::Text(content.clone())
+		} else {
+			let mut parts = Vec::with_capacity(images.len() + 1);
+			parts.push(SessionPart::text(content.clone()));
+			parts.extend(images);
+			MessageContent::Parts(parts)
+		};
+	}
 }
 
 pub(crate) struct LoadedParts {
@@ -1007,8 +1050,15 @@ impl DurableSession {
 		branch: &[MessageEntry],
 	) -> StoreResult<Vec<Option<String>>> {
 		// Terminal aborted/error turns are archive-only: align against the same
-		// replay projection the resumed conversation will contain.
-		let persisted: Vec<&MessageEntry> = crate::session::replayable_message_entries(branch)
+		// replay projection the resumed conversation will contain. Live messages
+		// may carry compaction rewrites already, so overlay them first.
+		let rewrites = lock(&self.projection)
+			.as_ref()
+			.map(|projection| projection.rewrites.clone())
+			.unwrap_or_default();
+		let mut branch_owned = branch.to_vec();
+		apply_projection_rewrites(&mut branch_owned, &rewrites);
+		let persisted: Vec<&MessageEntry> = crate::session::replayable_message_entries(&branch_owned)
 			.into_iter()
 			.filter(|entry| matches!(entry.message.role.as_str(), "user" | "assistant" | "toolResult"))
 			.collect();
@@ -1570,6 +1620,7 @@ impl DurableSession {
 			.push_back(message_id.clone());
 		let mut projection = lock(&self.projection);
 		if let Some(projection) = projection.as_mut()
+			&& !projection.preserve_branch
 			&& !projection.kept.contains(&message_id)
 		{
 			projection.kept.push(message_id);
@@ -1677,9 +1728,11 @@ impl DurableBoundary for DurableSession {
 			let projection = {
 				let mut current = lock(&self.projection);
 				current.as_mut().map(|projection| {
-					for id in appended_kept {
-						if !projection.kept.contains(&id) {
-							projection.kept.push(id);
+					if !projection.preserve_branch {
+						for id in appended_kept {
+							if !projection.kept.contains(&id) {
+								projection.kept.push(id);
+							}
 						}
 					}
 					projection.clone()
@@ -1748,7 +1801,160 @@ impl DurableBoundary for DurableSession {
 				serde_json::to_value(message).map_err(|error| DurableError::new(error.to_string()))?,
 			);
 		}
-		let projection = StoredProjection { kept, synthetic, anchor: None };
+		let previous_rewrites = lock(&self.projection)
+			.as_ref()
+			.map(|projection| projection.rewrites.clone())
+			.unwrap_or_default();
+		let rewrites = kept
+			.iter()
+			.filter_map(|id| previous_rewrites.get(id).map(|content| (id.clone(), content.clone())))
+			.collect();
+		let projection =
+			StoredProjection { kept, synthetic, anchor: None, rewrites, preserve_branch: false };
+		self.set_projection(Some(projection.clone())).await?;
+		let mut next_ids = vec![None; report.kept_at];
+		next_ids.extend(retained_ids);
+		if next_ids.len() != messages.len() {
+			return Err(DurableError::new(
+				"compaction projection does not cover the compacted conversation",
+			));
+		}
+		*lock(&self.tracked) = digests;
+		*lock(&self.tracked_ids) = next_ids;
+		*lock(&self.projection) = Some(projection);
+		Ok(())
+	}
+
+	async fn compacted_rewrites(
+		&self,
+		messages: &[Message],
+		report: Option<&CompactionReport>,
+		rewritten_indices: &[usize],
+	) -> Result<(), DurableError> {
+		if rewritten_indices.is_empty() {
+			return match report {
+				Some(report) => self.compacted(messages, report).await,
+				None => Ok(()),
+			};
+		}
+		let digests: Vec<u64> = messages
+			.iter()
+			.map(|message| self.incoming_digest(message))
+			.collect();
+		let tracked = lock(&self.tracked).clone();
+		let had_report = report.is_some();
+		let report = report.copied().unwrap_or(CompactionReport {
+			old_len: tracked.len(),
+			leading_system: 0,
+			kept_from: 0,
+			kept_at: 0,
+		});
+		if report.old_len != tracked.len() {
+			return Err(DurableError::new(format!(
+				"compaction report covers {} messages but {} are tracked",
+				report.old_len,
+				tracked.len()
+			)));
+		}
+		let tail = report
+			.old_len
+			.checked_sub(report.kept_from)
+			.ok_or_else(|| DurableError::new("compaction report has an inverted range"))?;
+		if report.kept_at.saturating_add(tail) != messages.len() {
+			return Err(DurableError::new(
+				"compaction report does not describe the compacted conversation",
+			));
+		}
+		let tracked_ids = lock(&self.tracked_ids).clone();
+		let mut rewritten_old = HashSet::new();
+		let mut current_rewrites = BTreeMap::new();
+		for &index in rewritten_indices {
+			if index < report.kept_at || index >= messages.len() {
+				return Err(DurableError::new(format!(
+					"compaction rewrite index {index} is outside the retained tail"
+				)));
+			}
+			if messages[index].role != Role::Tool {
+				return Err(DurableError::new(format!(
+					"compaction rewrite index {index} is not a tool result"
+				)));
+			}
+			let old_index = report.kept_from + (index - report.kept_at);
+			if old_index >= tracked.len() {
+				return Err(DurableError::new(format!(
+					"compaction rewrite index {index} has no tracked source"
+				)));
+			}
+			let Some(id) = tracked_ids.get(old_index).cloned().flatten() else {
+				return Err(DurableError::new(format!(
+					"compaction rewrite index {index} has no durable message id"
+				)));
+			};
+			rewritten_old.insert(old_index);
+			current_rewrites.insert(id, messages[index].content.clone());
+		}
+		let mut kept = Vec::with_capacity(tail);
+		let mut retained_ids: Vec<Option<String>> = vec![None; tail];
+		let previous_rewrites = lock(&self.projection)
+			.as_ref()
+			.map(|projection| projection.rewrites.clone())
+			.unwrap_or_default();
+		let mut rewrites = BTreeMap::new();
+		for offset in 0..tail {
+			let old_index = report.kept_from + offset;
+			let new_index = report.kept_at + offset;
+			if !rewritten_old.contains(&old_index)
+				&& digests[new_index] != tracked[old_index]
+			{
+				return Err(DurableError::new(
+					"compaction retained a message that was never persisted",
+				));
+			}
+			if let Some(id) = tracked_ids.get(old_index).cloned().flatten() {
+				if let Some(content) = previous_rewrites.get(&id) {
+					rewrites.insert(id.clone(), content.clone());
+				}
+				kept.push(id.clone());
+				retained_ids[offset] = Some(id);
+			}
+		}
+		rewrites.extend(current_rewrites);
+		let projection = match (had_report, lock(&self.projection).clone()) {
+			(false, Some(mut projection)) => {
+				projection.rewrites = rewrites;
+				projection
+			},
+			(false, None) => StoredProjection {
+				kept: Vec::new(),
+				synthetic: Vec::new(),
+				anchor: None,
+				rewrites,
+				preserve_branch: true,
+			},
+			(true, _) => {
+				let mut synthetic = Vec::new();
+				for message in &messages[..report.kept_at] {
+					if message.role == Role::System
+						&& !message
+							.content
+							.starts_with(pi_agent::compaction::COMPACTION_NOTICE_PREFIX)
+					{
+						continue;
+					}
+					synthetic.push(
+						serde_json::to_value(message)
+							.map_err(|error| DurableError::new(error.to_string()))?,
+					);
+				}
+				StoredProjection {
+					kept,
+					synthetic,
+					anchor: None,
+					rewrites,
+					preserve_branch: false,
+				}
+			},
+		};
 		self.set_projection(Some(projection.clone())).await?;
 		let mut next_ids = vec![None; report.kept_at];
 		next_ids.extend(retained_ids);
@@ -1861,7 +2067,9 @@ impl DurableBoundary for DurableSession {
 						.or_default()
 						.push_back(tool_entry.id.clone());
 					if let Some(projection) = lock(&projection_arc).as_mut() {
-						if !projection.kept.contains(&tool_entry.id) {
+						if !projection.preserve_branch
+							&& !projection.kept.contains(&tool_entry.id)
+						{
 							projection.kept.push(tool_entry.id);
 						}
 					}
@@ -2079,7 +2287,7 @@ impl DurableBoundary for DurableSession {
 				lock(&tracked_ids).push(Some(message_id.clone()));
 				let mut proj = lock(&projection_slot);
 				if let Some(proj) = proj.as_mut() {
-					if !proj.kept.contains(&message_id) {
+					if !proj.preserve_branch && !proj.kept.contains(&message_id) {
 						proj.kept.push(message_id.clone());
 					}
 					Some(proj.clone())
@@ -2121,10 +2329,9 @@ impl DurableBoundary for DurableSession {
 				if parts.branch_id != active_branch {
 					return Ok(Vec::new());
 				}
-				let active_ids: HashSet<String> = if let Some(proj) = &parts.projection {
-					proj.kept.iter().cloned().collect()
-				} else {
-					parts.branch_messages.into_iter().map(|m| m.id).collect()
+				let active_ids: HashSet<String> = match &parts.projection {
+					Some(proj) if !proj.preserve_branch => proj.kept.iter().cloned().collect(),
+					_ => parts.branch_messages.iter().map(|m| m.id.clone()).collect(),
 				};
 				Ok(records
 					.into_iter()
@@ -2332,6 +2539,12 @@ fn replay_loaded_session(loaded: &LoadedSession) -> StoreResult<Vec<Message>> {
 		return crate::runtime::history_messages_from_entries(&loaded.branch_messages)
 			.map_err(|error| StoreError::Corrupt(error.to_string()));
 	};
+	if projection.preserve_branch {
+		let mut branch = loaded.branch_messages.clone();
+		apply_projection_rewrites(&mut branch, &projection.rewrites);
+		return crate::runtime::history_messages_from_entries(&branch)
+			.map_err(|error| StoreError::Corrupt(error.to_string()));
+	}
 	let by_id: HashMap<&str, &MessageEntry> = loaded
 		.messages
 		.iter()
@@ -2353,6 +2566,7 @@ fn replay_loaded_session(loaded: &LoadedSession) -> StoreResult<Vec<Message>> {
 		};
 		kept.push((*entry).clone());
 	}
+	apply_projection_rewrites(&mut kept, &projection.rewrites);
 	restored.extend(
 		crate::runtime::history_messages_from_entries(&kept)
 			.map_err(|error| StoreError::Corrupt(error.to_string()))?,
@@ -2447,6 +2661,12 @@ impl ChildDurabilityFactory for StoreChildDurabilityFactory {
 					.map(Some)
 					.map_err(|error| StoreError::Corrupt(error.to_string()));
 			};
+			if projection.preserve_branch {
+				apply_projection_rewrites(&mut branch_messages, &projection.rewrites);
+				return crate::runtime::history_messages_from_entries(&branch_messages)
+					.map(Some)
+					.map_err(|error| StoreError::Corrupt(error.to_string()));
+			}
 			let mut session_messages = Vec::new();
 			for row in &snapshot.session_messages {
 				let entry: SessionEntry = serde_json::from_value(row.payload.clone())
@@ -2477,6 +2697,7 @@ impl ChildDurabilityFactory for StoreChildDurabilityFactory {
 				};
 				kept.push((*entry).clone());
 			}
+			apply_projection_rewrites(&mut kept, &projection.rewrites);
 			restored.extend(
 				crate::runtime::history_messages_from_entries(&kept)
 					.map_err(|error| StoreError::Corrupt(error.to_string()))?,
@@ -2754,13 +2975,13 @@ fn seed_entries(
 ) -> StoreResult<Vec<(u64, Option<String>)>> {
 	let by_id: HashMap<&str, &MessageEntry> =
 		all.iter().map(|entry| (entry.id.as_str(), entry)).collect();
-	let source: Vec<MessageEntry> = match projection {
-		Some(projection) => projection
+	let mut source: Vec<MessageEntry> = match projection {
+		Some(projection) if !projection.preserve_branch => projection
 			.kept
 			.iter()
 			.filter_map(|id| by_id.get(id.as_str()).map(|entry| (*entry).clone()))
 			.collect(),
-		None => {
+		_ => {
 			// Mirror `CheckpointHost::context_messages`: an assistant batch may
 			// have sibling tool results on another branch; they are replayed
 			// immediately after the call. The seed must include them or resume
@@ -2810,6 +3031,9 @@ fn seed_entries(
 			ordered
 		},
 	};
+	if let Some(projection) = projection {
+		apply_projection_rewrites(&mut source, &projection.rewrites);
+	}
 	// Use the exact provider-replay projection: terminal error/aborted turns
 	// and their paired tool results stay archived but are not part of the seed.
 	let replayable = crate::session::replayable_message_entries(&source);
@@ -3181,6 +3405,70 @@ mod tests {
 		crate::session_store::create_private_dir(&dir).expect("temp dir");
 		let path = dir.join("sessions.db");
 		(dir, path)
+	}
+
+	#[tokio::test]
+	async fn content_only_rewrites_persist_and_replay_after_resume() {
+		let (dir, path) = temp_db("rewrite-resume");
+		let session =
+			DurableSession::create(&path, header("rewrite", None)).expect("create session");
+		let messages = vec![
+			Message::user("read the file"),
+			Message::assistant_with_tools(
+				"reading",
+				vec![ToolCall {
+					id: "read-1".to_string(),
+					name: "read".to_string(),
+					arguments: serde_json::json!({ "path": "src/lib.rs" }),
+				}],
+			),
+			Message::tool("read-1", "full file body ".repeat(50)),
+			Message::user("continue"),
+		];
+		session.persist_messages(&messages).await.expect("persist");
+		let mut rewritten = messages.clone();
+		rewritten[2].content = "[read superseded]".to_string();
+		session
+			.compacted_rewrites(&rewritten, None, &[2])
+			.await
+			.expect("persist content-only rewrite");
+		session
+			.persist_messages(&rewritten)
+			.await
+			.expect("the next write must align with the rewritten digests");
+
+		let loaded = session.load().expect("reload");
+		assert_eq!(loaded.messages.len(), messages.len());
+		let projection = loaded.projection.as_ref().expect("projection");
+		assert!(projection.preserve_branch);
+		assert!(projection.kept.is_empty());
+		assert_eq!(projection.rewrites.len(), 1);
+		let (rewritten_id, rewritten_content) =
+			projection.rewrites.iter().next().expect("one rewrite");
+		assert_eq!(rewritten_content.as_str(), "[read superseded]");
+		let rewritten_id = rewritten_id.clone();
+		let replay = replay_loaded_session(&loaded).expect("resume replay");
+		assert_eq!(replay.len(), messages.len());
+		assert_eq!(replay[2].content, "[read superseded]");
+		assert_eq!(replay[2].role, Role::Tool);
+		assert_eq!(replay[3].content, "continue");
+
+		drop(session);
+		let (reopened, loaded) =
+			DurableSession::open(&path, "rewrite", header("rewrite", None)).expect("reopen");
+		let loaded = loaded.expect("loaded session");
+		assert_eq!(
+			loaded
+				.projection
+				.as_ref()
+				.and_then(|projection| projection.rewrites.get(&rewritten_id))
+				.map(String::as_str),
+			Some("[read superseded]")
+		);
+		let replay = replay_loaded_session(&loaded).expect("reopened replay");
+		assert_eq!(replay[2].content, "[read superseded]");
+		drop(reopened);
+		std::fs::remove_dir_all(dir).ok();
 	}
 
 	#[tokio::test]
