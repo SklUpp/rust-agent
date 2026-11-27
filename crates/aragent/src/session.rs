@@ -5930,7 +5930,7 @@ mod tests {
 		let legacy_dir = session_dir_paths(&cwd, None).legacy.first().cloned().expect("legacy dir");
 		fs::create_dir_all(&legacy_dir).expect("legacy sessions");
 		let legacy_db = crate::durable_session::database_path(&legacy_dir);
-		let legacy_store = SqliteStore::open(&legacy_db).expect("legacy store");
+		let mut legacy_store = SqliteStore::open(&legacy_db).expect("legacy store");
 		legacy_store
 			.create_session(NewSession {
 				id:                    "legacy-1".to_string(),
