@@ -3,7 +3,8 @@
 //! Order (CLI input first, most specific file next):
 //! `--system-prompt` > `<cwd>/.omp/SYSTEM.md` > `~/.aragent/agent/SYSTEM.md`
 //! > legacy `~/.omp/agent/SYSTEM.md` > `share/aragent/system-prompt.md` (with
-//! `share/omp` as a read-only fallback). `APPEND_SYSTEM.md` is additive on the same
+//! `share/omp` as a read-only fallback) > the bundled `prompts/system-prompt.md`.
+//! `APPEND_SYSTEM.md` is additive on the same
 //! roots; `PERSONALITY.md`, `RULES.md` and `AGENTS.md` contribute context
 //! files. A CLI value is a file path when that file exists (unless it contains
 //! a newline, which makes it a literal prompt) — `resolvePromptInput`
@@ -13,6 +14,9 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use crate::{Result, dirs};
+
+/// Bundled default system prompt, used when no CLI or file prompt exists.
+const DEFAULT_SYSTEM_PROMPT: &str = include_str!("../prompts/system-prompt.md");
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ContextFile {
@@ -41,6 +45,17 @@ pub fn resolve_input(input: &str) -> String {
 }
 
 pub fn resolve(cli_system: Option<&str>, cli_append: Option<&str>, cwd: &Path) -> Result<Prompts> {
+	resolve_with_share_dirs(cli_system, cli_append, cwd, &dirs::share_dirs())
+}
+
+/// `resolve` with explicit share roots, so tests never depend on installed
+/// executable-relative or `/usr/share` prompt files.
+fn resolve_with_share_dirs(
+	cli_system: Option<&str>,
+	cli_append: Option<&str>,
+	cwd: &Path,
+	share_dirs: &[PathBuf],
+) -> Result<Prompts> {
 	let project = dirs::project_config_dir(cwd);
 	let agent = dirs::agent_dir();
 	let legacy_agent = dirs::legacy_agent_dir().filter(|dir| *dir != agent);
@@ -50,12 +65,8 @@ pub fn resolve(cli_system: Option<&str>, cli_append: Option<&str>, cwd: &Path) -
 		None => {
 			let mut candidates = vec![project.join("SYSTEM.md"), agent.join("SYSTEM.md")];
 			candidates.extend(legacy_agent.as_ref().map(|dir| dir.join("SYSTEM.md")));
-			candidates.extend(
-				dirs::share_dirs()
-					.into_iter()
-					.map(|dir| dir.join("system-prompt.md")),
-			);
-			first_file(candidates)
+			candidates.extend(share_dirs.iter().map(|dir| dir.join("system-prompt.md")));
+			first_file(candidates).or_else(|| Some(DEFAULT_SYSTEM_PROMPT.to_string()))
 		},
 	};
 
@@ -187,5 +198,112 @@ mod tests {
 				None => env::remove_var("PI_CONFIG_DIR"),
 			}
 		}
+	}
+
+	/// Isolates the env-derived agent roots; restores them on drop.
+	struct IsolatedEnv(Vec<(&'static str, Option<std::ffi::OsString>)>);
+
+	impl IsolatedEnv {
+		fn new(root: &Path) -> Self {
+			let keys = [
+				"PI_CONFIG_DIR",
+				"PI_CODING_AGENT_DIR",
+				"ARAGENT_PROFILE",
+				"OMP_PROFILE",
+				"PI_PROFILE",
+			];
+			let saved: Vec<_> = keys
+				.into_iter()
+				.map(|key| (key, env::var_os(key)))
+				.collect();
+			// SAFETY: guarded by TEST_ENV_LOCK for the test's lifetime.
+			unsafe {
+				env::set_var("PI_CONFIG_DIR", root.join("config"));
+				env::set_var("PI_CODING_AGENT_DIR", root.join("config/agent"));
+				for key in ["ARAGENT_PROFILE", "OMP_PROFILE", "PI_PROFILE"] {
+					env::remove_var(key);
+				}
+			}
+			Self(saved)
+		}
+	}
+
+	impl Drop for IsolatedEnv {
+		fn drop(&mut self) {
+			// SAFETY: guarded by TEST_ENV_LOCK for the test's lifetime.
+			unsafe {
+				for (key, value) in self.0.drain(..) {
+					match value {
+						Some(value) => env::set_var(key, value),
+						None => env::remove_var(key),
+					}
+				}
+			}
+		}
+	}
+
+	#[test]
+	fn bundled_default_fills_prompt_when_no_files_exist() {
+		let _env = crate::TEST_ENV_LOCK.lock().expect("env lock");
+		let dir = temp_dir();
+		let _isolated = IsolatedEnv::new(&dir);
+
+		let prompts = resolve_with_share_dirs(None, None, &dir.join("work"), &[]).expect("resolve");
+		assert_eq!(prompts.system.as_deref(), Some(DEFAULT_SYSTEM_PROMPT));
+		assert_eq!(prompts.append, None);
+		assert!(prompts.files.is_empty());
+
+		fs::remove_dir_all(dir).ok();
+	}
+
+	#[test]
+	fn project_agent_share_and_cli_prompts_override_bundled_default() {
+		let _env = crate::TEST_ENV_LOCK.lock().expect("env lock");
+		let dir = temp_dir();
+		let _isolated = IsolatedEnv::new(&dir);
+		let work = dir.join("work");
+		let agent = dir.join("config/agent");
+		let shares = [dir.join("share")];
+
+		let project = work.join(".omp/SYSTEM.md");
+		write(&project, "project system");
+		assert_eq!(
+			resolve_with_share_dirs(None, None, &work, &shares)
+				.expect("resolve")
+				.system
+				.as_deref(),
+			Some("project system")
+		);
+		fs::remove_file(&project).expect("remove project system");
+
+		let agent_system = agent.join("SYSTEM.md");
+		write(&agent_system, "agent system");
+		assert_eq!(
+			resolve_with_share_dirs(None, None, &work, &shares)
+				.expect("resolve")
+				.system
+				.as_deref(),
+			Some("agent system")
+		);
+		fs::remove_file(&agent_system).expect("remove agent system");
+
+		write(&dir.join("share/system-prompt.md"), "share system");
+		assert_eq!(
+			resolve_with_share_dirs(None, None, &work, &shares)
+				.expect("resolve")
+				.system
+				.as_deref(),
+			Some("share system")
+		);
+
+		assert_eq!(
+			resolve_with_share_dirs(Some("cli system"), None, &work, &shares)
+				.expect("resolve")
+				.system
+				.as_deref(),
+			Some("cli system")
+		);
+
+		fs::remove_dir_all(dir).ok();
 	}
 }
