@@ -185,6 +185,12 @@ pub fn classify_tool(name: &str, args: &serde_json::Value) -> ToolTier {
 				ToolTier::Exec
 			}
 		},
+		// `get` only reads the goal state; every other op starts, resumes,
+		// drops, or completes the goal and stays gated.
+		"goal" => match args.get("op").and_then(|v| v.as_str()) {
+			Some("get") => ToolTier::Read,
+			_ => ToolTier::Exec,
+		},
 		// Auto-learn mutates durable memory and the managed-skill library.
 		// Upstream `learn` is write-tier for a skill payload or the local
 		// backend (the only backend wired here); `manage_skill` is always write.
@@ -229,6 +235,10 @@ pub fn extract_tool_detail(name: &str, args: &serde_json::Value) -> Option<Strin
 				None => Some(format!("action: {action}")),
 			}
 		},
+		"goal" => Some(format!(
+			"op: {}",
+			args.get("op").and_then(|v| v.as_str()).unwrap_or("(missing)")
+		)),
 		_ => None,
 	}
 }
@@ -891,6 +901,36 @@ mod tests {
 		let allow_bash = approvals(ApprovalMode::AlwaysAsk, &["bash"]);
 		assert_eq!(allow_bash.decide_tier("bash", ToolTier::Exec), Decision::Auto);
 		assert_eq!(allow_bash.decide_tier("write", ToolTier::Write), Decision::Ask);
+	}
+
+	#[test]
+	fn goal_get_is_read_tier_and_lifecycle_ops_stay_gated() {
+		use serde_json::json;
+
+		assert_eq!(classify_tool("goal", &json!({"op": "get"})), ToolTier::Read);
+		for op in ["create", "resume", "drop", "complete"] {
+			assert_ne!(
+				classify_tool("goal", &json!({"op": op})),
+				ToolTier::Read,
+				"goal op {op} must stay gated"
+			);
+		}
+		assert_ne!(classify_tool("goal", &json!({})), ToolTier::Read);
+		assert_ne!(classify_tool("goal", &json!({"op": "unknown"})), ToolTier::Read);
+		assert_eq!(
+			classify_tool("goal", &json!({"op": 123})),
+			ToolTier::Exec,
+			"a non-string op must stay gated"
+		);
+
+		assert_eq!(
+			extract_tool_detail("goal", &json!({"op": "create"})),
+			Some("op: create".to_string())
+		);
+		assert_eq!(
+			extract_tool_detail("goal", &json!({})),
+			Some("op: (missing)".to_string())
+		);
 	}
 
 	#[test]

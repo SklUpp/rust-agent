@@ -10,6 +10,10 @@ use crate::durable::{
 use crate::hooks::HookEngine;
 use crate::tool::ToolError;
 use crate::state::{AgentContext, ApprovalHint, ToolApprover, ToolCall, ToolResult};
+
+/// Upper bound on tool executions in flight inside one concurrent group.
+pub const DEFAULT_MAX_CONCURRENT_TOOLS: usize = 8;
+
 /// Scheduler partitions a tool batch into concurrent non-exclusive runs and
 /// sequential exclusive ones, preserving call order in the results.
 pub struct ToolScheduler {
@@ -23,6 +27,8 @@ pub struct ToolScheduler {
 	durable: Option<Arc<dyn DurableBoundary>>,
 	/// Trusted subprocess hooks for `PreToolUse`/`PostToolUse`.
 	hooks: Option<Arc<HookEngine>>,
+	/// Cap on non-exclusive tools executing at the same time in one batch.
+	max_concurrent: usize,
 }
 
 impl ToolScheduler {
@@ -33,6 +39,7 @@ impl ToolScheduler {
 			hidden: std::sync::Mutex::new(Vec::new()),
 			durable: None,
 			hooks: None,
+			max_concurrent: DEFAULT_MAX_CONCURRENT_TOOLS,
 		}
 	}
 
@@ -43,7 +50,23 @@ impl ToolScheduler {
 			hidden: std::sync::Mutex::new(Vec::new()),
 			durable: None,
 			hooks: None,
+			max_concurrent: DEFAULT_MAX_CONCURRENT_TOOLS,
 		}
+	}
+
+	/// Cap how many non-exclusive tools run at once. Clamped to
+	/// `1..=Semaphore::MAX_PERMITS` so the semaphore constructor cannot panic.
+	#[must_use]
+	pub const fn with_max_concurrent(mut self, limit: usize) -> Self {
+		// `Ord::clamp` is not const-callable; keep the bounds explicit.
+		self.max_concurrent = if limit == 0 {
+			1
+		} else if limit > tokio::sync::Semaphore::MAX_PERMITS {
+			tokio::sync::Semaphore::MAX_PERMITS
+		} else {
+			limit
+		};
+		self
 	}
 
 	pub fn approver(&self) -> Option<&Arc<dyn ToolApprover>> {
@@ -100,7 +123,7 @@ impl ToolScheduler {
 				results.extend(self.run_concurrent(&concurrent, ctx).await);
 				concurrent.clear();
 			}
-			results.push(self.run_single(call, ctx).await);
+			results.push(self.run_single(call, ctx, None, None).await);
 		}
 
 		if !concurrent.is_empty() {
@@ -109,7 +132,13 @@ impl ToolScheduler {
 		results
 	}
 
-	async fn run_single(&self, call: &ToolCall, ctx: &AgentContext) -> ToolResult {
+	async fn run_single(
+		&self,
+		call: &ToolCall,
+		ctx: &AgentContext,
+		exec_permits: Option<&Arc<tokio::sync::Semaphore>>,
+		hook_permits: Option<&Arc<tokio::sync::Semaphore>>,
+	) -> ToolResult {
 		let hidden = self.hidden();
 		let is_hidden = hidden.iter().any(|name| name == &call.name)
 			|| self
@@ -154,6 +183,25 @@ impl ToolScheduler {
 		let mut hook_context = Vec::new();
 		let mut approval_hint = ApprovalHint::default();
 		if let Some(hooks) = &self.hooks {
+			// Hook subprocesses are bounded too. A call queued behind another
+			// call's hook is cancelled here, before any effect exists.
+			let _hook_permit = match hook_permits {
+				Some(permits) => {
+					let permit = tokio::select! {
+						biased;
+						() = ctx.cancellation_token.cancelled() => {
+							return self
+								.abort_before_start(call, &effective_call, None)
+								.await;
+						},
+						permit = Arc::clone(permits).acquire_owned() => {
+							permit.expect("scheduler semaphore is never closed")
+						},
+					};
+					Some(permit)
+				},
+				None => None,
+			};
 			let decision = hooks.pre_tool_use(&call.name, &call.arguments).await;
 			hook_context.extend(decision.additional_context);
 			hook_context.extend(decision.system_messages);
@@ -247,6 +295,40 @@ impl ToolScheduler {
 			};
 		}
 
+		// The execution slot is taken after `PreToolUse` rewriting, so the
+		// exemption decision sees the effective arguments and a hub wait never
+		// holds a slot while blocked. It is taken before the durable intent: a
+		// turn killed while queued for a slot must leave no unresolved intents
+		// for tools that never started.
+		let exempt = (call.name == "hub" || tool.name() == "hub")
+			&& hub_op_is_control(&effective_call.arguments);
+		let exec_permit = match exec_permits {
+			Some(permits) if !exempt => {
+				// A cancel while queued must not let the effect start later.
+				let permit = tokio::select! {
+					biased;
+					() = ctx.cancellation_token.cancelled() => {
+						return self
+							.abort_before_start(call, &effective_call, None)
+							.await;
+					},
+					permit = Arc::clone(permits).acquire_owned() => {
+						permit.expect("scheduler semaphore is never closed")
+					},
+				};
+				// The permit wait may have raced a cancel that no longer wakes
+				// this future: recheck before the intent or effect starts.
+				if ctx.cancellation_token.is_cancelled() {
+					drop(permit);
+					return self
+						.abort_before_start(call, &effective_call, None)
+						.await;
+				}
+				Some(permit)
+			},
+			_ => None,
+		};
+
 		let execution_id = match &self.durable {
 			Some(durable) => match durable.begin_execution(&effective_call).await {
 				Ok(id) => Some(id),
@@ -268,23 +350,9 @@ impl ToolScheduler {
 		// The durable admission await may have raced a cancel (or a policy
 		// change observed by the caller): recheck before any effect starts.
 		if ctx.cancellation_token.is_cancelled() {
-			let aborted = ToolResult {
-				tool_call_id: call.id.clone(),
-				content: "Tool execution aborted before start".to_string(),
-				is_error: true,
-				terminate: false,
-				details: None,
-			};
-			if let (Some(durable), Some(execution_id)) = (&self.durable, execution_id.as_deref())
-				&& let Err(error) = durable.finish_execution(execution_id, &effective_call, &aborted).await
-			{
-				return durable_failure_result(
-					&call.id,
-					&error,
-					format!("tool cancellation outcome could not be persisted: {error}"),
-				);
-			}
-			return aborted;
+			return self
+				.abort_before_start(call, &effective_call, execution_id.as_deref())
+				.await;
 		}
 
 		let result = match tool.execute_with_call_id(&effective_call.id, &effective_call.arguments, ctx).await {
@@ -292,7 +360,21 @@ impl ToolScheduler {
 			Err(err) => tool_error_result(&effective_call.id, err),
 		};
 		let mut result = ToolResult { tool_call_id: call.id.clone(), ..result };
+		// Hook subprocesses have their own semaphore; release the execution
+		// slot first so permits are never held in a nested order.
+		drop(exec_permit);
 		if let Some(hooks) = &self.hooks {
+			// A completed tool always reports to `PostToolUse`, even after a
+			// cancel: the hook spawn is bounded, never dropped.
+			let _post_hook_permit = match hook_permits {
+				Some(permits) => Some(
+					Arc::clone(permits)
+						.acquire_owned()
+						.await
+						.expect("scheduler semaphore is never closed"),
+				),
+				None => None,
+			};
 			let post = hooks
 				.post_tool_use(
 					&effective_call.name,
@@ -324,9 +406,66 @@ impl ToolScheduler {
 		result
 	}
 
-	async fn run_concurrent(&self, calls: &[&ToolCall], ctx: &AgentContext) -> Vec<ToolResult> {
-		join_all(calls.iter().map(|call| self.run_single(call, ctx))).await
+	/// Terminal result for a call aborted before its effect starts. Rewrites the
+	/// durable intent to the aborted outcome; a cancellation outcome that could
+	/// not be persisted becomes a durability failure marker.
+	async fn abort_before_start(
+		&self,
+		call: &ToolCall,
+		effective_call: &ToolCall,
+		execution_id: Option<&str>,
+	) -> ToolResult {
+		let aborted = ToolResult {
+			tool_call_id: call.id.clone(),
+			content: "Tool execution aborted before start".to_string(),
+			is_error: true,
+			terminate: false,
+			details: None,
+		};
+		if let (Some(durable), Some(execution_id)) = (&self.durable, execution_id)
+			&& let Err(error) = durable
+				.finish_execution(execution_id, effective_call, &aborted)
+				.await
+		{
+			return durable_failure_result(
+				&call.id,
+				&error,
+				format!("tool cancellation outcome could not be persisted: {error}"),
+			);
+		}
+		aborted
 	}
+
+	async fn run_concurrent(&self, calls: &[&ToolCall], ctx: &AgentContext) -> Vec<ToolResult> {
+		// `join_all` polls in input order and collects in that order, so the
+		// results stay index-aligned with `calls` however the permits interleave.
+		let exec_permits = Arc::new(tokio::sync::Semaphore::new(self.max_concurrent));
+		let hook_permits = Arc::new(tokio::sync::Semaphore::new(self.max_concurrent));
+		join_all(calls.iter().map(|call| {
+			let exec_permits = Arc::clone(&exec_permits);
+			let hook_permits = Arc::clone(&hook_permits);
+			async move {
+				self.run_single(call, ctx, Some(&exec_permits), Some(&hook_permits))
+					.await
+			}
+		}))
+		.await
+	}
+}
+
+/// `hub` ops that only observe or unblock other calls. Work-starting ops
+/// (`start`, `restart`) and unknown/missing ops deliberately keep their
+/// concurrency permit so a batch cannot spawn unbounded work.
+fn hub_op_is_control(args: &serde_json::Value) -> bool {
+	// `HubTool` resolves the op with `require_non_empty_str`, which trims, so
+	// the exemption must trim the same way or a padded op silently escapes it.
+	matches!(
+		args.get("op").and_then(serde_json::Value::as_str).map(str::trim),
+		Some(
+			"jobs" | "cancel" | "wait" | "send" | "inbox" | "list" | "ps" | "logs" | "stop"
+				| "describe"
+		)
+	)
 }
 
 fn append_hook_text(result: &mut ToolResult, label: &str, text: &str) {
@@ -590,5 +729,485 @@ mod tests {
 		assert_eq!(results.len(), 1);
 		assert!(results[0].is_error, "cancelled turn must not execute the tool");
 		assert!(!marker.exists(), "approved call ran after cancellation");
+	}
+
+	struct ConcurrencyProbe {
+		active: Arc<std::sync::atomic::AtomicUsize>,
+		peak:   Arc<std::sync::atomic::AtomicUsize>,
+	}
+
+	#[async_trait]
+	impl crate::tool::Tool for ConcurrencyProbe {
+		fn name(&self) -> &str {
+			"probe"
+		}
+
+		fn description(&self) -> &str {
+			"concurrency probe"
+		}
+
+		fn schema(&self) -> serde_json::Value {
+			json!({"type": "object"})
+		}
+
+		async fn execute(
+			&self,
+			args: &serde_json::Value,
+			_ctx: &AgentContext,
+		) -> Result<crate::state::ToolResult, ToolError> {
+			use std::sync::atomic::Ordering;
+			let now = self.active.fetch_add(1, Ordering::SeqCst) + 1;
+			self.peak.fetch_max(now, Ordering::SeqCst);
+			let sleep_ms = args.get("sleep_ms").and_then(serde_json::Value::as_u64).unwrap_or(0);
+			tokio::time::sleep(Duration::from_millis(sleep_ms)).await;
+			self.active.fetch_sub(1, Ordering::SeqCst);
+			if args.get("fail").and_then(serde_json::Value::as_bool) == Some(true) {
+				return Err(ToolError::ExecutionFailed(format!("probe {sleep_ms} failed")));
+			}
+			Ok(crate::state::ToolResult {
+				tool_call_id: String::new(),
+				content: format!("probe {sleep_ms}"),
+				is_error: false,
+				terminate: false,
+				details: None,
+			})
+		}
+	}
+
+	fn probe_scheduler(
+		limit: usize,
+		active: &Arc<std::sync::atomic::AtomicUsize>,
+		peak: &Arc<std::sync::atomic::AtomicUsize>,
+	) -> ToolScheduler {
+		let mut registry = ToolRegistry::new();
+		registry.register(Arc::new(ConcurrencyProbe {
+			active: Arc::clone(active),
+			peak:   Arc::clone(peak),
+		}));
+		ToolScheduler::new(registry).with_max_concurrent(limit)
+	}
+
+	/// Test double for the real `hub` tool: `wait` blocks until a `send` in the
+	/// same batch notifies the shared gate.
+	struct HubGate {
+		gate: Arc<tokio::sync::Notify>,
+	}
+
+	#[async_trait]
+	impl crate::tool::Tool for HubGate {
+		fn name(&self) -> &str {
+			"hub"
+		}
+
+		fn description(&self) -> &str {
+			"hub test double"
+		}
+
+		fn schema(&self) -> serde_json::Value {
+			json!({"type": "object"})
+		}
+
+		async fn execute(
+			&self,
+			args: &serde_json::Value,
+			_ctx: &AgentContext,
+		) -> Result<crate::state::ToolResult, ToolError> {
+			match args.get("op").and_then(serde_json::Value::as_str) {
+				Some("wait") => {
+					self.gate.notified().await;
+				},
+				Some("send") => self.gate.notify_one(),
+				_ => {},
+			}
+			Ok(crate::state::ToolResult {
+				tool_call_id: String::new(),
+				content: "hub".to_string(),
+				is_error: false,
+				terminate: false,
+				details: None,
+			})
+		}
+	}
+
+	fn hub_call(id: &str, op: &str) -> ToolCall {
+		ToolCall {
+			id: id.to_string(),
+			name: "hub".to_string(),
+			arguments: json!({"op": op}),
+		}
+	}
+
+	/// Test double for hub work-starting ops: `start` sleeps, then marks done
+	/// so a later probe can prove it only ran after the permit was released.
+	/// `started` is written at execute entry, i.e. after the scheduler acquired
+	/// the permit, so a hook can wait for the effect boundary deterministically.
+	struct HubStart {
+		done:    Arc<std::sync::atomic::AtomicUsize>,
+		started: Option<Arc<std::path::PathBuf>>,
+	}
+
+	#[async_trait]
+	impl crate::tool::Tool for HubStart {
+		fn name(&self) -> &str {
+			"hub"
+		}
+
+		fn description(&self) -> &str {
+			"hub start test double"
+		}
+
+		fn schema(&self) -> serde_json::Value {
+			json!({"type": "object"})
+		}
+
+		async fn execute(
+			&self,
+			args: &serde_json::Value,
+			_ctx: &AgentContext,
+		) -> Result<crate::state::ToolResult, ToolError> {
+			if args.get("op").and_then(serde_json::Value::as_str) == Some("start") {
+				if let Some(path) = &self.started {
+					let _ = std::fs::write(path.as_path(), "1");
+				}
+				tokio::time::sleep(Duration::from_millis(30)).await;
+				self.done.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+			}
+			Ok(crate::state::ToolResult {
+				tool_call_id: String::new(),
+				content: "hub start".to_string(),
+				is_error: false,
+				terminate: false,
+				details: None,
+			})
+		}
+	}
+
+	/// Records how many hub `start`s had finished when it was allowed to run.
+	struct StartOrderProbe {
+		done:     Arc<std::sync::atomic::AtomicUsize>,
+		observed: Arc<std::sync::atomic::AtomicUsize>,
+	}
+
+	#[async_trait]
+	impl crate::tool::Tool for StartOrderProbe {
+		fn name(&self) -> &str {
+			"probe"
+		}
+
+		fn description(&self) -> &str {
+			"start-order probe"
+		}
+
+		fn schema(&self) -> serde_json::Value {
+			json!({"type": "object"})
+		}
+
+		async fn execute(
+			&self,
+			_args: &serde_json::Value,
+			_ctx: &AgentContext,
+		) -> Result<crate::state::ToolResult, ToolError> {
+			let done = self.done.load(std::sync::atomic::Ordering::SeqCst);
+			self.observed.store(done, std::sync::atomic::Ordering::SeqCst);
+			Ok(crate::state::ToolResult {
+				tool_call_id: String::new(),
+				content: format!("saw {done} starts"),
+				is_error: false,
+				terminate: false,
+				details: None,
+			})
+		}
+	}
+
+	fn probe_call(index: usize, sleep_ms: u64) -> ToolCall {
+		probe_call_with(index, sleep_ms, false)
+	}
+
+	fn probe_call_with(index: usize, sleep_ms: u64, fail: bool) -> ToolCall {
+		ToolCall {
+			id: format!("call_{index}"),
+			name: "probe".to_string(),
+			arguments: json!({"sleep_ms": sleep_ms, "fail": fail}),
+		}
+	}
+
+	#[tokio::test]
+	async fn concurrent_group_never_exceeds_max_concurrent() {
+		use std::sync::atomic::Ordering;
+		let active = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+		let peak = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+		let scheduler = probe_scheduler(2, &active, &peak);
+
+		let calls: Vec<ToolCall> = (0..6).map(|i| probe_call(i, 10)).collect();
+		let results = scheduler
+			.execute_batch(&calls, &AgentContext::new(temp_dir("max-concurrent")))
+			.await;
+
+		assert_eq!(results.len(), calls.len());
+		let observed = peak.load(Ordering::SeqCst);
+		assert!(observed <= 2, "peak {observed} exceeded max_concurrent 2");
+		assert_eq!(observed, 2, "the semaphore should still allow two overlapping tools");
+		assert_eq!(active.load(Ordering::SeqCst), 0, "every probe released its slot");
+	}
+
+	#[tokio::test]
+	async fn max_concurrent_zero_is_clamped_to_one() {
+		use std::sync::atomic::Ordering;
+		let active = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+		let peak = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+		let scheduler = probe_scheduler(0, &active, &peak);
+
+		let calls: Vec<ToolCall> = (0..3).map(|i| probe_call(i, 5)).collect();
+		let results = scheduler
+			.execute_batch(&calls, &AgentContext::new(temp_dir("clamped")))
+			.await;
+
+		assert_eq!(results.len(), 3);
+		assert_eq!(peak.load(Ordering::SeqCst), 1, "a zero limit must clamp to one");
+	}
+
+	#[test]
+	fn with_max_concurrent_clamps_to_the_semaphore_limits() {
+		let clamped = |limit: usize| {
+			ToolScheduler::new(ToolRegistry::new()).with_max_concurrent(limit).max_concurrent
+		};
+		assert_eq!(
+			clamped(usize::MAX),
+			tokio::sync::Semaphore::MAX_PERMITS,
+			"the semaphore constructor panics above MAX_PERMITS"
+		);
+		assert_eq!(clamped(3), 3);
+	}
+
+	#[tokio::test]
+	async fn hub_wait_does_not_starve_its_unblocking_send() {
+		let mut registry = ToolRegistry::new();
+		registry.register(Arc::new(HubGate { gate: Arc::new(tokio::sync::Notify::new()) }));
+		// One permit would deadlock if the wait held it: the send that releases
+		// the wait only runs after the batch's later calls get a turn.
+		let scheduler = ToolScheduler::new(registry).with_max_concurrent(1);
+		let calls = vec![hub_call("call_wait", "wait"), hub_call("call_send", "send")];
+
+		let results = tokio::time::timeout(
+			Duration::from_secs(5),
+			scheduler.execute_batch(&calls, &AgentContext::new(temp_dir("hub-exemption"))),
+		)
+		.await
+		.expect("hub wait must not starve the send that unblocks it");
+
+		let ids: Vec<&str> = results.iter().map(|result| result.tool_call_id.as_str()).collect();
+		assert_eq!(ids, ["call_wait", "call_send"]);
+		assert!(results.iter().all(|result| !result.is_error));
+	}
+
+	#[tokio::test]
+	async fn hub_start_stays_bounded_by_max_concurrent() {
+		use std::sync::atomic::{AtomicUsize, Ordering};
+		let done = Arc::new(AtomicUsize::new(0));
+		let observed = Arc::new(AtomicUsize::new(0));
+		let mut registry = ToolRegistry::new();
+		registry.register(Arc::new(HubStart { done: Arc::clone(&done), started: None }));
+		registry.register(Arc::new(StartOrderProbe {
+			done:     Arc::clone(&done),
+			observed: Arc::clone(&observed),
+		}));
+		let scheduler = ToolScheduler::new(registry).with_max_concurrent(1);
+
+		let calls = vec![hub_call("call_start", "start"), probe_call(0, 0)];
+		let results = tokio::time::timeout(
+			Duration::from_secs(5),
+			scheduler.execute_batch(&calls, &AgentContext::new(temp_dir("hub-start-bounded"))),
+		)
+		.await
+		.expect("a work-starting hub op must finish, not deadlock");
+
+		assert_eq!(results.len(), 2);
+		assert_eq!(
+			observed.load(Ordering::SeqCst),
+			1,
+			"hub start must hold the only permit until it finishes"
+		);
+	}
+
+	#[test]
+	fn hub_permit_exemption_covers_only_observe_and_unblock_ops() {
+		for op in [
+			"send", "wait", "inbox", "list", "jobs", "cancel", "ps", "logs", "stop", "describe",
+		] {
+			assert!(hub_op_is_control(&json!({"op": op})), "op {op} must skip the permit");
+		}
+		for op in ["start", "restart", "spawn", "unknown"] {
+			assert!(!hub_op_is_control(&json!({"op": op})), "op {op} must stay bounded");
+		}
+		// `HubTool` trims the op, so padded spellings must classify identically.
+		for op in [" wait ", " send ", "  jobs  "] {
+			assert!(hub_op_is_control(&json!({"op": op})), "padded op {op:?} must skip the permit");
+		}
+		for op in [" start ", " restart "] {
+			assert!(!hub_op_is_control(&json!({"op": op})), "padded op {op:?} must stay bounded");
+		}
+		assert!(!hub_op_is_control(&json!({})), "a missing op must stay bounded");
+		assert!(!hub_op_is_control(&json!({"op": 1})), "a non-string op must stay bounded");
+	}
+
+	#[cfg(unix)]
+	#[tokio::test]
+	async fn pre_tool_use_rewrite_decides_the_hub_permit() {
+		use std::sync::atomic::{AtomicUsize, Ordering};
+
+		use crate::hooks::{HookConfig, HookEngine, HookEvent, HookInvocation, HookRule};
+
+		let dir = temp_dir("hook-rewrite");
+		let ready = dir.join("hook.ready");
+		let started = dir.join("tool.started");
+		let done = Arc::new(AtomicUsize::new(0));
+		let observed = Arc::new(AtomicUsize::new(0));
+		let mut registry = ToolRegistry::new();
+		registry.register(Arc::new(HubStart {
+			done:    Arc::clone(&done),
+			started: Some(Arc::new(started.clone())),
+		}));
+		registry.register(Arc::new(StartOrderProbe {
+			done:     Arc::clone(&done),
+			observed: Arc::clone(&observed),
+		}));
+		let mut scheduler = ToolScheduler::new(registry).with_max_concurrent(1);
+		// The hub hook rewrites the exempt `wait` into work-starting `start`
+		// and drops `hook.ready` only after writing its reply. The probe hook
+		// waits for that file, then for `tool.started`, which the hub double
+		// writes only after the scheduler acquired the single permit. That
+		// closes the child-reap race: the probe cannot reach `acquire_owned`
+		// before the rewritten `start` holds the permit. Evaluating the
+		// pre-hook arguments would let the probe run first (observed == 0).
+		let hub_hook = HookRule {
+			event:      HookEvent::PreToolUse,
+			matcher:    Some("hub".to_string()),
+			invocation: HookInvocation::Shell(format!(
+				r#"cat >/dev/null; printf '%s' '{{"hookSpecificOutput":{{"updatedInput":{{"op":"start"}}}}}}'; : > '{}'"#,
+				ready.display()
+			)),
+			timeout_ms: 2_000,
+			fail_closed: true,
+		};
+		let probe_hook = HookRule {
+			event:      HookEvent::PreToolUse,
+			matcher:    Some("probe".to_string()),
+			invocation: HookInvocation::Shell(format!(
+				r#"cat >/dev/null; i=0; while [ ! -e '{}' ] && [ "$i" -lt 200 ]; do i=$((i+1)); sleep 0.01; done; j=0; while [ ! -e '{}' ] && [ "$j" -lt 200 ]; do j=$((j+1)); sleep 0.01; done"#,
+				ready.display(),
+				started.display()
+			)),
+			timeout_ms: 2_000,
+			fail_closed: false,
+		};
+		scheduler.set_hooks(Some(Arc::new(HookEngine::new(
+			HookConfig::new(vec![hub_hook, probe_hook]),
+			"scheduler-hook-test",
+			dir.clone(),
+		))));
+
+		let calls = vec![hub_call("call_rewritten", "wait"), probe_call(0, 0)];
+		let results = tokio::time::timeout(
+			Duration::from_secs(5),
+			scheduler.execute_batch(&calls, &AgentContext::new(dir)),
+		)
+		.await
+		.expect("the rewritten start must finish, not deadlock");
+
+		assert_eq!(results.len(), 2);
+		assert_eq!(results[0].tool_call_id, "call_rewritten");
+		assert_eq!(
+			observed.load(Ordering::SeqCst),
+			1,
+			"the post-hook `start` must hold the permit, not the pre-hook `wait`"
+		);
+	}
+
+	#[tokio::test]
+	async fn cancellation_while_queued_for_a_permit_never_starts_the_effect() {
+		use std::sync::atomic::Ordering;
+		let active = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+		let peak = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+		let scheduler = probe_scheduler(1, &active, &peak);
+		let calls = vec![probe_call(0, 200), probe_call(1, 0)];
+
+		let token = CancellationToken::new();
+		let ctx = AgentContext::with_cancellation(temp_dir("permit-cancel"), token.clone());
+		let batch = tokio::spawn(async move { scheduler.execute_batch(&calls, &ctx).await });
+		tokio::time::sleep(Duration::from_millis(50)).await;
+		token.cancel();
+
+		let results = tokio::time::timeout(Duration::from_secs(5), batch)
+			.await
+			.expect("a cancelled queued call must settle")
+			.expect("join");
+		assert_eq!(results.len(), 2);
+		assert_eq!(results[0].tool_call_id, "call_0");
+		assert_eq!(results[1].tool_call_id, "call_1");
+		assert!(!results[0].is_error, "the in-flight call completes normally");
+		assert!(results[1].is_error, "a cancelled queued call must not run");
+		assert!(
+			results[1].content.contains("aborted before start"),
+			"{}",
+			results[1].content
+		);
+		assert_eq!(peak.load(Ordering::SeqCst), 1);
+	}
+
+	#[tokio::test]
+	async fn concurrent_errors_and_cancellations_keep_call_order() {
+		let active = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+		let peak = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+		let scheduler = probe_scheduler(2, &active, &peak);
+
+		// Slow failures finish after fast successes: the error flag must stay
+		// on its own index instead of following completion order.
+		let calls = vec![
+			probe_call_with(0, 30, true),
+			probe_call_with(1, 0, true),
+			probe_call(2, 20),
+			probe_call(3, 0),
+		];
+		let results = scheduler
+			.execute_batch(&calls, &AgentContext::new(temp_dir("error-order")))
+			.await;
+		let ids: Vec<&str> = results.iter().map(|result| result.tool_call_id.as_str()).collect();
+		let expected: Vec<&str> = calls.iter().map(|call| call.id.as_str()).collect();
+		assert_eq!(ids, expected);
+		assert_eq!(
+			results.iter().map(|result| result.is_error).collect::<Vec<_>>(),
+			[true, true, false, false]
+		);
+
+		// A batch cancelled before start still yields one aborted result per
+		// call, in call order.
+		let token = CancellationToken::new();
+		token.cancel();
+		let ctx = AgentContext::with_cancellation(temp_dir("cancel-order"), token);
+		let results = scheduler.execute_batch(&calls, &ctx).await;
+		let ids: Vec<&str> = results.iter().map(|result| result.tool_call_id.as_str()).collect();
+		assert_eq!(ids, expected);
+		assert!(results.iter().all(|result| result.is_error));
+		assert!(results.iter().all(|result| result.content.contains("aborted before start")));
+	}
+
+	#[tokio::test]
+	async fn concurrent_results_keep_call_order_when_earlier_calls_are_slower() {
+		let active = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+		let peak = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+		let scheduler = probe_scheduler(DEFAULT_MAX_CONCURRENT_TOOLS, &active, &peak);
+
+		// Descending sleeps: later calls finish first, so completion order is
+		// the reverse of call order. Results must still be call-ordered.
+		let sleeps = [40, 30, 20, 10, 0];
+		let calls: Vec<ToolCall> =
+			sleeps.iter().enumerate().map(|(i, ms)| probe_call(i, *ms)).collect();
+		let results = scheduler
+			.execute_batch(&calls, &AgentContext::new(temp_dir("order")))
+			.await;
+
+		let ids: Vec<&str> = results.iter().map(|result| result.tool_call_id.as_str()).collect();
+		let expected: Vec<&str> = calls.iter().map(|call| call.id.as_str()).collect();
+		assert_eq!(ids, expected);
 	}
 }
