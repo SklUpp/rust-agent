@@ -2223,8 +2223,10 @@ fn reset(request: &Request, out: &mut impl Write) -> Result<()> {
 }
 
 fn init_xdg(out: &mut impl Write) -> Result<()> {
-	if !cfg!(any(target_os = "linux", target_os = "android", target_os = "macos")) {
-		return Err(Error::new("XDG directory setup is only supported on Linux and macOS."));
+	if !dirs::xdg_supported() {
+		return Err(Error::new(
+			"XDG directory setup is only supported on Linux, Android, and macOS.",
+		));
 	}
 	let home = dirs::home_dir();
 	let home_of = |key: &str, fallback: &str| {
@@ -3102,6 +3104,74 @@ mod tests {
 			}
 		}
 		let _ = std::fs::remove_dir_all(&base);
+	}
+
+	#[cfg(any(target_os = "linux", target_os = "android", target_os = "macos"))]
+	#[test]
+	fn init_xdg_creates_the_directories_dirs_resolves() {
+		let _env = crate::TEST_ENV_LOCK.lock().expect("env lock");
+		let base = std::env::temp_dir().join(format!(
+			"aragent-init-xdg-{}-{:?}",
+			std::process::id(),
+			std::time::SystemTime::now()
+				.duration_since(std::time::UNIX_EPOCH)
+				.map(|elapsed| elapsed.as_nanos())
+				.unwrap_or_default()
+		));
+		let home = base.join("home");
+		std::fs::create_dir_all(&home).expect("home");
+		let keys = [
+			"HOME",
+			"PI_CONFIG_DIR",
+			"PI_CODING_AGENT_DIR",
+			"ARAGENT_PROFILE",
+			"OMP_PROFILE",
+			"PI_PROFILE",
+			"XDG_DATA_HOME",
+			"XDG_STATE_HOME",
+			"XDG_CACHE_HOME",
+		];
+		let saved = keys.map(std::env::var_os);
+		let xdg = [
+			("XDG_DATA_HOME", dirs::AgentDirCategory::Data),
+			("XDG_STATE_HOME", dirs::AgentDirCategory::State),
+			("XDG_CACHE_HOME", dirs::AgentDirCategory::Cache),
+		];
+		// SAFETY: guarded by TEST_ENV_LOCK.
+		unsafe {
+			std::env::set_var("HOME", &home);
+			for key in &keys[1..] {
+				std::env::remove_var(*key);
+			}
+			for (key, _) in &xdg {
+				std::env::set_var(*key, home.join(*key));
+			}
+		}
+		let mut out = Vec::new();
+		let result = init_xdg(&mut out);
+		let created: Vec<PathBuf> =
+			xdg.iter().map(|(key, _)| home.join(*key).join(dirs::XDG_APP_DIR_NAME)).collect();
+		let resolved: Vec<PathBuf> = xdg
+			.iter()
+			.map(|(_, category)| dirs::root_subdir("sessions", *category))
+			.collect();
+		let existing: Vec<bool> = created.iter().map(|dir| dir.is_dir()).collect();
+		// SAFETY: guarded by TEST_ENV_LOCK.
+		unsafe {
+			for (key, value) in keys.into_iter().zip(saved) {
+				match value {
+					Some(value) => std::env::set_var(key, value),
+					None => std::env::remove_var(key),
+				}
+			}
+		}
+		let _ = std::fs::remove_dir_all(&base);
+		assert!(result.is_ok(), "{result:?}");
+		assert!(existing.iter().all(|present| *present), "{existing:?}");
+		let expected: Vec<PathBuf> = created.iter().map(|root| root.join("sessions")).collect();
+		assert_eq!(resolved, expected, "each category resolves under the created app root");
+		let text = String::from_utf8_lossy(&out);
+		assert_eq!(text.matches("Created ").count(), 3, "{text}");
 	}
 
 	#[test]

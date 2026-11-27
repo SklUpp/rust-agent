@@ -242,9 +242,18 @@ fn agent_category_root(category: AgentDirCategory) -> PathBuf {
 	xdg_agent_root(category).unwrap_or_else(agent_dir)
 }
 
-/// `DirResolver` XDG pin rules: Linux/macOS only, only when the agent dir is its
-/// default (no explicit `PI_CODING_AGENT_DIR` override), and — for a named
-/// profile — only when that category already contains `aragent/profiles/<name>`.
+/// Whether the XDG layout applies: Linux, Android and macOS. Windows and the
+/// BSDs keep the `~/.aragent` default. `arag config init-xdg` gates on the same
+/// predicate so the directories it creates are the ones this module resolves.
+#[must_use]
+pub const fn xdg_supported() -> bool {
+	cfg!(any(target_os = "linux", target_os = "android", target_os = "macos"))
+}
+
+/// `DirResolver` XDG pin rules: Linux, Android, and macOS only, only when the
+/// agent dir is its default (no explicit `PI_CODING_AGENT_DIR` override), and —
+/// for a named profile — only when that category already contains
+/// `aragent/profiles/<name>`.
 /// The base `arag` root is never consulted for a named profile, so a profile
 /// cannot silently move to XDG once the base app dir appears.
 ///
@@ -252,7 +261,7 @@ fn agent_category_root(category: AgentDirCategory) -> PathBuf {
 /// `omp` directory, so no mutation can land there. Read fallbacks use
 /// [`xdg_legacy_agent_root`].
 fn xdg_agent_root(category: AgentDirCategory) -> Option<PathBuf> {
-	if !cfg!(any(target_os = "linux", target_os = "macos")) {
+	if !xdg_supported() {
 		return None;
 	}
 	let base = base_config_root();
@@ -279,7 +288,7 @@ fn xdg_agent_root(category: AgentDirCategory) -> Option<PathBuf> {
 /// Legacy XDG `omp` app root, read-only. Same pin preconditions as
 /// [`xdg_agent_root`]; `None` under an explicit storage override.
 fn xdg_legacy_agent_root(category: AgentDirCategory) -> Option<PathBuf> {
-	if !cfg!(any(target_os = "linux", target_os = "macos")) || explicit_storage_override() {
+	if !xdg_supported() || explicit_storage_override() {
 		return None;
 	}
 	let base = base_config_root();
@@ -570,5 +579,81 @@ mod tests {
 			}),
 			Some(PathBuf::from("/xdg/omp"))
 		);
+	}
+
+	#[test]
+	fn xdg_supported_covers_every_init_xdg_target() {
+		assert_eq!(
+			xdg_supported(),
+			cfg!(any(target_os = "linux", target_os = "android", target_os = "macos")),
+			"`dirs.rs` XDG roots and `arag config init-xdg` must accept the same targets"
+		);
+	}
+
+	#[cfg(any(target_os = "linux", target_os = "android", target_os = "macos"))]
+	#[test]
+	fn xdg_roots_resolve_to_the_directories_init_xdg_creates() {
+		let _env = crate::TEST_ENV_LOCK.lock().expect("env lock");
+		let home = env::temp_dir().join(format!("aragent-dirs-xdg-{}", std::process::id()));
+		let keys = [
+			"HOME",
+			"PI_CONFIG_DIR",
+			"PI_CODING_AGENT_DIR",
+			"ARAGENT_PROFILE",
+			"OMP_PROFILE",
+			"PI_PROFILE",
+			"XDG_DATA_HOME",
+			"XDG_STATE_HOME",
+			"XDG_CACHE_HOME",
+		];
+		let saved = keys.map(env::var_os);
+		let data = home.join("data");
+		let state = home.join("state");
+		let cache = home.join("cache");
+		let _ = std::fs::remove_dir_all(&home);
+		for dir in [&data, &state, &cache] {
+			std::fs::create_dir_all(dir.join(XDG_APP_DIR_NAME)).expect("xdg app dir");
+		}
+		std::fs::create_dir_all(data.join(XDG_LEGACY_APP_DIR_NAME)).expect("legacy xdg app dir");
+		// SAFETY: guarded by TEST_ENV_LOCK.
+		unsafe {
+			env::set_var("HOME", &home);
+			for key in &keys[1..] {
+				env::remove_var(*key);
+			}
+			env::set_var("XDG_DATA_HOME", &data);
+			env::set_var("XDG_STATE_HOME", &state);
+			env::set_var("XDG_CACHE_HOME", &cache);
+		}
+		let roots = [
+			xdg_agent_root(AgentDirCategory::Data),
+			xdg_agent_root(AgentDirCategory::State),
+			xdg_agent_root(AgentDirCategory::Cache),
+		];
+		let legacy = [
+			xdg_legacy_agent_root(AgentDirCategory::Data),
+			xdg_legacy_agent_root(AgentDirCategory::State),
+			xdg_legacy_agent_root(AgentDirCategory::Cache),
+		];
+		let subdir = root_subdir("sessions", AgentDirCategory::Data);
+		let worktrees = worktrees_root();
+		unsafe {
+			for (key, value) in keys.into_iter().zip(saved) {
+				match value {
+					Some(value) => env::set_var(key, value),
+					None => env::remove_var(key),
+				}
+			}
+		}
+		let _ = std::fs::remove_dir_all(&home);
+		// `arag config init-xdg` creates `$XDG_*_HOME/aragent` for these three.
+		assert_eq!(roots[0], Some(data.join(XDG_APP_DIR_NAME)));
+		assert_eq!(roots[1], Some(state.join(XDG_APP_DIR_NAME)));
+		assert_eq!(roots[2], Some(cache.join(XDG_APP_DIR_NAME)));
+		assert_eq!(legacy[0], Some(data.join(XDG_LEGACY_APP_DIR_NAME)));
+		assert_eq!(legacy[1], None, "no `$XDG_STATE_HOME/omp` migration");
+		assert_eq!(legacy[2], None, "no `$XDG_CACHE_HOME/omp` migration");
+		assert_eq!(subdir, data.join(XDG_APP_DIR_NAME).join("sessions"));
+		assert_eq!(worktrees, data.join(XDG_APP_DIR_NAME).join("wt"));
 	}
 }
