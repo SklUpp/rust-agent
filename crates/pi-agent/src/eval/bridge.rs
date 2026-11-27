@@ -24,7 +24,7 @@ use tokio::{
 };
 use tokio_util::sync::CancellationToken;
 
-use crate::state::AgentContext;
+use crate::{security_primitives::constant_time_eq, state::AgentContext};
 
 use super::{
 	host::{
@@ -462,21 +462,13 @@ async fn write_response(
 	stream.flush().await
 }
 
-/// Length-independent comparison of the presented token.
-fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
-	let mut difference = left.len() ^ right.len();
-	for index in 0..left.len().max(right.len()) {
-		let a = left.get(index).copied().unwrap_or(0);
-		let b = right.get(index).copied().unwrap_or(0);
-		difference |= usize::from(a ^ b);
-	}
-	difference == 0
-}
-
 #[cfg(test)]
 mod tests {
 	use super::*;
-	use crate::{eval::ArtifactRef, state::ToolResult, tool::ToolError};
+	use crate::{
+		eval::ArtifactRef, security_primitives::constant_time_eq, state::ToolResult,
+		tool::ToolError,
+	};
 	use async_trait::async_trait;
 
 	#[test]

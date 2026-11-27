@@ -15,6 +15,7 @@ pub mod provider;
 pub mod provider_anthropic;
 #[cfg(feature = "direct-providers")]
 pub mod provider_ollama;
+pub mod security_primitives;
 pub mod state;
 pub mod subagent_advisor;
 pub mod subagent_lifecycle;

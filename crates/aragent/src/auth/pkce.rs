@@ -49,17 +49,13 @@ pub fn random_owner_id() -> Result<String, AuthError> {
 	random_uuid_v4()
 }
 
-/// `crypto.getRandomValues` equivalent. Unreadable `/dev/urandom` is a hard
-/// error: a weak fallback would weaken PKCE/state, and Android always has it.
+/// `crypto.getRandomValues` equivalent. A failing OS CSPRNG is a hard error:
+/// a weak fallback would weaken PKCE/state.
 fn random_bytes(len: usize) -> Result<Vec<u8>, AuthError> {
-	use std::io::Read as _;
 	let mut bytes = vec![0u8; len];
-	std::fs::File::open("/dev/urandom")
-		.and_then(|mut file| file.read_exact(&mut bytes))
-		.map_err(|err| {
-			// The OS error string carries no secret; no weak fallback is used.
-			AuthError::new(AuthErrorKind::Configuration, format!("cannot read /dev/urandom: {err}"))
-		})?;
+	pi_agent::security_primitives::random_bytes(&mut bytes).map_err(|err| {
+		AuthError::new(AuthErrorKind::Configuration, format!("cannot fill random bytes: {err}"))
+	})?;
 	Ok(bytes)
 }
 
@@ -67,16 +63,7 @@ fn random_bytes(len: usize) -> Result<Vec<u8>, AuthError> {
 /// takes the same path, so timing cannot reveal how much of the nonce matched.
 #[must_use]
 pub fn constant_time_eq(left: &str, right: &str) -> bool {
-	let left = left.as_bytes();
-	let right = right.as_bytes();
-	let mut diff = u8::from(left.len() != right.len());
-	let len = left.len().max(right.len());
-	for index in 0..len {
-		let a = left.get(index).copied().unwrap_or(0);
-		let b = right.get(index).copied().unwrap_or(0);
-		diff |= a ^ b;
-	}
-	diff == 0
+	pi_agent::security_primitives::constant_time_eq_str(left, right)
 }
 
 #[cfg(test)]

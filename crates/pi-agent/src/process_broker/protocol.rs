@@ -399,17 +399,8 @@ pub fn now_ms() -> u64 {
 		.unwrap_or_default()
 }
 
-/// Random lowercase hex from `/dev/urandom` (token, ids, instance id).
-pub fn random_hex(bytes: usize) -> io::Result<String> {
-	let mut buffer = vec![0u8; bytes];
-	std::fs::File::open("/dev/urandom")?.read_exact(&mut buffer)?;
-	let mut text = String::with_capacity(bytes * 2);
-	for byte in buffer {
-		use std::fmt::Write as _;
-		let _ = write!(text, "{byte:02x}");
-	}
-	Ok(text)
-}
+/// Random lowercase hex from the OS CSPRNG (token, ids, instance id).
+pub use crate::security_primitives::random_hex;
 
 /// Current effective uid (Unix) for directory/file ownership checks.
 #[cfg(unix)]
@@ -587,16 +578,7 @@ pub fn ensure_token(runtime_dir: &Path) -> io::Result<String> {
 /// Constant-time token comparison.
 #[must_use]
 pub fn token_matches(expected: &str, provided: &str) -> bool {
-	let expected = expected.as_bytes();
-	let provided = provided.as_bytes();
-	if expected.len() != provided.len() {
-		return false;
-	}
-	let mut difference = 0u8;
-	for (left, right) in expected.iter().zip(provided) {
-		difference |= left ^ right;
-	}
-	difference == 0
+	crate::security_primitives::constant_time_eq_str(expected, provided)
 }
 
 /// Kernel start time (`/proc/<pid>/stat` field 22) used as safe process identity.

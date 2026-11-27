@@ -1,11 +1,5 @@
 //! Small dependency-free helpers shared by eval backends.
 
-use std::{
-	io::Read as _,
-	sync::atomic::{AtomicU64, Ordering},
-	time::{SystemTime, UNIX_EPOCH},
-};
-
 const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
 
 /// Standard base64 with `=` padding.
@@ -47,23 +41,11 @@ pub fn base64_decode(data: &str) -> Option<Vec<u8>> {
 	Some(out)
 }
 
-/// Random hex token for the loopback bridge. Prefers `/dev/urandom`; falls back
-/// to time+pid+counter so a permission-restricted host still gets a unique
-/// per-process value.
+/// Random hex token for the loopback bridge from the OS CSPRNG.
+///
+/// Fails closed: a host without working OS randomness cannot serve the bridge.
 pub fn random_token() -> String {
-	static COUNTER: AtomicU64 = AtomicU64::new(0);
-	let mut bytes = [0u8; 16];
-	let mut filled = false;
-	if let Ok(mut file) = std::fs::File::open("/dev/urandom") {
-		filled = file.read_exact(&mut bytes).is_ok();
-	}
-	if !filled {
-		let now = SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |elapsed| elapsed.as_nanos());
-		let counter = COUNTER.fetch_add(1, Ordering::Relaxed);
-		let mix = now ^ (u128::from(std::process::id()) << 64) ^ u128::from(counter);
-		bytes.copy_from_slice(&mix.to_le_bytes());
-	}
-	bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+	crate::security_primitives::random_hex(16).expect("OS CSPRNG unavailable")
 }
 
 #[cfg(test)]
