@@ -2816,11 +2816,16 @@ mod tests {
 		assert_eq!(dropped, Value::Map(Vec::new()));
 
 		let kept = drop_group_shadows(
-			&yaml::parse("tui:\n  resizeScrollback: preserve\nauth:\n  broker: nonsense\nautoResume: true\n")
-				.expect("parse"),
+			&yaml::parse(
+				"bash:\n  autoBackground: nonsense\ncompaction:\n  enabled: false\nautoResume: true\n",
+			)
+			.expect("parse"),
 		);
-		assert!(kept.get("tui").and_then(|tui| tui.get("resizeScrollback")).is_some());
-		assert!(kept.get("auth").is_some_and(|auth| auth.as_map().is_some_and(|pairs| pairs.is_empty())));
+		assert!(kept.get("bash").is_some_and(|bash| bash.as_map().is_some_and(|pairs| pairs.is_empty())));
+		assert_eq!(
+			kept.get("compaction").and_then(|group| group.get("enabled")).and_then(Value::as_bool),
+			Some(false)
+		);
 		assert_eq!(kept.get("autoResume").and_then(Value::as_bool), Some(true));
 
 		let unknown = drop_group_shadows(

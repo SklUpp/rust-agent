@@ -363,7 +363,6 @@ impl AcpAgent {
 	fn ext_method(&self, method: &str, params: Option<&Value>) -> Result<Value, RequestError> {
 		let root = self.runtime().sessions_root();
 		match method {
-			"speech.models.list" => Ok(capabilities::speech_models_catalog()),
 			"_omp/sessions/listAll" => {
 				let limit = params
 					.and_then(|params| params.get("limit"))

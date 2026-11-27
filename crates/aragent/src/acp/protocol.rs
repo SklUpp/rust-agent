@@ -3,8 +3,7 @@
 //! Ground truth is `packages/utils/src/acp/transport.ts` (envelopes, error
 //! codes, messages) and `packages/utils/src/acp/protocol.ts` (capability
 //! shapes). Only what the transport and the ACP session driver share lives
-//! here: session state, method dispatch and speech catalogues belong to the
-//! modules built on top.
+//! here: session state and method dispatch belong to the modules built on top.
 
 use std::{fmt, hash::{Hash, Hasher}};
 

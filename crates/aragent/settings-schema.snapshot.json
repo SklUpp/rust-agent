@@ -24,18 +24,6 @@
 			"credential": false
 		},
 		{
-			"path": "auth.broker.url",
-			"type": "string",
-			"defaultAbsent": true,
-			"credential": false
-		},
-		{
-			"path": "auth.broker.token",
-			"type": "string",
-			"defaultAbsent": true,
-			"credential": true
-		},
-		{
 			"path": "autoResume",
 			"type": "boolean",
 			"default": false,
@@ -656,41 +644,6 @@
 				"label": "Image URL SSH Remote Port",
 				"description": "Remote listen port of the ssh reverse forward that your web server proxies to",
 				"group": "Vision"
-			}
-		},
-		{
-			"path": "tui.maxInlineImageColumns",
-			"type": "number",
-			"default": 100,
-			"credential": false
-		},
-		{
-			"path": "tui.maxInlineImageRows",
-			"type": "number",
-			"default": 20,
-			"credential": false
-		},
-		{
-			"path": "tui.maxInlineImages",
-			"type": "number",
-			"default": 8,
-			"credential": false
-		},
-		{
-			"path": "tui.resizeScrollback",
-			"type": "enum",
-			"values": [
-				"append",
-				"rebuild",
-				"preserve"
-			],
-			"default": "rebuild",
-			"credential": false,
-			"ui": {
-				"tab": "appearance",
-				"label": "Resize Scrollback",
-				"description": "How a settled terminal resize refreshes transcript rows retained in terminal scrollback",
-				"group": "Display"
 			}
 		},
 		{
@@ -2201,33 +2154,6 @@
 			}
 		},
 		{
-			"path": "tools.format",
-			"type": "enum",
-			"values": [
-				"auto",
-				"native",
-				"glm",
-				"hermes",
-				"kimi",
-				"xml",
-				"anthropic",
-				"deepseek",
-				"harmony",
-				"qwen3",
-				"gemini",
-				"gemma",
-				"minimax"
-			],
-			"default": "auto",
-			"credential": false,
-			"ui": {
-				"tab": "context",
-				"label": "Tool Calling Mode",
-				"description": "Controls how tools are exposed to the model. Auto uses provider-native tool calls unless the selected model is marked as not supporting them, then falls back to the GLM owned dialect. Native forces provider-native tools; the other values force the named owned dialect. Applies on session start.",
-				"group": "Experimental"
-			}
-		},
-		{
 			"path": "snapcompact.shape",
 			"type": "enum",
 			"values": [
@@ -3338,18 +3264,6 @@
 			}
 		},
 		{
-			"path": "bash.autoBackground.enabled",
-			"type": "boolean",
-			"default": true,
-			"credential": false,
-			"ui": {
-				"tab": "shell",
-				"label": "Bash Auto-Background",
-				"description": "Automatically background long-running bash commands and deliver the result later",
-				"group": "Bash"
-			}
-		},
-		{
 			"path": "bash.patterns",
 			"type": "array",
 			"default": [],
@@ -3813,30 +3727,6 @@
 			}
 		},
 		{
-			"path": "speechgen.enabled",
-			"type": "boolean",
-			"default": false,
-			"credential": false,
-			"ui": {
-				"tab": "tools",
-				"label": "Speech Generation",
-				"description": "Enable the tts tool for on-device (Kokoro) or xAI Grok Voice speech-file synthesis",
-				"group": "Available Tools"
-			}
-		},
-		{
-			"path": "generate_image.enabled",
-			"type": "boolean",
-			"default": false,
-			"credential": false,
-			"ui": {
-				"tab": "tools",
-				"label": "Generate Image",
-				"description": "Enable the generate_image tool (text-to-image generation and editing). Exposed as an xd:// device when tools.xdev is on.",
-				"group": "Available Tools"
-			}
-		},
-		{
 			"path": "inspect_image.enabled",
 			"type": "boolean",
 			"default": false,
@@ -4040,90 +3930,6 @@
 			}
 		},
 		{
-			"path": "browser.enabled",
-			"type": "boolean",
-			"default": true,
-			"credential": false,
-			"ui": {
-				"tab": "tools",
-				"label": "Browser",
-				"description": "Enable the browser tool for scripted Chromium automation (puppeteer)",
-				"group": "Available Tools"
-			}
-		},
-		{
-			"path": "browser.cdpUrl",
-			"type": "string",
-			"defaultAbsent": true,
-			"credential": false,
-			"ui": {
-				"tab": "tools",
-				"label": "Browser CDP URL",
-				"description": "Default HTTP CDP discovery endpoint (for example http://127.0.0.1:9222) to attach to instead of launching a browser. Explicit app.cdp_url or app.path on the tool call take precedence.",
-				"group": "Grep & Browser"
-			}
-		},
-		{
-			"path": "browser.relay",
-			"type": "boolean",
-			"default": false,
-			"credential": false,
-			"ui": {
-				"tab": "tools",
-				"label": "Browser Relay",
-				"description": "Drive your own Chrome tabs through the arag browser relay. Install the extension once (`arag browser-relay install`); the relay server auto-starts when the browser tool needs it. Takes precedence over Browser CDP URL; set PI_BROWSER_RELAY=0 or PI_BROWSER_RELAY=1 to override.",
-				"group": "Grep & Browser"
-			}
-		},
-		{
-			"path": "browser.relayUrl",
-			"type": "string",
-			"defaultAbsent": true,
-			"credential": false,
-			"ui": {
-				"tab": "tools",
-				"label": "Browser Relay URL",
-				"description": "arag browser relay endpoint (default http://127.0.0.1:9224).",
-				"group": "Grep & Browser"
-			}
-		},
-		{
-			"path": "browser.headless",
-			"type": "boolean",
-			"default": true,
-			"credential": false,
-			"ui": {
-				"tab": "tools",
-				"label": "Headless Browser",
-				"description": "Launch browser in headless mode (disable to show browser UI)",
-				"group": "Grep & Browser"
-			}
-		},
-		{
-			"path": "browser.cmux",
-			"type": "boolean",
-			"default": true,
-			"credential": false,
-			"ui": {
-				"tab": "tools",
-				"label": "cmux Browser",
-				"description": "Use cmux WKWebView surfaces for browser automation when a cmux socket is available. Set PI_BROWSER_CMUX=0 or PI_BROWSER_CMUX=1 to override.",
-				"group": "Grep & Browser"
-			}
-		},
-		{
-			"path": "browser.screenshotDir",
-			"type": "string",
-			"defaultAbsent": true,
-			"credential": false,
-			"ui": {
-				"tab": "tools",
-				"label": "Screenshot Directory",
-				"description": "Directory to save screenshots. If unset, screenshots go to a temp file. Supports ~. Examples: ~/Downloads, ~/Desktop, /sdcard/Download (Android)",
-				"group": "Grep & Browser"
-			}
-		},
-		{
 			"path": "tools.intentTracing",
 			"type": "boolean",
 			"default": true,
@@ -4214,47 +4020,6 @@
 			"type": "number",
 			"default": 60000,
 			"credential": false
-		},
-		{
-			"path": "tools.xdev",
-			"type": "boolean",
-			"default": true,
-			"credential": false,
-			"ui": {
-				"tab": "tools",
-				"label": "xd:// Tools",
-				"description": "Mount rarely-used (discoverable) tools under xd:// device URLs driven via read/write instead of shipping their schemas on every request. Sessions whose explicit tool list grants read but omits write mount devices through a device-only write transport (filesystem writes stay rejected). Disable to expose every enabled tool top-level.",
-				"group": "Discovery & MCP"
-			}
-		},
-		{
-			"path": "tools.xdevDocs",
-			"type": "enum",
-			"values": [
-				"inline",
-				"builtins",
-				"catalog"
-			],
-			"default": "builtins",
-			"credential": false,
-			"ui": {
-				"tab": "tools",
-				"label": "xd:// Prompt Docs",
-				"description": "Choose which mounted-device docs and schemas are inlined in the system prompt. Built-ins keeps core tools inline while MCP and extension tools stay on-demand.",
-				"group": "Discovery & MCP"
-			}
-		},
-		{
-			"path": "tools.xdevInlineDevices",
-			"type": "array",
-			"default": [],
-			"credential": false,
-			"ui": {
-				"tab": "tools",
-				"label": "xd:// Inline Devices",
-				"description": "When xd:// Prompt Docs is Built-ins Only, inline dynamic devices whose names match these glob patterns (for example mcp__context_mode_*). Catalog Only ignores this setting.",
-				"group": "Discovery & MCP"
-			}
 		},
 		{
 			"path": "mcp.enableProjectConfig",
@@ -4790,18 +4555,6 @@
 			}
 		},
 		{
-			"path": "secrets.enabled",
-			"type": "boolean",
-			"default": false,
-			"credential": false,
-			"ui": {
-				"tab": "providers",
-				"label": "Hide Secrets",
-				"description": "Obfuscate configured secrets and redact credential-shaped tokens before sending to AI providers",
-				"group": "Privacy"
-			}
-		},
-		{
 			"path": "providers.ollama-cloud.maxConcurrency",
 			"type": "number",
 			"default": 3,
@@ -4985,73 +4738,6 @@
 				"tab": "providers",
 				"label": "Local TTS Voice",
 				"description": "Kokoro voice used by the local TTS backend (American/British, female/male)",
-				"group": "Services"
-			}
-		},
-		{
-			"path": "speech.enabled",
-			"type": "boolean",
-			"default": false,
-			"credential": false,
-			"ui": {
-				"tab": "providers",
-				"label": "Speech Vocalization",
-				"description": "Speak the assistant's output aloud through the speakers as it streams",
-				"group": "Services"
-			}
-		},
-		{
-			"path": "speech.mode",
-			"type": "enum",
-			"values": [
-				"all",
-				"assistant",
-				"yield"
-			],
-			"default": "assistant",
-			"credential": false,
-			"ui": {
-				"tab": "providers",
-				"label": "Speech Vocalization Mode",
-				"description": "What to speak: all = assistant messages + thinking; assistant = messages only; yield = only the final message at turn end",
-				"group": "Services"
-			}
-		},
-		{
-			"path": "speech.enhanced",
-			"type": "boolean",
-			"default": false,
-			"credential": false,
-			"ui": {
-				"tab": "providers",
-				"label": "Enhanced Speech Rewriting",
-				"description": "Rewrite assistant output into natural spoken prose with the tiny/smol model before synthesis (describes code, drops links and markdown). Falls back to mechanical cleanup on failure",
-				"group": "Services"
-			}
-		},
-		{
-			"path": "speech.voice",
-			"type": "enum",
-			"values": [
-				"af_heart",
-				"af_bella",
-				"af_nicole",
-				"af_aoede",
-				"af_kore",
-				"af_sarah",
-				"am_michael",
-				"am_fenrir",
-				"am_puck",
-				"bf_emma",
-				"bm_george",
-				"bm_fable"
-			],
-			"default": "af_heart",
-			"credential": false,
-			"ui": {
-				"tab": "providers",
-				"label": "Speech Vocalization Voice",
-				"description": "Kokoro voice used when speaking the assistant's output aloud",
 				"group": "Services"
 			}
 		},
@@ -5485,42 +5171,6 @@
 			"path": "searxng.safesearch",
 			"type": "number",
 			"defaultAbsent": true,
-			"credential": false
-		},
-		{
-			"path": "commit.mapReduceEnabled",
-			"type": "boolean",
-			"default": true,
-			"credential": false
-		},
-		{
-			"path": "commit.mapReduceThreshold",
-			"type": "number",
-			"default": 5000,
-			"credential": false
-		},
-		{
-			"path": "commit.mapBatchTokenBudget",
-			"type": "number",
-			"default": 16000,
-			"credential": false
-		},
-		{
-			"path": "commit.cacheEnabled",
-			"type": "boolean",
-			"default": true,
-			"credential": false
-		},
-		{
-			"path": "commit.cacheTtlDays",
-			"type": "number",
-			"default": 14,
-			"credential": false
-		},
-		{
-			"path": "commit.changelogMaxDiffChars",
-			"type": "number",
-			"default": 120000,
 			"credential": false
 		},
 		{

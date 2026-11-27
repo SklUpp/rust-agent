@@ -1,12 +1,12 @@
-//! Advertised ACP surface: `initialize`, `authenticate`, speech catalogue and
-//! `_omp/*` extension payloads.
+//! Advertised ACP surface: `initialize`, `authenticate` and `_omp/*`
+//! extension payloads.
 //!
 //! Ground truth is `modes/acp/acp-agent.ts` (`initialize` 631-675,
-//! `authenticate` 678-689, `extMethod` 1128-1199) plus the speech registries
-//! (`stt/models.ts`, `tts/models.ts`). Only what this build actually serves is
-//! advertised: `loadSession`, MCP `http`/`sse`, embedded context/images and the
-//! list/fork/resume/close session capabilities. No audio prompt capability, no
-//! client-side `fs`/`terminal`/`elicitation` claim (those are client gates).
+//! `authenticate` 678-689, `extMethod` 1128-1199). Only what this build
+//! actually serves is advertised: `loadSession`, MCP `http`/`sse`, embedded
+//! context/images and the list/fork/resume/close session capabilities. No
+//! audio prompt capability, no client-side `fs`/`terminal`/`elicitation`
+//! claim (those are client gates).
 
 use serde_json::{Value, json};
 
@@ -74,87 +74,6 @@ pub fn authenticate(method_id: &str, client: &ClientCapabilities) -> Result<Valu
 		)),
 		other => Err(RequestError::new(INTERNAL_ERROR, format!("Unknown ACP auth method: {other}"))),
 	}
-}
-
-/// `speech.models.list` payload.
-///
-/// Value tables copied from the generated settings surface: the build has no
-/// speech backend for ACP, and the client only uses this catalog to render
-/// settings pickers.
-#[must_use]
-pub fn speech_models_catalog() -> Value {
-	json!({
-		"settings": {
-			"speechToTextModel": "stt.modelName",
-			"textToSpeechModel": "tts.localModel",
-			"textToSpeechVoice": "tts.localVoice",
-			"speechVoice": "speech.voice",
-		},
-		"defaults": {
-			"speechToTextModel": "parakeet",
-			"textToSpeechModel": "kokoro",
-			"voice": "af_heart",
-		},
-		"speechToText": {
-			"setting": "stt.modelName",
-			"defaultValue": "parakeet",
-			"models": [
-				{
-					"value": "fast",
-					"label": "Fast (Whisper base)",
-					"description": "Whisper base, multilingual. Smallest + fastest; lowest accuracy. Best for low-resource machines."
-				},
-				{
-					"value": "balanced",
-					"label": "Balanced (Whisper small)",
-					"description": "Whisper small, multilingual. More accurate than Fast, still light on CPU/RAM."
-				},
-				{
-					"value": "turbo",
-					"label": "Turbo (Whisper large-v3)",
-					"description": "Whisper large-v3-turbo, 99 languages. Widest language coverage; large download, slower."
-				},
-				{
-					"value": "parakeet",
-					"label": "Parakeet TDT v3 (SoTA)",
-					"description": "NVIDIA Parakeet TDT 0.6B v3, 25 languages. Open ASR Leaderboard leader — best accuracy and far fastest decoding. Default."
-				}
-			],
-		},
-		"textToSpeech": {
-			"modelSetting": "tts.localModel",
-			"voiceSetting": "tts.localVoice",
-			"speechVoiceSetting": "speech.voice",
-			"defaultModel": "kokoro",
-			"defaultVoice": "af_heart",
-			"models": [
-				{
-					"value": "kokoro",
-					"label": "Kokoro-82M",
-					"description": "Kokoro-82M neural TTS — SoTA on-device quality, multi-voice, fully local",
-					"voices": tts_voices(),
-				}
-			],
-			"voices": tts_voices(),
-		},
-	})
-}
-
-fn tts_voices() -> Value {
-	json!([
-		{ "value": "af_heart", "label": "Heart (American female)" },
-		{ "value": "af_bella", "label": "Bella (American female)" },
-		{ "value": "af_nicole", "label": "Nicole (American female)" },
-		{ "value": "af_aoede", "label": "Aoede (American female)" },
-		{ "value": "af_kore", "label": "Kore (American female)" },
-		{ "value": "af_sarah", "label": "Sarah (American female)" },
-		{ "value": "am_michael", "label": "Michael (American male)" },
-		{ "value": "am_fenrir", "label": "Fenrir (American male)" },
-		{ "value": "am_puck", "label": "Puck (American male)" },
-		{ "value": "bf_emma", "label": "Emma (British female)" },
-		{ "value": "bm_george", "label": "George (British male)" },
-		{ "value": "bm_fable", "label": "Fable (British male)" }
-	])
 }
 
 /// Extension listing. No extension loader exists in this build; the TS
