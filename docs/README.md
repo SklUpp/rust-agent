@@ -68,6 +68,9 @@
 - `research-2026-11-27-16-unified-domain6-platform-pkg.md` — Унифицированный аудит Домена 6 (`ScoutUnifiedPlatformPkg`): платформа/Android HAL, packaging/notices, CI и R12
 - `research-2026-11-27-17-unified-corpus-index.md` — Унифицированный индекс корпуса (`ScoutDocsUnifiedIndex`): 25-строчная матрица, 22 конфликта и 12 целевых направлений Stage 2 (`DIR-01..DIR-12`)
 - `research-2026-11-27-18-unified-reviews-errata.md` — Независимый аудит ревью унифицированных исследований (`ReviewUnifiedBatch1`, `ReviewUnifiedBatch2`, `ReviewUnifiedBatch3`)
+- `research-2026-11-27-19-target-dir01-04-05-status-scope-journal.md` — Целевое исследование Stage 2 (`TargetDir01StatusTruth`): канонический статус/HEAD/CI (`DIR-01`), дрейф `SCOPE_LATEST.yaml` (`DIR-04`) и журнал решений D80/D84–D96 (`DIR-05`)
+- `research-2026-11-27-20-target-dir03-06-approval-hooks-safety.md` — Целевое исследование Stage 2 (`TargetDir03ApprovalSafety`): отмена/approvals D50 (`DIR-03`), hooks/trust (`DIR-06`), обход `hub start` и пробелы DAP
+- `research-2026-11-27-21-target-dir07-provider-mcp-wire.md` — Целевое исследование Stage 2 (`TargetDir07ProviderMcpWire`): wire-контракт провайдеров и MCP (`DIR-07`)
 
 ## Правила обновления
 
