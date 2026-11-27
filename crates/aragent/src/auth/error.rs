@@ -15,6 +15,8 @@
 
 use std::fmt;
 
+use pi_agent::provider::error_flags;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AuthErrorKind {
 	/// Non-2xx from an endpoint that is not the token endpoint.
@@ -135,23 +137,45 @@ impl AuthError {
 	/// survive them (`auth-classify.ts`, `flags.ts:253-257`).
 	#[must_use]
 	pub fn is_definitive(&self) -> bool {
-		self.grant_dead
-			&& !matches!(
-				self.kind,
-				AuthErrorKind::Cancelled | AuthErrorKind::Timeout | AuthErrorKind::Polling
-			)
+		if matches!(
+			self.kind,
+			AuthErrorKind::Cancelled | AuthErrorKind::Timeout | AuthErrorKind::Polling
+		) {
+			return false;
+		}
+		if self.grant_dead {
+			return true;
+		}
+		// Transport-level transient statuses never disable a stored credential,
+		// even when the body echoes an auth-shaped word (`auth-classify.ts`).
+		if self
+			.status
+			.is_some_and(|status| matches!(status, 408 | 425 | 429 | 500..=599))
+		{
+			return false;
+		}
+		// Marker-only: `error_for()` embeds the bare status ("HTTP 401") in the
+		// message, so only an explicit dead-grant identifier may fence the row.
+		error_flags::is_oauth_revocation_message(&self.message)
 	}
 
 	#[must_use]
 	pub fn is_transient(&self) -> bool {
-		!self.is_definitive()
-			&& matches!(
-				self.kind,
-				AuthErrorKind::Timeout
-					| AuthErrorKind::Polling
-					| AuthErrorKind::Http
-					| AuthErrorKind::Validation
-			)
+		if self.kind == AuthErrorKind::Cancelled || self.is_definitive() {
+			return false;
+		}
+		if matches!(
+			self.kind,
+			AuthErrorKind::Timeout | AuthErrorKind::Polling | AuthErrorKind::Http | AuthErrorKind::Validation
+		) {
+			return true;
+		}
+		// Semantic retryability for token/auth flows: usage caps, account policy,
+		// an explicit 401/403, or an invalidated OAuth bearer (`auth-classify.ts`).
+		matches!(
+			self.kind,
+			AuthErrorKind::TokenRefresh | AuthErrorKind::TokenExchange
+		) && error_flags::is_auth_retryable_error(self.status, &self.message)
 	}
 }
 
@@ -1090,6 +1114,22 @@ mod tests {
 				.with_grant_dead()
 				.is_definitive()
 		);
+		// `error_for()` embeds the status; a bare 401 refresh failure must not
+		// fence the stored grant.
+		assert!(
+			!AuthError::new(AuthErrorKind::TokenRefresh, "token refresh failed (HTTP 401)")
+				.with_status(401)
+				.is_definitive()
+		);
+		// `invalid_grant_type` is not `invalid_grant`: no dead-grant marker.
+		assert!(
+			!AuthError::new(
+				AuthErrorKind::TokenRefresh,
+				"TokenRefresh failed (HTTP 400): invalid_grant_type"
+			)
+			.with_status(400)
+			.is_definitive()
+		);
 
 		assert!(
 			AuthError::new(AuthErrorKind::Http, "busy")
@@ -1103,6 +1143,7 @@ mod tests {
 	fn invalid_grant_bodies_are_recognised() {
 		assert!(is_invalid_grant_body(r#"{"error":"invalid_grant"}"#));
 		assert!(is_invalid_grant_body(r#"{"error":"expired_token"}"#));
+		assert!(!is_invalid_grant_body(r#"{"error":"invalid_grant_type"}"#));
 		assert!(!is_invalid_grant_body(r#"{"error":"rate_limit_exceeded"}"#));
 		assert!(!is_invalid_grant_body("<html>blocked</html>"));
 	}

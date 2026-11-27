@@ -19,6 +19,10 @@ const MAX_SSE_LINE_BYTES: usize = 1024 * 1024;
 /// Bounded, redacted response-body handling shared by the HTTP adapters.
 pub(crate) mod body;
 
+/// Semantic provider-error classification (flags, rate-limit reasons, OAuth
+/// retryability) ported from `packages/ai/src/error/`.
+pub mod error_flags;
+
 /// Shared HTTP retry policy: status classification, `Retry-After` parsing and
 /// backoff schedules.
 pub(crate) mod retry;
