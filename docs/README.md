@@ -60,6 +60,13 @@
 - `research-2026-11-27-08-reviews-audit.md` — Сводный аудит независимых ревью (`ResearchReviewPlatform` и `ResearchReviewCoreEcosystem`) + матрица Go/No-Go
 - `research-2026-11-27-09-vfs-path-mirroring.md` — Расширение VFS до единого формата зеркалирования путей (`PathSpace` / `RootMap`, пересмотр границ D86)
 - `research-2026-11-27-10-platform-hal-tool-availability.md` — Платформенное разделение кода (`pi-sys` HAL), runtime-пробы `Caps` и максимальная доступность инструментов по OS
+- `research-2026-11-27-11-unified-domain1-core-state.md` — Унифицированный аудит Домена 1 (`ScoutUnifiedCoreState`): core loop, SQLite v7, compaction, VFS
+- `research-2026-11-27-12-unified-domain2-tools-exec.md` — Унифицированный аудит Домена 2 (`ScoutUnifiedToolsExec`): инструменты, shell, изоляция, `pi-iso`/`pi-vcs`, `fastproot`/LKL
+- `research-2026-11-27-13-unified-domain3-providers-sec.md` — Унифицированный аудит Домена 3 (`ScoutUnifiedProvidersSec`): провайдеры, `9Router`, MCP, auth, trust, redaction
+- `research-2026-11-27-14-unified-domain4-analysis-memory.md` — Унифицированный аудит Домена 4 (`ScoutUnifiedAnalysisMemory`): `pi-ast`, RepoMap, LSP/DAP, memory/embeddings, skills/rules
+- `research-2026-11-27-15-unified-domain5-frontends-ops.md` — Унифицированный аудит Домена 5 (`ScoutUnifiedFrontendsOps`): TUI/CLI/REPL/RPC/ACP, hooks, profiles, R9–R11
+- `research-2026-11-27-16-unified-domain6-platform-pkg.md` — Унифицированный аудит Домена 6 (`ScoutUnifiedPlatformPkg`): платформа/Android HAL, packaging/notices, CI и R12
+- `research-2026-11-27-17-unified-corpus-index.md` — Унифицированный индекс корпуса (`ScoutDocsUnifiedIndex`): 25-строчная матрица, 22 конфликта и 12 целевых направлений Stage 2 (`DIR-01..DIR-12`)
 
 ## Правила обновления
 
