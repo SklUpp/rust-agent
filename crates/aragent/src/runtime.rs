@@ -21,8 +21,6 @@ use pi_agent::{
 	PendingStore, ReadTool, SteeringEvent, Supervisor, TodoTool, Tool, ToolApprover, ToolRegistry,
 	WriteTool,
 	provider::{http::OpenAiCompatibleProvider, timeout::TimeoutProvider},
-	provider_anthropic::{AnthropicConfig, AnthropicMessagesProvider, AnthropicThinkingConfig},
-	provider_ollama::OllamaProvider,
 	dap::{DapSessionManager, DapTool},
 	process_broker::BrokerProcessBackend,
 	tools::process::{ProcessBackend, ProcessManager},
@@ -49,6 +47,11 @@ use pi_agent::{
 		AgentCatalog, ChildModel, ChildModelFactory, EFFORT_SELECTORS, parse_effort_prefix,
 		split_effort_selector,
 	},
+};
+#[cfg(feature = "direct-providers")]
+use pi_agent::{
+	provider_anthropic::{AnthropicConfig, AnthropicMessagesProvider, AnthropicThinkingConfig},
+	provider_ollama::OllamaProvider,
 };
 
 use crate::{
@@ -2997,7 +3000,9 @@ impl Iterator for BoundedEventStream {
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum WireDialect {
 	OpenAiCompletions,
+	#[cfg(feature = "direct-providers")]
 	OllamaChat,
+	#[cfg(feature = "direct-providers")]
 	AnthropicMessages,
 }
 
@@ -3005,11 +3010,20 @@ impl WireDialect {
 	const fn api(self) -> &'static str {
 		match self {
 			Self::OpenAiCompletions => "openai-completions",
+			#[cfg(feature = "direct-providers")]
 			Self::OllamaChat => "ollama-chat",
+			#[cfg(feature = "direct-providers")]
 			Self::AnthropicMessages => "anthropic-messages",
 		}
 	}
 }
+
+/// Wire dialects this build was compiled with, for the unsupported-api error.
+#[cfg(feature = "direct-providers")]
+const SUPPORTED_APIS: &str = "`openai-completions`, `ollama-chat` and `anthropic-messages`";
+/// Wire dialects this build was compiled with, for the unsupported-api error.
+#[cfg(not(feature = "direct-providers"))]
+const SUPPORTED_APIS: &str = "`openai-completions`";
 
 /// Resolve the wire dialect. Precedence is TS `modelDef.api ?? providerApi`:
 /// the per-model `api` is authoritative and a connection block only fills in
@@ -3025,11 +3039,18 @@ fn wire_dialect(
 		.or_else(|| connection.and_then(|connection| connection.api.as_deref()));
 	match api {
 		None | Some("openai-completions") => Ok(WireDialect::OpenAiCompletions),
+		#[cfg(feature = "direct-providers")]
 		Some("ollama-chat") => Ok(WireDialect::OllamaChat),
+		#[cfg(feature = "direct-providers")]
 		Some("anthropic-messages") => Ok(WireDialect::AnthropicMessages),
+		#[cfg(not(feature = "direct-providers"))]
+		Some(other @ ("ollama-chat" | "anthropic-messages")) => Err(format!(
+			"direct provider dialect `{other}` for `{provider}/{model}` requires the \
+			 `direct-providers` feature (or route via `openai-completions`)"
+		)),
 		Some(other) => Err(format!(
 			"unsupported provider api `{other}` for `{provider}/{model}`: this build speaks \
-			 `openai-completions`, `ollama-chat` and `anthropic-messages`"
+			 {SUPPORTED_APIS}"
 		)),
 	}
 }
@@ -3062,6 +3083,7 @@ fn wire_base_url(
 		}),
 		// The adapter normalizes a bare host; the default is the local daemon
 		// unless the provider is the cloud one (its rows all use the cloud URL).
+		#[cfg(feature = "direct-providers")]
 		WireDialect::OllamaChat => Ok(configured.unwrap_or_else(|| {
 			if provider == "ollama-cloud" {
 				"https://ollama.com".to_string()
@@ -3069,6 +3091,7 @@ fn wire_base_url(
 				"http://127.0.0.1:11434".to_string()
 			}
 		})),
+		#[cfg(feature = "direct-providers")]
 		WireDialect::AnthropicMessages => anthropic_base_url(provider, configured)
 			.ok_or_else(|| format!("provider `{provider}` has no baseUrl for `anthropic-messages`")),
 	}
@@ -3079,6 +3102,7 @@ fn wire_base_url(
 /// the configured URL, then the official default. The adapter appends
 /// `/v1/messages`, so a trailing `/v1` is dropped
 /// (TS `normalizeAnthropicBaseUrl`).
+#[cfg(feature = "direct-providers")]
 fn anthropic_base_url(provider: &str, configured: Option<String>) -> Option<String> {
 	const OFFICIAL: &str = "https://api.anthropic.com";
 	fn normalize(value: String) -> String {
@@ -3105,16 +3129,19 @@ fn anthropic_base_url(provider: &str, configured: Option<String>) -> Option<Stri
 }
 
 /// `compat`/`thinking` JSON flag, `None` when the block or key is absent.
+#[cfg(feature = "direct-providers")]
 fn json_flag(block: Option<&serde_json::Value>, key: &str) -> Option<bool> {
 	block?.get(key)?.as_bool()
 }
 
 /// `compat`/`thinking` JSON counter, `None` when the block or key is absent.
+#[cfg(feature = "direct-providers")]
 fn json_u64(block: Option<&serde_json::Value>, key: &str) -> Option<u64> {
 	block?.get(key)?.as_u64()
 }
 
 /// String pairs of one authored `thinking.effortMap`-style object.
+#[cfg(feature = "direct-providers")]
 fn json_string_map(
 	block: Option<&serde_json::Value>,
 	key: &str,
@@ -3132,6 +3159,7 @@ fn json_string_map(
 
 /// Apply the authored compat flags that are present, leaving the adapter
 /// default in place for every key the model does not declare.
+#[cfg(feature = "direct-providers")]
 fn apply_compat_flags(
 	compat: Option<&serde_json::Value>,
 	flags: &mut [(&str, &mut bool)],
@@ -3148,6 +3176,7 @@ fn apply_compat_flags(
 
 /// Anthropic thinking request state derived from the authored model metadata
 /// and the turn's requested effort (TS `buildParams` thinking selection).
+#[cfg(feature = "direct-providers")]
 struct AnthropicThinking {
 	thinking:      Option<AnthropicThinkingConfig>,
 	output_effort: Option<String>,
@@ -3157,6 +3186,7 @@ struct AnthropicThinking {
 /// TS `isAdaptiveOnlyThinking` minus the `usesAdaptiveThinkingTagOnly` case:
 /// an `anthropic-adaptive` model that only drives thinking through the tag
 /// itself is not an adaptive-effort model.
+#[cfg(feature = "direct-providers")]
 fn anthropic_adaptive_only(
 	mode: Option<&str>,
 	compat: Option<&serde_json::Value>,
@@ -3179,6 +3209,7 @@ fn anthropic_adaptive_only(
 }
 
 /// Thinking budget per effort (TS `ANTHROPIC_THINKING`).
+#[cfg(feature = "direct-providers")]
 fn anthropic_thinking_budget(effort: &str) -> u32 {
 	match effort {
 		"minimal" => 1024,
@@ -3193,6 +3224,7 @@ fn anthropic_thinking_budget(effort: &str) -> u32 {
 /// TS `requireSupportedEffort` (`model-thinking.ts:868-879`): an effort the
 /// model does not declare is an error, never a silent clamp. `getSupportedEfforts`
 /// (`:824-829`) is `reasoning ? thinking.efforts : []`.
+#[cfg(feature = "direct-providers")]
 fn require_supported_effort(
 	provider: &str,
 	model: &str,
@@ -3211,6 +3243,7 @@ fn require_supported_effort(
 }
 
 /// TS error text for an effort the model does not declare.
+#[cfg(feature = "direct-providers")]
 fn unsupported_effort_error(
 	provider: &str,
 	model: &str,
@@ -3230,6 +3263,7 @@ fn unsupported_effort_error(
 /// mapped value is itself declared), then either map may merely alias the
 /// requested effort for the adapter to remap later. Anything else is the TS
 /// unsupported-effort error, never a silent substitution.
+#[cfg(feature = "direct-providers")]
 fn resolve_openai_reasoning_effort(
 	provider: &str,
 	model: &str,
@@ -3286,6 +3320,7 @@ fn resolve_openai_reasoning_effort(
 /// the adapter omits the field when it is unset. Effort is validated through
 /// [`require_supported_effort`] exactly where TS maps it: the adaptive and
 /// budget-effort modes only.
+#[cfg(feature = "direct-providers")]
 fn anthropic_thinking(
 	provider: &str,
 	model: &str,
@@ -3367,11 +3402,18 @@ fn wire_provider(
 	service_tier: Option<String>,
 	credential: Option<pi_agent::provider::CredentialCallback>,
 ) -> std::result::Result<Arc<dyn ModelProvider>, String> {
+	// Only the direct-provider adapters read catalog metadata; the
+	// OpenAI-compatible arm shapes its request from the resolved target.
+	#[cfg(not(feature = "direct-providers"))]
+	let _ = catalog;
+	#[cfg(feature = "direct-providers")]
 	let info = catalog
 		.providers
 		.get(target.provider)
 		.and_then(|models| models.get(target.model));
+	#[cfg(feature = "direct-providers")]
 	let compat = catalog.model_compat(target.provider, target.model);
+	#[cfg(feature = "direct-providers")]
 	let thinking = catalog.model_thinking(target.provider, target.model);
 	let setup = |err: pi_agent::ProviderError| format!("pi-agent provider setup failed: {err}");
 	let inner: Arc<dyn ModelProvider> = match target.dialect {
@@ -3399,6 +3441,7 @@ fn wire_provider(
 				.with_provider_id(target.provider.to_string());
 			Arc::new(provider) as Arc<dyn ModelProvider>
 		},
+		#[cfg(feature = "direct-providers")]
 		WireDialect::OllamaChat => {
 			let reasoning = resolve_openai_reasoning_effort(
 				target.provider,
@@ -3442,6 +3485,7 @@ fn wire_provider(
 				.with_max_tokens(info.and_then(|info| info.max_tokens));
 			Arc::new(provider) as Arc<dyn ModelProvider>
 		},
+		#[cfg(feature = "direct-providers")]
 		WireDialect::AnthropicMessages => {
 			let mut anthropic = AnthropicConfig::new(target.base_url, target.api_key, target.model);
 			anthropic.max_tokens = info
@@ -3501,6 +3545,7 @@ fn wire_provider(
 
 /// Parse the catalog `cost` block into the TS `ModelCost` record: the four
 /// per-million rates (missing ones `0`) and the authored `longContext` verbatim.
+#[cfg(feature = "direct-providers")]
 fn ollama_model_cost(
 	cost: Option<&serde_json::Value>,
 ) -> Option<pi_agent::provider_ollama::OllamaPayloadCost> {
@@ -3520,12 +3565,14 @@ fn ollama_model_cost(
 }
 
 /// Authored `thinking` flag; `None` when the model never declared it.
+#[cfg(feature = "direct-providers")]
 fn authored_flag(thinking: &serde_json::Value, key: &str) -> Option<bool> {
 	thinking.get(key).and_then(serde_json::Value::as_bool)
 }
 
 /// Authored `thinking` string map (`effortMap`, `effortRouting`). `None` when
 /// the key is absent; non-string values are dropped, as the catalog does.
+#[cfg(feature = "direct-providers")]
 fn authored_string_map(
 	thinking: &serde_json::Value,
 	key: &str,
@@ -3544,6 +3591,7 @@ fn authored_string_map(
 
 /// Authored `thinking.effortBudgets`: TS numbers, kept as `u64` without
 /// truncation; non-numeric entries are dropped.
+#[cfg(feature = "direct-providers")]
 fn authored_u64_map(
 	thinking: &serde_json::Value,
 	key: &str,
@@ -3559,6 +3607,7 @@ fn authored_u64_map(
 /// Materialize the authored thinking block plus the catalog effort listing.
 /// TS carries no thinking config when the model exposes no effort ladder, and
 /// every optional field stays authored optionality (`None`, never `false`).
+#[cfg(feature = "direct-providers")]
 fn ollama_model_thinking(
 	thinking: Option<&serde_json::Value>,
 	efforts: Option<&[String]>,
@@ -3599,6 +3648,7 @@ fn ollama_model_thinking(
 
 /// Input modalities: the authored list wins, otherwise they are derived from the
 /// resolved image capability so the array is always concrete.
+#[cfg(feature = "direct-providers")]
 fn ollama_model_input(
 	info: Option<&crate::catalog::ModelInfo>,
 	supports_images: bool,
@@ -3611,6 +3661,7 @@ fn ollama_model_input(
 }
 
 /// TS `Model.headers`: the model-authored headers only.
+#[cfg(feature = "direct-providers")]
 fn ollama_model_headers(info: Option<&crate::catalog::ModelInfo>) -> Vec<(String, String)> {
 	info.and_then(|info| info.headers.as_ref())
 		.map(|headers| {
@@ -3626,6 +3677,7 @@ fn ollama_model_headers(info: Option<&crate::catalog::ModelInfo>) -> Vec<(String
 /// precedence is the runtime's existing one: `config.yml` provider, else the
 /// `models.yml` provider block (the same pair used for baseUrl/api/key and
 /// Anthropic caller headers).
+#[cfg(feature = "direct-providers")]
 fn ollama_request_headers(
 	catalog: &crate::catalog::Catalog,
 	config: &crate::config::Config,
@@ -3648,6 +3700,7 @@ fn ollama_request_headers(
 /// Build the resolved model context once per provider, directly in the
 /// adapter-owned type: this is the only boundary between catalog data and the
 /// `onPayload` hook, with no intermediate mirror.
+#[cfg(feature = "direct-providers")]
 fn ollama_model_context(
 	catalog: &crate::catalog::Catalog,
 	target: &WireTarget<'_>,
@@ -10430,6 +10483,7 @@ mod tests {
 	/// TS `resolveOpenAiReasoningEffort`: a declared effort passes through, the
 	/// compat remap wins only when its target is declared, an alias-only map
 	/// keeps the requested effort, and anything else is the unsupported error.
+	#[cfg(feature = "direct-providers")]
 	#[test]
 	fn ollama_effort_resolution_follows_ts_precedence() {
 		let reasoning = |efforts: &[&str], reasoning: bool| ModelInfo {
@@ -10514,6 +10568,7 @@ mod tests {
 
 	/// Only the cloud provider defaults to the hosted endpoint; a local Ollama
 	/// provider without a configured route talks to the daemon.
+	#[cfg(feature = "direct-providers")]
 	#[test]
 	fn ollama_defaults_differ_between_local_and_cloud() {
 		let catalog_without_route = catalog_with_model("ollama", "qwen3", ModelInfo {
@@ -10616,6 +10671,7 @@ mod tests {
 	}
 
 	/// One catalog provider/model pair with an optional connection block.
+	#[cfg(feature = "direct-providers")]
 	fn catalog_with_model(
 		provider: &str,
 		model: &str,
@@ -10636,6 +10692,7 @@ mod tests {
 	/// Child dispatch resolves the same way as the root: the per-model dialect and
 	/// route win over the catalog provider fallback, the adapter stamps the child
 	/// provider id, and the child never receives the root turn's credential.
+	#[cfg(feature = "direct-providers")]
 	#[test]
 	fn child_dispatch_uses_model_route_and_own_key() {
 		let catalog = catalog_with_model("childprov", "claude-child", ModelInfo {
@@ -10696,6 +10753,7 @@ mod tests {
 	/// directly in the adapter types: materialized thinking with authored
 	/// optionality, parsed cost, honest limits, model-only headers, and the
 	/// connection headers kept outside the hook-visible model.
+	#[cfg(feature = "direct-providers")]
 	#[test]
 	fn ollama_payload_context_materializes_catalog_metadata() {
 		use crate::catalog::{Catalog, ModelInfo};
@@ -10822,6 +10880,7 @@ mod tests {
 
 	/// `config.yml` is the CLI's own override: a gateway base URL there must not
 	/// be shadowed by the catalog's (usually bundled, vendor-default) route.
+	#[cfg(feature = "direct-providers")]
 	#[test]
 	fn cli_base_url_outranks_the_catalog_route() {
 		let catalog = catalog_with_model("childprov", "claude-child", ModelInfo {
@@ -11273,6 +11332,7 @@ mod process_scope_tests {
 
 	/// A child spawned with the parent's live map resolves its own model and
 	/// inherits the selection: an Anthropic child provider sends fast mode.
+	#[cfg(feature = "direct-providers")]
 	#[tokio::test]
 	async fn child_provider_inherits_the_resolved_priority_tier() {
 		use std::io::{Read, Write};
