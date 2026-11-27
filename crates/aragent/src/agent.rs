@@ -240,6 +240,11 @@ pub struct RunRequest {
 	/// Never journaled, never an assistant turn (no fake completed response),
 	/// and carries no tool calls so nothing can replay effects.
 	pub interrupted_context: Option<String>,
+	/// Trusted one-shot warning that the previous turn was interrupted and
+	/// that some tool effects are unconfirmed. Injected as a developer message
+	/// before the user prompt, never journaled, and consumed by exactly one
+	/// turn. `None` for a clean turn, a capture run, or a child agent.
+	pub interruption_warning: Option<String>,
 	/// Resolved per-family service-tier selection (TS `ServiceTierByFamily`,
 	/// string values). Empty means "no selection" and must not re-enable the
 	/// configured priority default.

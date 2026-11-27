@@ -43,7 +43,7 @@ mod imp {
 	use pi_agent::tools::ask::{AskAnswer, AskChannel, AskOutcome, AskQuestion};
 	use tokio_util::sync::CancellationToken;
 
-	use crate::Session;
+	use crate::{RetryDecision, Session};
 	use aragent::Result;
 
 	/// One message from a worker turn, an observer, or an approval/ask request.
@@ -81,6 +81,7 @@ mod imp {
 			cancel: CancellationToken,
 			reply: tokio::sync::oneshot::Sender<AskOutcome>,
 		},
+		Warning(String),
 		TurnError(String),
 		TurnDone,
 	}
@@ -529,6 +530,9 @@ mod imp {
 	#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 	enum Key {
 		Char(char),
+		/// ESC followed by a printable byte. A lone ESC still arrives as
+		/// [`Key::Esc`] via the idle flush.
+		Alt(char),
 		Enter,
 		Backspace,
 		Delete,
@@ -724,6 +728,12 @@ mod imp {
 							_ => {},
 						}
 						index += 3;
+					} else if (0x20..=0x7e).contains(&buffer[index + 1]) {
+						// ESC + printable is Alt+key (e.g. Alt+R). CSI/SS3
+						// sequences above keep precedence; a lone ESC is left
+						// for the idle flush.
+						keys.push(Key::Alt(char::from(buffer[index + 1])));
+						index += 2;
 					} else {
 						keys.push(Key::Esc);
 						index += 1;
@@ -1229,6 +1239,9 @@ mod imp {
 	enum Dialog {
 		Approval { name: String, detail: Option<String>, reply: tokio::sync::oneshot::Sender<bool> },
 		Ask(AskState),
+		/// Mandatory retry gate: only `y` confirms, `n`/Esc/Ctrl-C cancel. An
+		/// `Alt+R` received here is an ordinary key and cannot bypass it.
+		Confirm { message: String, reply: std::sync::mpsc::Sender<bool> },
 	}
 
 	enum Action {
@@ -1237,6 +1250,12 @@ mod imp {
 		Submit(String),
 		Steer(String),
 		Cancel,
+		/// Manual retry of the interrupted turn; resolved by the run loop so
+		/// unknown-outcome confirmation happens before any request is built.
+		Retry,
+		/// A sync confirmation dialog answered; breaks the event loop so the
+		/// driver can read the reply channel.
+		DialogAnswered,
 		Command(UiCommand),
 	}
 
@@ -1252,6 +1271,7 @@ mod imp {
 		Model(Option<String>),
 		Cwd(Option<String>),
 		Memory(Vec<String>),
+		Retry,
 		Exit,
 	}
 
@@ -1279,6 +1299,7 @@ mod imp {
 					.map(|argument| argument.split_whitespace().map(str::to_string).collect())
 					.unwrap_or_default(),
 			)),
+			"/retry" if argument.is_none() => Some(UiCommand::Retry),
 			_ => None,
 		}
 	}
@@ -1564,6 +1585,7 @@ mod imp {
 						.push_back(UiMsg::Ask { questions, cancel, reply });
 					self.maybe_open_dialog();
 				},
+				UiMsg::Warning(warning) => self.push(Kind::System, warning),
 				UiMsg::TurnError(error) => self.push(Kind::ToolError, error),
 				UiMsg::TurnDone => {
 					self.busy = false;
@@ -1635,6 +1657,9 @@ mod imp {
 					},
 					Dialog::Ask(state) => {
 						let _ = state.reply.send(AskOutcome::Aborted);
+					},
+					Dialog::Confirm { reply, .. } => {
+						let _ = reply.send(false);
 					},
 				}
 			}
@@ -1747,6 +1772,23 @@ mod imp {
 						}
 						self.dialog = Some(Dialog::Ask(state));
 					},
+					Dialog::Confirm { message, reply } => {
+						let decision = match key {
+							Key::Char('y') | Key::Char('Y') => Some(true),
+							Key::Char('n') | Key::Char('N') | Key::Esc | Key::CtrlC => Some(false),
+							_ => None,
+						};
+						match decision {
+							Some(value) => {
+								let _ = reply.send(value);
+								self.dirty = true;
+								return Some(Action::DialogAnswered);
+							},
+							None => {
+								self.dialog = Some(Dialog::Confirm { message, reply });
+							},
+						}
+					},
 				}
 				self.dirty = true;
 				return Some(Action::None);
@@ -1800,6 +1842,15 @@ mod imp {
 					self.clear_screen = true;
 				},
 				Key::CtrlU => self.input.clear(),
+				Key::Alt(ch) => {
+					if matches!(ch, 'r' | 'R') {
+						if self.busy {
+							self.push_system("retry unavailable while a turn runs (Ctrl-C cancels)");
+						} else {
+							return Some(Action::Retry);
+						}
+					}
+				},
 				Key::Enter => {
 					let text = self.input.text();
 					if self.busy {
@@ -2056,6 +2107,14 @@ mod imp {
 						}
 					}
 					lines.push("[y] approve   [n] deny   Esc deny".to_string());
+					lines
+				},
+				Some(Dialog::Confirm { message, .. }) => {
+					let mut lines = vec!["Confirmation required".to_string()];
+					for line in wrap_text(&sanitize(message), width) {
+						lines.push(format!("  {line}"));
+					}
+					lines.push("[y] retry   [n] cancel   Esc cancel".to_string());
 					lines
 				},
 				Some(Dialog::Ask(state)) => {
@@ -2513,6 +2572,7 @@ mod imp {
 			"/memory <args>   same grammar as `arag memory`".to_string(),
 			"/model [id]      show or switch the model".to_string(),
 			"/cwd [path]      show or change the working directory".to_string(),
+			"/retry           retry the interrupted turn (Alt+R)".to_string(),
 			"/config          effective settings (read-only)".to_string(),
 			"/clear           clear this transcript".to_string(),
 			"/help            this list".to_string(),
@@ -2660,6 +2720,8 @@ mod imp {
 					app.push(Kind::System, line);
 				}
 			},
+			// Resolved by the run loop before dispatch so confirmation can run.
+			UiCommand::Retry => {},
 		}
 		app.status = status_of(session);
 		app.history_lines = history_lines(&session.history, session.interrupted_fragment.as_deref());
@@ -2669,7 +2731,12 @@ mod imp {
 
 	// ── Worker turn ────────────────────────────────────────────────────────
 
-	fn turn_worker(session: &mut Session<'_>, tx: &Sender<UiMsg>, prompt: String) {
+	fn turn_worker(
+		session: &mut Session<'_>,
+		tx: &Sender<UiMsg>,
+		prompt: String,
+		parts: Vec<aragent::session::ContentPart>,
+	) {
 		let result = catch_unwind(AssertUnwindSafe(|| -> Result<()> {
 			let mut reporter = Reporter::new(OutputMode::Text, io::sink(), io::sink());
 			let event_tx = tx.clone();
@@ -2722,7 +2789,7 @@ mod imp {
 					prompt.clone()
 				},
 			};
-			session.turn(None, text, Vec::new(), OutputMode::Text, &mut reporter)?;
+			session.turn(None, text, parts, OutputMode::Text, &mut reporter)?;
 			session.drive_goal_continuation(OutputMode::Text, &mut reporter)?;
 			session.drive_autolearn_capture(OutputMode::Text);
 			reporter.finish()?;
@@ -2736,6 +2803,11 @@ mod imp {
 			Err(_) => {
 				let _ = tx.send(UiMsg::TurnError("turn panicked".to_string()));
 			},
+		}
+		// An interrupted turn leaves the trusted warning for the next request and
+		// must say so immediately, including that a tool effect may have run.
+		if let Some(warning) = session.interruption_warning.as_deref() {
+			let _ = tx.send(UiMsg::Warning(format!("warning: {warning}")));
 		}
 		let _ = tx.send(UiMsg::TurnDone);
 	}
@@ -2893,6 +2965,12 @@ mod imp {
 							return Ok(Action::Submit(prompt));
 						}
 					},
+					Action::Retry => {
+						if !context.busy {
+							return Ok(Action::Retry);
+						}
+					},
+					Action::DialogAnswered => return Ok(Action::DialogAnswered),
 					Action::Command(command) => {
 						if context.busy {
 							context.app.busy_command(command);
@@ -2925,6 +3003,46 @@ mod imp {
 		}
 	}
 
+	/// Drive the mandatory retry confirmation to an answer. `y` retries,
+	/// `n`/Esc/Ctrl-C cancels; `Alt+R` inside the dialog is an ordinary key and
+	/// cannot bypass it. Returns `false` on teardown/EOF.
+	fn confirm_retry_dialog(
+		terminal: &mut Terminal,
+		app: &mut App,
+		receiver: &Receiver<UiMsg>,
+		runner: &Arc<PiAgentRunner>,
+		cancel: &Arc<std::sync::Mutex<crate::TurnCancelState>>,
+		message: String,
+	) -> Result<bool> {
+		let (reply, answers) = mpsc::channel();
+		app.dialog = Some(Dialog::Confirm { message, reply });
+		app.dirty = true;
+		loop {
+			let action = {
+				let mut idle = LoopContext {
+					terminal: &mut *terminal,
+					app: &mut *app,
+					receiver,
+					runner,
+					cancel,
+					busy: false,
+					buffer: Vec::new(),
+					paste_mode: false,
+					esc_since: None,
+				};
+				event_loop(&mut idle)?
+			};
+			if matches!(action, Action::Exit) {
+				return Ok(false);
+			}
+			match answers.try_recv() {
+				Ok(answer) => return Ok(answer),
+				Err(TryRecvError::Empty) => {},
+				Err(TryRecvError::Disconnected) => return Ok(false),
+			}
+		}
+	}
+
 	// ── Entry point ────────────────────────────────────────────────────────
 
 	pub(crate) fn run(session: &mut Session<'_>, runner: &Arc<PiAgentRunner>) -> Result<()> {
@@ -2945,6 +3063,9 @@ mod imp {
 				"recovered interrupted assistant fragment (not journaled; sent to the model once, no tool calls): {preview}{ellipsis}"
 			));
 		}
+		if let Some(warning) = session.interruption_warning.as_deref() {
+			app.push_system(format!("warning: {warning}"));
+		}
 		app.push_system("arag interactive TUI — /help lists commands; Ctrl-C cancels a turn");
 
 		let outcome = (|| -> Result<()> {
@@ -2963,6 +3084,56 @@ mod imp {
 					};
 					event_loop(&mut idle)?
 				};
+				// `/retry` and `Alt+R` are resolved here, before a turn is
+				// built, so unknown tool outcomes can force confirmation.
+				let mut retry_parts = Vec::new();
+				let action = match action {
+					Action::Retry | Action::Command(UiCommand::Retry) => {
+						match session.retry_decision(false) {
+							RetryDecision::Run(plan) => {
+								retry_parts = plan.parts;
+								Action::Submit(plan.prompt)
+							},
+							RetryDecision::Confirm(warning) => {
+								app.push_system(format!("warning: {warning}"));
+								let confirmed = confirm_retry_dialog(
+									&mut terminal,
+									&mut app,
+									&receiver,
+									runner,
+									&cancel,
+									format!("{warning}\n\nRetry the interrupted turn?"),
+								)?;
+								if !confirmed {
+									app.push_system("retry cancelled");
+									Action::None
+								} else {
+									match session.retry_decision(true) {
+										RetryDecision::Run(plan) => {
+											retry_parts = plan.parts;
+											Action::Submit(plan.prompt)
+										},
+										RetryDecision::Confirm(_) => {
+											app.push_system(
+												"warning: retry still requires confirmation",
+											);
+											Action::None
+										},
+										RetryDecision::Refused(message) => {
+											app.push_system(format!("warning: {message}"));
+											Action::None
+										},
+									}
+								}
+							},
+							RetryDecision::Refused(message) => {
+								app.push_system(format!("warning: {message}"));
+								Action::None
+							},
+						}
+					},
+					other => other,
+				};
 				match action {
 					Action::Exit => break,
 					Action::Command(command) => {
@@ -2971,6 +3142,7 @@ mod imp {
 						}
 					},
 					Action::Submit(prompt) => {
+						let turn_parts = std::mem::take(&mut retry_parts);
 						app.start_turn(&prompt);
 						app.history_lines =
 							history_lines(&session.history, session.interrupted_fragment.as_deref());
@@ -2983,7 +3155,7 @@ mod imp {
 						let worker_session: &mut Session<'_> = &mut *session;
 						std::thread::scope(|scope| -> Result<()> {
 							let _worker = scope.spawn(move || {
-								turn_worker(worker_session, &worker_tx, worker_prompt);
+								turn_worker(worker_session, &worker_tx, worker_prompt, turn_parts);
 							});
 							let action = {
 								let mut busy = LoopContext {
@@ -3021,7 +3193,11 @@ mod imp {
 							break;
 						}
 					},
-					Action::Steer(_) | Action::Cancel | Action::None => {},
+					Action::Steer(_)
+					| Action::Cancel
+					| Action::None
+					| Action::Retry
+					| Action::DialogAnswered => {},
 				}
 			}
 			Ok(())
@@ -3302,6 +3478,48 @@ mod imp {
 			}
 			assert_eq!(app.input.text(), "line1\nline2");
 			assert!(!app.pasting);
+		}
+
+		#[test]
+		fn alt_r_parses_and_lone_esc_is_preserved() {
+			let mut paste_mode = false;
+			let mut buffer = vec![0x1b];
+			assert!(parse_keys(&mut buffer, &mut paste_mode).is_empty());
+			assert_eq!(buffer, vec![0x1b]);
+			buffer.extend_from_slice(b"r");
+			assert_eq!(parse_keys(&mut buffer, &mut paste_mode), vec![Key::Alt('r')]);
+			assert!(buffer.is_empty());
+
+			// CSI/SS3 and paste prefixes still win over the Alt branch.
+			let mut buffer = b"\x1b[A".to_vec();
+			assert_eq!(parse_keys(&mut buffer, &mut paste_mode), vec![Key::Up]);
+		}
+
+		#[test]
+		fn alt_r_requests_retry_only_when_idle() {
+			let mut app = test_app();
+			assert!(matches!(app.on_key(Key::Alt('r')), Some(Action::Retry)));
+			app.busy = true;
+			assert!(app.on_key(Key::Alt('r')).is_none());
+			assert!(app.entries.iter().any(|entry| entry.text.contains("retry unavailable")));
+		}
+
+		#[test]
+		fn retry_command_parses_only_bare() {
+			assert_eq!(parse_ui_command("/retry"), Some(UiCommand::Retry));
+			assert_eq!(parse_ui_command("/retry now"), None);
+		}
+
+		#[test]
+		fn confirm_dialog_requires_an_explicit_answer() {
+			let mut app = test_app();
+			let (reply, answers) = mpsc::channel();
+			app.dialog = Some(Dialog::Confirm { message: "unknown outcome".to_string(), reply });
+			assert!(matches!(app.on_key(Key::Alt('r')), Some(Action::None)));
+			assert!(app.dialog.is_some(), "Alt+R must not bypass the gate");
+			assert!(app.on_key(Key::Char('y')).is_some());
+			assert!(answers.try_recv().unwrap_or(false));
+			assert!(app.dialog.is_none());
 		}
 
 		#[test]

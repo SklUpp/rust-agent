@@ -2115,6 +2115,78 @@ async fn ownership_gated_recovery_is_session_scoped_and_idempotent() {
 }
 
 
+/// R10: an interrupted effect stays unresolved across recovery and a later
+/// turn. The host may retry the prompt, but the runtime must never invent an
+/// outcome, re-run the tool, or duplicate the synthetic interrupted result.
+#[tokio::test]
+async fn unresolved_effect_survives_a_later_turn_without_auto_retry() {
+	let dir = temp_dir("r10-no-auto-retry");
+	let db = dir.join("sessions.db");
+	let session = DurableSession::create(db.clone(), header("s-r10", &dir)).expect("create");
+	let call = ToolCall {
+		id: "call-r10".to_string(),
+		name: "effect".to_string(),
+		arguments: json!({}),
+	};
+	session
+		.persist_messages(&[
+			Message::user("run the effect"),
+			Message::assistant_with_tools("calling effect", vec![call.clone()]),
+		])
+		.await
+		.expect("persist interrupted turn");
+	let execution_id = session.begin_execution(&call).await.expect("intent");
+	drop(session);
+
+	let (reopened, _loaded) =
+		DurableSession::open(db.clone(), "s-r10", header("s-r10", &dir)).expect("reopen");
+	let unresolved = reopened.unresolved_intents().expect("unresolved");
+	assert_eq!(unresolved.len(), 1);
+	assert_eq!(unresolved[0].execution_id, execution_id);
+
+	// The host starts a later turn from the recovered branch. The synthetic
+	// interrupted tool result is history, not a durable outcome.
+	let interrupted = "Execution interrupted; outcome unknown; not retried.";
+	reopened
+		.persist_messages(&[
+			Message::user("run the effect"),
+			Message::assistant_with_tools("calling effect", vec![call]),
+			Message::tool_with_status("call-r10", "effect", interrupted, true),
+			Message::assistant("next answer"),
+		])
+		.await
+		.expect("later turn must persist over the recovered history");
+
+	let unresolved = reopened.unresolved_intents().expect("unresolved after next turn");
+	assert_eq!(unresolved.len(), 1, "a later turn must not resolve the effect");
+	assert!(
+		reopened
+			.execution(&execution_id)
+			.expect("execution")
+			.expect("row")
+			.outcome
+			.is_none(),
+		"no outcome may be invented for an unconfirmed effect"
+	);
+	drop(reopened);
+
+	let (again, loaded_again) =
+		DurableSession::open(db.clone(), "s-r10", header("s-r10", &dir)).expect("reopen again");
+	let loaded_again = loaded_again.expect("loaded");
+	assert_eq!(
+		loaded_again
+			.branch_messages
+			.iter()
+			.filter(|entry| entry.message.role == "toolResult")
+			.count(),
+		1,
+		"recovery must not duplicate or replay the interrupted result"
+	);
+	assert_eq!(again.unresolved_intents().expect("unresolved again").len(), 1);
+
+	std::fs::remove_dir_all(dir).ok();
+}
+
 #[tokio::test]
 async fn reopen_with_missing_intent_refuses_dangling_replay_and_creates_no_execution() {
 	let dir = temp_dir("missing-intent");

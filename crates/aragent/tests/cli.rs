@@ -465,6 +465,7 @@ fn fake_request(prompt: &str) -> RunRequest {
 		continuation: false,
 		plan_context: None,
 		interrupted_context: None,
+		interruption_warning: None,
 		advisor_card_sink: None,
 		service_tier_by_family: std::collections::BTreeMap::new(),
 		security_host: None,

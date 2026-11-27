@@ -12,6 +12,9 @@ pub enum ReplCommand {
 	Cwd(Option<String>),
 	/// `/memory <action> [...]`, same grammar as `arag memory`.
 	Memory(Vec<String>),
+	/// `/retry`: manually repeat the interrupted turn (asks on stdout when an
+	/// unknown tool outcome needs confirmation).
+	Retry,
 	Prompt(String),
 }
 
@@ -33,6 +36,7 @@ pub fn parse(line: &str) -> Option<ReplCommand> {
 		"/exit" | "/quit" => Some(ReplCommand::Exit),
 		"/model" => Some(ReplCommand::Model(argument)),
 		"/cwd" => Some(ReplCommand::Cwd(argument)),
+		"/retry" if argument.is_none() => Some(ReplCommand::Retry),
 		"/memory" => Some(ReplCommand::Memory(
 			argument
 				.map(|argument| argument.split_whitespace().map(str::to_string).collect())
@@ -65,6 +69,11 @@ mod tests {
 			]))
 		);
 		assert_eq!(parse("/memory"), Some(ReplCommand::Memory(Vec::new())));
+		assert_eq!(parse("/retry"), Some(ReplCommand::Retry));
+		assert_eq!(
+			parse("/retry --confirm"),
+			Some(ReplCommand::Prompt("/retry --confirm".into()))
+		);
 		assert_eq!(parse("fix the tests"), Some(ReplCommand::Prompt("fix the tests".into())));
 		assert_eq!(
 			parse("/unknown stays a prompt"),

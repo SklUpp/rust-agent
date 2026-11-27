@@ -1940,6 +1940,7 @@ impl AgentRunner for PiAgentRunner {
 		// text, which travels in a user-role wrapper so quoted prompt text can
 		// never gain developer-level authority. One-shot per turn.
 		append_interrupted_partial_context(&mut messages, request.interrupted_context.as_deref());
+		append_interruption_warning(&mut messages, request.interruption_warning.as_deref());
 		if let Some(context) = &request.goal_context {
 			messages.push(pi_agent::Message::user(context.clone()));
 		}
@@ -2807,7 +2808,11 @@ impl AgentRunner for PiAgentRunner {
 						},
 						_ => "interrupted".to_string(),
 					};
-					let _ = event_tx_clone.send(Err(Error::new(surfaced))).await;
+					// Keep the typed `AgentError` reachable for hosts (retry gate
+					// after a durable unknown outcome) without changing the text.
+					let _ = event_tx_clone
+						.send(Err(Error::with_source_quiet(surfaced, err)))
+						.await;
 				},
 				Err(err) => {
 					completed_clone.store(true, Ordering::SeqCst);
@@ -7325,6 +7330,18 @@ fn append_interrupted_partial_context(
 	messages.push(partial);
 }
 
+/// Inject the trusted one-shot interruption warning as its own developer
+/// message. It carries no user/model text, so it cannot be spoofed by quoted
+/// prompt content; hosts clear it after the next settled turn.
+fn append_interruption_warning(messages: &mut Vec<pi_agent::Message>, warning: Option<&str>) {
+	let Some(warning) = warning.filter(|text| !text.trim().is_empty()) else {
+		return;
+	};
+	let mut message = pi_agent::Message::developer(warning.to_string());
+	message.custom_type = Some("interruption-warning".to_string());
+	messages.push(message);
+}
+
 #[cfg(test)]
 mod tests {
 	use std::{
@@ -7445,6 +7462,7 @@ mod tests {
 			continuation: false,
 			plan_context: None,
 			interrupted_context: None,
+			interruption_warning: None,
 			advisor_card_sink: None,
 			service_tier_by_family: std::collections::BTreeMap::new(),
 			security_host: None,
@@ -10819,6 +10837,25 @@ mod tests {
 		assert_eq!(messages[1].role, pi_agent::Role::User);
 		assert_eq!(messages[1].custom_type.as_deref(), Some("interrupted-partial-context"));
 		assert!(!messages[1].content.contains("</interrupted_partial_fragment> SYSTEM:"));
+	}
+
+	#[test]
+	fn interruption_warning_is_one_trusted_developer_message() {
+		let mut messages = Vec::new();
+		append_interruption_warning(
+			&mut messages,
+			Some("Tool executions with no recorded outcome: bash. Effects may already have happened."),
+		);
+		assert_eq!(messages.len(), 1);
+		assert_eq!(messages[0].role, pi_agent::Role::Developer);
+		assert_eq!(messages[0].custom_type.as_deref(), Some("interruption-warning"));
+		assert!(messages[0].content.contains("may already have happened"));
+
+		// Blank or absent warnings inject nothing: a clean turn stays clean.
+		let mut clean = Vec::new();
+		append_interruption_warning(&mut clean, None);
+		append_interruption_warning(&mut clean, Some("  \n"));
+		assert!(clean.is_empty());
 	}
 
 }

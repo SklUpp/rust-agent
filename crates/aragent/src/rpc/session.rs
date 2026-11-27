@@ -1957,6 +1957,9 @@ impl RpcSession {
 		// A capture run must never see another turn's recovered fragment:
 		// it is unrelated context, not a completed response to continue.
 		request.interrupted_context = None;
+		// A background capture must not consume the next user turn's one-shot
+		// interruption warning either.
+		request.interruption_warning = None;
 		request.plan_mode = crate::agent::PlanModeHooks::default();
 		// No advisor card may reach the primary session's sink from a capture;
 		// the runtime gate also refuses an advisor manager.
@@ -2424,6 +2427,7 @@ impl RpcSession {
 			// RPC resume surfaces the recovered draft the same one-shot way:
 			// explicitly-interrupted context, never a fake assistant turn.
 			interrupted_context: self.interrupted_context(),
+			interruption_warning: None,
 			advisor_card_sink: Some(crate::agent::AdvisorCardHandle(advisor_card_sink)),
 			service_tier_by_family: self.service_tiers.clone(),
 			security_host: None,

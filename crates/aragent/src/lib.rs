@@ -79,12 +79,15 @@ use std::fmt;
 pub struct Error {
 	message: String,
 	source: Option<Box<dyn std::error::Error + Send + Sync>>,
+	/// Keep the source for downcasting while `Display` stays the message
+	/// alone. Used when the message is already the surfaced reason.
+	quiet_source: bool,
 }
 
 impl Error {
 	#[must_use]
 	pub fn new(message: impl Into<String>) -> Self {
-		Self { message: message.into(), source: None }
+		Self { message: message.into(), source: None, quiet_source: false }
 	}
 
 	#[must_use]
@@ -92,14 +95,41 @@ impl Error {
 		message: impl Into<String>,
 		source: impl std::error::Error + Send + Sync + 'static,
 	) -> Self {
-		Self { message: message.into(), source: Some(Box::new(source)) }
+		Self {
+			message: message.into(),
+			source: Some(Box::new(source)),
+			quiet_source: false,
+		}
+	}
+
+	/// Like [`Self::with_source`], but `Display` shows only the message. The
+	/// typed source stays reachable through [`Self::downcast_source`].
+	#[must_use]
+	pub fn with_source_quiet(
+		message: impl Into<String>,
+		source: impl std::error::Error + Send + Sync + 'static,
+	) -> Self {
+		Self {
+			message: message.into(),
+			source: Some(Box::new(source)),
+			quiet_source: true,
+		}
+	}
+
+	/// Typed access to the wrapped source, when one was preserved.
+	#[must_use]
+	pub fn downcast_source<T: std::error::Error + 'static>(&self) -> Option<&T> {
+		let source: &(dyn std::error::Error + 'static) = self.source.as_deref()?;
+		source.downcast_ref::<T>()
 	}
 }
 
 impl fmt::Display for Error {
 	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
 		f.write_str(&self.message)?;
-		if let Some(source) = &self.source {
+		if let Some(source) = &self.source
+			&& !self.quiet_source
+		{
 			write!(f, ": {source}")?;
 		}
 		Ok(())
@@ -138,3 +168,27 @@ pub const EXIT_USAGE: u8 = 2;
 /// Serialises unit tests that mutate process-wide environment variables.
 #[cfg(test)]
 pub(crate) static TEST_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+#[cfg(test)]
+mod error_tests {
+	use super::Error;
+
+	#[derive(Debug)]
+	struct TypedSource;
+
+	impl std::fmt::Display for TypedSource {
+		fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+			f.write_str("typed source detail")
+		}
+	}
+
+	impl std::error::Error for TypedSource {}
+
+	#[test]
+	fn quiet_source_stays_downcastable_without_display_noise() {
+		let error = Error::with_source_quiet("interrupted", TypedSource);
+		assert_eq!(error.to_string(), "interrupted");
+		assert!(error.downcast_source::<TypedSource>().is_some());
+		assert!(error.downcast_source::<std::io::Error>().is_none());
+	}
+}

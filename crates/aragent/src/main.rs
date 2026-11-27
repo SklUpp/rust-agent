@@ -1248,6 +1248,11 @@ fn run() -> std::result::Result<(), CliError> {
 		history: Vec::new(),
 		checkpoint_host: CheckpointHost::new(),
 		interrupted_fragment: None,
+		retry_prompt: None,
+		retry_parts: Vec::new(),
+		last_turn_interrupted: false,
+		last_turn_durable_unknown: false,
+		interruption_warning: None,
 		turn_tool_calls: 0,
 		turn_started_in_goal: false,
 		in_memory_messages: None,
@@ -1563,6 +1568,42 @@ fn run() -> std::result::Result<(), CliError> {
 		);
 	}
 	session.store = store;
+	// A reopened session with unresolved executions must warn the next model
+	// turn before it does anything. The store open already surfaced the named
+	// warning; this seeds the trusted one-shot context copy.
+	let startup_intents = session.store.unresolved_intents();
+	match &startup_intents {
+		Ok(intents) if !intents.is_empty() => {
+			session.interruption_warning = Some(session::interruption_warning(intents, false, false));
+		},
+		Ok(_) => {},
+		Err(error) => {
+			eprintln!("warning: cannot read unresolved tool executions: {error}");
+			// Fail closed for the next model turn too: the TUI already shows
+			// `interruption_warning` at startup, and `/retry` refuses while the
+			// store read keeps failing.
+			session.interruption_warning = Some(format!(
+				"WARNING: Startup could not verify unresolved tool executions from the session \
+				 store ({error}). Previous tool effects may already have happened; nothing was \
+				 replayed automatically. Verify repository and external state before repeating \
+				 side effects."
+			));
+		},
+	}
+	// A reopened crash has no in-memory flag. Recognize an interrupted last turn
+	// (aborted stop, missing interrupted tool result, or an empty pre-assistant
+	// turn with durable evidence) so `/retry` works after restart. A later
+	// cleanly-completed turn with older intents stays non-retryable.
+	let unresolved = startup_intents.as_ref().is_ok_and(|intents| !intents.is_empty());
+	let recovered_fragment =
+		session.store.recovered_partial_text().ok().flatten().is_some();
+	let reopened_interrupted = session
+		.history
+		.last()
+		.is_some_and(|turn| session::turn_was_interrupted(turn, unresolved, recovered_fragment));
+	if reopened_interrupted {
+		session.last_turn_interrupted = true;
+	}
 	// `memory://` is mounted after the store opens so the handler can bind this
 	// conversation's id; session-scoped rows stay invisible to other sessions.
 	let memory_session_id = session.store.enabled().then(|| session.store.id().to_owned());
@@ -1802,6 +1843,44 @@ fn interactive_tui_available(mode: OutputMode) -> bool {
 			.is_some_and(|term| !term.is_empty() && term.to_string_lossy() != "dumb")
 }
 
+/// Run one user-visible turn: the turn, its opt-in goal continuation, the
+/// auto-learn capture, and a per-turn reporter flush. Shared by typed prompts
+/// and `/retry` so a retried turn cannot skip a post-turn stage.
+fn run_repl_turn<W: Write, E: Write>(
+	session: &mut Session<'_>,
+	mode: OutputMode,
+	reporter: &mut Reporter<W, E>,
+	prompt: String,
+	parts: Vec<ContentPart>,
+) -> Result<()> {
+	if let Err(error) = session.turn(None, prompt, parts, mode, reporter) {
+		reporter.finish().ok();
+		return Err(error);
+	}
+	// Opt-in headless continuation (`goal.continuationModes`).
+	if let Err(error) = session.drive_goal_continuation(mode, reporter) {
+		reporter.finish().ok();
+		return Err(error);
+	}
+	session.drive_autolearn_capture(mode);
+	// Text mode buffers the final assistant message until `finish`: flush it
+	// per turn so REPL output is visible immediately instead of only at exit.
+	reporter.finish()?;
+	Ok(())
+}
+
+/// Explicit `[y/N]` gate for a retry over unknown tool outcomes. Only `y`/`yes`
+/// (any case) confirms; EOF, Enter, or anything else cancels.
+fn repl_confirm_retry() -> Result<bool> {
+	eprint!("retry the interrupted turn anyway? [y/N] ");
+	io::stderr().flush()?;
+	let mut answer = String::new();
+	if io::stdin().read_line(&mut answer)? == 0 {
+		return Ok(false);
+	}
+	Ok(matches!(answer.trim().to_ascii_lowercase().as_str(), "y" | "yes"))
+}
+
 fn run_repl<W: Write, E: Write>(
 	session: &mut Session<'_>,
 	mode: OutputMode,
@@ -1874,22 +1953,45 @@ fn run_repl<W: Write, E: Write>(
 						text
 					},
 				};
-				if let Err(error) = session.turn(None, text, Vec::new(), mode, reporter) {
-					reporter.finish().ok();
+				if let Err(error) = run_repl_turn(session, mode, reporter, text, Vec::new()) {
 					eprintln!("{error}");
-					continue;
+					if let Some(warning) = session.interruption_warning.as_deref() {
+						eprintln!("warning: {warning}");
+					}
 				}
-				// Opt-in headless continuation (`goal.continuationModes`).
-				if let Err(error) = session.drive_goal_continuation(mode, reporter) {
-					reporter.finish().ok();
+			},
+			repl::ReplCommand::Retry => {
+				let plan = match session.retry_decision(false) {
+					RetryDecision::Run(plan) => Some(plan),
+					RetryDecision::Confirm(warning) => {
+						eprintln!("warning: {warning}");
+						if repl_confirm_retry()? {
+							match session.retry_decision(true) {
+								RetryDecision::Run(plan) => Some(plan),
+								RetryDecision::Confirm(_) | RetryDecision::Refused(_) => {
+									eprintln!("warning: retry refused after confirmation");
+									None
+								},
+							}
+						} else {
+							eprintln!("retry cancelled");
+							None
+						}
+					},
+					RetryDecision::Refused(message) => {
+						eprintln!("warning: {message}");
+						None
+					},
+				};
+				if let Some(plan) = plan
+					&& let Err(error) =
+						run_repl_turn(session, mode, reporter, plan.prompt, plan.parts)
+				{
 					eprintln!("{error}");
-					continue;
+					if let Some(warning) = session.interruption_warning.as_deref() {
+						eprintln!("warning: {warning}");
+					}
 				}
-				session.drive_autolearn_capture(mode);
-				// Text mode buffers the final assistant message until `finish`:
-				// flush it per turn so REPL output is visible immediately instead
-				// of only when `/exit` ends the session.
-				reporter.finish()?;
 			},
 		}
 	}
@@ -1986,6 +2088,30 @@ fn persist_advisor_card<W: Write, E: Write>(
 	reporter.advisor_card(content, details)
 }
 
+/// One resolved manual retry: the exact prompt/parts of the interrupted turn.
+/// The trusted warning is already installed on the session, so the next
+/// request carries it exactly once.
+pub(crate) struct RetryPlan {
+	pub prompt: String,
+	pub parts: Vec<ContentPart>,
+}
+
+/// Outcome of resolving `/retry`/`Alt+R`. `Confirm` means unknown outcomes
+/// exist and the front-end must ask (TUI dialog, REPL `[y/N]`) before running.
+pub(crate) enum RetryDecision {
+	Run(RetryPlan),
+	Confirm(String),
+	Refused(String),
+}
+
+/// True when a surfaced error carries `AgentError::DurableUnknownOutcome`,
+/// whether it came from the drive loop or the post-failure stream drain.
+fn is_durable_unknown_outcome(error: &Error) -> bool {
+	error
+		.downcast_source::<pi_agent::AgentError>()
+		.is_some_and(pi_agent::AgentError::is_durable_unknown_outcome)
+}
+
 struct Session<'a> {
 	runner: &'a dyn AgentRunner,
 	config: Config,
@@ -2039,6 +2165,19 @@ struct Session<'a> {
 	/// the model once as separate interrupted context. Cleared when the next
 	/// journaled terminal persists.
 	interrupted_fragment: Option<String>,
+	/// Raw prompt (and parts) of the last user turn, captured before the turn
+	/// starts so a manual retry repeats exactly that input.
+	retry_prompt: Option<String>,
+	retry_parts: Vec<ContentPart>,
+	/// Last turn ended interrupted/failed; `/retry` and `Alt+R` may repeat it.
+	last_turn_interrupted: bool,
+	/// The last failure carried `AgentError::DurableUnknownOutcome`: a write
+	/// may have committed unseen, so a retry needs explicit confirmation.
+	last_turn_durable_unknown: bool,
+	/// Trusted one-shot warning for the next request (interruption + unknown
+	/// tool effects). Seeded at reopen when unresolved intents exist, refreshed
+	/// on an interrupted turn, cleared after a clean turn.
+	interruption_warning: Option<String>,
 	/// Tool results in the just-finished turn (TS `tool_execution_end` count),
 	turn_tool_calls: usize,
 	/// Goal mode when the just-finished turn started; capture skips the turn
@@ -2534,6 +2673,9 @@ impl Session<'_> {
 			// The recovered fragment belongs to the next real turn, not to a
 			// background capture: hand it back instead of consuming it here.
 			self.interrupted_fragment = request.interrupted_context.take();
+			// The interruption warning belongs to the next real user turn too;
+			// a capture must not consume or repeat it.
+			request.interruption_warning = None;
 			request.todo_phases = Vec::new();
 			request.extra_mcp_servers = Vec::new();
 			request.config.tools = Some(Vec::new());
@@ -2602,6 +2744,111 @@ impl Session<'_> {
 			self.tools_enabled && self.tool_selected("task"),
 		);
 		(hooks, context)
+	}
+
+	/// Unresolved executions for this session, as plain error text so the retry
+	/// gate can fail closed instead of assuming a clean state.
+	fn unresolved_tool_intents(
+		&self,
+	) -> std::result::Result<Vec<crate::session_store::UnresolvedIntent>, String> {
+		self.store.unresolved_intents().map_err(|error| error.to_string())
+	}
+
+	/// Trusted warning for the current interruption state. A failed read never
+	/// downgrades to "clean": the text says the runtime could not verify.
+	fn current_interruption_warning(&self, retry: bool) -> String {
+		match self.unresolved_tool_intents() {
+			Ok(intents) => session::interruption_warning(
+				&intents,
+				self.last_turn_durable_unknown,
+				retry,
+			),
+			Err(error) => {
+				let mut text = String::from(
+					"The previous turn was interrupted or failed before it completed.",
+				);
+				text.push_str(&format!(
+					" The runtime could not read unresolved tool executions ({error}); treat their \
+					 effect state as unconfirmed."
+				));
+				if self.last_turn_durable_unknown {
+					text.push_str(
+						" A durable session write also ended with an unknown outcome; its commit \
+						 state is unconfirmed.",
+					);
+				}
+				text.push_str(" Nothing was retried automatically.");
+				if retry {
+					text.push_str(
+						" This retry repeats only the interrupted prompt, by explicit user \
+						 command; it does not authorize replaying tool calls.",
+					);
+				}
+				text
+			},
+		}
+	}
+
+	/// Resolve a manual retry. `confirm = false` never crosses an unknown
+	/// outcome: it returns [`RetryDecision::Confirm`] and the front-end must
+	/// ask. A storage read failure refuses instead of assuming no effect ran.
+	fn retry_decision(&mut self, confirm: bool) -> RetryDecision {
+		let intents = match self.unresolved_tool_intents() {
+			Ok(intents) => intents,
+			Err(error) => {
+				return RetryDecision::Refused(format!(
+					"cannot verify unknown tool outcomes ({error}); retry refused"
+				));
+			},
+		};
+		let durable_unknown = self.last_turn_durable_unknown;
+		let gate = !intents.is_empty() || durable_unknown;
+		let last_turn = self.history.last();
+		// Reopened crashes carry no in-memory flag: recognize an aborted stop,
+		// a missing interrupted tool result, or a pre-assistant empty turn with
+		// durable evidence. Older intents behind a clean later turn do not
+		// qualify.
+		let recovered_fragment = self.store.recovered_partial_text().ok().flatten().is_some();
+		let interrupted = self.last_turn_interrupted
+			|| last_turn.is_some_and(|turn| {
+				session::turn_was_interrupted(turn, !intents.is_empty(), recovered_fragment)
+			});
+		let prompt = self
+			.retry_prompt
+			.clone()
+			.filter(|prompt| !prompt.trim().is_empty())
+			.or_else(|| {
+				last_turn
+					.map(|turn| turn.prompt.clone())
+					.filter(|prompt| !prompt.trim().is_empty())
+			});
+		let Some(prompt) = prompt.filter(|_| interrupted) else {
+			let mut message = String::from("no interrupted turn to retry");
+			if gate {
+				message.push_str("; ");
+				message.push_str(&session::interruption_warning(
+					&intents,
+					durable_unknown,
+					false,
+				));
+			}
+			return RetryDecision::Refused(message);
+		};
+		if gate && !confirm {
+			return RetryDecision::Confirm(session::interruption_warning(
+				&intents,
+				durable_unknown,
+				true,
+			));
+		}
+		let parts = if self.retry_prompt.is_some() {
+			self.retry_parts.clone()
+		} else {
+			last_turn.map(|turn| turn.parts.clone()).unwrap_or_default()
+		};
+		let warning = session::interruption_warning(&intents, durable_unknown, true);
+		self.interruption_warning = Some(warning);
+		RetryDecision::Run(RetryPlan { prompt, parts })
 	}
 
 	fn request(
@@ -2736,6 +2983,7 @@ impl Session<'_> {
 			// in-memory copy once the terminal assistant message has cleared
 			// the store draft; an aborted turn re-peeks the fresh draft.
 			interrupted_context: self.interrupted_fragment.clone(),
+			interruption_warning: self.interruption_warning.clone(),
 			advisor_card_sink: Some(agent::AdvisorCardHandle(advisor_card_sink)),
 			service_tier_by_family,
 			security_host: None,
@@ -2772,6 +3020,13 @@ impl Session<'_> {
 				"cannot append to legacy v1 session log: read-only; use import_legacy_v1",
 			));
 		}
+		// Hold the caller's exact input privately until the runner accepts the
+		// request. A validation/journal/request failure before that point must
+		// not pair a never-started prompt with the previous turn's interrupted
+		// state.
+		let retry_capture = hidden_custom_type
+			.is_none()
+			.then(|| (raw_prompt.clone(), initial_parts.clone()));
 		if hidden_custom_type.is_none()
 			&& let Some(shared) = self.plan_yolo.as_ref()
 		{
@@ -2978,6 +3233,11 @@ impl Session<'_> {
 				return Err(err);
 			},
 		};
+		// The turn is now executing: pair this prompt with a possible abort.
+		if let Some((prompt, parts)) = retry_capture {
+			self.retry_prompt = Some(prompt);
+			self.retry_parts = parts;
+		}
 		let mut reporter_failed = false;
 
 		let session_config = &self.config;
@@ -3678,13 +3938,15 @@ impl Session<'_> {
 			},
 		);
 
+		let mut drain_durable_unknown = false;
 		if drive_result.is_err() {
 			cancel_token.cancel();
 			if let Some(shared) = self.plan_yolo.as_ref() {
 				shared.cancel_pending();
 			}
 			for event in stream {
-				if let Ok(event) = event {
+				match event {
+					Ok(event) => {
 					builder.observe(&event);
 					let _ = handle_event(
 						&event,
@@ -3709,6 +3971,14 @@ impl Session<'_> {
 							reporter_failed = true;
 						}
 					}
+					},
+					// The error that ended the turn may surface here instead of
+					// `drive_result`; preserve a durable unknown outcome so the
+					// retry gate stays closed.
+					Err(drain_err) => {
+						drain_durable_unknown =
+							drain_durable_unknown || is_durable_unknown_outcome(&drain_err);
+					},
 				}
 			}
 			// A failed turn can still journal accepted steering (the loop writes
@@ -3800,10 +4070,16 @@ impl Session<'_> {
 
 		let mut record = builder.finish();
 		if let Err(err) = drive_result {
-			let canon = session::canonical_stop_reason(&record.stop_reason);
-			if record.stop_reason.is_empty() || canon == "toolUse" {
-				record.stop_reason = "aborted".to_string();
-			}
+			// Every failed surfacing is a manual-retry target. The typed
+			// `AgentError` is preserved by the runner, so a durable write whose
+			// commit state is unknown can force the confirmation gate.
+			record.stop_reason = "aborted".to_string();
+			self.last_turn_interrupted = true;
+			// Sticky across failures: a later plain timeout on a retry must not
+			// erase an earlier durable unknown-outcome. Only a clean completion
+			// clears it.
+			self.last_turn_durable_unknown |=
+				drain_durable_unknown || is_durable_unknown_outcome(&err);
 			self.checkpoint_host.abandon_in_memory_rewind();
 			if let Some(messages) = self.in_memory_messages.as_mut() {
 				messages.truncate(in_memory_before);
@@ -3819,6 +4095,8 @@ impl Session<'_> {
 				.store
 				.recovered_partial_text()
 				.map_err(|error| Error::with_source("cannot read recovered stream draft", error))?;
+			let warning = self.current_interruption_warning(false);
+			self.interruption_warning = Some(warning);
 			return Err(err);
 		}
 		let rewound = self.checkpoint_host.finish_in_memory_rewind();
@@ -3833,6 +4111,12 @@ impl Session<'_> {
 			.store
 			.recovered_partial_text()
 			.map_err(|error| Error::with_source("cannot read recovered stream draft", error))?;
+		// The trusted interruption warning rode exactly this turn; a clean
+		// completion ends it. Earlier unresolved intents still gate the next
+		// `/retry` from the store itself.
+		self.interruption_warning = None;
+		self.last_turn_interrupted = false;
+		self.last_turn_durable_unknown = false;
 		Ok(())
 	}
 }
@@ -5234,6 +5518,23 @@ fn run_commit_command(message: Option<&str>, cwd: &Path) -> std::result::Result<
 #[cfg(test)]
 mod tests {
 	use super::*;
+
+	/// The drain may be the only place a durability error surfaces; its flag is
+	/// sticky through the abort path and must not be erased by a later plain
+	/// timeout.
+	#[test]
+	fn drain_durable_unknown_is_detected_and_sticky() {
+		let durable = Error::with_source_quiet(
+			"interrupted",
+			pi_agent::AgentError::DurableUnknownOutcome("writer stopped".to_string()),
+		);
+		assert!(is_durable_unknown_outcome(&durable));
+		let mut drained = false;
+		drained = drained || is_durable_unknown_outcome(&durable);
+		drained = drained || is_durable_unknown_outcome(&Error::new("turn timed out"));
+		assert!(drained);
+		assert!(!is_durable_unknown_outcome(&Error::new("turn timed out")));
+	}
 
 	#[test]
 	fn model_switch_clears_inherited_cache_key_but_keeps_explicit() {

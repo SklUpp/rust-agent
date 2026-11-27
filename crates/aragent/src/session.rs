@@ -757,6 +757,88 @@ pub fn canonical_stop_reason(reason: &str) -> &str {
 	}
 }
 
+/// Distinct tool names from unresolved executions, in first-seen order.
+/// Presence is not proof the effect started; callers only warn.
+#[must_use]
+pub fn unresolved_tool_names(intents: &[crate::session_store::UnresolvedIntent]) -> String {
+	const SHOWN: usize = 5;
+	let mut names: Vec<&str> = Vec::new();
+	for intent in intents {
+		if !names.contains(&intent.tool_name.as_str()) {
+			names.push(&intent.tool_name);
+		}
+	}
+	let total = names.len();
+	names.truncate(SHOWN);
+	let mut text = names.join(", ");
+	if total > SHOWN {
+		text.push_str(&format!(" and {} more", total - SHOWN));
+	}
+	text
+}
+
+/// True when the last turn did not settle cleanly, including after reopen.
+/// An empty assistant turn counts only with durable evidence (an unresolved
+/// execution or a recovered draft); a later cleanly-completed turn with older
+/// unresolved intents stays non-retryable.
+#[must_use]
+pub fn turn_was_interrupted(
+	turn: &TurnRecord,
+	has_unresolved_intents: bool,
+	has_recovered_fragment: bool,
+) -> bool {
+	if canonical_stop_reason(&turn.stop_reason) == "aborted" {
+		return true;
+	}
+	if turn.tool_calls.iter().any(|call| {
+		call.is_error
+			&& (call.result == "Tool result missing (interrupted)"
+				|| call.result == crate::session_store::SqliteStore::INTERRUPTED_UNKNOWN_OUTCOME)
+	}) {
+		return true;
+	}
+	canonical_stop_reason(&turn.stop_reason) == "stop"
+		&& turn.assistant.trim().is_empty()
+		&& turn.tool_calls.is_empty()
+		&& (has_unresolved_intents || has_recovered_fragment)
+}
+
+/// Trusted warning for an interrupted/failed turn. It states that effects with
+/// no recorded outcome may already have happened and that nothing was retried
+/// automatically; `retry` adds the explicit-manual-retry boundary.
+#[must_use]
+pub fn interruption_warning(
+	intents: &[crate::session_store::UnresolvedIntent],
+	durable_unknown: bool,
+	retry: bool,
+) -> String {
+	let mut text = String::from(
+		"The previous turn was interrupted or failed before it completed.",
+	);
+	let names = unresolved_tool_names(intents);
+	if !names.is_empty() {
+		text.push_str(&format!(
+			" Tool executions with no recorded outcome: {names}. Their effects may already \
+			 have happened; do not assume they succeeded or failed, and verify before relying \
+			 on them."
+		));
+	}
+	if durable_unknown {
+		text.push_str(
+			" A durable session write also ended with an unknown outcome; its commit state is \
+			 unconfirmed.",
+		);
+	}
+	text.push_str(" The runtime did not retry them automatically.");
+	if retry {
+		text.push_str(
+			" This retry repeats only the interrupted prompt, by explicit user command; it does \
+			 not authorize replaying tool calls or treating those effects as confirmed.",
+		);
+	}
+	text
+}
+
 impl SessionMessage {
 	#[must_use]
 	pub fn user(content: MessageContent, timestamp_ms: u64) -> Self {
@@ -1752,9 +1834,11 @@ impl SessionStore {
 					.map(|durable| durable.unresolved_intents());
 				match unresolved {
 					Some(Ok(intents)) if !intents.is_empty() => store.warn(format!(
-						"session has {} unresolved tool execution(s); the effect state is \
-						 unconfirmed and will not be replayed automatically",
-						intents.len()
+						"session has {} unresolved tool execution(s) ({}); the effect state is \
+						 unconfirmed — the action may already have run — and nothing was \
+						 replayed automatically",
+						intents.len(),
+						unresolved_tool_names(&intents)
 					)),
 					Some(Ok(_)) | None => {},
 					Some(Err(error)) => store.warn(format!(
@@ -2005,6 +2089,18 @@ impl SessionStore {
 			let boundary: std::sync::Arc<dyn pi_agent::DurableBoundary> = durable;
 			boundary
 		})
+	}
+
+	/// Executions whose outcome was never recorded. Presence is not proof the
+	/// effect started; callers warn and never replay automatically. An
+	/// unpersisted session has none, so this is `Ok(empty)`.
+	pub fn unresolved_intents(
+		&self,
+	) -> crate::session_store::StoreResult<Vec<crate::session_store::UnresolvedIntent>> {
+		match &self.durable {
+			Some(durable) => durable.unresolved_intents(),
+			None => Ok(Vec::new()),
+		}
 	}
 
 	/// Interrupted stream text from the branch-scoped durable draft, if any.
@@ -8169,5 +8265,95 @@ mod tests {
 		assert!(!fork_dir.join("sessions.db").exists(), "preflight must precede target creation");
 		fs::remove_dir_all(dir).ok();
 		fs::remove_dir_all(fork_dir).ok();
+	}
+
+	fn unresolved(name: &str) -> crate::session_store::UnresolvedIntent {
+		crate::session_store::UnresolvedIntent {
+			execution_id: format!("exec-{name}"),
+			session_id: "session".to_string(),
+			branch_id: "branch".to_string(),
+			provider_call_id: format!("call-{name}"),
+			tool_name: name.to_string(),
+			payload: json!({"command": "true"}),
+			created_at_ms: 1,
+		}
+	}
+
+	#[test]
+	fn interruption_warning_names_tools_and_states_effects_may_have_run() {
+		let intents = vec![unresolved("bash"), unresolved("bash"), unresolved("edit")];
+		assert_eq!(unresolved_tool_names(&intents), "bash, edit");
+		let warning = interruption_warning(&intents, true, true);
+		assert!(warning.contains("bash, edit"), "{warning}");
+		assert!(warning.contains("may already have happened"), "{warning}");
+		assert!(warning.contains("did not retry them automatically"), "{warning}");
+		assert!(warning.contains("unknown outcome"), "{warning}");
+		assert!(warning.contains("does not authorize replaying"), "{warning}");
+		assert!(!interruption_warning(&[], false, false).contains("does not authorize"));
+	}
+
+	#[test]
+	fn reopened_turn_classification_uses_durable_evidence() {
+		let aborted = TurnRecord {
+			prompt: "p".to_string(),
+			stop_reason: "aborted".to_string(),
+			..TurnRecord::default()
+		};
+		assert!(turn_was_interrupted(&aborted, false, false));
+
+		let missing_result = TurnRecord {
+			prompt: "p".to_string(),
+			stop_reason: "toolUse".to_string(),
+			tool_calls: vec![ToolCallRecord {
+				id: "call".to_string(),
+				name: "bash".to_string(),
+				arguments: json!({}),
+				result: "Tool result missing (interrupted)".to_string(),
+				is_error: true,
+				result_parts: Vec::new(),
+				details: None,
+			}],
+			..TurnRecord::default()
+		};
+		assert!(turn_was_interrupted(&missing_result, false, false));
+
+		// Reopen recovery writes a synthetic tool result and marks the call
+		// matched, so `derive_turn_history` keeps `stop_reason = "stop"`; the
+		// recovered result must still make the turn retryable.
+		let recovered = TurnRecord {
+			prompt: "p".to_string(),
+			stop_reason: "stop".to_string(),
+			tool_calls: vec![ToolCallRecord {
+				id: "call".to_string(),
+				name: "bash".to_string(),
+				arguments: json!({}),
+				result: crate::session_store::SqliteStore::INTERRUPTED_UNKNOWN_OUTCOME.to_string(),
+				is_error: true,
+				result_parts: Vec::new(),
+				details: None,
+			}],
+			..TurnRecord::default()
+		};
+		assert!(turn_was_interrupted(&recovered, false, false));
+
+		// Crash before any assistant output: durable evidence is required.
+		let crashed = TurnRecord {
+			prompt: "p".to_string(),
+			stop_reason: "stop".to_string(),
+			..TurnRecord::default()
+		};
+		assert!(turn_was_interrupted(&crashed, true, false));
+		assert!(turn_was_interrupted(&crashed, false, true));
+		assert!(!turn_was_interrupted(&crashed, false, false));
+
+		// A later cleanly-completed turn is not retryable just because an older
+		// unresolved effect still exists.
+		let completed = TurnRecord {
+			prompt: "p".to_string(),
+			assistant: "done".to_string(),
+			stop_reason: "stop".to_string(),
+			..TurnRecord::default()
+		};
+		assert!(!turn_was_interrupted(&completed, true, true));
 	}
 }

@@ -298,6 +298,7 @@ impl SecurityRunSession {
 			goal_context: None,
 			plan_context: None,
 			interrupted_context: None,
+			interruption_warning: None,
 			credential_resolver: Some(ResolverHandle(Arc::new(ExactResolverAdapter {
 				resolver: self.request.resolver.clone(),
 				cancel:   self.request.cancel.clone(),

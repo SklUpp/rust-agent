@@ -46,10 +46,13 @@ pub fn drive(
 	mut on_event: impl FnMut(&Event) -> Result<()>,
 ) -> Result<()> {
 	for event in events {
+		// Surface an error the runner already yielded before consulting the
+		// clock: a durable unknown-outcome (or reasoned interrupt) must never be
+		// masked by a simultaneous `--max-time` expiry.
+		let event = event?;
 		if deadline.is_some_and(|deadline| deadline.exceeded(elapsed())) {
 			return Err(Error::new(TIMEOUT_MESSAGE));
 		}
-		let event = event?;
 		on_event(&event)?;
 	}
 	Ok(())
@@ -116,6 +119,22 @@ mod tests {
 			drive(stream, Deadline::new(Some(Duration::from_secs(5))), || Duration::ZERO, |_| Ok(()))
 				.expect_err("runner error");
 		assert_eq!(error.to_string(), "boom");
+	}
+
+	/// A durable write may have committed unseen exactly when the clock also
+	/// expires. The already-yielded runner error must win: retry gating needs
+	/// `DurableUnknownOutcome`, not a plain timeout.
+	#[test]
+	fn runner_error_precedes_expired_deadline() {
+		let stream = vec![Err(Error::new("Durable session write outcome unknown"))].into_iter();
+		let error = drive(
+			stream,
+			Deadline::new(Some(Duration::from_secs(5))),
+			|| Duration::from_secs(60),
+			|_| Ok(()),
+		)
+		.expect_err("runner error must surface");
+		assert_eq!(error.to_string(), "Durable session write outcome unknown");
 	}
 
 	#[test]
