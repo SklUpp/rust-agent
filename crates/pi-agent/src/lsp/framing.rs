@@ -13,12 +13,24 @@
 //! is a protocol violation that cannot be resynchronised safely, so it is
 //! surfaced as an error and the reader tears the client down.
 
-use std::fmt;
+use std::{fmt, io::Write as _};
 
 /// Maximum accepted header block, including the `\r\n\r\n` terminator.
 pub const MAX_HEADER_BYTES: usize = 64 * 1024;
 /// Maximum accepted JSON payload for one message.
 pub const MAX_CONTENT_BYTES: usize = 64 * 1024 * 1024;
+
+/// Encode one JSON value as a `Content-Length`-framed LSP/DAP message.
+///
+/// The header length is the UTF-8 byte count of the payload, never its
+/// character count.
+pub fn encode_frame(value: &serde_json::Value) -> Result<Vec<u8>, serde_json::Error> {
+	let body = serde_json::to_vec(value)?;
+	let mut frame = Vec::with_capacity(body.len() + 32);
+	let _ = write!(frame, "Content-Length: {}\r\n\r\n", body.len());
+	frame.extend_from_slice(&body);
+	Ok(frame)
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FramingError {
@@ -204,5 +216,36 @@ mod tests {
 		framer.push(&bytes[..bytes.len() - 2]);
 		assert!(framer.drain(|_| {}).expect("incomplete is not an error").is_empty());
 		assert_eq!(framer.remainder(), bytes[..bytes.len() - 2].to_vec());
+	}
+
+	#[test]
+	fn encoded_frame_round_trips_through_framer() {
+		let value = serde_json::json!({"jsonrpc": "2.0", "id": 1, "result": null});
+		let bytes = encode_frame(&value).expect("encode");
+		let mut framer = MessageFramer::new();
+		framer.push(&bytes);
+		let out = framer.drain(|_| {}).expect("decode");
+		assert!(framer.is_empty());
+		assert_eq!(out.len(), 1);
+		assert_eq!(
+			serde_json::from_str::<serde_json::Value>(&out[0]).expect("json"),
+			value
+		);
+	}
+
+	#[test]
+	fn encoded_header_counts_utf8_bytes_not_chars() {
+		let value = serde_json::json!({"text": "héllo—日本語"});
+		let body = serde_json::to_vec(&value).expect("body");
+		assert!(body.len() > value.to_string().chars().count());
+		let bytes = encode_frame(&value).expect("encode");
+		let header = std::str::from_utf8(&bytes[..bytes.len() - body.len()]).expect("utf8 header");
+		assert_eq!(header, format!("Content-Length: {}\r\n\r\n", body.len()));
+		let mut framer = MessageFramer::new();
+		framer.push(&bytes);
+		assert_eq!(
+			framer.drain(|_| {}).expect("decode"),
+			vec![String::from_utf8(body).expect("utf8 body")]
+		);
 	}
 }

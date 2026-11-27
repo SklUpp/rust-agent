@@ -33,7 +33,7 @@ use tokio_util::sync::CancellationToken;
 use super::{
 	config::{get_lsp_server_for_file, get_lsp_servers, is_method_not_found_error, load_config},
 	edits::{apply_workspace_edit, ExecutedWorkspaceChange},
-	framing::{FramingError, MessageFramer},
+	framing::{FramingError, MessageFramer, encode_frame},
 	lspmux,
 	mux::{self, MuxConnectParams},
 	types::{
@@ -269,12 +269,17 @@ impl LspClient {
 		#[cfg(unix)]
 		{
 			if let Ok(pid) = i32::try_from(self.pid) {
-				// The child was started as its own process group (pgid == pid),
-				// so a negative pid kills the server and any tool children it
-				// spawned instead of leaking them.
-				unsafe {
-					libc::kill(-pid, libc::SIGKILL);
-					libc::kill(pid, libc::SIGKILL);
+				// The child is its own process-group leader (pgid == pid), so the
+				// group signal also reaps any tool children it spawned.
+				// `kill_process_group` refuses the harness's own group and
+				// unreachable targets; fall back to the leader pid only then.
+				if !pi_shell::process::kill_process_group(
+					pid,
+					pi_shell::process::KILL_SIGNAL,
+				) {
+					unsafe {
+						libc::kill(pid, libc::SIGKILL);
+					}
 				}
 				return;
 			}
@@ -298,11 +303,8 @@ impl LspClient {
 	}
 
 	async fn write_message(&self, message: Value, cancel: &CancellationToken) -> Result<(), LspError> {
-		let payload = serde_json::to_vec(&message)
+		let framed = encode_frame(&message)
 			.map_err(|error| LspError::Message(format!("failed to encode LSP message: {error}")))?;
-		let mut framed = Vec::with_capacity(payload.len() + 32);
-		framed.extend_from_slice(format!("Content-Length: {}\r\n\r\n", payload.len()).as_bytes());
-		framed.extend_from_slice(&payload);
 
 		let mut guard = tokio::select! {
 			guard = self.stdin.lock() => guard,
@@ -1013,9 +1015,12 @@ async fn spawn_and_initialize(
 				return;
 			};
 			let message = json!({ "jsonrpc": "2.0", "method": mux::MUX_RESTART_METHOD });
+			let frame = encode_frame(&message).ok();
 			let mut guard = client.stdin.lock().await;
-			if let Some(writer) = guard.as_mut() {
-				let _ = writer.write_all(mux::frame(&message).as_bytes()).await;
+			if let Some(writer) = guard.as_mut()
+				&& let Some(frame) = &frame
+			{
+				let _ = writer.write_all(frame).await;
 				let _ = writer.flush().await;
 			}
 			guard.take();

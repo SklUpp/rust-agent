@@ -31,9 +31,12 @@ use tokio::{
 
 use super::{
 	MUX_CONNECT_METHOD, MUX_PING_METHOD, MUX_PING_RESULT, MUX_RESTART_METHOD, MuxConnectParams,
-	MuxConnectResult, frame, server_key,
+	MuxConnectResult, server_key,
 };
-use crate::{lsp::framing::MessageFramer, process_broker::protocol};
+use crate::{
+	lsp::framing::{MessageFramer, encode_frame},
+	process_broker::protocol,
+};
 
 /// How long an unbound server child survives for reuse by a later link.
 const SERVER_LINGER: Duration = Duration::from_secs(5 * 60);
@@ -101,7 +104,7 @@ struct ClientPending {
 
 struct Session {
 	id: u64,
-	out: mpsc::UnboundedSender<String>,
+	out: mpsc::UnboundedSender<Vec<u8>>,
 	close: watch::Sender<bool>,
 	open_uris: Mutex<HashSet<String>>,
 	forwarded: Mutex<HashMap<String, i64>>,
@@ -114,8 +117,14 @@ struct Session {
 
 impl Session {
 	fn send(&self, message: Value) {
-		if !self.closed.load(Ordering::SeqCst) {
-			let _ = self.out.send(frame(&message));
+		if self.closed.load(Ordering::SeqCst) {
+			return;
+		}
+		match encode_frame(&message) {
+			Ok(frame) => {
+				let _ = self.out.send(frame);
+			},
+			Err(error) => eprintln!("LSP mux session encode failed: {error}"),
 		}
 	}
 }
@@ -146,7 +155,7 @@ struct ServerInstance {
 	pid: u32,
 	next_id: AtomicI64,
 	next_client_id: AtomicI64,
-	sink: mpsc::UnboundedSender<String>,
+	sink: mpsc::UnboundedSender<Vec<u8>>,
 	stopping: AtomicBool,
 	exited: AtomicBool,
 	sessions: Mutex<Vec<Arc<Session>>>,
@@ -161,7 +170,7 @@ struct ServerInstance {
 }
 
 impl ServerInstance {
-	fn new(key: String, pid: u32, sink: mpsc::UnboundedSender<String>) -> Self {
+	fn new(key: String, pid: u32, sink: mpsc::UnboundedSender<Vec<u8>>) -> Self {
 		Self {
 			key,
 			pid,
@@ -191,7 +200,12 @@ impl ServerInstance {
 	}
 
 	fn send(&self, message: Value) {
-		let _ = self.sink.send(frame(&message));
+		match encode_frame(&message) {
+			Ok(frame) => {
+				let _ = self.sink.send(frame);
+			},
+			Err(error) => eprintln!("LSP mux server encode failed: {error}"),
+		}
 	}
 
 	fn is_stopping(&self) -> bool {
@@ -372,7 +386,7 @@ impl LspMuxServer {
 	fn start_session(self: &Arc<Self>, stream: UnixStream) {
 		let id = self.next_session.fetch_add(1, Ordering::SeqCst);
 		let (mut read, write) = stream.into_split();
-		let (out_tx, out_rx) = mpsc::unbounded_channel::<String>();
+		let (out_tx, out_rx) = mpsc::unbounded_channel::<Vec<u8>>();
 		let (close_tx, close_rx) = watch::channel(false);
 		let writer_close = close_rx.clone();
 		tokio::spawn(async move { writer_loop(write, out_rx, writer_close).await });
@@ -996,10 +1010,16 @@ impl LspMuxServer {
 		#[cfg(unix)]
 		{
 			if let Ok(pid) = i32::try_from(server.pid) {
-				// The child is its own process group (pgid == pid).
-				unsafe {
-					libc::kill(-pid, libc::SIGKILL);
-					libc::kill(pid, libc::SIGKILL);
+				// The child is its own process-group leader (pgid == pid).
+				// `kill_process_group` refuses the harness's own group and
+				// unreachable targets; fall back to the leader pid only then.
+				if !pi_shell::process::kill_process_group(
+					pid,
+					pi_shell::process::KILL_SIGNAL,
+				) {
+					unsafe {
+						libc::kill(pid, libc::SIGKILL);
+					}
 				}
 				return;
 			}
@@ -1079,7 +1099,7 @@ async fn wait_close(close: &mut watch::Receiver<bool>) {
 
 async fn writer_loop(
 	mut write: OwnedWriteHalf,
-	mut receiver: mpsc::UnboundedReceiver<String>,
+	mut receiver: mpsc::UnboundedReceiver<Vec<u8>>,
 	mut close: watch::Receiver<bool>,
 ) {
 	loop {
@@ -1090,7 +1110,7 @@ async fn writer_loop(
 			},
 			message = receiver.recv() => match message {
 				Some(message) => {
-					if write.write_all(message.as_bytes()).await.is_err() {
+					if write.write_all(&message).await.is_err() {
 						return;
 					}
 				},
@@ -1100,9 +1120,9 @@ async fn writer_loop(
 	}
 }
 
-async fn write_queue(mut stdin: ChildStdin, mut receiver: mpsc::UnboundedReceiver<String>) {
+async fn write_queue(mut stdin: ChildStdin, mut receiver: mpsc::UnboundedReceiver<Vec<u8>>) {
 	while let Some(message) = receiver.recv().await {
-		if stdin.write_all(message.as_bytes()).await.is_err() {
+		if stdin.write_all(&message).await.is_err() {
 			return;
 		}
 	}

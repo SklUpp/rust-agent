@@ -45,12 +45,6 @@ pub const MUX_PING_RESULT: &str = "pong";
 /// Notification on a bound link: kill that link's server process.
 pub const MUX_RESTART_METHOD: &str = "omp/muxRestartServer";
 
-/// Frame one JSON-RPC message with an LSP `Content-Length` header.
-pub(crate) fn frame(message: &serde_json::Value) -> String {
-	let body = serde_json::to_string(message).unwrap_or_else(|_| "null".to_string());
-	format!("Content-Length: {}\r\n\r\n{body}", body.len())
-}
-
 /// Banner printed on stdout once the mux socket accepts connections.
 #[must_use]
 pub fn ready_banner(endpoint: &Path) -> String {

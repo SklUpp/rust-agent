@@ -35,7 +35,7 @@ use tokio::net::{
 };
 use tokio_util::sync::CancellationToken;
 
-use crate::lsp::framing::{FramingError, MessageFramer};
+use crate::lsp::framing::{FramingError, MessageFramer, encode_frame};
 
 use super::config::{ConnectMode, ResolvedAdapter, substitute_port};
 use super::types::Capabilities;
@@ -954,10 +954,7 @@ async fn connect_loop(child: &mut Child, port: u16, wait: Duration) -> Result<Tc
 }
 
 async fn write_frame(inner: &Arc<Inner>, message: &Value) -> Result<(), DapError> {
-	let content = serde_json::to_string(message).map_err(|error| DapError::message(error.to_string()))?;
-	let mut frame = Vec::with_capacity(content.len() + 32);
-	frame.extend_from_slice(format!("Content-Length: {}\r\n\r\n", content.len()).as_bytes());
-	frame.extend_from_slice(content.as_bytes());
+	let frame = encode_frame(message).map_err(|error| DapError::message(error.to_string()))?;
 	let mut writer = inner.writer.lock().await;
 	let write = async {
 		writer.write_all(&frame).await?;

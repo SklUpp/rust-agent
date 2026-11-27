@@ -22,7 +22,7 @@ use tokio::{
 };
 
 use crate::{
-	lsp::framing::MessageFramer,
+	lsp::framing::{MessageFramer, encode_frame},
 	process_broker::{
 		client::BrokerClient,
 		protocol::{self, WireSpec},
@@ -33,7 +33,6 @@ use crate::{
 use super::{
 	DAEMON_NAME, MUX_CONNECT_METHOD, MUX_PING_METHOD, MUX_PING_RESULT, MuxConnectParams,
 	MuxConnectResult, PROJECT_DIR_ENV, READY_PATTERN, SOCKET_ENV, WORKER_ARG, endpoint_for_project,
-	frame,
 };
 
 const CONNECT_TIMEOUT: Duration = Duration::from_millis(3_000);
@@ -84,7 +83,8 @@ async fn dial(endpoint: &Path, params: &MuxConnectParams) -> Option<SharedTransp
 		"method": MUX_CONNECT_METHOD,
 		"params": params,
 	});
-	writer.write_all(frame(&request).as_bytes()).await.ok()?;
+	let frame = encode_frame(&request).ok()?;
+	writer.write_all(&frame).await.ok()?;
 	writer.flush().await.ok()?;
 	let (result, leftover) = timeout(HANDSHAKE_TIMEOUT, read_handshake(&mut reader))
 		.await
@@ -135,7 +135,10 @@ async fn probe(endpoint: &Path) -> bool {
 	};
 	let (mut reader, mut writer) = stream.into_split();
 	let request = json!({ "jsonrpc": "2.0", "id": "probe", "method": MUX_PING_METHOD, "params": null });
-	if writer.write_all(frame(&request).as_bytes()).await.is_err() {
+	let Ok(frame) = encode_frame(&request) else {
+		return false;
+	};
+	if writer.write_all(&frame).await.is_err() {
 		return false;
 	}
 	let mut framer = MessageFramer::new();
