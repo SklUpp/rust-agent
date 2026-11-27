@@ -33,6 +33,8 @@
 | `agent-core-extraction-design.md` | извлечение Rust-ядра из донора |
 | `agent-loop-tool-implementation-map.md` | карта реализации agent loop и инструментов |
 | `modular-reuse-blueprint.md` | согласованная матрица модульного переиспользования, Cargo features и лицензий (2026-11-20) |
+| `agent-reuse-and-templates-plan.md` | план унификации обвязки, шаблоны вариаций модулей и дорожная карта волн W1–W3 (2026-11-27) |
+| `agent-cross-os-exec-pipeline.md` | кросс-платформенный пайплайн изоляции/запуска команд (`pi-sys::exec`, Linux/Android/macOS/Windows) (2026-11-27) |
 
 ## Архив исследований
 
@@ -71,6 +73,8 @@
 - `research-2026-11-27-19-target-dir01-04-05-status-scope-journal.md` — Целевое исследование Stage 2 (`TargetDir01StatusTruth`): канонический статус/HEAD/CI (`DIR-01`), дрейф `SCOPE_LATEST.yaml` (`DIR-04`) и журнал решений D80/D84–D96 (`DIR-05`)
 - `research-2026-11-27-20-target-dir03-06-approval-hooks-safety.md` — Целевое исследование Stage 2 (`TargetDir03ApprovalSafety`): отмена/approvals D50 (`DIR-03`), hooks/trust (`DIR-06`), обход `hub start` и пробелы DAP
 - `research-2026-11-27-21-target-dir07-provider-mcp-wire.md` — Целевое исследование Stage 2 (`TargetDir07ProviderMcpWire`): wire-контракт провайдеров и MCP (`DIR-07`)
+- `research-2026-11-27-22-multi-os-containment.md` — Мультиплатформенная процессная и файловая контейнеризация (`ResearchMultiOSContainment`): матрица Linux/Android/macOS/Windows, проверка лицензий и контракты `UnknownOutcome`/kill/PTY/net
+- `research-2026-11-27-23-agent-containment-architecture.md` — Архитектура сдерживания внутри `arag` (`ResearchAgentContainmentArchitecture`): инвентаризация швов спавна/БД/ФС, Host Control Plane vs Contained EP, P1/P2 дыры границ
 
 ## Правила обновления
 
