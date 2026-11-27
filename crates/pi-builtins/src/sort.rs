@@ -162,12 +162,53 @@ fn physical_memory_bytes() -> Option<u128> {
 	}
 }
 
+/// Parses the `MemAvailable:` field of `/proc/meminfo` into bytes.
+///
+/// Invalid, zero, or missing entries yield `None` so the caller can fall back
+/// to another estimate.
+#[cfg(all(
+	target_family = "unix",
+	not(target_os = "redox"),
+	any(target_os = "linux", target_os = "android")
+))]
+fn parse_proc_memavailable_bytes(contents: &str) -> Option<u128> {
+	for line in contents.lines() {
+		let Some(rest) = line.strip_prefix("MemAvailable:") else {
+			continue;
+		};
+
+		let mut fields = rest.trim().split_ascii_whitespace();
+		let Some(amount) = fields.next().and_then(|value| value.parse::<u128>().ok()) else {
+			continue;
+		};
+
+		if fields.next() != Some("kB") || amount == 0 {
+			continue;
+		}
+
+		return Some(amount.saturating_mul(1024));
+	}
+
+	None
+}
+
 #[cfg(all(
 	target_family = "unix",
 	not(target_os = "redox"),
 	any(target_os = "linux", target_os = "android")
 ))]
 fn physical_memory_bytes_unix() -> Option<u128> {
+	// Prefer `MemAvailable` over total physical RAM: it accounts for
+	// reclaimable memory, so Android/Linux `sort` sizes its buffer from what
+	// the kernel can actually hand out instead of over-allocating.
+	if let Some(bytes) = std::fs::read_to_string("/proc/meminfo")
+		.ok()
+		.as_deref()
+		.and_then(parse_proc_memavailable_bytes)
+	{
+		return Some(bytes);
+	}
+
 	use nix::unistd::{SysconfVar, sysconf};
 
 	let pages = match sysconf(SysconfVar::_PHYS_PAGES) {
@@ -202,6 +243,50 @@ mod tests {
 			desired_file_buffer_bytes(large as u128),
 			super::super::MAX_AUTOMATIC_BUF_SIZE as u128
 		);
+	}
+
+	#[cfg(all(
+		target_family = "unix",
+		not(target_os = "redox"),
+		any(target_os = "linux", target_os = "android")
+	))]
+	mod proc_meminfo {
+		use super::super::parse_proc_memavailable_bytes;
+
+		#[test]
+		fn parses_available_kilobytes() {
+			let contents = "MemTotal:       16000000 kB\nMemFree:          500000 kB\nMemAvailable:    2048000 kB\n";
+			assert_eq!(parse_proc_memavailable_bytes(contents), Some(2_097_152_000));
+		}
+
+		#[test]
+		fn missing_available_yields_none() {
+			assert_eq!(parse_proc_memavailable_bytes("MemTotal: 8000 kB\n"), None);
+			assert_eq!(parse_proc_memavailable_bytes(""), None);
+		}
+
+		#[test]
+		fn malformed_and_zero_values_are_ignored() {
+			for contents in [
+				"MemAvailable: nonsense kB\n",
+				"MemAvailable: 512 MB\n",
+				"MemAvailable: 0 kB\n",
+				"MemAvailable: 1024\n",
+				"MemAvailable:\n",
+			] {
+				assert_eq!(parse_proc_memavailable_bytes(contents), None, "{contents:?}");
+			}
+
+			// A bad entry is skipped, not fatal: a later valid line still wins.
+			let mixed = "MemAvailable: bogus kB\nMemAvailable: 1024 kB\n";
+			assert_eq!(parse_proc_memavailable_bytes(mixed), Some(1_048_576));
+		}
+
+		#[test]
+		fn overflow_saturates() {
+			let contents = format!("MemAvailable: {} kB\n", u128::MAX);
+			assert_eq!(parse_proc_memavailable_bytes(&contents), Some(u128::MAX));
+		}
 	}
 }
 
