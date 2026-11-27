@@ -635,25 +635,77 @@ struct GitOutput {
 	code: i32,
 }
 
+/// Ambient Git control variables that would redirect the child away from the
+/// sandbox checkout (or its config/credentials). The parent may run inside a
+/// hook, a rebase, or a bare repo; none of that may pierce the isolation.
+const GIT_AMBIENT_OVERRIDES: &[&str] = &[
+	"GIT_DIR",
+	"GIT_WORK_TREE",
+	"GIT_COMMON_DIR",
+	"GIT_INDEX_FILE",
+	"GIT_OBJECT_DIRECTORY",
+	"GIT_ALTERNATE_OBJECT_DIRECTORIES",
+	"GIT_CONFIG_GLOBAL",
+	"GIT_CONFIG_SYSTEM",
+	"GIT_CONFIG_NOSYSTEM",
+	"GIT_CONFIG_COUNT",
+	"GIT_CONFIG_PARAMETERS",
+	"GIT_ASKPASS",
+	"SSH_ASKPASS",
+	"GIT_SSH",
+	"GIT_SSH_COMMAND",
+	"GIT_EXEC_PATH",
+	"GIT_TEMPLATE_DIR",
+];
+
+/// `GIT_CONFIG_KEY_<n>` / `GIT_CONFIG_VALUE_<n>` are numbered slots named by
+/// `GIT_CONFIG_COUNT`; the count is scrubbed above, but the ambient slots must
+/// go too so a caller cannot smuggle config through a stale parent shell.
+fn is_dynamic_git_config_override(key: &std::ffi::OsStr) -> bool {
+	key.to_str().is_some_and(|key| {
+		key.starts_with("GIT_CONFIG_KEY_") || key.starts_with("GIT_CONFIG_VALUE_")
+	})
+}
+
+fn git_command(cwd: &Path, args: &[&str], envs: &[(&str, std::ffi::OsString)]) -> Command {
+	let ambient = std::env::vars_os().map(|(key, _)| key);
+	git_command_with_ambient(cwd, args, envs, ambient)
+}
+
+fn git_command_with_ambient(
+	cwd: &Path,
+	args: &[&str],
+	envs: &[(&str, std::ffi::OsString)],
+	ambient: impl IntoIterator<Item = std::ffi::OsString>,
+) -> Command {
+	let mut command = Command::new("git");
+	command.arg("-C").arg(cwd).args(args);
+	for key in GIT_AMBIENT_OVERRIDES {
+		command.env_remove(key);
+	}
+	for key in ambient {
+		if is_dynamic_git_config_override(&key) {
+			command.env_remove(key);
+		}
+	}
+	command.env("GIT_TERMINAL_PROMPT", "0");
+	for (key, value) in envs {
+		command.env(key, value);
+	}
+	command
+		.stdin(Stdio::null())
+		.stdout(Stdio::piped())
+		.stderr(Stdio::piped());
+	command
+}
+
 fn run_git(
 	cwd: &Path,
 	args: &[&str],
 	envs: &[(&str, std::ffi::OsString)],
 	allow_exit1: bool,
 ) -> Result<GitOutput, String> {
-	let mut command = Command::new("git");
-	command
-		.arg("-C")
-		.arg(cwd)
-		.args(args)
-		.env("GIT_TERMINAL_PROMPT", "0")
-		.stdin(Stdio::null())
-		.stdout(Stdio::piped())
-		.stderr(Stdio::piped());
-	for (key, value) in envs {
-		command.env(key, value);
-	}
-	let output = command.output().map_err(|error| {
+	let output = git_command(cwd, args, envs).output().map_err(|error| {
 		format!(
 			"cannot run git {} in {}: {error}",
 			args.join(" "),
@@ -4432,6 +4484,62 @@ mod tests {
 			String::from_utf8_lossy(&output.stderr)
 		);
 		String::from_utf8_lossy(&output.stdout).trim().to_string()
+	}
+
+	#[test]
+	fn git_command_clears_ambient_overrides_and_keeps_caller_env() {
+		let cwd = Path::new("/tmp/iso-cwd");
+		let caller = [("GIT_SSH_COMMAND", std::ffi::OsString::from("ssh -i custom"))];
+		let ambient = [
+			std::ffi::OsString::from("GIT_CONFIG_KEY_0"),
+			std::ffi::OsString::from("GIT_CONFIG_VALUE_0"),
+			std::ffi::OsString::from("PATH"),
+		];
+		let command = git_command_with_ambient(cwd, &["status"], &caller, ambient);
+		let std_command = command.as_std();
+		let env: Vec<(String, Option<String>)> = std_command
+			.get_envs()
+			.map(|(key, value)| {
+				(
+					key.to_string_lossy().into_owned(),
+					value.map(|value| value.to_string_lossy().into_owned()),
+				)
+			})
+			.collect();
+		let lookup = |key: &str| -> Option<Option<String>> {
+			env.iter()
+				.find(|(name, _)| name == key)
+				.map(|(_, value)| value.clone())
+		};
+		for key in GIT_AMBIENT_OVERRIDES {
+			if *key == "GIT_SSH_COMMAND" {
+				// Provided explicitly by the caller below, so it must survive.
+				continue;
+			}
+			assert_eq!(lookup(key), Some(None), "{key} must be removed from the child env");
+		}
+		for key in [
+			"GIT_CONFIG_COUNT",
+			"GIT_CONFIG_PARAMETERS",
+			"GIT_CONFIG_KEY_0",
+			"GIT_CONFIG_VALUE_0",
+		] {
+			assert_eq!(lookup(key), Some(None), "{key} must be removed from the child env");
+		}
+		assert_eq!(lookup("PATH"), None, "unrelated ambient vars must not be touched");
+		assert_eq!(
+			lookup("GIT_TERMINAL_PROMPT"),
+			Some(Some("0".to_string())),
+			"non-interactive git must be pinned"
+		);
+		assert_eq!(
+			lookup("GIT_SSH_COMMAND"),
+			Some(Some("ssh -i custom".to_string())),
+			"caller envs must win over the scrub"
+		);
+		let args: Vec<&std::ffi::OsStr> = std_command.get_args().collect();
+		let expected = [std::ffi::OsStr::new("-C"), cwd.as_os_str(), std::ffi::OsStr::new("status")];
+		assert_eq!(args, expected, "the checkout is selected with -C, not Command::current_dir");
 	}
 
 	fn repo(dir: &Path) {

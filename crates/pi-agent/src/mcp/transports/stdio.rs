@@ -88,6 +88,9 @@ pub(crate) fn apply_isolated_env(cmd: &mut Command, overrides: &HashMap<String, 
 
 pub struct StdioTransport {
     child: Arc<Mutex<Option<Child>>>,
+    /// Process group lead captured at spawn (`process_group(0)`), so close and
+    /// drop can signal grandchildren the MCP server may have spawned.
+    pgid: Option<u32>,
     stdin_tx: mpsc::Sender<String>,
     pending_requests: Arc<Mutex<HashMap<String, oneshot::Sender<Result<Value, McpError>>>>>,
     next_id: AtomicU64,
@@ -115,10 +118,15 @@ impl StdioTransport {
         cmd.stdin(std::process::Stdio::piped());
         cmd.stdout(std::process::Stdio::piped());
         cmd.stderr(std::process::Stdio::null());
+        // Own process group: close/drop must reach grandchildren (npx wrappers,
+        // tool servers) that would otherwise outlive the transport.
+        #[cfg(unix)]
+        cmd.process_group(0);
 
         let mut child = cmd.spawn().map_err(|e| {
             McpError::Transport(format!("Failed to spawn stdio process '{}': {}", config.command, e))
         })?;
+        let pgid = child.id();
 
         let stdout = child.stdout.take().ok_or_else(|| {
             McpError::Transport("Failed to capture stdio stdout".to_string())
@@ -268,6 +276,7 @@ impl StdioTransport {
 
         Ok(Self {
             child: Arc::new(Mutex::new(Some(child))),
+            pgid,
             stdin_tx,
             pending_requests,
             next_id: AtomicU64::new(1),
@@ -395,6 +404,7 @@ impl McpTransport for StdioTransport {
             child_guard.take()
         };
         if let Some(mut child) = child_opt {
+            kill_process_group(self.pgid);
             let _ = child.kill().await;
             // Reap in the background so close() never blocks on a stuck wait.
             tokio::spawn(async move {
@@ -421,6 +431,7 @@ impl Drop for StdioTransport {
         }
         let mut child_guard = self.child.lock().unwrap();
         if let Some(mut child) = child_guard.take() {
+            kill_process_group(self.pgid);
             let _ = child.start_kill();
             if let Ok(handle) = tokio::runtime::Handle::try_current() {
                 handle.spawn(async move {
@@ -437,6 +448,24 @@ impl Drop for StdioTransport {
             let _ = tx.send(Err(McpError::Closed));
         }
     }
+}
+
+/// SIGKILL the transport's whole process group. `kill` also accepts an
+/// already-reaped pid (ESRCH), so no liveness check is needed.
+fn kill_process_group(pgid: Option<u32>) {
+    #[cfg(unix)]
+    if let Some(pgid) = pgid
+        && let Ok(pgid) = i32::try_from(pgid)
+        && pgid > 0
+    {
+        // SAFETY: `kill` tolerates any pid; the pgid came from `spawn` with
+        // `process_group(0)`, so it names a group this transport created.
+        unsafe {
+            libc::kill(-pgid, libc::SIGKILL);
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = pgid;
 }
 
 #[cfg(test)]
@@ -611,6 +640,105 @@ for line in sys.stdin:
             if tokio::time::Instant::now() >= deadline {
                 panic!("pid {pid} still in /proc after close — unreaped zombie");
             }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    /// A grandchild holding a FIFO write end must die with `close()`: once the
+    /// server's whole process group is gone, the reader sees EOF. This avoids
+    /// `/proc` and zombie-timing races (Linux, macOS, Android/Termux). The
+    /// directory and descriptor are RAII so a panicking assertion leaks neither.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn close_kills_server_grandchildren() {
+        use std::os::fd::{AsRawFd as _, FromRawFd as _, OwnedFd};
+        use std::os::unix::ffi::OsStrExt as _;
+
+        struct TempDir(std::path::PathBuf);
+
+        impl Drop for TempDir {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let dir =
+            std::env::temp_dir().join(format!("omp-mcp-grandchild-{}-{nanos}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("fifo dir");
+        let dir = TempDir(dir);
+        let fifo = dir.0.join("fifo");
+        let fifo_c = std::ffi::CString::new(fifo.as_os_str().as_bytes()).expect("fifo path");
+        // SAFETY: `fifo_c` is a valid NUL-terminated path and `0o600` is a mode
+        // mask for the FIFO this test creates.
+        let made = unsafe { libc::mkfifo(fifo_c.as_ptr(), 0o600) };
+        assert_eq!(made, 0, "mkfifo: {}", std::io::Error::last_os_error());
+        // SAFETY: same valid path; `open` returned a fresh descriptor that
+        // `OwnedFd` now owns and closes on every exit path.
+        let read_fd = unsafe { libc::open(fifo_c.as_ptr(), libc::O_RDONLY | libc::O_NONBLOCK) };
+        assert!(read_fd >= 0, "open fifo: {}", std::io::Error::last_os_error());
+        // SAFETY: `read_fd` is a fresh descriptor no other owner holds.
+        let read_fd = unsafe { OwnedFd::from_raw_fd(read_fd) };
+
+        let config = MCPStdioServerConfig {
+            command: "sh".to_string(),
+            args: vec![
+                "-c".to_string(),
+                "sleep 30 > \"$1\" & wait".to_string(),
+                "_".to_string(),
+                fifo.to_string_lossy().into_owned(),
+            ],
+            env: HashMap::new(),
+            cwd: None,
+            timeout: Some(5_000),
+            request_id_format: Some(RequestIdFormat::Number),
+        };
+        let transport = StdioTransport::spawn(&config)
+            .await
+            .expect("spawn grandchild server");
+
+        let mut byte = 0u8;
+        // With no writer a FIFO read returns 0; `EAGAIN` proves the background
+        // `sleep` opened the write end.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            // SAFETY: `read_fd` is open and `byte` is a one-byte buffer.
+            let read = unsafe { libc::read(read_fd.as_raw_fd(), (&raw mut byte).cast(), 1) };
+            if read == -1 {
+                let error = std::io::Error::last_os_error();
+                assert_eq!(error.kind(), std::io::ErrorKind::WouldBlock, "{error}");
+                break;
+            }
+            assert_eq!(read, 0, "unexpected data from the fifo");
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "grandchild never opened the fifo write end"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+
+        transport.close().await.expect("close");
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            // SAFETY: same descriptor; EOF means every write end is closed.
+            let read = unsafe { libc::read(read_fd.as_raw_fd(), (&raw mut byte).cast(), 1) };
+            if read == 0 {
+                break;
+            }
+            if read < 0 {
+                let error = std::io::Error::last_os_error();
+                assert_eq!(error.kind(), std::io::ErrorKind::WouldBlock, "{error}");
+            } else {
+                panic!("unexpected data from the fifo after close");
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "grandchild survived close: the fifo still has a writer"
+            );
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
     }

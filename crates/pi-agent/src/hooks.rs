@@ -645,7 +645,11 @@ impl HookEngine {
 				command
 			},
 		};
+		// Hooks inherit only the platform allowlist: provider keys, `PI_*`
+		// knobs, and agent sockets must not leak into arbitrary hook scripts.
 		command
+			.env_clear()
+			.envs(crate::state::platform_env(crate::state::utf8_env_vars()))
 			.current_dir(&self.cwd)
 			.stdin(Stdio::piped())
 			.stdout(Stdio::piped())

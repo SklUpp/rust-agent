@@ -194,3 +194,37 @@ async fn force_ask_without_approver_fails_closed() {
 	);
 	assert!(seen.lock().expect("seen lock").is_empty());
 }
+
+/// Ambient credentials must not reach hook subprocesses, while the platform
+/// baseline (`PATH`) survives. The real assertion runs in a re-executed child
+/// process with the credentials set explicitly, so no parallel test ever sees
+/// a mutated process environment (and there is nothing to restore).
+#[tokio::test]
+async fn hook_subprocess_env_is_scrubbed() {
+	const CHILD_MARKER: &str = "PI_HOOK_SCRUB_CHILD";
+	if std::env::var_os(CHILD_MARKER).is_none() {
+		let exe = std::env::current_exe().expect("current test executable");
+		let output = std::process::Command::new(exe)
+			.args(["--exact", "hook_subprocess_env_is_scrubbed", "--nocapture"])
+			.env(CHILD_MARKER, "1")
+			.env("OPENAI_API_KEY", "sk-ambient-leak-canary")
+			.env("SSH_AUTH_SOCK", "/tmp/ambient-agent.sock")
+			.output()
+			.expect("re-exec hook env test");
+		assert!(
+			output.status.success(),
+			"isolated hook env test failed: {}\nstdout:\n{}\nstderr:\n{}",
+			output.status,
+			String::from_utf8_lossy(&output.stdout),
+			String::from_utf8_lossy(&output.stderr)
+		);
+		return;
+	}
+
+	let hook = engine(
+		HookEvent::PreToolUse,
+		r#"cat >/dev/null; leak=""; [ -n "${OPENAI_API_KEY+x}" ] && leak="$leak openai"; [ -n "${SSH_AUTH_SOCK+x}" ] && leak="$leak ssh"; [ -n "$PATH" ] || leak="$leak nopath"; printf '{"hookSpecificOutput":{"additionalContext":"%s"}}' "${leak:-clean}""#,
+	);
+	let decision = hook.pre_tool_use("record", &json!({})).await;
+	assert_eq!(decision.additional_context, ["clean"], "hook saw ambient credentials or lost PATH");
+}
