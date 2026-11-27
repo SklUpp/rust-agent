@@ -37,6 +37,7 @@ use crate::{
 	session_store::{SCHEMA_VERSION, SqliteStore},
 	yaml,
 };
+use pi_agent::state::lexical_normalize;
 
 const REPORT_VERSION: u32 = 1;
 const SECTIONS: [&str; 9] = [
@@ -1549,29 +1550,6 @@ fn normalize_artifact_path(path: &Path, state: &mut ArtifactState) -> Option<Pat
 	} else {
 		Some(lexical_normalize(path))
 	}
-}
-
-fn lexical_normalize(path: &Path) -> PathBuf {
-	use std::path::Component;
-	let absolute = path.is_absolute();
-	let mut out = PathBuf::new();
-	for component in path.components() {
-		match component {
-			Component::CurDir => {},
-			Component::ParentDir => {
-				if !out.pop() && !absolute {
-					out.push("..");
-				}
-			},
-			Component::Prefix(prefix) => out.push(prefix.as_os_str()),
-			Component::RootDir => out.push(component.as_os_str()),
-			Component::Normal(part) => out.push(part),
-		}
-	}
-	if absolute && out.as_os_str().is_empty() {
-		out.push(Path::new("/"));
-	}
-	out
 }
 
 fn resolve_artifact_path(

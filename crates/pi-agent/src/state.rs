@@ -1463,15 +1463,38 @@ fn resolve_root(path: &Path) -> PathBuf {
 	std::fs::canonicalize(path).unwrap_or_else(|_| lexical_normalize(path))
 }
 
-fn lexical_normalize(path: &Path) -> PathBuf {
+/// Collapse `.`/`..` without touching the filesystem (a symlinked parent must
+/// not change the authored target).
+///
+/// Root and Windows prefix components are never popped: `/../a` becomes `/a`
+/// and `C:\..\a` becomes `C:\a`. A leading `..` survives only on relative
+/// paths (`a/../../b` becomes `../b`); at an absolute root the extra `..` is
+/// discarded. `.` and the empty path normalize to an empty path.
+#[must_use]
+pub fn lexical_normalize(path: &Path) -> PathBuf {
 	let mut normalized = PathBuf::new();
+	let mut at_root = false;
 	for component in path.components() {
 		match component {
+			Component::Prefix(prefix) => normalized.push(prefix.as_os_str()),
+			Component::RootDir => {
+				normalized.push(component.as_os_str());
+				at_root = true;
+			},
 			Component::CurDir => {},
 			Component::ParentDir => {
-				normalized.pop();
+				let pops_normal = normalized
+					.components()
+					.next_back()
+					.is_some_and(|last| matches!(last, Component::Normal(_)));
+				if pops_normal {
+					normalized.pop();
+				} else if !at_root {
+					// Relative path: keep the leading `..` for the caller.
+					normalized.push(Component::ParentDir.as_os_str());
+				}
 			},
-			other => normalized.push(other.as_os_str()),
+			Component::Normal(part) => normalized.push(part),
 		}
 	}
 	normalized
@@ -2236,5 +2259,42 @@ mod path_map_symlink_tests {
 			let mapped = map.to_client_path(&real.join("file.rs")).expect("maps");
 			assert_eq!(mapped, link.join("file.rs"));
 		}
+	}
+}
+
+#[cfg(test)]
+mod lexical_normalize_tests {
+	use super::*;
+
+	#[test]
+	fn lexical_normalization_is_root_and_prefix_aware() {
+		let cases: &[(&str, &str)] = &[
+			("/../a", "/a"),
+			("/..", "/"),
+			("/a/./b/../c", "/a/c"),
+			("/a/b/../../..", "/"),
+			("a/../../b", "../b"),
+			("../../a", "../../a"),
+			("a/..", ""),
+			("a/b/../..", ""),
+			("./a", "a"),
+			(".", ""),
+			("", ""),
+		];
+		for (input, expected) in cases {
+			assert_eq!(
+				lexical_normalize(Path::new(input)),
+				PathBuf::from(expected),
+				"lexical_normalize({input:?})"
+			);
+		}
+	}
+
+	#[cfg(windows)]
+	#[test]
+	fn lexical_normalization_keeps_drive_prefixes() {
+		assert_eq!(lexical_normalize(Path::new(r"C:\..\a")), PathBuf::from(r"C:\a"));
+		assert_eq!(lexical_normalize(Path::new(r"C:\a\..\..\b")), PathBuf::from(r"C:\b"));
+		assert_eq!(lexical_normalize(Path::new(r"C:\..")), PathBuf::from(r"C:\"));
 	}
 }

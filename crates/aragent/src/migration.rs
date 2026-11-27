@@ -26,6 +26,7 @@ use std::{
 	path::{Path, PathBuf},
 };
 
+use pi_agent::state::lexical_normalize;
 use pi_agent::tools::atomic_publish::publish_staged_file_io;
 
 use crate::dirs::{self, AgentDirCategory};
@@ -313,9 +314,9 @@ fn internal_symlink_target(
 	Some(dst_root.join(relative))
 }
 
-/// Lexically normalized absolute path, canonicalizing the deepest existing
-/// ancestor so `..`, symlinked parents and not-yet-created destinations agree
-/// with [`fs::canonicalize`] on the parts that exist.
+/// Absolute path whose deepest existing ancestor is canonicalized and whose
+/// missing suffix is re-attached, then cleaned by [`lexical_normalize`] so
+/// `..` and `.` never reach [`fs::canonicalize`] comparisons.
 fn normalize_path(path: &Path) -> PathBuf {
 	let absolute = if path.is_absolute() {
 		path.to_path_buf()
@@ -335,17 +336,9 @@ fn normalize_path(path: &Path) -> PathBuf {
 	}
 	let mut normalized = fs::canonicalize(&existing).unwrap_or(existing);
 	for component in suffix.into_iter().rev() {
-		let text = component.to_string_lossy();
-		if text == "." {
-			continue;
-		}
-		if text == ".." {
-			normalized.pop();
-			continue;
-		}
 		normalized.push(component);
 	}
-	normalized
+	lexical_normalize(&normalized)
 }
 
 /// `<name>-wal` / `<name>-shm` / `<name>-journal` belonging to a `.db` in the

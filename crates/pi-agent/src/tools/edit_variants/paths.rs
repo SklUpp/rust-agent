@@ -16,12 +16,14 @@
 
 use std::{
 	collections::HashSet,
-	path::{Component, Path, PathBuf},
+	path::{Path, PathBuf},
 };
 
 use tokio_util::sync::CancellationToken;
 
 use crate::tool::ToolError;
+
+pub use crate::state::lexical_normalize;
 
 /// Internal schemes the TypeScript `edit` tool routes through
 /// `InternalUrlRouter`/`resolvePlanPath`. This crate has no URL adapter.
@@ -101,24 +103,6 @@ pub fn resolve_to_cwd(path: &str, cwd: &Path) -> PathBuf {
 	let candidate = Path::new(&expanded);
 	let joined = if candidate.is_absolute() { candidate.to_path_buf() } else { cwd.join(candidate) };
 	lexical_normalize(&joined)
-}
-
-/// Collapse `.`/`..` without touching the filesystem (a symlinked parent must
-/// not change the authored target).
-pub fn lexical_normalize(path: &Path) -> PathBuf {
-	let mut out = PathBuf::new();
-	for component in path.components() {
-		match component {
-			Component::CurDir => {},
-			Component::ParentDir => {
-				if !out.pop() {
-					out.push(component.as_os_str());
-				}
-			},
-			other => out.push(other.as_os_str()),
-		}
-	}
-	out
 }
 
 /// Resolve the authored path for an edit call.

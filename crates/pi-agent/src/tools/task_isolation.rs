@@ -52,7 +52,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::{
 	provider::{ModelProvider, ToolChoice},
-	state::Message,
+	state::{Message, lexical_normalize},
 	tools::conflict::{ConflictHistory, scan_conflict_lines},
 	workspace_writer::{
 		FileVersion, LockError, VersionError, WorkspaceWriter, replace_if_unchanged,
@@ -3179,25 +3179,11 @@ fn registered_admin(git_entry: &Path) -> Result<Option<PathBuf>, String> {
 	let Some(raw) = text.trim().strip_prefix("gitdir:") else {
 		return Ok(None);
 	};
-	let admin = normalize_path(&git_entry.parent().unwrap_or(Path::new(".")).join(raw.trim()));
+	let admin = lexical_normalize(&git_entry.parent().unwrap_or(Path::new(".")).join(raw.trim()));
 	let back = fs::read_to_string(admin.join("gitdir")).unwrap_or_default();
-	let back = fs::canonicalize(back.trim()).unwrap_or_else(|_| normalize_path(Path::new(back.trim())));
-	let entry = fs::canonicalize(git_entry).unwrap_or_else(|_| normalize_path(git_entry));
+	let back = fs::canonicalize(back.trim()).unwrap_or_else(|_| lexical_normalize(Path::new(back.trim())));
+	let entry = fs::canonicalize(git_entry).unwrap_or_else(|_| lexical_normalize(git_entry));
 	Ok((back == entry).then_some(admin))
-}
-
-fn normalize_path(path: &Path) -> PathBuf {
-	let mut out = PathBuf::new();
-	for component in path.components() {
-		match component {
-			std::path::Component::CurDir => {},
-			std::path::Component::ParentDir => {
-				out.pop();
-			},
-			other => out.push(other.as_os_str()),
-		}
-	}
-	out
 }
 
 fn read_prefixed(dir: &Path, prefix: &str) -> Vec<(String, Vec<u8>)> {

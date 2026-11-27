@@ -3249,21 +3249,9 @@ fn resolve_to_cwd(base_path: &str, cwd: &Path) -> PathBuf {
 		}
 	}
 }
+/// Canonical path when it exists, otherwise a lexical cleanup.
 fn normalize_path(path: &Path) -> PathBuf {
-	if let Ok(canon) = path.canonicalize() {
-		return canon;
-	}
-	let mut normalized = PathBuf::new();
-	for comp in path.components() {
-		match comp {
-			std::path::Component::CurDir => {},
-			std::path::Component::ParentDir => {
-				normalized.pop();
-			},
-			c => normalized.push(c.as_os_str()),
-		}
-	}
-	normalized
+	path.canonicalize().unwrap_or_else(|_| crate::state::lexical_normalize(path))
 }
 
 fn is_root_path(path: &Path) -> bool {
