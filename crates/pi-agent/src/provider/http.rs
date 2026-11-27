@@ -8,6 +8,12 @@ use std::time::Duration;
 use async_trait::async_trait;
 
 use super::*;
+use crate::provider::{
+	body::{bounded_redaction, read_body_bounded},
+	retry::{
+		RetryPolicy, is_concurrency_admission_rejection, should_retry_response, sleep_before_retry,
+	},
+};
 
 /// TCP/TLS connect budget for a provider endpoint.
 ///
@@ -60,6 +66,8 @@ pub struct OpenAiCompatibleProvider {
 	provider_id: Option<String>,
 	/// Per-request credential callback; `None` uses `api_key`.
 	credential: Option<CredentialCallback>,
+	/// Retry budget and delay schedule for transient HTTP failures.
+	retry: RetryPolicy,
 }
 
 impl OpenAiCompatibleProvider {
@@ -107,6 +115,7 @@ impl OpenAiCompatibleProvider {
 			service_tier: None,
 			provider_id: None,
 			credential: None,
+			retry: RetryPolicy::default(),
 		}
 	}
 
@@ -114,6 +123,14 @@ impl OpenAiCompatibleProvider {
 	#[must_use]
 	pub fn with_credential_callback(mut self, callback: Option<CredentialCallback>) -> Self {
 		self.credential = callback;
+		self
+	}
+
+	/// Replace the transient-HTTP retry budget. `0` makes every failure
+	/// terminal (the pre-retry contract used by transport-boundary tests).
+	#[must_use]
+	pub fn with_max_retries(mut self, retries: u32) -> Self {
+		self.retry.max_retries = retries;
 		self
 	}
 
@@ -278,15 +295,19 @@ impl OpenAiCompatibleProvider {
 impl OpenAiCompatibleProvider {
 	/// Send one request with the per-request credential and the exact auth-retry
 	/// contract: refresh only on 401/403 + parsed `invalid_key`, then reissue the
-	/// same body once. Any other failure is returned unchanged. The bearer key
-	/// that actually produced the response is returned so diagnostics can be
-	/// redacted with it (a callback may have rotated the configured key).
+	/// same body once. Transient HTTP failures (408/409/429/5xx) are retried
+	/// inside this method, before a response is handed to a stream, so no chunk
+	/// from a failed attempt can ever be observed (`fetchWithRetry` parity).
+	/// Any other failure is returned unchanged. The bearer key that actually
+	/// produced the response is returned so diagnostics can be redacted with it
+	/// (a callback may have rotated the configured key).
 	async fn post_authenticated(
 		&self,
 		body: &OpenAiChatRequest,
 		stream: bool,
 	) -> Result<(reqwest::Response, String), ProviderError> {
 		let mut force_refresh = false;
+		let mut attempt = 0u32;
 		let mut key = match &self.credential {
 			Some(callback) => callback(false).map_err(ProviderError::AuthRefresh)?,
 			None => self.api_key.clone(),
@@ -301,9 +322,10 @@ impl OpenAiCompatibleProvider {
 			if status.is_success() {
 				return Ok((response, key));
 			}
+			let headers = response.headers().clone();
+			let bounded = read_body_bounded(response, MAX_ERROR_BODY_BYTES).await?;
 			if !force_refresh && matches!(status.as_u16(), 401 | 403) {
-				let body = read_body_bounded(response, MAX_ERROR_BODY_BYTES).await?;
-				if is_invalid_key_body(&body.text) {
+				if is_invalid_key_body(&bounded.text) {
 					if let Some(callback) = &self.credential {
 						key = callback(true).map_err(ProviderError::AuthRefresh)?;
 						force_refresh = true;
@@ -312,13 +334,31 @@ impl OpenAiCompatibleProvider {
 				}
 				return Err(ProviderError::HttpStatus(
 					status.as_u16(),
-					diagnostic_body(&body.text, body.truncated, &self.diagnostic_secrets(&key)),
+					bounded_redaction(
+						&bounded.text,
+						&self.diagnostic_secrets(&key),
+						bounded.truncated,
+					),
 				));
 			}
-			let body = read_body_bounded(response, MAX_ERROR_BODY_BYTES).await?;
+			// A concurrency-admission 429 is a proxy shed, not backpressure:
+			// the session layer owns its retry (`openai-http.ts` issue #8854).
+			if attempt < self.retry.max_retries
+				&& should_retry_response(&headers, status.as_u16())
+				&& !is_concurrency_admission_rejection(&headers, &bounded.text)
+				&& let Some(delay) = self.retry.delay(&headers, &bounded.text, attempt)
+			{
+				attempt += 1;
+				sleep_before_retry(delay).await;
+				continue;
+			}
 			return Err(ProviderError::HttpStatus(
 				status.as_u16(),
-				diagnostic_body(&body.text, body.truncated, &self.diagnostic_secrets(&key)),
+				bounded_redaction(
+					&bounded.text,
+					&self.diagnostic_secrets(&key),
+					bounded.truncated,
+				),
 			));
 		}
 	}
@@ -372,7 +412,7 @@ impl ModelProvider for OpenAiCompatibleProvider {
 			ProviderError::Protocol(crate::provider::redact_with(
 				&format!(
 					"invalid chat completion body: {err}; body: {}",
-					diagnostic_body(&text, false, &secrets)
+					bounded_redaction(&text, &secrets, false)
 				),
 				&secrets,
 			))
@@ -438,65 +478,6 @@ fn normalize_prompt_cache_key(value: &str) -> Option<String> {
 	}
 	let hash = crate::tools::naming::bun_hash_base36(value.as_bytes());
 	Some(format!("pc_{hash}"))
-}
-
-/// Body text capped at a byte limit, plus whether bytes were dropped.
-struct BoundedBody {
-	text:      String,
-	truncated: bool,
-}
-
-/// Read at most `limit` body bytes, then stop; never buffers past the ceiling
-/// even for an endless response.
-async fn read_body_bounded(
-	response: reqwest::Response,
-	limit: usize,
-) -> Result<BoundedBody, ProviderError> {
-	let mut stream = response.bytes_stream();
-	let mut bytes: Vec<u8> = Vec::new();
-	let mut truncated = false;
-	while let Some(item) = stream.next().await {
-		let chunk = item.map_err(network_error)?;
-		if bytes.len() + chunk.len() > limit {
-			let room = limit.saturating_sub(bytes.len());
-			bytes.extend_from_slice(&chunk[..room]);
-			truncated = true;
-			break;
-		}
-		bytes.extend_from_slice(&chunk);
-	}
-	let mut text = String::from_utf8_lossy(&bytes).into_owned();
-	if truncated {
-		trim_partial_token(&mut text);
-	}
-	Ok(BoundedBody { text, truncated })
-}
-
-/// Best effort for a byte-capped read: drop the incomplete trailing token so a
-/// credential sliced across the cap is unlikely to survive as a prefix.
-fn trim_partial_token(text: &mut String) {
-	let boundary = text
-		.char_indices()
-		.rev()
-		.find(|(_, ch)| {
-			ch.is_whitespace() || matches!(ch, '"' | '\'' | ',' | ':' | '{' | '}' | '[' | ']')
-		})
-		.map(|(index, ch)| index + ch.len_utf8());
-	if let Some(boundary) = boundary
-		&& boundary < text.len()
-	{
-		text.truncate(boundary);
-	}
-}
-
-/// Redact first, then bound to the diagnostic character limit; `truncated`
-/// marks a byte-capped read so the diagnostic says the tail was dropped.
-fn diagnostic_body(text: &str, truncated: bool, secrets: &[String]) -> String {
-	let mut bounded = snippet(&crate::provider::redact_with(text, secrets));
-	if truncated {
-		bounded.push_str("\n[truncated]");
-	}
-	bounded
 }
 
 fn network_error(err: reqwest::Error) -> ProviderError {
@@ -582,42 +563,52 @@ mod tests {
 		assert_ne!(key, long);
 	}
 
-	/// Serve exactly one HTTP/1.1 request with `status`/`body`, then close.
-	async fn serve_once(status: u16, body: Vec<u8>) -> String {
+	/// Serve one request per entry, then close; `retry-after-ms: 0` keeps
+	/// retry tests free of real backoff sleeps.
+	async fn serve_sequence(responses: Vec<(u16, Vec<u8>)>) -> String {
 		let listener = TcpListener::bind(("127.0.0.1", 0)).await.expect("bind");
 		let addr = listener.local_addr().expect("addr");
 		tokio::spawn(async move {
-			let (mut socket, _) = listener.accept().await.expect("accept");
-			let mut request = Vec::new();
-			let mut chunk = [0u8; 1024];
-			loop {
-				let read = socket.read(&mut chunk).await.expect("read request");
-				if read == 0 {
-					break;
-				}
-				request.extend_from_slice(&chunk[..read]);
-				let Some(head_end) = request.windows(4).position(|w| w == b"\r\n\r\n") else {
-					continue;
+			for (status, body) in responses {
+				let Ok((mut socket, _)) = listener.accept().await else {
+					return;
 				};
-				let head = String::from_utf8_lossy(&request[..head_end]).to_lowercase();
-				let content_length = head
-					.lines()
-					.find_map(|line| line.strip_prefix("content-length:"))
-					.and_then(|value| value.trim().parse::<usize>().ok())
-					.unwrap_or(0);
-				if request.len() >= head_end + 4 + content_length {
-					break;
+				let mut request = Vec::new();
+				let mut chunk = [0u8; 1024];
+				loop {
+					let read = socket.read(&mut chunk).await.expect("read request");
+					if read == 0 {
+						break;
+					}
+					request.extend_from_slice(&chunk[..read]);
+					let Some(head_end) = request.windows(4).position(|w| w == b"\r\n\r\n") else {
+						continue;
+					};
+					let head = String::from_utf8_lossy(&request[..head_end]).to_lowercase();
+					let content_length = head
+						.lines()
+						.find_map(|line| line.strip_prefix("content-length:"))
+						.and_then(|value| value.trim().parse::<usize>().ok())
+						.unwrap_or(0);
+					if request.len() >= head_end + 4 + content_length {
+						break;
+					}
 				}
+				let head = format!(
+					"HTTP/1.1 {status} TEST\r\ncontent-type: application/json\r\nretry-after-ms: 0\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+					body.len()
+				);
+				socket.write_all(head.as_bytes()).await.expect("write head");
+				let _ = socket.write_all(&body).await;
+				let _ = socket.shutdown().await;
 			}
-			let head = format!(
-				"HTTP/1.1 {status} TEST\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
-				body.len()
-			);
-			socket.write_all(head.as_bytes()).await.expect("write head");
-			let _ = socket.write_all(&body).await;
-			let _ = socket.shutdown().await;
 		});
 		format!("http://{addr}/v1")
+	}
+
+	/// Serve exactly one HTTP/1.1 request with `status`/`body`, then close.
+	async fn serve_once(status: u16, body: Vec<u8>) -> String {
+		serve_sequence(vec![(status, body)]).await
 	}
 
 	#[tokio::test]
@@ -625,7 +616,8 @@ mod tests {
 		let base_url = serve_once(500, br#"{"error":{"message":"bad key sk-secret-123"}}"#.to_vec())
 			.await;
 		let provider = OpenAiCompatibleProvider::new(base_url, "sk-secret-123", "model-x")
-			.expect("build");
+			.expect("build")
+			.with_max_retries(0);
 		let err = provider.complete(&[], &[], &ToolChoice::Auto).await.unwrap_err();
 		let text = match err {
 			ProviderError::HttpStatus(status, text) => {
@@ -647,7 +639,8 @@ mod tests {
 			});
 		let provider = OpenAiCompatibleProvider::new(base_url, "configured-key", "model-x")
 			.expect("build")
-			.with_credential_callback(Some(callback));
+			.with_credential_callback(Some(callback))
+			.with_max_retries(0);
 		let err = provider.complete(&[], &[], &ToolChoice::Auto).await.unwrap_err();
 		let text = match err {
 			ProviderError::HttpStatus(_, text) => text,
@@ -685,11 +678,39 @@ mod tests {
 		assert!(text.contains("[redacted]"), "not redacted: {text}");
 	}
 
-	#[test]
-	fn trim_partial_token_drops_the_cut_tail() {
-		let mut text = "error: sk-secret".to_string();
-		trim_partial_token(&mut text);
-		assert_eq!(text, "error: ");
+	#[tokio::test]
+	async fn retries_transient_429_before_returning_the_response() {
+		let success = br#"{"choices":[{"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1}}"#.to_vec();
+		let base_url = serve_sequence(vec![
+			(429, br#"{"error":"slow down"}"#.to_vec()),
+			(200, success),
+		])
+		.await;
+		let provider = OpenAiCompatibleProvider::new(base_url, "key", "model-x")
+			.expect("build")
+			.with_max_retries(1);
+		let message = provider
+			.complete(&[], &[], &ToolChoice::Auto)
+			.await
+			.expect("retry succeeds");
+		assert_eq!(message.content, "ok");
+	}
+
+	#[tokio::test]
+	async fn exhausted_retries_surface_the_last_http_status() {
+		let base_url = serve_sequence(vec![
+			(503, b"busy".to_vec()),
+			(503, b"still busy".to_vec()),
+		])
+		.await;
+		let provider = OpenAiCompatibleProvider::new(base_url, "key", "model-x")
+			.expect("build")
+			.with_max_retries(1);
+		let err = provider.complete(&[], &[], &ToolChoice::Auto).await.unwrap_err();
+		match err {
+			ProviderError::HttpStatus(503, text) => assert!(text.contains("still busy"), "{text}"),
+			other => panic!("expected HttpStatus(503), got {other:?}"),
+		}
 	}
 
 	#[tokio::test]

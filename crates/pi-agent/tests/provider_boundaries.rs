@@ -273,7 +273,9 @@ async fn sse_stream_surfaces_transport_and_serialization_errors_then_stops() {
 async fn http_stream_error_body_is_bounded_and_status_surfaces() {
 	let long_body = "x".repeat(5_000);
 	let url = serve_responses(vec![response("429 Too Many Requests", "text/plain", &long_body)]).await;
-	let provider = OpenAiCompatibleProvider::new(url, "key", "model").expect("provider");
+	let provider = OpenAiCompatibleProvider::new(url, "key", "model")
+		.expect("provider")
+		.with_max_retries(0);
 
 	let err = match provider.stream(&[Message::user("hi")], &[], &ToolChoice::Auto).await {
 		Err(err) => err,
@@ -710,7 +712,8 @@ async fn provider_errors_never_echo_the_api_key() {
 	)])
 	.await;
 	let provider = OpenAiCompatibleProvider::new(url, "sk-secret-boundary", "model")
-		.expect("provider");
+		.expect("provider")
+		.with_max_retries(0);
 	let err = provider
 		.complete(&[Message::user("hi")], &[], &ToolChoice::Auto)
 		.await

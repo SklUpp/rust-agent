@@ -10,11 +10,18 @@ use serde::{Deserialize, Serialize};
 use crate::state::{Message, Role, StopReason, TokenUsage, ToolCall, UsagePresence};
 
 /// Maximum characters of an error response body kept for diagnostics.
-const ERROR_BODY_CHARS: usize = 2048;
+pub(crate) const ERROR_BODY_CHARS: usize = 2048;
 
 /// Hard ceiling on one unterminated SSE line; a longer line is a protocol
 /// error instead of unbounded buffering.
 const MAX_SSE_LINE_BYTES: usize = 1024 * 1024;
+
+/// Bounded, redacted response-body handling shared by the HTTP adapters.
+pub(crate) mod body;
+
+/// Shared HTTP retry policy: status classification, `Retry-After` parsing and
+/// backoff schedules.
+pub(crate) mod retry;
 
 /// OpenAI-compatible chat-completions transport.
 pub mod http;
