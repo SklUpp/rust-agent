@@ -2750,7 +2750,7 @@ impl Session<'_> {
 	/// gate can fail closed instead of assuming a clean state.
 	fn unresolved_tool_intents(
 		&self,
-	) -> std::result::Result<Vec<crate::session_store::UnresolvedIntent>, String> {
+	) -> std::result::Result<Vec<aragent::session_store::UnresolvedIntent>, String> {
 		self.store.unresolved_intents().map_err(|error| error.to_string())
 	}
 
