@@ -1,7 +1,12 @@
 //! `web_search` backed by a host-configured SearXNG instance.
 //!
+//! An unconfigured instance, a transport/timeout failure, an HTTP 5xx, or a
+//! search whose engines all failed falls back to DuckDuckGo Lite HTML (no
+//! credentials, same rendered output); configuration errors and caller
+//! cancellation never fall back.
+//!
 //! Upstream resolves a provider chain (`web/search/provider.ts`); this slice
-//! ships the SearXNG backend only, so there is one concrete tool and no
+//! ships SearXNG plus the free fallback, so there is one concrete tool and no
 //! provider abstraction. The endpoint and every credential arrive through
 //! [`SearxngConfig`] from trusted host settings/env, never from tool arguments,
 //! so the model cannot redirect the request.
@@ -12,16 +17,17 @@
 //! auth before Bearer, `week` recency mapped to SearXNG's `month`, configured
 //! engine shortcuts resolved through `/config`, rows without a `url` dropped,
 //! lenient constraint relaxation, empty results with unresponsive engines
-//! reported as 503, and every model-facing error scrubbed of the resolved
-//! authorization material.
+//! treated as unavailable, and every model-facing error scrubbed of the
+//! resolved authorization material.
 
 use std::{
 	collections::{BTreeMap, HashMap},
-	sync::{Arc, Mutex},
+	sync::{Arc, LazyLock, Mutex},
 	time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use async_trait::async_trait;
+use regex::Regex;
 use reqwest::{StatusCode, Url, header};
 use serde_json::{Value, json};
 use tokio_util::sync::CancellationToken;
@@ -48,6 +54,16 @@ const SNIPPET_MAX_CHARS: usize = 240;
 const ERROR_BODY_MAX_CHARS: usize = 2_000;
 const NOT_CONFIGURED: &str =
 	"SearXNG endpoint not configured. Set searxng.endpoint in settings or SEARXNG_ENDPOINT in environment.";
+
+/// Credential-free fallback used when SearXNG is unconfigured or unavailable.
+const DUCKDUCKGO_LITE_URL: &str = "https://lite.duckduckgo.com/lite/";
+const DUCKDUCKGO_TIMEOUT: Duration = Duration::from_secs(10);
+/// The lite page is ~50 KB; stop buffering here so a hostile or runaway
+/// response cannot grow memory without bound.
+const DUCKDUCKGO_MAX_HTML_BYTES: usize = 256 * 1024;
+/// The lite endpoint rejects obvious bot agents.
+const DUCKDUCKGO_USER_AGENT: &str =
+	"Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0 Safari/537.36";
 
 /// Per-endpoint cache of shortcut/name → canonical engine names, mirroring
 /// upstream's process-lifetime `engineNameMapCache`. Failures are not cached,
@@ -159,11 +175,13 @@ impl Redactor {
 	}
 }
 
-/// SearXNG-backed `web_search`.
+/// SearXNG-backed `web_search`, with a credential-free DuckDuckGo Lite
+/// fallback for an unconfigured or unavailable instance.
 pub struct WebSearchTool {
 	config: SearxngConfig,
 	client: reqwest::Client,
 	timeout: Duration,
+	fallback_endpoint: String,
 }
 
 impl WebSearchTool {
@@ -178,7 +196,16 @@ impl WebSearchTool {
 				.build()
 				.expect("failed to construct web search HTTP client with preconfigured TLS"),
 			timeout: REQUEST_TIMEOUT,
+			fallback_endpoint: DUCKDUCKGO_LITE_URL.to_string(),
 		}
+	}
+
+	/// Override the DuckDuckGo Lite endpoint. Host/test plumbing only: the tool
+	/// schema never exposes it, so the model cannot redirect the fallback.
+	#[must_use]
+	pub fn with_fallback_endpoint(mut self, endpoint: impl Into<String>) -> Self {
+		self.fallback_endpoint = endpoint.into();
+		self
 	}
 
 	fn parse_args(&self, args: &Value) -> Result<SearchParams, ToolError> {
@@ -300,12 +327,16 @@ impl WebSearchTool {
 			let encoded = crate::eval::util::base64_encode(format!("{username}:{password}").as_bytes());
 			return Ok(Some(format!("Basic {encoded}")));
 		}
-		Ok(self
-			.config
-			.token
-			.as_deref()
-			.filter(|token| !token.is_empty())
-			.map(|token| format!("Bearer {token}")))
+		let Some(token) = self.config.token.as_deref().filter(|token| !token.is_empty()) else {
+			return Ok(None);
+		};
+		let authorization = format!("Bearer {token}");
+		if header::HeaderValue::from_str(&authorization).is_err() {
+			return Err(ToolError::ExecutionFailed(
+				"SearXNG token is not a valid HTTP Authorization header value.".to_string(),
+			));
+		}
+		Ok(Some(authorization))
 	}
 
 	fn validate_safesearch(&self) -> Result<(), ToolError> {
@@ -440,34 +471,137 @@ impl WebSearchTool {
 		Ok(url)
 	}
 
-	/// One bounded request: the caller's cancellation token and the transport
-	/// deadline both end the exchange, including the body read.
+	/// One bounded request. HTTP 5xx is classified before the body is read, so a
+	/// large or broken 5xx body cannot change the outcome. A non-2xx body read
+	/// failure (including a 4xx body over 4 MiB) stays fatal instead of becoming
+	/// a fallback-eligible outage.
 	async fn send(
 		&self,
 		request: reqwest::RequestBuilder,
 		token: &CancellationToken,
 		redactor: &Redactor,
-	) -> Result<(StatusCode, String), ToolError> {
+	) -> Result<(StatusCode, String), SearXngFailure> {
+		let response = tokio::select! {
+			() = token.cancelled() => return Err(SearXngFailure::Fatal(ToolError::Aborted(
+				"web search cancelled".to_string(),
+			))),
+			result = tokio::time::timeout(self.timeout, request.send()) => match result {
+				Ok(Ok(response)) => response,
+				Ok(Err(_)) | Err(_) => return Err(SearXngFailure::Unavailable),
+			},
+		};
+		let status = response.status();
+		if status.is_server_error() {
+			return Err(SearXngFailure::Unavailable);
+		}
+		let body = tokio::select! {
+			() = token.cancelled() => return Err(SearXngFailure::Fatal(ToolError::Aborted(
+				"web search cancelled".to_string(),
+			))),
+			result = tokio::time::timeout(self.timeout, read_bounded_body(response)) => match result {
+				Ok(Ok(body)) => body,
+				Ok(Err(error)) => {
+					let message = format!(
+						"SearXNG request failed while reading the response: {}",
+						redactor.redact(&error)
+					);
+					return Err(if status.is_success() {
+						SearXngFailure::Unavailable
+					} else {
+						SearXngFailure::Fatal(ToolError::ExecutionFailed(message))
+					});
+				},
+				Err(_) => {
+					let message = format!("SearXNG request timed out after {}s", self.timeout.as_secs());
+					return Err(if status.is_success() {
+						SearXngFailure::Unavailable
+					} else {
+						SearXngFailure::Fatal(ToolError::ExecutionFailed(message))
+					});
+				},
+			},
+		};
+		Ok((status, body))
+	}
+
+	/// One DuckDuckGo Lite search. HTML-only: no credentials are sent and
+	/// redirects stay disabled, so the fixed lite endpoint cannot bounce the
+	/// client to another origin.
+	async fn duckduckgo_search(
+		&self,
+		params: &SearchParams,
+		token: &CancellationToken,
+	) -> Result<SearchResponse, ToolError> {
+		let url = Url::parse(&self.fallback_endpoint).map_err(|error| {
+			ToolError::ExecutionFailed(format!(
+				"duckduckgo lite endpoint is not a valid URL: {error}"
+			))
+		})?;
+		if !matches!(url.scheme(), "http" | "https") {
+			return Err(ToolError::ExecutionFailed(
+				"duckduckgo lite endpoint must use the http or https scheme".to_string(),
+			));
+		}
+		let query = strip_external_bangs(&format_scraper_query(&params.query));
+		let request = self
+			.client
+			.post(url)
+			.header(header::ACCEPT, "text/html")
+			.header(header::USER_AGENT, DUCKDUCKGO_USER_AGENT)
+			.form(&[("q", query.as_str())]);
 		let exchange = async {
 			let response = request.send().await.map_err(|error| {
-				ToolError::ExecutionFailed(redactor.redact(&format!("SearXNG request failed: {error}")))
+				ToolError::ExecutionFailed(format!("DuckDuckGo lite request failed: {error}"))
 			})?;
 			let status = response.status();
-			let body = read_bounded_body(response)
+			if !status.is_success() {
+				return Err(ToolError::ExecutionFailed(format!(
+					"DuckDuckGo lite search returned HTTP {}",
+					status.as_u16()
+				)));
+			}
+			let body = read_capped_body(response, DUCKDUCKGO_MAX_HTML_BYTES)
 				.await
-				.map_err(|error| ToolError::ExecutionFailed(redactor.redact(&error)))?;
-			Ok::<_, ToolError>((status, body))
+				.map_err(ToolError::ExecutionFailed)?;
+			Ok::<_, ToolError>(parse_duckduckgo_lite(&body))
 		};
-		tokio::select! {
+		let mut response = tokio::select! {
 			() = token.cancelled() => Err(ToolError::Aborted("web search cancelled".to_string())),
-			result = tokio::time::timeout(self.timeout, exchange) => match result {
+			result = tokio::time::timeout(DUCKDUCKGO_TIMEOUT, exchange) => match result {
 				Ok(result) => result,
 				Err(_) => Err(ToolError::ExecutionFailed(format!(
-					"SearXNG request timed out after {}s",
-					self.timeout.as_secs()
+					"DuckDuckGo lite request timed out after {}s",
+					DUCKDUCKGO_TIMEOUT.as_secs()
 				))),
 			},
+		}?;
+		apply_constraints(&mut response, &params.parsed);
+		response.sources.truncate(params.num_results);
+		if response.sources.is_empty() {
+			return Err(ToolError::ExecutionFailed(
+				"DuckDuckGo lite returned no usable results.".to_string(),
+			));
 		}
+		Ok(response)
+	}
+
+	async fn fallback_result(
+		&self,
+		params: &SearchParams,
+		token: &CancellationToken,
+		fallback_note: Option<String>,
+	) -> Result<ToolResult, ToolError> {
+		let mut response = self.duckduckgo_search(params, token).await?;
+		if let Some(note) = fallback_note {
+			response.notes.push(note);
+		}
+		if params.recency.is_some() {
+			response.notes.push(
+				"duckduckgo-free does not filter by recency; results may be older than requested."
+					.to_string(),
+			);
+		}
+		Ok(search_result(&response, "duckduckgo_free"))
 	}
 
 	fn parse_response(
@@ -477,38 +611,32 @@ impl WebSearchTool {
 		limit: usize,
 		parsed: &StructuredQuery,
 		redactor: &Redactor,
-	) -> Result<SearchResponse, ToolError> {
+	) -> Result<SearchResponse, SearXngFailure> {
 		if !status.is_success() {
-			return Err(ToolError::ExecutionFailed(http_error_message(
+			return Err(SearXngFailure::Fatal(ToolError::ExecutionFailed(http_error_message(
 				status,
 				&redactor.redact(&body),
-			)));
+			))));
 		}
 		let payload: Value = serde_json::from_str(&body).map_err(|error| {
-			ToolError::ExecutionFailed(format!("SearXNG response was not valid JSON: {error}"))
+			SearXngFailure::Fatal(ToolError::ExecutionFailed(format!(
+				"SearXNG response was not valid JSON: {error}"
+			)))
 		})?;
-		let mut response = map_response(&payload, limit).map_err(|error| redactor.redact_error(error))?;
+		let mut response = map_response(&payload, limit).map_err(|failure| match failure {
+			SearXngFailure::Unavailable => SearXngFailure::Unavailable,
+			SearXngFailure::Fatal(error) => SearXngFailure::Fatal(redactor.redact_error(error)),
+		})?;
 
 		// Lenient constraint pass: enforce site:/inurl:/intitle:/filetype:/date
 		// directives the engine could not honor natively, relaxing any dimension
 		// that would wipe out every result instead of returning nothing.
-		if parsed.has_constraints && !response.sources.is_empty() {
-			let (kept, dropped) = filter_source_indices(&response.sources, parsed);
-			if kept.len() != response.sources.len() {
-				response.sources =
-					kept.iter().map(|index| response.sources[*index].clone()).collect();
-			}
-			for label in dropped {
-				response
-					.notes
-					.push(format!("no results matched `{label}`; the constraint was relaxed"));
-			}
-		}
+		apply_constraints(&mut response, parsed);
 
 		if response.answer.is_none() && response.sources.is_empty() && response.related_questions.is_empty() {
-			return Err(ToolError::ExecutionFailed(
+			return Err(SearXngFailure::Fatal(ToolError::ExecutionFailed(
 				"SearXNG returned no renderable search content.".to_string(),
-			));
+			)));
 		}
 		Ok(response)
 	}
@@ -571,14 +699,31 @@ impl Tool for WebSearchTool {
 
 	async fn execute(&self, args: &Value, ctx: &AgentContext) -> Result<ToolResult, ToolError> {
 		let params = self.parse_args(args)?;
-		let base = self.endpoint_base()?;
-		self.validate_safesearch()?;
-		let authorization = self.resolve_auth()?;
-		let redactor = Redactor::new(&self.config, authorization.as_deref());
 		let token = ctx.cancellation_token.clone();
 		if token.is_cancelled() {
 			return Err(ToolError::Aborted("web search cancelled".to_string()));
 		}
+		// Control-only endpoints are configuration errors, not blank/unconfigured.
+		if self.config.endpoint.as_deref().is_some_and(has_control_characters) {
+			return Err(ToolError::ExecutionFailed(
+				"searxng.endpoint must not contain control characters".to_string(),
+			));
+		}
+		// A blank endpoint is the normal unconfigured case: no SearXNG syntax or
+		// credentials to validate, so go straight to the free fallback.
+		if !self.config.endpoint.as_deref().is_some_and(|endpoint| !endpoint.trim().is_empty()) {
+			return self
+				.fallback_result(
+					&params,
+					&token,
+					Some("SearXNG endpoint not configured; used duckduckgo-free.".to_string()),
+				)
+				.await;
+		}
+		let base = self.endpoint_base()?;
+		self.validate_safesearch()?;
+		let authorization = self.resolve_auth()?;
+		let redactor = Redactor::new(&self.config, authorization.as_deref());
 		let engines = match self.config.engines.as_deref().filter(|raw| !raw.trim().is_empty()) {
 			Some(raw) => self.resolve_engines(raw, &base, authorization.as_deref(), &redactor, &token).await,
 			None => None,
@@ -588,16 +733,44 @@ impl Tool for WebSearchTool {
 		if let Some(authorization) = &authorization {
 			request = request.header(header::AUTHORIZATION, authorization.clone());
 		}
-		let (status, body) = self.send(request, &token, &redactor).await?;
-		let response = self.parse_response(status, body, params.num_results, &params.parsed, &redactor)?;
-		Ok(ToolResult {
-			tool_call_id: String::new(),
-			content: format_for_llm(&response),
-			is_error: false,
-			terminate: false,
-			details: None,
-		})
+		let (status, body) = match self.send(request, &token, &redactor).await {
+			Ok(exchange) => exchange,
+			Err(SearXngFailure::Unavailable) => {
+				return self
+					.fallback_result(
+						&params,
+						&token,
+						Some("SearXNG was unavailable; fell back to duckduckgo-free.".to_string()),
+					)
+					.await;
+			},
+			Err(SearXngFailure::Fatal(error)) => return Err(error),
+		};
+		let response = match self.parse_response(status, body, params.num_results, &params.parsed, &redactor) {
+			Ok(response) => response,
+			Err(SearXngFailure::Unavailable) => {
+				return self
+					.fallback_result(
+						&params,
+						&token,
+						Some("SearXNG was unavailable; fell back to duckduckgo-free.".to_string()),
+					)
+					.await;
+			},
+			Err(SearXngFailure::Fatal(error)) => return Err(error),
+		};
+		Ok(search_result(&response, "searxng"))
 	}
+}
+
+/// Outcome of a SearXNG lookup. Only [`SearXngFailure::Unavailable`] is safe to
+/// retry on the credential-free fallback; everything else is surfaced.
+enum SearXngFailure {
+	/// Transport/connect/timeout, HTTP 5xx (detected before the body read), or
+	/// every routed engine failed with no usable result.
+	Unavailable,
+	/// Configuration-independent wire/payload failure, 3xx/4xx, or cancellation.
+	Fatal(ToolError),
 }
 
 struct SearchParams {
@@ -703,6 +876,223 @@ async fn read_bounded_body(mut response: reqwest::Response) -> Result<String, St
 	Ok(String::from_utf8_lossy(&buf).into_owned())
 }
 
+/// Read at most `cap` body bytes, then stop; the DDG lite page is parsed from
+/// that bounded prefix, mirroring upstream's `MAX_HTML_BYTES` slice.
+async fn read_capped_body(mut response: reqwest::Response, cap: usize) -> Result<String, String> {
+	let mut buf: Vec<u8> = Vec::new();
+	while buf.len() < cap {
+		let Some(chunk) = response.chunk().await.map_err(|error| error.to_string())? else {
+			break;
+		};
+		let take = chunk.len().min(cap - buf.len());
+		buf.extend_from_slice(&chunk[..take]);
+		if take < chunk.len() {
+			break;
+		}
+	}
+	Ok(String::from_utf8_lossy(&buf).into_owned())
+}
+
+fn search_result(response: &SearchResponse, backend: &str) -> ToolResult {
+	ToolResult {
+		tool_call_id: String::new(),
+		content: format_for_llm(response),
+		is_error: false,
+		terminate: false,
+		details: Some(json!({ "backend": backend, "sources": response.sources.len() })),
+	}
+}
+
+/// Lenient constraint pass shared by both backends: relax any dimension that
+/// would eliminate every result and report it instead of returning nothing.
+fn apply_constraints(response: &mut SearchResponse, parsed: &StructuredQuery) {
+	if !parsed.has_constraints || response.sources.is_empty() {
+		return;
+	}
+	let (kept, dropped) = filter_source_indices(&response.sources, parsed);
+	if kept.len() != response.sources.len() {
+		response.sources = kept.iter().map(|index| response.sources[*index].clone()).collect();
+	}
+	for label in dropped {
+		response
+			.notes
+			.push(format!("no results matched `{label}`; the constraint was relaxed"));
+	}
+}
+
+// Upstream `freeWebSearch.ts` patterns. Captures are hard-bounded so malformed
+// or adversarial HTML cannot force catastrophic backtracking.
+static DDG_ANCHOR: LazyLock<Regex> = LazyLock::new(|| {
+	Regex::new(r#"(?is)<a\b([^>]*?class=['"][^'"]*result-link[^'"]*['"][^>]*)>(.{0,512}?)</a>"#)
+		.expect("DuckDuckGo anchor pattern is valid")
+});
+static DDG_HREF: LazyLock<Regex> =
+	LazyLock::new(|| Regex::new(r#"(?i)href=['"]([^'"]+)['"]"#).expect("href pattern is valid"));
+static DDG_SNIPPET: LazyLock<Regex> = LazyLock::new(|| {
+	Regex::new(
+		r#"(?is)<td\b[^>]*?class=['"][^'"]*result-snippet[^'"]*['"][^>]*>(.{0,2048}?)</td>"#,
+	)
+	.expect("DuckDuckGo snippet pattern is valid")
+});
+static HTML_TAG: LazyLock<Regex> =
+	LazyLock::new(|| Regex::new(r"(?s)<[^>]*>").expect("HTML tag pattern is valid"));
+
+/// One `<a class=result-link>` match with its byte span in the page.
+struct DuckDuckGoRow {
+	start: usize,
+	end:   usize,
+	title: String,
+	url:   Option<String>,
+}
+
+/// Parse DuckDuckGo Lite HTML into sources. Each result's snippet is searched
+/// only between its anchor and the next anchor, so a missing snippet cannot
+/// shift later snippets onto earlier rows.
+fn parse_duckduckgo_lite(html: &str) -> SearchResponse {
+	// Keep every anchor, including ones later dropped, so their spans still
+	// delimit the preceding row's snippet window.
+	let mut rows = Vec::new();
+	for captures in DDG_ANCHOR.captures_iter(html) {
+		let Some(whole) = captures.get(0) else {
+			continue;
+		};
+		rows.push(DuckDuckGoRow {
+			start: whole.start(),
+			end:   whole.end(),
+			title: strip_html_tags(&captures[2]),
+			url:   DDG_HREF
+				.captures(&captures[1])
+				.and_then(|href| resolve_duckduckgo_url(&href[1])),
+		});
+	}
+	let mut sources = Vec::new();
+	for (index, row) in rows.iter().enumerate() {
+		let window_end = rows.get(index + 1).map_or(html.len(), |next| next.start).max(row.end);
+		let snippet = DDG_SNIPPET
+			.captures(&html[row.end..window_end])
+			.map(|captures| strip_html_tags(&captures[1]))
+			.map(|snippet| snippet.trim().to_string())
+			.filter(|snippet| !snippet.is_empty());
+		let Some(url) = row.url.as_ref() else {
+			continue;
+		};
+		if row.title.is_empty() {
+			continue;
+		}
+		sources.push(SearchSource {
+			title: row.title.clone(),
+			url: url.clone(),
+			snippet,
+			published_date: None,
+			age_seconds: None,
+		});
+	}
+	SearchResponse { answer: None, sources, related_questions: Vec::new(), notes: Vec::new() }
+}
+
+/// Strip tags after decoding entities, exactly like upstream `stripTags`: the
+/// loop runs to a fixpoint and a trailing unclosed `<…` is dropped.
+fn strip_html_tags(html: &str) -> String {
+	let mut text = decode_html_entities(html);
+	loop {
+		if !HTML_TAG.is_match(&text) {
+			break;
+		}
+		text = HTML_TAG.replace_all(&text, "").into_owned();
+	}
+	if let Some(index) = text.rfind('<')
+		&& !text[index..].contains('>')
+	{
+		text.truncate(index);
+	}
+	text.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn decode_html_entities(text: &str) -> String {
+	let mut decoded = String::with_capacity(text.len());
+	let mut rest = text;
+	while let Some(index) = rest.find('&') {
+		decoded.push_str(&rest[..index]);
+		let tail = &rest[index + 1..];
+		let end = tail
+			.char_indices()
+			.take(32)
+			.find(|(_, character)| *character == ';')
+			.map(|(position, _)| position);
+		let Some(end) = end else {
+			decoded.push('&');
+			rest = tail;
+			continue;
+		};
+		if let Some(character) = decode_entity(&tail[..end]) {
+			decoded.push(character);
+			rest = &tail[end + 1..];
+		} else {
+			decoded.push('&');
+			rest = tail;
+		}
+	}
+	decoded.push_str(rest);
+	decoded
+}
+
+fn decode_entity(entity: &str) -> Option<char> {
+	match entity.to_ascii_lowercase().as_str() {
+		"amp" => Some('&'),
+		"lt" => Some('<'),
+		"gt" => Some('>'),
+		"quot" => Some('"'),
+		"apos" | "#39" => Some('\''),
+		"nbsp" => Some(' '),
+		_ => {
+			let number = entity.strip_prefix('#')?;
+			let code = match number.strip_prefix('x').or_else(|| number.strip_prefix('X')) {
+				Some(hex) => u32::from_str_radix(hex, 16).ok()?,
+				None => number.parse().ok()?,
+			};
+			char::from_u32(code)
+		},
+	}
+}
+
+/// Upstream `resolveResultUrl`: unwrap the `uddg=` redirect, normalize a
+/// protocol-relative href, and keep only absolute http(s) URLs.
+fn resolve_duckduckgo_url(href: &str) -> Option<String> {
+	let candidate = match duckduckgo_redirect_target(href) {
+		Some(encoded) => percent_decode(encoded).unwrap_or_else(|| href.to_string()),
+		None if href.starts_with("//") => format!("https:{href}"),
+		None => href.to_string(),
+	};
+	let url = Url::parse(&candidate).ok()?;
+	matches!(url.scheme(), "http" | "https").then(|| url.to_string())
+}
+
+fn duckduckgo_redirect_target(href: &str) -> Option<&str> {
+	let start = href.find("uddg=")?;
+	if !matches!(href[..start].chars().next_back(), Some('?' | '&')) {
+		return None;
+	}
+	let tail = &href[start + "uddg=".len()..];
+	Some(tail.split(|character| matches!(character, '&' | '#')).next().unwrap_or(tail))
+}
+
+fn percent_decode(input: &str) -> Option<String> {
+	let bytes = input.as_bytes();
+	let mut decoded = Vec::with_capacity(bytes.len());
+	let mut index = 0;
+	while index < bytes.len() {
+		if bytes[index] == b'%' {
+			let hex = std::str::from_utf8(bytes.get(index + 1..index + 3)?).ok()?;
+			decoded.push(u8::from_str_radix(hex, 16).ok()?);
+			index += 3;
+		} else {
+			decoded.push(bytes[index]);
+			index += 1;
+		}
+	}
+	String::from_utf8(decoded).ok()
+}
+
 fn http_error_message(status: StatusCode, body: &str) -> String {
 	if body_is_quota_exhausted(body) {
 		return "searxng: credits exhausted".to_string();
@@ -736,14 +1126,14 @@ fn body_is_quota_exhausted(body: &str) -> bool {
 	false
 }
 
-fn map_response(payload: &Value, limit: usize) -> Result<SearchResponse, ToolError> {
+fn map_response(payload: &Value, limit: usize) -> Result<SearchResponse, SearXngFailure> {
 	let results: &[Value] = match payload.get("results") {
 		None | Some(Value::Null) => &[],
 		Some(Value::Array(items)) => items.as_slice(),
 		Some(_) => {
-			return Err(ToolError::ExecutionFailed(
+			return Err(SearXngFailure::Fatal(ToolError::ExecutionFailed(
 				"SearXNG response field `results` is not an array".to_string(),
-			));
+			)));
 		},
 	};
 	let now_ms = now_millis();
@@ -779,12 +1169,8 @@ fn map_response(payload: &Value, limit: usize) -> Result<SearchResponse, ToolErr
 		});
 	}
 	let sources: Vec<SearchSource> = sources.into_iter().take(limit).collect();
-	if sources.is_empty()
-		&& let Some(failures) = unresponsive_failures(payload)
-	{
-		return Err(ToolError::ExecutionFailed(format!(
-			"SearXNG returned no usable results; upstream engines failed: {failures}"
-		)));
+	if sources.is_empty() && unresponsive_failures(payload).is_some() {
+		return Err(SearXngFailure::Unavailable);
 	}
 	Ok(SearchResponse {
 		answer: format_answers(payload.get("answers")),
@@ -1011,6 +1397,11 @@ mod tests {
 			..SearxngConfig::default()
 		});
 		assert!(half.resolve_auth().is_err());
+		let invalid_bearer = WebSearchTool::new(SearxngConfig {
+			token: Some("bad\ntoken".to_string()),
+			..SearxngConfig::default()
+		});
+		assert!(invalid_bearer.resolve_auth().is_err(), "a control character cannot form a header");
 	}
 
 	#[test]
@@ -1035,20 +1426,13 @@ mod tests {
 	}
 
 	#[test]
-	fn redacts_engine_failure_reasons_in_mapping_errors() {
+	fn maps_unresponsive_engines_to_unavailable() {
 		let payload = json!({
 			"results": [],
 			"unresponsive_engines": [["google", "proxy said pass-secret is wrong"]]
 		});
-		let error = map_response(&payload, DEFAULT_NUM_RESULTS).expect_err("no usable results");
-		let config = SearxngConfig {
-			basic_username: Some("user".to_string()),
-			basic_password: Some("pass-secret".to_string()),
-			..SearxngConfig::default()
-		};
-		let redactor = Redactor::new(&config, Some("Basic dXNlcjpwYXNzLXNlY3JldA=="));
-		let message = format!("{}", redactor.redact_error(error));
-		assert!(message.contains("google: proxy said [redacted] is wrong"), "{message}");
+		let failure = map_response(&payload, DEFAULT_NUM_RESULTS).expect_err("no usable results");
+		assert!(matches!(failure, SearXngFailure::Unavailable));
 	}
 
 	#[test]
