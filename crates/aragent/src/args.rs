@@ -694,6 +694,14 @@ fn export_operand_dispatches(command: &clap::Command, argv: &[std::ffi::OsString
 	verb_slot(command, argv).is_some_and(|verb| dispatch_verb(command, verb))
 }
 
+/// Built `RawCli` command so clap's generated `-h`/`-V` flags are present in
+/// `get_arguments()`.
+fn raw_cli_command() -> clap::Command {
+	let mut command = RawCli::command();
+	command.build();
+	command
+}
+
 /// Refusal for a known upstream verb that would otherwise be absorbed as prompt
 /// text, or `None` when argv is not such an invocation.
 ///
@@ -712,7 +720,7 @@ fn export_operand_dispatches(command: &clap::Command, argv: &[std::ffi::OsString
 /// including a first word that merely resembles a verb — passes through
 /// untouched.
 pub fn refused_verb_message(argv: &[std::ffi::OsString]) -> Option<String> {
-	let command = RawCli::command();
+	let command = raw_cli_command();
 	if requests_help_or_version(&command, argv, 1) {
 		return None;
 	}
@@ -741,7 +749,7 @@ pub fn refused_verb_message(argv: &[std::ffi::OsString]) -> Option<String> {
 /// this same argv shape, so it must be recognized here rather than by the
 /// caller.
 pub fn is_read_only_startup(argv: &[std::ffi::OsString]) -> bool {
-	let command = RawCli::command();
+	let command = raw_cli_command();
 	if requests_help_or_version(&command, argv, 1) {
 		return true;
 	}
@@ -856,7 +864,7 @@ fn short_cluster_help(command: &clap::Command, flag: &str) -> bool {
 /// Without a leading `launch` or root `--export` this is exactly
 /// [`Cli::parse_from`].
 pub fn parse_cli(argv: Vec<std::ffi::OsString>) -> Cli {
-	let command = RawCli::command();
+	let command = raw_cli_command();
 	if requests_help_or_version(&command, &argv, 1) {
 		return parse_matches(command, argv);
 	}
@@ -1011,6 +1019,8 @@ fn flag_value_kind(arg: &clap::Arg) -> FlagValueKind {
 		| clap::ArgAction::SetFalse
 		| clap::ArgAction::Count
 		| clap::ArgAction::Help
+		| clap::ArgAction::HelpShort
+		| clap::ArgAction::HelpLong
 		| clap::ArgAction::Version => FlagValueKind::Valueless,
 		clap::ArgAction::Set => match arg.get_num_args() {
 			Some(range) if range.min_values() == 0 => FlagValueKind::Optional,

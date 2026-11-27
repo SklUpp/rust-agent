@@ -52,6 +52,11 @@ def sha256_file(path: Path) -> str:
 def check(cond: bool, msg: str) -> None:
     if not cond:
         raise AssertionError(msg)
+def section_codes(report: dict, name: str) -> list[str]:
+    for section in report.get("sections", []):
+        if isinstance(section, dict) and section.get("name") == name:
+            return [f["code"] for f in section.get("findings", []) if isinstance(f, dict)]
+    raise AssertionError(f"section {name!r} missing from doctor report: {report}")
 
 
 def write_fixture_configs(agent_dir: Path, port: int) -> None:
@@ -211,7 +216,7 @@ def test_r9_migration_and_r11_doctor(binary: Path, timeout: float) -> None:
         env = make_isolated_env(home)
 
         # Read-only startup checks must NOT create ~/.aragent
-        for flag in ("--help", "--version"):
+        for flag in ("--help", "-h", "--version", "-V"):
             p = subprocess.run([str(binary), flag], env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=timeout)
             check(p.returncode == 0, f"{flag} failed rc={p.returncode}: {p.stderr}")
             check(not (home / ".aragent").exists(), f"{flag} must not create ~/.aragent")
@@ -229,7 +234,7 @@ def test_r9_migration_and_r11_doctor(binary: Path, timeout: float) -> None:
         check(not (home / ".aragent").exists(), "read-only doctor must not create ~/.aragent")
         rep_before = json.loads(doc_before.stdout)
         check(rep_before["summary"]["errors"] == 0, f"unexpected doctor errors: {rep_before}")
-        cfg_codes_before = [f["code"] for f in rep_before["sections"]["config"]["findings"]]
+        cfg_codes_before = section_codes(rep_before, "config")
         check("legacy-pending" in cfg_codes_before, f"expected legacy-pending in config section: {cfg_codes_before}")
 
         # Normal run triggers copy-only R9 migration
@@ -276,7 +281,7 @@ def test_r9_migration_and_r11_doctor(binary: Path, timeout: float) -> None:
         check(doc_after.returncode in (0, 1), f"post-migration doctor failed: {doc_after.stderr}")
         rep_after = json.loads(doc_after.stdout)
         check(rep_after["summary"]["errors"] == 0, f"post-migration doctor errors: {rep_after}")
-        cfg_codes_after = [f["code"] for f in rep_after["sections"]["config"]["findings"]]
+        cfg_codes_after = section_codes(rep_after, "config")
         check("legacy-root" in cfg_codes_after and "legacy-pending" not in cfg_codes_after, f"unexpected post-migration codes: {cfg_codes_after}")
         print("[PASS] 1. R9 copy-only migration + R11 doctor --json read-only")
     finally:
