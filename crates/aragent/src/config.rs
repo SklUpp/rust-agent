@@ -5364,7 +5364,8 @@ mod tests {
 			("SEARXNG_BASIC_PASSWORD".to_string(), password.to_string()),
 		]);
 		register_searxng_env_secrets(&env);
-		let redacted = crate::auth::known_secrets::redact(&format!("{token} {password}"));
+		let raw = format!("{token} {password}");
+		let redacted = crate::auth::known_secrets::redact(&raw);
 		assert!(!redacted.contains(token), "{redacted}");
 		assert!(!redacted.contains(password), "{redacted}");
 
@@ -5399,9 +5400,10 @@ mod tests {
 		});
 		register_mcp_server_secrets(&stdio);
 		register_mcp_server_secrets(&http);
-		let redacted = crate::auth::known_secrets::redact(&format!(
+		let raw_mcp = format!(
 			"{env_secret} {github_secret} {plain_env} Bearer {header_secret} {plain_header}"
-		));
+		);
+		let redacted = crate::auth::known_secrets::redact(&raw_mcp);
 		assert!(!redacted.contains(env_secret), "{redacted}");
 		assert!(!redacted.contains(github_secret), "{redacted}");
 		assert!(redacted.contains(plain_env), "NODE_ENV must stay visible: {redacted}");
