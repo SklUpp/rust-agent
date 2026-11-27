@@ -506,6 +506,7 @@ fn network_error(err: reqwest::Error) -> ProviderError {
 #[cfg(test)]
 mod tests {
 	use super::*;
+	use crate::tools::registry::tool_schema_envelope;
 	use tokio::io::{AsyncReadExt, AsyncWriteExt};
 	use tokio::net::TcpListener;
 
@@ -541,10 +542,11 @@ mod tests {
 	fn required_tool_choice_serializes_as_bare_mode_string() {
 		let provider = OpenAiCompatibleProvider::new("https://example.test/v1", "key", "model-x")
 			.expect("build");
-		let tools = vec![serde_json::json!({
-			"type": "function",
-			"function": { "name": "read", "parameters": { "type": "object" } }
-		})];
+		let tools = vec![tool_schema_envelope(
+			"read",
+			"Read a file",
+			serde_json::json!({ "type": "object" }),
+		)];
 		let request = provider
 			.request(&[], &tools, &ToolChoice::Required, true)
 			.expect("request");

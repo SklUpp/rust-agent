@@ -26,7 +26,7 @@ use super::process::{
 	LogOptions, ProcessBackend, ProcessError, ProcessSnapshot, ProcessSpec, ProcessState, ReadySpec,
 	RestartPolicy, Signal, WaitRequest, is_terminal_state,
 };
-use crate::tool::{Tool, ToolError};
+use crate::tool::{Tool, ToolError, aborted_result, args_object, require_non_empty_str};
 use crate::{
 	mailbox::{
 		DEFAULT_IRC_TIMEOUT_MS, IrcMessage, MAIN_AGENT_ID, format_incoming,
@@ -585,18 +585,9 @@ impl Tool for HubTool {
 		})
 	}
 
-	fn is_exclusive(&self) -> bool {
-		false
-	}
-
 	async fn execute(&self, args: &Value, ctx: &AgentContext) -> Result<ToolResult, ToolError> {
-		let obj = args
-			.as_object()
-			.ok_or_else(|| ToolError::InvalidArguments("Arguments must be an object".to_string()))?;
-		let op = obj
-			.get("op")
-			.and_then(Value::as_str)
-			.ok_or_else(|| ToolError::InvalidArguments("Missing 'op' argument".to_string()))?;
+		let obj = args_object(args)?;
+		let op = require_non_empty_str(obj, "op")?;
 
 		match op {
 			"jobs" => self.execute_jobs(),
@@ -988,7 +979,7 @@ impl HubTool {
 				result.map_err(process_tool_error)?
 			},
 			_ = ctx.cancellation_token.cancelled() => {
-				return Err(ToolError::Aborted("hub start was cancelled".to_string()));
+				return aborted_result("hub start was cancelled");
 			},
 		};
 		let daemon = outcome.snapshot;
@@ -1076,7 +1067,7 @@ impl HubTool {
 				result.map_err(process_tool_error)?
 			},
 			_ = ctx.cancellation_token.cancelled() => {
-				return Err(ToolError::Aborted("hub logs was cancelled".to_string()));
+				return aborted_result("hub logs was cancelled");
 			},
 		};
 		let newline = if !outcome.text.is_empty() && !outcome.text.ends_with('\n') {
@@ -1128,7 +1119,7 @@ impl HubTool {
 				result.map_err(process_tool_error)?
 			},
 			_ = ctx.cancellation_token.cancelled() => {
-				return Err(ToolError::Aborted("hub wait was cancelled".to_string()));
+				return aborted_result("hub wait was cancelled");
 			},
 		};
 		let mut lines = vec![daemon_label(&outcome.snapshot)];

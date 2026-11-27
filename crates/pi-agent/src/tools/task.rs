@@ -34,7 +34,7 @@ use crate::{
 	subagent_lifecycle::TranscriptJournal,
 	supervisor::{ChildGuard, ChildSpawn, Supervisor, cap_result_text},
 	task_persisted_revive::{PersistedChildSession, RevivedChild},
-	tool::{Tool, ToolError},
+	tool::{Tool, ToolError, args_object},
 };
 
 #[derive(Clone)]
@@ -4105,10 +4105,6 @@ impl Tool for TaskTool {
 		})
 	}
 
-	fn is_exclusive(&self) -> bool {
-		false
-	}
-
 	async fn execute(&self, args: &Value, ctx: &AgentContext) -> Result<ToolResult, ToolError> {
 		self.run_call(None, args, ctx).await
 	}
@@ -4181,9 +4177,7 @@ impl TaskTool {
 			)));
 		}
 
-		let obj = args
-			.as_object()
-			.ok_or_else(|| ToolError::InvalidArguments("Arguments must be an object".to_string()))?;
+		let obj = args_object(args)?;
 
 		let defaults = ItemDefaults {
 			output_schema: parse_schema(obj.get("outputSchema"))?,

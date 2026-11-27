@@ -52,10 +52,6 @@ impl Tool for YieldTool {
 		})
 	}
 
-	fn is_exclusive(&self) -> bool {
-		false
-	}
-
 	async fn execute(&self, args: &Value, _ctx: &AgentContext) -> Result<ToolResult, ToolError> {
 		let result_val = args.get("result").ok_or_else(|| {
 			ToolError::InvalidArguments("Missing required parameter 'result'".to_string())

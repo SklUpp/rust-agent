@@ -7,8 +7,8 @@
 use async_trait::async_trait;
 use serde_json::{Value, json};
 
-use crate::tool::{Tool, ToolError};
 use crate::state::{AgentContext, ToolResult};
+use crate::tool::{Tool, ToolError, args_object, reject_unknown, require_str};
 
 pub struct ThinkTool;
 
@@ -48,26 +48,10 @@ impl Tool for ThinkTool {
 		})
 	}
 
-	fn is_exclusive(&self) -> bool {
-		false
-	}
-
 	async fn execute(&self, args: &Value, _ctx: &AgentContext) -> Result<ToolResult, ToolError> {
-		let obj = args
-			.as_object()
-			.ok_or_else(|| ToolError::InvalidArguments("Arguments must be an object".to_string()))?;
-		if obj.get("thoughts").and_then(Value::as_str).is_none() {
-			return Err(ToolError::InvalidArguments(
-				"Missing required parameter 'thoughts'".to_string(),
-			));
-		}
-		for key in obj.keys() {
-			if key != "thoughts" {
-				return Err(ToolError::InvalidArguments(format!(
-					"Unknown parameter '{key}': think accepts only 'thoughts'"
-				)));
-			}
-		}
+		let obj = args_object(args)?;
+		require_str(obj, "thoughts")?;
+		reject_unknown(obj, &["thoughts"])?;
 		Ok(ToolResult {
 			tool_call_id: String::new(),
 			content: "------".to_string(),

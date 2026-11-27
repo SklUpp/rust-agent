@@ -37,6 +37,19 @@ pub fn excluded_tool_reason(name: &str) -> Option<&'static str> {
 		.map(|(_, reason)| *reason)
 }
 
+/// OpenAI `tools[]` envelope for one model-facing tool schema.
+#[must_use]
+pub fn tool_schema_envelope(name: &str, description: &str, parameters: Value) -> Value {
+	serde_json::json!({
+		"type": "function",
+		"function": {
+			"name": name,
+			"description": description,
+			"parameters": parameters
+		}
+	})
+}
+
 /// Registry storing available tools for model interaction.
 ///
 /// Ordered (`BTreeMap`) so the schema list handed to the provider — part of the
@@ -88,14 +101,11 @@ impl ToolRegistry {
 			.values()
 			.filter(|tool| !hidden.iter().any(|name| name.as_str() == tool.name()))
 			.map(|tool| {
-				serde_json::json!({
-					"type": "function",
-					"function": {
-						"name": tool.wire_name().unwrap_or_else(|| tool.name()),
-						"description": tool.description(),
-						"parameters": tool.schema()
-					}
-				})
+				tool_schema_envelope(
+					tool.wire_name().unwrap_or_else(|| tool.name()),
+					tool.description(),
+					tool.schema(),
+				)
 			})
 			.collect()
 	}
@@ -183,14 +193,11 @@ impl ToolRegistry {
 			.tools
 			.values()
 			.map(|tool| {
-				serde_json::json!({
-					"type": "function",
-					"function": {
-						"name": tool.wire_name().unwrap_or_else(|| tool.name()),
-						"description": tool.description(),
-						"parameters": tool.schema()
-					}
-				})
+				tool_schema_envelope(
+					tool.wire_name().unwrap_or_else(|| tool.name()),
+					tool.description(),
+					tool.schema(),
+				)
 			})
 			.collect()
 	}
