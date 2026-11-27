@@ -58,6 +58,8 @@
 - `research-2026-11-27-06-9router-fork-sync.md` — Track 6: интеграция `9router` / `9routerx` / `CLIProxyAPI` (fork/upstream sync)
 - `research-2026-11-27-07-multiplatform-fallback.md` — Track 7: мультиплатформенная одновременная работа, remote offload и fallback
 - `research-2026-11-27-08-reviews-audit.md` — Сводный аудит независимых ревью (`ResearchReviewPlatform` и `ResearchReviewCoreEcosystem`) + матрица Go/No-Go
+- `research-2026-11-27-09-vfs-path-mirroring.md` — Расширение VFS до единого формата зеркалирования путей (`PathSpace` / `RootMap`, пересмотр границ D86)
+- `research-2026-11-27-10-platform-hal-tool-availability.md` — Платформенное разделение кода (`pi-sys` HAL), runtime-пробы `Caps` и максимальная доступность инструментов по OS
 
 ## Правила обновления
 
