@@ -5,8 +5,10 @@
 //! - existing destination files always win, so a partially migrated tree can
 //!   be re-merged without data loss;
 //! - symlinks are copied as symlinks (never followed into external trees);
-//! - `run/` (runtime locks/daemons), sockets, FIFOs, devices and `*.lock`
-//!   files are skipped;
+//! - `run/` (runtime locks/daemons) is always skipped at the source root;
+//!   the legacy user root additionally skips transient `wt/`, `cache/`,
+//!   `webcache/`, `logs/` and `natives/` trees;
+//! - sockets, FIFOs, devices and `*.lock` files are skipped;
 //! - private directories are created `0700`, files `0600`, and executables
 //!   `0700`;
 //! - `.migrated-from-omp-v1` is written atomically only when no copy error was
@@ -70,7 +72,7 @@ pub fn migrate_if_needed() {
 		legacy.display(),
 		current.display()
 	);
-	let mut report = copy_merge(&legacy, &current);
+	let mut report = copy_merge_legacy_root(&legacy, &current);
 	for category in [AgentDirCategory::Data, AgentDirCategory::State, AgentDirCategory::Cache] {
 		let Some(base) = category.xdg_home() else {
 			continue;
@@ -118,9 +120,21 @@ pub fn migration_pending(legacy: &Path, current: &Path) -> bool {
 /// Recursively merge `src` into `dst` without overwriting destination entries.
 ///
 /// `src` is never written. Returns warnings instead of failing so one
-/// unreadable file cannot abort the whole migration.
+/// unreadable file cannot abort the whole migration. Only `run/` is skipped at
+/// the source root; other same-named directories are preserved.
 #[must_use]
 pub fn copy_merge(src: &Path, dst: &Path) -> MergeReport {
+	copy_merge_with(src, dst, false)
+}
+
+/// Merge the implicit legacy user root (`~/.omp`), skipping runtime and
+/// transient top-level trees that the current process recreates. Other merged
+/// trees (XDG, sessions, security stores) keep those directories.
+fn copy_merge_legacy_root(src: &Path, dst: &Path) -> MergeReport {
+	copy_merge_with(src, dst, true)
+}
+
+fn copy_merge_with(src: &Path, dst: &Path, legacy_root: bool) -> MergeReport {
 	let mut report = MergeReport::default();
 	// The root itself may be a symlink to the user's data root; follow it, but
 	// entries below are handled with `symlink_metadata` and never followed.
@@ -142,7 +156,7 @@ pub fn copy_merge(src: &Path, dst: &Path) -> MergeReport {
 		));
 		return report;
 	}
-	merge_dir(src, dst, true, &src_root, &dst_norm, &mut report);
+	merge_dir(src, dst, true, legacy_root, &src_root, &dst_norm, &mut report);
 	report
 }
 
@@ -150,6 +164,7 @@ fn merge_dir(
 	src: &Path,
 	dst: &Path,
 	root: bool,
+	legacy_root: bool,
 	src_root: &Path,
 	dst_root: &Path,
 	report: &mut MergeReport,
@@ -180,9 +195,12 @@ fn merge_dir(
 			},
 		};
 		let name = entry.file_name();
+		if is_skipped_root_dir(root, legacy_root, &name) {
+			report.skipped_special += 1;
+			continue;
+		}
 		let src_path = entry.path();
 		let dst_path = dst.join(&name);
-		let is_run_dir = root && name == "run";
 		let metadata = match fs::symlink_metadata(&src_path) {
 			Ok(metadata) => metadata,
 			Err(error) => {
@@ -191,15 +209,11 @@ fn merge_dir(
 			},
 		};
 		let file_type = metadata.file_type();
-		if is_run_dir {
-			report.skipped_special += 1;
-			continue;
-		}
 		if let Ok(dst_metadata) = fs::symlink_metadata(&dst_path) {
 			// Existing files (and symlinks) always win, but an existing
 			// directory is merged so a partial tree still receives new files.
 			if file_type.is_dir() && dst_metadata.is_dir() {
-				merge_dir(&src_path, &dst_path, false, src_root, dst_root, report);
+				merge_dir(&src_path, &dst_path, false, false, src_root, dst_root, report);
 			} else {
 				report.skipped_existing += 1;
 			}
@@ -230,7 +244,7 @@ fn merge_dir(
 			continue;
 		}
 		if file_type.is_dir() {
-			merge_dir(&src_path, &dst_path, false, src_root, dst_root, report);
+			merge_dir(&src_path, &dst_path, false, false, src_root, dst_root, report);
 			report.copied_dirs += 1;
 			continue;
 		}
@@ -259,6 +273,20 @@ fn merge_dir(
 				.warnings
 				.push(format!("cannot copy {}: {error}", src_path.display())),
 		}
+	}
+}
+
+/// `run/` is runtime state and never migrated from any source root. The other
+/// transient trees are skipped only for the implicit legacy user root; XDG,
+/// session and security merges keep legitimate `cache/`, `logs/` etc.
+fn is_skipped_root_dir(root: bool, legacy_root: bool, name: &std::ffi::OsStr) -> bool {
+	if !root {
+		return false;
+	}
+	match name.to_str() {
+		Some("run") => true,
+		Some("wt" | "cache" | "webcache" | "logs" | "natives") => legacy_root,
+		_ => false,
 	}
 }
 
@@ -719,6 +747,70 @@ mod tests {
 		assert!(legacy.join("run/session-writer/a.lock").is_file(), "legacy run/ stays intact");
 		assert!(legacy.join("broker.sock").exists(), "legacy sockets stay intact");
 		assert!(report.skipped_special >= 3);
+	}
+
+	#[test]
+	fn copy_merge_skips_transient_root_dirs_but_keeps_nested_ones() {
+		let base = temp_dir("transient-root");
+		let legacy = base.join("legacy");
+		let current = base.join("current");
+		let external = base.join("external");
+		write(&external.join("secret.txt"), "outside");
+		for name in ["run", "wt", "webcache", "logs", "natives"] {
+			write(&legacy.join(name).join("state.txt"), name);
+		}
+		std::os::unix::fs::symlink(&external, legacy.join("cache")).expect("cache link");
+		write(&legacy.join("agent/state.txt"), "agent");
+		write(&legacy.join("agent/cache/cached.txt"), "nested cache");
+		write(&legacy.join("agent/logs/trace.log"), "nested logs");
+		write(&legacy.join("profiles/work/agent/state.txt"), "profile");
+
+		let report = copy_merge_legacy_root(&legacy, &current);
+
+		assert!(report.is_clean(), "{:?}", report.warnings);
+		for name in ["run", "wt", "cache", "webcache", "logs", "natives"] {
+			assert!(!current.join(name).exists(), "legacy top-level {name} must be skipped");
+		}
+		assert!(legacy.join("run/state.txt").is_file(), "legacy run/ stays intact");
+		assert!(
+			fs::symlink_metadata(legacy.join("cache")).unwrap().file_type().is_symlink(),
+			"a skipped transient symlink is never followed or replaced"
+		);
+		assert_eq!(fs::read_to_string(external.join("secret.txt")).unwrap(), "outside");
+		assert_eq!(fs::read_to_string(current.join("agent/state.txt")).unwrap(), "agent");
+		assert_eq!(
+			fs::read_to_string(current.join("agent/cache/cached.txt")).unwrap(),
+			"nested cache"
+		);
+		assert_eq!(
+			fs::read_to_string(current.join("agent/logs/trace.log")).unwrap(),
+			"nested logs"
+		);
+		assert_eq!(
+			fs::read_to_string(current.join("profiles/work/agent/state.txt")).unwrap(),
+			"profile"
+		);
+		assert_eq!(report.skipped_special, 6);
+
+		// `copy_merge` also migrates XDG, session-artifact and security-store
+		// trees, where same-named directories are legitimate.
+		let base = temp_dir("transient-generic");
+		let source = base.join("source");
+		let destination = base.join("destination");
+		for name in ["wt", "cache", "webcache", "logs", "natives"] {
+			write(&source.join(name).join("state.txt"), name);
+		}
+		write(&source.join("run/state.txt"), "run");
+		let report = copy_merge(&source, &destination);
+		assert!(report.is_clean(), "{:?}", report.warnings);
+		for name in ["wt", "cache", "webcache", "logs", "natives"] {
+			assert_eq!(
+				fs::read_to_string(destination.join(name).join("state.txt")).unwrap(),
+				name,
+				"copy_merge must preserve {name}/"
+			);
+		}
+		assert!(!destination.join("run").exists(), "copy_merge still skips root run/");
 	}
 
 	#[test]
