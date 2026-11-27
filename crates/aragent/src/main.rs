@@ -22,7 +22,7 @@ use aragent::{
 	config::Config,
 	config_cmd, daemon_broker,
 	deadline::{self, Deadline},
-	dirs, file_mentions,
+	dirs, doctor, file_mentions,
 	foreign_session::{self, ForeignSessionSource, ForeignSessionStore},
 	goal::{self, GoalMode, GoalModeState, GoalPersist, GoalRuntime, RestorePlan, TokenCounters},
 	goal_tool::{GOAL_TOOL_NAME, GoalTool},
@@ -783,6 +783,53 @@ fn run() -> std::result::Result<(), CliError> {
 			out.flush()?;
 			err.flush()?;
 			return local_exit(code);
+		},
+		Some(Command::Doctor {
+			fix,
+			json,
+			session_dir,
+			prune_artifacts,
+			redact_legacy,
+			backup,
+			yes,
+			reset_probes,
+		}) => {
+			let base = base_dir(&cli)?;
+			let sessions = session_dir
+				.as_ref()
+				.or(cli.session_dir.as_ref())
+				.map(|dir| dirs::absolute(&base, dir));
+			if let Some(dir) = &sessions
+				&& dir.exists()
+				&& !dir.is_dir()
+			{
+				return Err(CliError::usage(format!(
+					"arag doctor --session-dir {} is not a directory",
+					dir.display()
+				)));
+			}
+			let opts = doctor::DoctorOptions {
+				fix: *fix,
+				json: *json,
+				session_dir: sessions,
+				prune_artifacts: *prune_artifacts,
+				redact_legacy: *redact_legacy,
+				backup: backup.as_ref().map(|path| dirs::absolute(&base, path)),
+				yes: *yes,
+				reset_probes: *reset_probes,
+				overlays: cli.config.clone(),
+			};
+			doctor::validate_options(&opts).map_err(CliError::usage)?;
+			register_startup_credentials_for(&cli, &base);
+			let stdout = io::stdout();
+			let mut out = io::BufWriter::new(stdout.lock());
+			let code = doctor::run_doctor(&opts, &base, &mut out)
+				.map_err(|error| CliError::usage(error.to_string()))?;
+			out.flush().map_err(|error| CliError::usage(error.to_string()))?;
+			return local_exit(code);
+		},
+		Some(Command::InternalProbe { syscall }) => {
+			return local_exit(doctor::run_internal_probe(syscall));
 		},
 		Some(Command::Setup { component, check, json }) => {
 			let base = base_dir(&cli)?;

@@ -1468,6 +1468,65 @@ pub enum Command {
 		retain_newest_per_cwd: Option<u32>,
 	},
 
+	/// Diagnose local runtime state without modifying it.
+	///
+	/// Opens session and credential databases read-only, checks schema
+	/// integrity, unfinished work, redaction, artifacts, config, locks, file
+	/// permissions, and provider environment presence. Never prints secret
+	/// values. Exit codes: `0` clean, `1` findings present, `2` I/O or
+	/// argument validation error.
+	///
+	/// `--fix` is limited to safe non-destructive repairs. Data modification
+	/// requires explicit opt-in: `--prune-artifacts --yes` deletes artifact
+	/// files, and `--redact-legacy --backup <PATH> --yes` rewrites stored text
+	/// after writing a database backup.
+	Doctor {
+		/// Apply safe non-destructive repairs (WAL checkpoint, dead gc.lock and
+		/// broker lease cleanup, permission fixes). Never deletes advisory lock
+		/// files or relinks artifacts by filename.
+		#[arg(long)]
+		fix:             bool,
+		/// Output a structured JSON report instead of the section report.
+		#[arg(long)]
+		json:            bool,
+		/// Session storage root to scan instead of the default agent sessions
+		/// directory.
+		#[arg(long = "session-dir", value_name = "DIR")]
+		session_dir:     Option<PathBuf>,
+		/// Delete artifacts eligible for pruning; requires `--yes`.
+		#[arg(long = "prune-artifacts")]
+		prune_artifacts: bool,
+		/// Rewrite stored history that still contains redactable secrets;
+		/// requires `--backup` and `--yes`.
+		#[arg(long = "redact-legacy")]
+		redact_legacy:   bool,
+		/// Database backup path written before `--redact-legacy` modifies
+		/// anything.
+		#[arg(long, value_name = "PATH")]
+		backup:          Option<PathBuf>,
+		/// Confirm a data-modifying operation (`--prune-artifacts` or
+		/// `--redact-legacy`).
+		#[arg(long)]
+		yes:             bool,
+		/// Discard the cached Android runtime capability probe profile.
+		#[arg(long = "reset-probes")]
+		reset_probes:    bool,
+	},
+
+	/// Hidden child entry point for one fork-isolated syscall capability probe.
+	///
+	/// Never called by users: `arag doctor` spawns it with a short timeout so a
+	/// single `SIGSYS` cannot abort the remaining probes. Exit codes are the
+	/// `PROBE_*` constants in `aragent::doctor`; informational output is
+	/// suppressed.
+	#[command(hide = true, name = "__probe", disable_help_flag = true)]
+	InternalProbe {
+		/// Probe name (`pidfd_open`, `landlock_create_ruleset`,
+		/// `seccomp_unotify`, `unshare_user`, `memfd_create_execveat`).
+		#[arg(value_name = "SYSCALL", allow_hyphen_values = true)]
+		syscall: String,
+	},
+
 	/// Run onboarding setup or check optional dependencies.
 	///
 	/// `setup python` executes the configured/discovered interpreter for the

@@ -2341,6 +2341,129 @@ impl SqliteStore {
 		Ok(Self { path, connection })
 	}
 
+	/// Open an existing database for the narrow maintenance writes `arag doctor`
+	/// performs. Unlike [`Self::open`], this never creates directories, migrates
+	/// the schema, or changes the journal mode.
+	pub fn open_read_write_existing(path: impl Into<PathBuf>) -> StoreResult<Self> {
+		let path = path.into();
+		if path.as_os_str().is_empty() {
+			return Err(StoreError::Validation("session store path must not be empty".to_string()));
+		}
+		if !path.exists() {
+			return Err(StoreError::NotFound(format!(
+				"session database {} does not exist",
+				path.display()
+			)));
+		}
+		let connection = Connection::open_with_flags(
+			&path,
+			OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+		)?;
+		connection.busy_timeout(std::time::Duration::from_secs(5))?;
+		connection.pragma_update(None, "foreign_keys", "ON")?;
+		Ok(Self { path, connection })
+	}
+
+	/// Fold the write-ahead log into the main database file. Maintenance-only:
+	/// read-only callers must use [`Self::open_read_only`].
+	pub fn checkpoint_wal_truncate(&self) -> StoreResult<()> {
+		let (busy, _log, _checkpointed): (i64, i64, i64) = self.connection.query_row(
+			"PRAGMA wal_checkpoint(TRUNCATE)",
+			[],
+			|row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+		)?;
+		if busy != 0 {
+			return Err(StoreError::Validation(
+				"database is busy; WAL checkpoint skipped".to_string(),
+			));
+		}
+		Ok(())
+	}
+
+	/// Rewrite legacy session-history text/JSON that still contains redactable
+	/// secrets, in one `BEGIN IMMEDIATE` transaction. Returns changed row counts
+	/// by table. Never retries, replays, or touches rows that need no change.
+	pub fn redact_legacy_history(&mut self) -> StoreResult<Vec<(&'static str, usize)>> {
+		let transaction = self
+			.connection
+			.transaction_with_behavior(TransactionBehavior::Immediate)?;
+		let counts = Self::redact_in_transaction(&transaction)?;
+		transaction.commit()?;
+		Ok(counts)
+	}
+
+	/// Backup-then-redact under one writer lock: `BEGIN IMMEDIATE` is acquired
+	/// first, then `snapshot` runs while no other connection can commit (so the
+	/// backup and the rewritten rows describe exactly the same pre-redaction
+	/// state), and only then the DDL/DML runs and commits. Any snapshot or
+	/// verification error rolls the whole transaction back.
+	pub fn redact_legacy_history_with_backup<F>(
+		&mut self,
+		backup_target: &Path,
+		snapshot: F,
+	) -> StoreResult<Vec<(&'static str, usize)>>
+	where
+		F: FnOnce(&Path) -> std::result::Result<(), String>,
+	{
+		let transaction = self
+			.connection
+			.transaction_with_behavior(TransactionBehavior::Immediate)?;
+		snapshot(backup_target).map_err(StoreError::Validation)?;
+		let counts = Self::redact_in_transaction(&transaction)?;
+		transaction.commit()?;
+		Ok(counts)
+	}
+
+	fn redact_in_transaction(
+		transaction: &Transaction<'_>,
+	) -> StoreResult<Vec<(&'static str, usize)>> {
+		// Terminal outcomes are immutable by trigger, but legacy rows may still
+		// carry a secret. Drop and recreate the exact trigger inside the same
+		// transaction so an error rolls back both the update and the DDL.
+		let outcome_trigger = transaction
+			.query_row(
+				"SELECT sql FROM sqlite_master WHERE type = 'trigger' AND \
+				 name = 'executions_outcome_immutable'",
+				[],
+				|row| row.get::<_, String>(0),
+			)
+			.optional()?;
+		if outcome_trigger.is_some() {
+			transaction.execute_batch("DROP TRIGGER executions_outcome_immutable;")?;
+		}
+		let mut counts = Vec::new();
+		for (table, key, columns) in LEGACY_REDACTION_COLUMNS {
+			let changed = redact_table_rows(transaction, *table, *key, *columns)?;
+			if changed > 0 {
+				counts.push((*table, changed));
+			}
+		}
+		if let Some(sql) = outcome_trigger {
+			transaction.execute_batch(&sql)?;
+		}
+		Ok(counts)
+	}
+
+	/// Write a consistent standalone snapshot of this database to `target`.
+	/// `VACUUM INTO` reads one snapshot (including committed WAL content) and
+	/// never modifies the source, so concurrent writers cannot tear the copy.
+	pub fn vacuum_into(&self, target: &Path) -> StoreResult<()> {
+		if target.as_os_str().is_empty() {
+			return Err(StoreError::Validation("backup target must not be empty".to_string()));
+		}
+		if target.exists() {
+			return Err(StoreError::Validation(format!(
+				"backup target {} already exists",
+				target.display()
+			)));
+		}
+		let Some(target_text) = target.to_str() else {
+			return Err(StoreError::Validation("backup target path is not valid UTF-8".to_string()));
+		};
+		self.connection.execute("VACUUM INTO ?1", params![target_text])?;
+		Ok(())
+	}
+
 	/// Export one session's exact schema rows into a portable document. Read-only
 	/// from the caller's perspective: no recovery, no reconcile, no timestamp
 	/// refresh. Artifacts and workspace state are excluded (D55).
@@ -3408,6 +3531,11 @@ impl SqliteStore {
 	#[must_use]
 	pub fn path(&self) -> &Path {
 		&self.path
+	}
+
+	/// Borrow the underlying connection for read-only diagnostics (`arag doctor`).
+	pub(crate) fn connection(&self) -> &Connection {
+		&self.connection
 	}
 
 	/// Create the schema or verify the recorded version, in one transaction.
@@ -7659,6 +7787,108 @@ fn require_branch_owner(
 		))),
 	}
 }
+/// Columns rewritten by `arag doctor --redact-legacy`, in one transaction.
+/// `bool` marks a JSON column (parsed and traversed) versus free text.
+const LEGACY_REDACTION_COLUMNS: &[(&str, &str, &[(&str, bool)])] = &[
+	("sessions", "id", &[("payload_json", true)]),
+	("branches", "id", &[("payload_json", true)]),
+	("messages", "seq", &[("payload_json", true)]),
+	("executions", "seq", &[("intent_json", true), ("outcome_json", true)]),
+	("deliveries", "delivery_id", &[("payload_json", true)]),
+	("worker_completions", "worker_id", &[("completion_json", true)]),
+	("artifacts", "artifact_id", &[("location", false), ("metadata_json", true)]),
+	("task_admissions", "task_id", &[("spec_json", true)]),
+	("stream_drafts", "branch_id", &[("payload_json", true)]),
+];
+
+fn column_exists_conn(
+	connection: &Connection,
+	table: &str,
+	column: &str,
+) -> rusqlite::Result<bool> {
+	use rusqlite::OptionalExtension as _;
+	connection
+		.query_row(
+			"SELECT 1 FROM pragma_table_info(?1) WHERE name = ?2",
+			params![table, column],
+			|_| Ok(()),
+		)
+		.optional()
+		.map(|row| row.is_some())
+}
+
+fn redact_table_rows(
+	transaction: &Transaction<'_>,
+	table: &str,
+	key: &str,
+	columns: &'static [(&'static str, bool)],
+) -> StoreResult<usize> {
+	if !table_exists_conn(transaction, table)? {
+		return Ok(0);
+	}
+	let mut present: Vec<(&'static str, bool)> = Vec::new();
+	for (column, is_json) in columns {
+		if column_exists_conn(transaction, table, column)? {
+			present.push((*column, *is_json));
+		}
+	}
+	if present.is_empty() {
+		return Ok(0);
+	}
+	let projection = present.iter().map(|(column, _)| *column).collect::<Vec<_>>().join(", ");
+	let sql = format!("SELECT {key}, {projection} FROM {table}");
+	let mut statement = transaction.prepare(&sql)?;
+	let mut rows = statement.query([])?;
+	let mut pending: Vec<(rusqlite::types::Value, Vec<(&'static str, String)>)> = Vec::new();
+	while let Some(row) = rows.next()? {
+		let row_key: rusqlite::types::Value = row.get(0)?;
+		let mut changes: Vec<(&'static str, String)> = Vec::new();
+		for (offset, (column, is_json)) in present.iter().enumerate() {
+			let value: Option<String> = row.get(offset + 1)?;
+			let Some(value) = value else {
+				continue;
+			};
+			let redacted = if *is_json {
+				let Ok(mut json) = serde_json::from_str::<Value>(&value) else {
+					continue;
+				};
+				let before = json.clone();
+				redact_json_strings(&mut json);
+				if json == before {
+					continue;
+				}
+				serde_json::to_string(&json)?
+			} else {
+				let redacted = redact_free_text(&value);
+				if redacted == value {
+					continue;
+				}
+				redacted
+			};
+			changes.push((*column, redacted));
+		}
+		if !changes.is_empty() {
+			pending.push((row_key, changes));
+		}
+	}
+	drop(rows);
+	drop(statement);
+
+	let mut changed_rows = 0usize;
+	for (row_key, changes) in pending {
+		let assignments =
+			changes.iter().map(|(column, _)| format!("{column} = ?")).collect::<Vec<_>>().join(", ");
+		let sql = format!("UPDATE {table} SET {assignments} WHERE {key} = ?");
+		let mut values: Vec<rusqlite::types::Value> = changes
+			.into_iter()
+			.map(|(_, value)| rusqlite::types::Value::Text(value))
+			.collect();
+		values.push(row_key);
+		changed_rows += transaction.execute(&sql, params_from_iter(values))?;
+	}
+	Ok(changed_rows)
+}
+
 fn encode_json(value: &Value) -> StoreResult<String> {
 	serde_json::to_string(value).map_err(StoreError::Json)
 }
