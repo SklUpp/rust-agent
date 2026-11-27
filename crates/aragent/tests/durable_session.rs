@@ -220,6 +220,22 @@ fn temp_dir(label: &str) -> PathBuf {
 	path
 }
 
+fn create_private_dir(dir: &std::path::Path) {
+	#[cfg(unix)]
+	{
+		use std::os::unix::fs::DirBuilderExt;
+		std::fs::DirBuilder::new()
+			.recursive(true)
+			.mode(0o700)
+			.create(dir)
+			.expect("create private dir");
+	}
+	#[cfg(not(unix))]
+	{
+		std::fs::create_dir_all(dir).expect("create private dir");
+	}
+}
+
 fn header(id: &str, cwd: &std::path::Path) -> SessionHeader {
 	SessionHeader {
 		kind: "session".to_string(),
@@ -3725,7 +3741,7 @@ fn session_store_open_sets_occupied_when_lease_held() {
 
 	let dir = temp_dir("store-occupied");
 	let db_dir = dir.join("project");
-	std::fs::create_dir_all(&db_dir).unwrap();
+	create_private_dir(&db_dir);
 	let live = DurableSession::create(
 		aragent::durable_session::database_path(&db_dir),
 		header("s-store", &db_dir),

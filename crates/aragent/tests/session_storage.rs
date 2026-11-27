@@ -31,6 +31,22 @@ fn temp_dir(prefix: &str) -> PathBuf {
 	dir
 }
 
+fn create_private_dir(dir: &std::path::Path) {
+	#[cfg(unix)]
+	{
+		use std::os::unix::fs::DirBuilderExt;
+		std::fs::DirBuilder::new()
+			.recursive(true)
+			.mode(0o700)
+			.create(dir)
+			.expect("create private dir");
+	}
+	#[cfg(not(unix))]
+	{
+		fs::create_dir_all(dir).expect("create private dir");
+	}
+}
+
 #[test]
 fn read_ts_v3_session_fixture() {
 	let fixture_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -167,7 +183,7 @@ fn explicit_import_legacy_v1_creates_valid_v3_copy_without_mutating_v1() {
 	let original_content = fs::read_to_string(&v1_file).expect("read v1");
 
 	let target_dir = temp.join("v3-target");
-	fs::create_dir_all(&target_dir).expect("create target dir");
+	create_private_dir(&target_dir);
 
 	let imported_path = import_legacy_v1(&v1_file, &target_dir, None)
 		.expect("import legacy v1");
@@ -399,7 +415,7 @@ fn fork_session_creates_new_session_with_parent_reference() {
 	fs::copy(&fixture_path, &original).expect("copy");
 
 	let target_dir = temp.join("forks");
-	fs::create_dir_all(&target_dir).expect("create forks dir");
+	create_private_dir(&target_dir);
 
 	let forked_path = fork_session(&original, None, Some(&target_dir))
 		.expect("fork session");
@@ -432,7 +448,7 @@ fn fork_session_creates_new_session_with_parent_reference() {
 #[test]
 fn durable_fork_preserves_offbranch_tool_result_projection() {
 	let temp = temp_dir("durable-sibling");
-	let source_dir = temp.join("source"); let target_dir = temp.join("target"); fs::create_dir_all(&source_dir).expect("source");
+	let source_dir = temp.join("source"); let target_dir = temp.join("target"); create_private_dir(&source_dir);
 	let mut store = SqliteStore::open(source_dir.join("sessions.db")).expect("store");
 	let message = |id: &str, branch: &str, parent: Option<&str>, role: &str, content: &str| NewMessage { id: id.into(), session_id: "source".into(), branch_id: branch.into(), parent_message_id: parent.map(str::to_string), payload: json!({"type":"message","id":id,"parentId":parent,"timestamp":"2026-01-01T00:00:00Z","message":{"role":role,"content":content,"timestamp":1}}) };
 	let user = message("m1", "active", None, "user", "request");
@@ -449,7 +465,7 @@ fn durable_fork_preserves_offbranch_tool_result_projection() {
 
 #[test]
 fn durable_fork_validates_synthetic_call_with_offbranch_result() {
-	let temp = temp_dir("synthetic-call"); let source_dir = temp.join("source"); let target_dir = temp.join("target"); fs::create_dir_all(&source_dir).expect("source");
+	let temp = temp_dir("synthetic-call"); let source_dir = temp.join("source"); let target_dir = temp.join("target"); create_private_dir(&source_dir);
 	let mut store = SqliteStore::open(source_dir.join("sessions.db")).expect("store");
 	let assistant = NewMessage { id: "a1".into(), session_id: "source".into(), branch_id: "root".into(), parent_message_id: None, payload: json!({"type":"message","id":"a1","timestamp":"2026-01-01T00:00:00Z","message":{"role":"assistant","content":[{"type":"toolCall","id":"c1","name":"tool","arguments":{}}],"timestamp":1,"api":"openai-completions","provider":"test","model":"model","stopReason":"toolUse"}}) };
 	let result = NewMessage { id: "r1".into(), session_id: "source".into(), branch_id: "sibling".into(), parent_message_id: Some("a1".into()), payload: json!({"type":"message","id":"r1","parentId":"a1","timestamp":"2026-01-01T00:00:01Z","message":{"role":"toolResult","toolCallId":"c1","toolName":"tool","content":[{"type":"text","text":"ok"}],"isError":false,"timestamp":2}}) };
@@ -461,7 +477,7 @@ fn durable_fork_validates_synthetic_call_with_offbranch_result() {
 
 #[test]
 fn durable_fork_rejects_projected_tool_result_without_matching_ancestor() {
-	let temp = temp_dir("synthetic-unmatched"); let source_dir = temp.join("source"); let target_dir = temp.join("target"); fs::create_dir_all(&source_dir).expect("source");
+	let temp = temp_dir("synthetic-unmatched"); let source_dir = temp.join("source"); let target_dir = temp.join("target"); create_private_dir(&source_dir);
 	let mut store = SqliteStore::open(source_dir.join("sessions.db")).expect("store");
 	let result = NewMessage { id: "r1".into(), session_id: "source".into(), branch_id: "sibling".into(), parent_message_id: Some("a1".into()), payload: json!({"type":"message","id":"r1","parentId":"a1","timestamp":"2026-01-01T00:00:01Z","message":{"role":"toolResult","toolCallId":"real","toolName":"tool","content":"ok","isError":false,"timestamp":2}}) };
 	let assistant = NewMessage { id: "a1".into(), session_id: "source".into(), branch_id: "root".into(), parent_message_id: None, payload: json!({"type":"message","id":"a1","timestamp":"2026-01-01T00:00:00Z","message":{"role":"assistant","content":[{"type":"toolCall","id":"real","name":"tool","arguments":{}}],"timestamp":1,"api":"openai-completions","provider":"test","model":"model","stopReason":"toolUse"}}) };
@@ -478,7 +494,7 @@ fn fork_of_fork_retains_immutable_unknown_provenance_after_source_outcome_change
 	let source_dir = temp.join("source");
 	let first_dir = temp.join("first");
 	let second_dir = temp.join("second");
-	fs::create_dir_all(&source_dir).expect("source");
+	create_private_dir(&source_dir);
 	let mut store = SqliteStore::open(source_dir.join("sessions.db")).expect("store");
 	store.create_session(NewSession { id: "source".into(), parent_session_id: None, payload: json!({"type":"session","version":3,"id":"source","timestamp":"2026-01-01T00:00:00Z","cwd":"/tmp"}), initial_branch_id: "source.main".into(), initial_branch_payload: json!({}) }).expect("session");
 	store.append_message(NewMessage { id: "a1".into(), session_id: "source".into(), branch_id: "source.main".into(), parent_message_id: None, payload: json!({"type":"message","id":"a1","timestamp":"2026-01-01T00:00:00Z","message":{"role":"assistant","content":[{"type":"toolCall","id":"shared","name":"bash"}],"timestamp":1}}) }).expect("assistant");
@@ -537,7 +553,7 @@ fn fork_rejects_message_referencing_missing_execution_before_publication() {
 	let temp = temp_dir("provenance-missing");
 	let source_dir = temp.join("source");
 	let target_dir = temp.join("target");
-	fs::create_dir_all(&source_dir).expect("source");
+	create_private_dir(&source_dir);
 	let mut store = SqliteStore::open(source_dir.join("sessions.db")).expect("store");
 	store.create_session(NewSession { id: "source".into(), parent_session_id: None, payload: json!({"type":"session","version":3,"id":"source","timestamp":"2026-01-01T00:00:00Z","cwd":"/tmp"}), initial_branch_id: "source.main".into(), initial_branch_payload: json!({}) }).expect("session");
 	store.append_message(NewMessage { id: "a1".into(), session_id: "source".into(), branch_id: "source.main".into(), parent_message_id: None, payload: json!({"type":"message","id":"a1","timestamp":"2026-01-01T00:00:00Z","message":{"role":"assistant","content":[{"type":"toolCall","id":"shared","name":"bash"}],"timestamp":1}}) }).expect("assistant");
@@ -555,7 +571,7 @@ fn fork_prunes_sibling_branch_with_dangling_execution_reference() {
 	let temp = temp_dir("provenance-pruned");
 	let source_dir = temp.join("source");
 	let target_dir = temp.join("target");
-	fs::create_dir_all(&source_dir).expect("source");
+	create_private_dir(&source_dir);
 	let mut store = SqliteStore::open(source_dir.join("sessions.db")).expect("store");
 	store.create_session(NewSession { id: "source".into(), parent_session_id: None, payload: json!({"type":"session","version":3,"id":"source","timestamp":"2026-01-01T00:00:00Z","cwd":"/tmp"}), initial_branch_id: "source.main".into(), initial_branch_payload: json!({}) }).expect("session");
 	store.append_message(NewMessage { id: "a1".into(), session_id: "source".into(), branch_id: "source.main".into(), parent_message_id: None, payload: json!({"type":"message","id":"a1","timestamp":"2026-01-01T00:00:00Z","message":{"role":"user","content":"one","timestamp":1}}) }).expect("active message");
@@ -576,7 +592,7 @@ fn fork_prunes_sibling_branch_with_dangling_execution_reference() {
 
 #[test]
 fn fork_remaps_legacy_anchor_alias() {
-	let temp = temp_dir("legacy-anchor"); let source_dir = temp.join("source"); let target_dir = temp.join("target"); fs::create_dir_all(&source_dir).expect("source");
+	let temp = temp_dir("legacy-anchor"); let source_dir = temp.join("source"); let target_dir = temp.join("target"); create_private_dir(&source_dir);
 	let mut store = SqliteStore::open(source_dir.join("sessions.db")).expect("store");
 	store.create_session(NewSession { id: "source".into(), parent_session_id: None, payload: json!({"type":"session","version":3,"id":"source","timestamp":"2026-01-01T00:00:00Z","cwd":"/tmp"}), initial_branch_id: "active".into(), initial_branch_payload: json!({}) }).expect("session");
 	store.append_message(NewMessage { id: "m1".into(), session_id: "source".into(), branch_id: "active".into(), parent_message_id: None, payload: json!({"type":"message","id":"m1","timestamp":"2026-01-01T00:00:00Z","message":{"role":"user","content":"one","timestamp":1}}) }).expect("message");
@@ -599,9 +615,9 @@ fn moved_worktree_continue_reroots_and_resume_prefix_matches() {
 	let sessions_dir = temp.join("sessions");
 	let old_cwd = temp.join("old-project");
 	let new_cwd = temp.join("new-project");
-	fs::create_dir_all(&sessions_dir).expect("create sessions dir");
-	fs::create_dir_all(&old_cwd).expect("create old cwd");
-	fs::create_dir_all(&new_cwd).expect("create new cwd");
+	create_private_dir(&sessions_dir);
+	create_private_dir(&old_cwd);
+	create_private_dir(&new_cwd);
 
 	let id = "0192a5b0-7e44-7123-8abc-0123456789ab";
 	let mut seed = SessionStore::open(&SessionOptions {
@@ -664,8 +680,8 @@ fn breadcrumb_resumes_durable_session_after_legacy_file_deletion() {
 	let temp = temp_dir("breadcrumb-delete-legacy");
 	let sessions_dir = temp.join("sessions");
 	let cwd = temp.join("project");
-	fs::create_dir_all(&sessions_dir).expect("sessions dir");
-	fs::create_dir_all(&cwd).expect("cwd");
+	create_private_dir(&sessions_dir);
+	create_private_dir(&cwd);
 
 	let session_id = "0192a5b0-7e44-7123-8abc-0123456789ab";
 	let legacy_filename = format!("2026-03-31T08-00-00-000Z_{session_id}.jsonl");
@@ -725,8 +741,8 @@ fn breadcrumb_exact_stem_takes_priority_over_timestamp_stripped_id() {
 	let temp = temp_dir("breadcrumb-exact-stem");
 	let sessions_dir = temp.join("sessions");
 	let cwd = temp.join("project");
-	fs::create_dir_all(&sessions_dir).expect("sessions dir");
-	fs::create_dir_all(&cwd).expect("cwd");
+	create_private_dir(&sessions_dir);
+	create_private_dir(&cwd);
 
 	let stripped_id = "0192a5b0-test-stripped";
 	let exact_stem_id = format!("2026-03-31T08-00-00-000Z_{stripped_id}");
@@ -1526,7 +1542,7 @@ fn ts_v3_session_round_trip_preserves_ordered_parts_stop_reasons_and_resume_fork
 
 	// FORK: the round-tripped TS session still forks with lineage and parts.
 	let ts_fork_dir = temp.join("ts-forks");
-	fs::create_dir_all(&ts_fork_dir).expect("create TS fork dir");
+	create_private_dir(&ts_fork_dir);
 	let forked_path =
 		fork_session(&imported_path, None, Some(&ts_fork_dir)).expect("fork TS session");
 	assert!(!forked_path.exists(), "fork writes SQLite, not JSONL");
@@ -1575,7 +1591,7 @@ fn ts_v3_session_round_trip_preserves_ordered_parts_stop_reasons_and_resume_fork
 	let legacy_source = temp.join("v1-source.jsonl");
 	fs::copy(&legacy_fixture, &legacy_source).expect("copy v1 fixture");
 	let imported_dir = temp.join("v3-from-v1");
-	fs::create_dir_all(&imported_dir).expect("create import dir");
+	create_private_dir(&imported_dir);
 	let imported_path = import_legacy_v1(&legacy_source, &imported_dir, None).expect("import v1");
 
 	let mut imported = SessionStore::open(&SessionOptions {
@@ -1603,7 +1619,7 @@ fn ts_v3_session_round_trip_preserves_ordered_parts_stop_reasons_and_resume_fork
 	let imported_id = imported.header().expect("imported header").id.clone();
 
 	let legacy_fork_dir = temp.join("legacy-forks");
-	fs::create_dir_all(&legacy_fork_dir).expect("create legacy fork dir");
+	create_private_dir(&legacy_fork_dir);
 	let legacy_fork_path =
 		fork_session(&imported_path, None, Some(&legacy_fork_dir)).expect("fork imported v1");
 	assert!(!legacy_fork_path.exists(), "fork writes SQLite, not JSONL");
@@ -1765,7 +1781,7 @@ fn fork_copies_resolved_provenance_and_allows_new_reuse_cross_db() {
 	let temp = temp_dir("provenance-cross");
 	let source_dir = temp.join("source");
 	let target_dir = temp.join("target");
-	fs::create_dir_all(&source_dir).expect("source");
+	create_private_dir(&source_dir);
 	let mut store = SqliteStore::open(source_dir.join("sessions.db")).expect("store");
 	store.create_session(NewSession { id: "source".into(), parent_session_id: None, payload: json!({"type":"session","version":3,"id":"source","timestamp":"2026-01-01T00:00:00Z","cwd":"/tmp"}), initial_branch_id: "source.main".into(), initial_branch_payload: json!({}) }).expect("session");
 	store.append_message(NewMessage { id: "a1".into(), session_id: "source".into(), branch_id: "source.main".into(), parent_message_id: None, payload: json!({"type":"message","id":"a1","timestamp":"2026-01-01T00:00:00Z","message":{"role":"assistant","content":[{"type":"toolCall","id":"shared","name":"bash"}],"timestamp":1}}) }).expect("assistant");
@@ -1801,7 +1817,7 @@ fn fork_copies_resolved_provenance_and_allows_new_reuse_cross_db() {
 fn fork_same_db_unknown_provenance_is_immutable_and_not_operational() {
 	let temp = temp_dir("provenance-same");
 	let dir = temp.join("db");
-	fs::create_dir_all(&dir).expect("dir");
+	create_private_dir(&dir);
 	let db = dir.join("sessions.db");
 	let mut store = SqliteStore::open(&db).expect("store");
 	store.create_session(NewSession { id: "source".into(), parent_session_id: None, payload: json!({"type":"session","version":3,"id":"source","timestamp":"2026-01-01T00:00:00Z","cwd":"/tmp"}), initial_branch_id: "source.main".into(), initial_branch_payload: json!({}) }).expect("session");
