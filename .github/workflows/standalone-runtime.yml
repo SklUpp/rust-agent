@@ -60,7 +60,7 @@ jobs:
         if: github.event_name == 'workflow_dispatch' && inputs.refresh_patch_lock
         run: |
           cargo update -p rustls -p rustls-webpki -p tokio -p rustix
-          cargo update --ignore-rust-version -p url
+          cargo update --ignore-rust-version -p url -p form_urlencoded
       - name: Check agent core and CLI
         run: cargo check --locked -p pi-agent -p aragent
       - name: Test agent core and CLI
@@ -126,7 +126,7 @@ jobs:
         if: github.event_name == 'workflow_dispatch' && inputs.refresh_patch_lock
         run: |
           cargo update -p rustls -p rustls-webpki -p tokio -p rustix
-          cargo update --ignore-rust-version -p url
+          cargo update --ignore-rust-version -p url -p form_urlencoded
       - name: Build arag for aarch64-linux-android
         env:
           NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
@@ -178,7 +178,7 @@ jobs:
         if: github.event_name == 'workflow_dispatch' && inputs.refresh_patch_lock
         run: |
           cargo update -p rustls -p rustls-webpki -p tokio -p rustix
-          cargo update --ignore-rust-version -p url
+          cargo update --ignore-rust-version -p url -p form_urlencoded
       - name: Check advisories, licenses, and sources
         run: cargo deny check
       - name: Generate dependency license data
