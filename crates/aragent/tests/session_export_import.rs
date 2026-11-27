@@ -23,6 +23,11 @@ fn temp_dir(prefix: &str) -> PathBuf {
 	);
 	let dir = std::env::temp_dir().join(unique);
 	fs::create_dir_all(&dir).expect("create temp dir");
+	#[cfg(unix)]
+	{
+		use std::os::unix::fs::PermissionsExt;
+		fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).expect("chmod temp dir");
+	}
 	dir
 }
 

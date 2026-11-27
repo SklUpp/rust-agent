@@ -211,6 +211,12 @@ fn temp_dir(label: &str) -> PathBuf {
 		NEXT.fetch_add(1, Ordering::SeqCst)
 	));
 	std::fs::create_dir_all(&path).expect("create temp dir");
+	#[cfg(unix)]
+	{
+		use std::os::unix::fs::PermissionsExt;
+		std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700))
+			.expect("chmod temp dir");
+	}
 	path
 }
 

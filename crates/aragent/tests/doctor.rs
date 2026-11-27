@@ -47,7 +47,7 @@ impl Fixture {
 		for dir in [&home, &base, &agent, &sessions, &project, &work, &tmp, &runtime] {
 			fs::create_dir_all(dir).expect("create fixture directory");
 		}
-		for dir in [&home, &base, &agent, &sessions, &tmp, &runtime] {
+		for dir in [&root, &home, &base, &agent, &sessions, &project, &work, &tmp, &runtime] {
 			set_mode(dir, 0o700);
 		}
 		Self { root, home, base, agent, sessions, work, project }
