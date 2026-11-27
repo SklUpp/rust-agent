@@ -201,17 +201,17 @@ fn corrupted_database_reports_json_findings() {
 
 	let output = fixture.run(&["doctor", "--json"]);
 	assert_eq!(code(&output), 1, "{}", stdout(&output));
-	let report = report(&output);
-	assert_json_schema(&report);
-	assert_eq!(report["clean"], false);
-	let db = report["sections"]
+	let initial_report = report(&output);
+	assert_json_schema(&initial_report);
+	assert_eq!(initial_report["clean"], false);
+	let db = initial_report["sections"]
 		.as_array()
 		.expect("sections")
 		.iter()
 		.find(|section| section["name"] == "db")
 		.expect("db section");
 	assert_ne!(db["status"], "ok");
-	let codes = section_codes(&report, "db");
+	let codes = section_codes(&initial_report, "db");
 	assert!(
 		codes.contains(&"db-open") || codes.contains(&"integrity"),
 		"expected an open/integrity finding, got {codes:?}"
@@ -266,9 +266,9 @@ fn orphan_rows_fail_and_fix_only_checkpoints_the_wal() {
 
 	let scan = fixture.run(&["doctor", "--json"]);
 	assert_eq!(code(&scan), 1, "{}", stdout(&scan));
-	let report = report(&scan);
-	assert_json_schema(&report);
-	assert!(section_codes(&report, "db").contains(&"foreign-key"));
+	let scan_report = report(&scan);
+	assert_json_schema(&scan_report);
+	assert!(section_codes(&scan_report, "db").contains(&"foreign-key"));
 
 	let fixed = fixture.run(&["doctor", "--fix", "--json"]);
 	assert_eq!(code(&fixed), 1, "orphans must remain without explicit repair");
