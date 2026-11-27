@@ -54,7 +54,7 @@ pub use task::TaskTool;
 pub use think::ThinkTool;
 pub use todo::TodoTool;
 pub use yield_tool::YieldTool;
-pub use web_search::{SearxngConfig, WebSearchTool};
+pub use web_search::{GatewaySearchConfig, SearxngConfig, WebSearchTool};
 pub use staged_ops::{FileOpsAction, OpKind, PreparedOp};
 
 use std::{

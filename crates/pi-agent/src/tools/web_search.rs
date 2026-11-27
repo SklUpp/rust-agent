@@ -8,8 +8,16 @@
 //! Upstream resolves a provider chain (`web/search/provider.ts`); this slice
 //! ships SearXNG plus the free fallback, so there is one concrete tool and no
 //! provider abstraction. The endpoint and every credential arrive through
-//! [`SearxngConfig`] from trusted host settings/env, never from tool arguments,
-//! so the model cannot redirect the request.
+//! [`SearxngConfig`] (and optionally [`GatewaySearchConfig`]) from trusted host
+//! settings/env, never from tool arguments, so the model cannot redirect the
+//! request.
+//!
+//! When a gateway is configured, `POST {gateway}/v1/search` (9router/
+//! OmniRoute contract: `{provider, query, max_results, time_range}`, unified
+//! `{provider, query, results[], answer, errors[]}`) is tried first. Its
+//! transient outcomes — transport/timeout, 404, 408, 429, 5xx, or a 200 with
+//! only upstream errors — drop through to the SearXNG → DuckDuckGo chain; its
+//! configuration and payload errors are surfaced.
 //!
 //! Request/response mapping mirrors `web/search/providers/searxng.ts`:
 //! `GET {endpoint}/search?format=json`, query canonicalized with
@@ -134,6 +142,49 @@ impl SearxngConfig {
 	}
 }
 
+/// Optional 9router/OmniRoute search gateway, host-resolved.
+///
+/// `endpoint` is the gateway root (a trailing `/v1` is accepted and not
+/// doubled); `provider` selects the gateway-side search adapter and is omitted
+/// when unset so gateways with auto-selection still work; `api_key` is sent as
+/// `Bearer` and never reaches a tool argument.
+#[derive(Clone, Default, PartialEq, Eq)]
+pub struct GatewaySearchConfig {
+	pub endpoint: Option<String>,
+	pub api_key:  Option<String>,
+	pub provider: Option<String>,
+}
+
+/// Credentials are masked (presence only).
+impl std::fmt::Debug for GatewaySearchConfig {
+	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		f.debug_struct("GatewaySearchConfig")
+			.field("endpoint", &self.endpoint)
+			.field("api_key", &self.api_key.as_ref().map(|_| "[REDACTED]"))
+			.field("provider", &self.provider)
+			.finish()
+	}
+}
+
+impl GatewaySearchConfig {
+	/// Layer the `NINEROUTER_*` environment fallbacks under the settings values.
+	///
+	/// Only the host calls this; the tool never reads the environment itself.
+	#[must_use]
+	pub fn with_env_overrides(mut self, env: &HashMap<String, String>) -> Self {
+		if !self.endpoint.as_deref().is_some_and(|value| !value.is_empty()) {
+			self.endpoint = env.get("NINEROUTER_URL").filter(|value| !value.is_empty()).cloned();
+		}
+		if !self.api_key.as_deref().is_some_and(|value| !value.is_empty()) {
+			self.api_key = env.get("NINEROUTER_API_KEY").filter(|value| !value.is_empty()).cloned();
+		}
+		if !self.provider.as_deref().is_some_and(|value| !value.is_empty()) {
+			self.provider = env.get("NINEROUTER_SEARCH_PROVIDER").filter(|value| !value.is_empty()).cloned();
+		}
+		self
+	}
+}
+
 /// Everything that must never reach the model in transport or mapping errors:
 /// the resolved `Authorization` value, its Basic payload, and the raw secrets.
 struct Redactor {
@@ -154,9 +205,28 @@ impl Redactor {
 				secrets.push(secret.to_string());
 			}
 		}
+		Self::from_secrets(secrets)
+	}
+
+	fn from_secrets(secrets: impl IntoIterator<Item = String>) -> Self {
+		let mut expanded: Vec<String> = Vec::new();
+		for secret in secrets {
+			if secret.is_empty() {
+				continue;
+			}
+			// Error bodies often echo a credential inside JSON, where `"` and
+			// `\` arrive escaped (`\"`, `\\`). Scrub both spellings.
+			if let Ok(quoted) = serde_json::to_string(&secret)
+				&& let Some(escaped) = quoted.strip_prefix('"').and_then(|quoted| quoted.strip_suffix('"'))
+				&& escaped != secret.as_str()
+			{
+				expanded.push(escaped.to_string());
+			}
+			expanded.push(secret);
+		}
 		// Longest first so an encoded header cannot survive a partial replace.
-		secrets.sort_by_key(|secret| std::cmp::Reverse(secret.len()));
-		Self { secrets }
+		expanded.sort_by_key(|secret| std::cmp::Reverse(secret.len()));
+		Self { secrets: expanded }
 	}
 
 	fn redact(&self, text: &str) -> String {
@@ -179,6 +249,7 @@ impl Redactor {
 /// fallback for an unconfigured or unavailable instance.
 pub struct WebSearchTool {
 	config: SearxngConfig,
+	gateway: Option<GatewaySearchConfig>,
 	client: reqwest::Client,
 	timeout: Duration,
 	fallback_endpoint: String,
@@ -188,6 +259,7 @@ impl WebSearchTool {
 	pub fn new(config: SearxngConfig) -> Self {
 		Self {
 			config,
+			gateway: None,
 			// Endpoint is fixed by host config; a redirect could both break the
 			// JSON parse (external bangs) and carry `Authorization` to another
 			// origin, so redirects are surfaced as errors instead of followed.
@@ -198,6 +270,14 @@ impl WebSearchTool {
 			timeout: REQUEST_TIMEOUT,
 			fallback_endpoint: DUCKDUCKGO_LITE_URL.to_string(),
 		}
+	}
+
+	/// Install a host-resolved search gateway, tried before SearXNG. Host
+	/// plumbing only: the tool schema never exposes the endpoint or key.
+	#[must_use]
+	pub fn with_gateway(mut self, gateway: GatewaySearchConfig) -> Self {
+		self.gateway = Some(gateway);
+		self
 	}
 
 	/// Override the DuckDuckGo Lite endpoint. Host/test plumbing only: the tool
@@ -218,8 +298,8 @@ impl WebSearchTool {
 				| "temperature" => {},
 				"endpoint" | "base_url" | "url" => {
 					return Err(ToolError::InvalidArguments(format!(
-						"'{key}' is not a tool parameter: the SearXNG endpoint comes from host \
-						 settings (searxng.endpoint / SEARXNG_ENDPOINT)"
+						"'{key}' is not a tool parameter: search endpoints and credentials come from \
+						 host settings (searxng.* / gateway.*), never from tool arguments"
 					)));
 				},
 				other => {
@@ -261,8 +341,9 @@ impl WebSearchTool {
 		})
 	}
 
-	/// Validate the configured endpoint and return it without the trailing `/`,
-	/// so both `/search` and `/config` resolve against the same canonical base.
+	/// Validate the configured SearXNG endpoint and return it without the
+	/// trailing `/`, so both `/search` and `/config` resolve against the same
+	/// canonical base.
 	fn endpoint_base(&self) -> Result<String, ToolError> {
 		let endpoint = self
 			.config
@@ -270,32 +351,47 @@ impl WebSearchTool {
 			.as_deref()
 			.filter(|endpoint| !endpoint.trim().is_empty())
 			.ok_or_else(|| ToolError::ExecutionFailed(NOT_CONFIGURED.to_string()))?;
-		if endpoint.chars().any(char::is_control) {
+		validated_endpoint_base(
+			endpoint,
+			"searxng.endpoint",
+			"searxng.basicUsername/searxng.basicPassword or searxng.token",
+		)
+	}
+
+	/// Resolve the gateway search URL, or `None` when no gateway is configured.
+	/// A trailing `/v1` on the host setting is tolerated so both the gateway
+	/// root and an OpenAI-style base point at the same `POST /v1/search`.
+	fn gateway_endpoint(&self) -> Result<Option<Url>, ToolError> {
+		let Some(gateway) = &self.gateway else {
+			return Ok(None);
+		};
+		let Some(endpoint) = gateway.endpoint.as_deref() else {
+			return Ok(None);
+		};
+		// Match the SearXNG path: a control-only endpoint is a host
+		// configuration error, while a blank one is simply unconfigured.
+		if has_control_characters(endpoint) {
 			return Err(ToolError::ExecutionFailed(
-				"searxng.endpoint must not contain control characters".to_string(),
+				"gateway.endpoint must not contain control characters".to_string(),
 			));
 		}
-		let base = endpoint.trim().trim_end_matches('/').to_string();
-		let url = Url::parse(&base)
-			.map_err(|error| ToolError::ExecutionFailed(format!("searxng.endpoint is not a valid URL: {error}")))?;
-		if !matches!(url.scheme(), "http" | "https") {
+		if endpoint.trim().is_empty() {
+			return Ok(None);
+		}
+		let base = validated_endpoint_base(
+			endpoint,
+			"gateway.endpoint",
+			"gateway.apiKey or NINEROUTER_API_KEY",
+		)?;
+		let base = base.strip_suffix("/v1").unwrap_or(&base);
+		if base.is_empty() {
 			return Err(ToolError::ExecutionFailed(
-				"searxng.endpoint must use the http or https scheme".to_string(),
+				"gateway.endpoint must include a host".to_string(),
 			));
 		}
-		if !url.username().is_empty() || url.password().is_some() {
-			return Err(ToolError::ExecutionFailed(
-				"searxng.endpoint must not embed credentials; use searxng.basicUsername/\
-				 searxng.basicPassword or searxng.token"
-					.to_string(),
-			));
-		}
-		if url.query().is_some() || url.fragment().is_some() {
-			return Err(ToolError::ExecutionFailed(
-				"searxng.endpoint must not carry a query string or fragment".to_string(),
-			));
-		}
-		Ok(base)
+		Url::parse(&format!("{base}/v1/search"))
+			.map(Some)
+			.map_err(|error| ToolError::ExecutionFailed(format!("gateway.endpoint is not a valid URL: {error}")))
 	}
 
 	/// Resolve `Authorization` following upstream precedence: Basic credentials
@@ -480,48 +576,125 @@ impl WebSearchTool {
 		request: reqwest::RequestBuilder,
 		token: &CancellationToken,
 		redactor: &Redactor,
-	) -> Result<(StatusCode, String), SearXngFailure> {
+	) -> Result<(StatusCode, String), SearchFailure> {
 		let response = tokio::select! {
-			() = token.cancelled() => return Err(SearXngFailure::Fatal(ToolError::Aborted(
+			() = token.cancelled() => return Err(SearchFailure::Fatal(ToolError::Aborted(
 				"web search cancelled".to_string(),
 			))),
 			result = tokio::time::timeout(self.timeout, request.send()) => match result {
 				Ok(Ok(response)) => response,
-				Ok(Err(_)) | Err(_) => return Err(SearXngFailure::Unavailable),
+				Ok(Err(_)) | Err(_) => return Err(SearchFailure::Unavailable),
 			},
 		};
 		let status = response.status();
 		if status.is_server_error() {
-			return Err(SearXngFailure::Unavailable);
+			return Err(SearchFailure::Unavailable);
 		}
 		let body = tokio::select! {
-			() = token.cancelled() => return Err(SearXngFailure::Fatal(ToolError::Aborted(
+			() = token.cancelled() => return Err(SearchFailure::Fatal(ToolError::Aborted(
 				"web search cancelled".to_string(),
 			))),
 			result = tokio::time::timeout(self.timeout, read_bounded_body(response)) => match result {
 				Ok(Ok(body)) => body,
 				Ok(Err(error)) => {
 					let message = format!(
-						"SearXNG request failed while reading the response: {}",
+						"web search request failed while reading the response: {}",
 						redactor.redact(&error)
 					);
 					return Err(if status.is_success() {
-						SearXngFailure::Unavailable
+						SearchFailure::Unavailable
 					} else {
-						SearXngFailure::Fatal(ToolError::ExecutionFailed(message))
+						SearchFailure::Fatal(ToolError::ExecutionFailed(message))
 					});
 				},
 				Err(_) => {
-					let message = format!("SearXNG request timed out after {}s", self.timeout.as_secs());
+					let message = format!("web search request timed out after {}s", self.timeout.as_secs());
 					return Err(if status.is_success() {
-						SearXngFailure::Unavailable
+						SearchFailure::Unavailable
 					} else {
-						SearXngFailure::Fatal(ToolError::ExecutionFailed(message))
+						SearchFailure::Fatal(ToolError::ExecutionFailed(message))
 					});
 				},
 			},
 		};
 		Ok((status, body))
+	}
+
+	/// Resolve gateway auth material and a redactor covering `Bearer`/raw keys.
+	fn gateway_auth(&self) -> Result<(Option<String>, Redactor), ToolError> {
+		let gateway = self
+			.gateway
+			.as_ref()
+			.ok_or_else(|| ToolError::ExecutionFailed("gateway is not configured".to_string()))?;
+		let key = gateway.api_key.as_deref().filter(|key| !key.is_empty());
+		let authorization = key.map(|key| format!("Bearer {key}"));
+		if let Some(authorization) = &authorization
+			&& header::HeaderValue::from_str(authorization).is_err()
+		{
+			return Err(ToolError::ExecutionFailed(
+				"gateway.apiKey is not a valid HTTP Authorization header value.".to_string(),
+			));
+		}
+		let redactor = Redactor::from_secrets(
+			authorization.iter().cloned().chain(key.map(str::to_string)),
+		);
+		Ok((authorization, redactor))
+	}
+
+	/// One `POST {gateway}/v1/search` attempt. Gateway errors are scrubbed of
+	/// every key form before they can reach the model.
+	async fn gateway_search(
+		&self,
+		url: Url,
+		params: &SearchParams,
+		token: &CancellationToken,
+	) -> Result<SearchResponse, SearchFailure> {
+		let (authorization, redactor) = self
+			.gateway_auth()
+			.map_err(SearchFailure::Fatal)?;
+		let gateway = self.gateway.as_ref().expect("gateway checked by gateway_endpoint");
+		let mut payload = json!({
+			"query": strip_external_bangs(params.query.trim()),
+			"max_results": params.num_results,
+		});
+		if let Some(provider) = gateway.provider.as_deref().filter(|provider| !provider.trim().is_empty()) {
+			payload["provider"] = json!(provider.trim());
+		}
+		if let Some(recency) = params.recency {
+			payload["time_range"] = json!(recency.as_str());
+		}
+		let mut request = self
+			.client
+			.post(url)
+			.header(header::ACCEPT, "application/json")
+			.json(&payload);
+		if let Some(authorization) = &authorization {
+			request = request.header(header::AUTHORIZATION, authorization.clone());
+		}
+		let (status, body) = self.send(request, token, &redactor).await?;
+		if !status.is_success() {
+			// Scrub before truncation (so a full key cannot straddle the cut)
+			// and again after formatting (so JSON-escaped echoes are covered).
+			let message = redactor.redact(&gateway_error_message(status, &redactor.redact(&body)));
+			// 404/408/429 are "no usable gateway search right now"; auth and
+			// malformed-request statuses are host configuration errors.
+			return Err(if matches!(status.as_u16(), 404 | 408 | 429) {
+				SearchFailure::Unavailable
+			} else {
+				SearchFailure::Fatal(ToolError::ExecutionFailed(message))
+			});
+		}
+		let payload: Value = serde_json::from_str(&body).map_err(|error| {
+			SearchFailure::Fatal(ToolError::ExecutionFailed(format!(
+				"search gateway response was not valid JSON: {error}"
+			)))
+		})?;
+		let mut response = map_gateway_response(&payload, params.num_results).map_err(|failure| match failure {
+			SearchFailure::Unavailable => SearchFailure::Unavailable,
+			SearchFailure::Fatal(error) => SearchFailure::Fatal(redactor.redact_error(error)),
+		})?;
+		apply_constraints(&mut response, &params.parsed);
+		Ok(response)
 	}
 
 	/// One DuckDuckGo Lite search. HTML-only: no credentials are sent and
@@ -611,21 +784,21 @@ impl WebSearchTool {
 		limit: usize,
 		parsed: &StructuredQuery,
 		redactor: &Redactor,
-	) -> Result<SearchResponse, SearXngFailure> {
+	) -> Result<SearchResponse, SearchFailure> {
 		if !status.is_success() {
-			return Err(SearXngFailure::Fatal(ToolError::ExecutionFailed(http_error_message(
+			return Err(SearchFailure::Fatal(ToolError::ExecutionFailed(http_error_message(
 				status,
 				&redactor.redact(&body),
 			))));
 		}
 		let payload: Value = serde_json::from_str(&body).map_err(|error| {
-			SearXngFailure::Fatal(ToolError::ExecutionFailed(format!(
+			SearchFailure::Fatal(ToolError::ExecutionFailed(format!(
 				"SearXNG response was not valid JSON: {error}"
 			)))
 		})?;
 		let mut response = map_response(&payload, limit).map_err(|failure| match failure {
-			SearXngFailure::Unavailable => SearXngFailure::Unavailable,
-			SearXngFailure::Fatal(error) => SearXngFailure::Fatal(redactor.redact_error(error)),
+			SearchFailure::Unavailable => SearchFailure::Unavailable,
+			SearchFailure::Fatal(error) => SearchFailure::Fatal(redactor.redact_error(error)),
 		})?;
 
 		// Lenient constraint pass: enforce site:/inurl:/intitle:/filetype:/date
@@ -634,7 +807,7 @@ impl WebSearchTool {
 		apply_constraints(&mut response, parsed);
 
 		if response.answer.is_none() && response.sources.is_empty() && response.related_questions.is_empty() {
-			return Err(SearXngFailure::Fatal(ToolError::ExecutionFailed(
+			return Err(SearchFailure::Fatal(ToolError::ExecutionFailed(
 				"SearXNG returned no renderable search content.".to_string(),
 			)));
 		}
@@ -668,7 +841,7 @@ impl Tool for WebSearchTool {
 				"query": {
 					"type": "string",
 					"description": "Search query; Google-style site:/after:/inurl:/filetype: operators \
-					 are forwarded to SearXNG."
+					 are forwarded to the configured search backend."
 				},
 				"recency": {
 					"type": "string",
@@ -703,6 +876,17 @@ impl Tool for WebSearchTool {
 		if token.is_cancelled() {
 			return Err(ToolError::Aborted("web search cancelled".to_string()));
 		}
+		// A configured gateway is tried before SearXNG. Its endpoint is
+		// validated first so an explicit host misconfiguration is surfaced
+		// instead of silently degrading to the free fallback.
+		let gateway_failed = match self.gateway_endpoint()? {
+			Some(url) => match self.gateway_search(url, &params, &token).await {
+				Ok(response) => return Ok(search_result(&response, "gateway")),
+				Err(SearchFailure::Fatal(error)) => return Err(error),
+				Err(SearchFailure::Unavailable) => true,
+			},
+			None => false,
+		};
 		// Control-only endpoints are configuration errors, not blank/unconfigured.
 		if self.config.endpoint.as_deref().is_some_and(has_control_characters) {
 			return Err(ToolError::ExecutionFailed(
@@ -713,11 +897,7 @@ impl Tool for WebSearchTool {
 		// credentials to validate, so go straight to the free fallback.
 		if !self.config.endpoint.as_deref().is_some_and(|endpoint| !endpoint.trim().is_empty()) {
 			return self
-				.fallback_result(
-					&params,
-					&token,
-					Some("SearXNG endpoint not configured; used duckduckgo-free.".to_string()),
-				)
+				.fallback_result(&params, &token, Some(fallback_note(gateway_failed, true)))
 				.await;
 		}
 		let base = self.endpoint_base()?;
@@ -735,39 +915,73 @@ impl Tool for WebSearchTool {
 		}
 		let (status, body) = match self.send(request, &token, &redactor).await {
 			Ok(exchange) => exchange,
-			Err(SearXngFailure::Unavailable) => {
+			Err(SearchFailure::Unavailable) => {
 				return self
-					.fallback_result(
-						&params,
-						&token,
-						Some("SearXNG was unavailable; fell back to duckduckgo-free.".to_string()),
-					)
+					.fallback_result(&params, &token, Some(fallback_note(gateway_failed, false)))
 					.await;
 			},
-			Err(SearXngFailure::Fatal(error)) => return Err(error),
+			Err(SearchFailure::Fatal(error)) => return Err(error),
 		};
 		let response = match self.parse_response(status, body, params.num_results, &params.parsed, &redactor) {
 			Ok(response) => response,
-			Err(SearXngFailure::Unavailable) => {
+			Err(SearchFailure::Unavailable) => {
 				return self
-					.fallback_result(
-						&params,
-						&token,
-						Some("SearXNG was unavailable; fell back to duckduckgo-free.".to_string()),
-					)
+					.fallback_result(&params, &token, Some(fallback_note(gateway_failed, false)))
 					.await;
 			},
-			Err(SearXngFailure::Fatal(error)) => return Err(error),
+			Err(SearchFailure::Fatal(error)) => return Err(error),
 		};
 		Ok(search_result(&response, "searxng"))
 	}
 }
 
-/// Outcome of a SearXNG lookup. Only [`SearXngFailure::Unavailable`] is safe to
-/// retry on the credential-free fallback; everything else is surfaced.
-enum SearXngFailure {
+/// Note attached when the SearXNG-backed attempt falls through to the
+/// credential-free fallback; names the gateway too when it failed first.
+fn fallback_note(gateway_failed: bool, searxng_unconfigured: bool) -> String {
+	if gateway_failed {
+		"Search gateway and SearXNG were unavailable; fell back to duckduckgo-free.".to_string()
+	} else if searxng_unconfigured {
+		"SearXNG endpoint not configured; used duckduckgo-free.".to_string()
+	} else {
+		"SearXNG was unavailable; fell back to duckduckgo-free.".to_string()
+	}
+}
+
+/// Validate a host-configured backend base URL: no control characters, http(s)
+/// only, no embedded credentials, no query/fragment, no trailing `/`.
+fn validated_endpoint_base(raw: &str, setting: &str, credential_hint: &str) -> Result<String, ToolError> {
+	if raw.chars().any(char::is_control) {
+		return Err(ToolError::ExecutionFailed(format!(
+			"{setting} must not contain control characters"
+		)));
+	}
+	let base = raw.trim().trim_end_matches('/').to_string();
+	let url = Url::parse(&base)
+		.map_err(|error| ToolError::ExecutionFailed(format!("{setting} is not a valid URL: {error}")))?;
+	if !matches!(url.scheme(), "http" | "https") {
+		return Err(ToolError::ExecutionFailed(format!(
+			"{setting} must use the http or https scheme"
+		)));
+	}
+	if !url.username().is_empty() || url.password().is_some() {
+		return Err(ToolError::ExecutionFailed(format!(
+			"{setting} must not embed credentials; use {credential_hint}"
+		)));
+	}
+	if url.query().is_some() || url.fragment().is_some() {
+		return Err(ToolError::ExecutionFailed(format!(
+			"{setting} must not carry a query string or fragment"
+		)));
+	}
+	Ok(base)
+}
+
+/// Outcome of one configured backend lookup. Only
+/// [`SearchFailure::Unavailable`] is safe to retry on the credential-free
+/// fallback; everything else is surfaced.
+enum SearchFailure {
 	/// Transport/connect/timeout, HTTP 5xx (detected before the body read), or
-	/// every routed engine failed with no usable result.
+	/// every routed upstream failed with no usable result.
 	Unavailable,
 	/// Configuration-independent wire/payload failure, 3xx/4xx, or cancellation.
 	Fatal(ToolError),
@@ -804,6 +1018,16 @@ impl Recency {
 		match self {
 			Self::Day => "day",
 			Self::Week | Self::Month => "month",
+			Self::Year => "year",
+		}
+	}
+
+	/// Gateway adapters accept the caller-facing names directly.
+	fn as_str(self) -> &'static str {
+		match self {
+			Self::Day => "day",
+			Self::Week => "week",
+			Self::Month => "month",
 			Self::Year => "year",
 		}
 	}
@@ -1126,12 +1350,113 @@ fn body_is_quota_exhausted(body: &str) -> bool {
 	false
 }
 
-fn map_response(payload: &Value, limit: usize) -> Result<SearchResponse, SearXngFailure> {
+fn gateway_error_message(status: StatusCode, body: &str) -> String {
+	let detail = match status.as_u16() {
+		401 => "401 unauthorized".to_string(),
+		403 => "403 forbidden".to_string(),
+		404 => "404 search endpoint not found".to_string(),
+		408 => "408 request timeout".to_string(),
+		429 => "429 rate limited".to_string(),
+		code => format!("HTTP {code}"),
+	};
+	let body = body.trim();
+	if body.is_empty() {
+		format!("search gateway: {detail}")
+	} else {
+		format!(
+			"search gateway: {detail}: {}",
+			truncate_text(body, ERROR_BODY_MAX_CHARS)
+		)
+	}
+}
+
+/// Map the 9router/OmniRoute unified envelope
+/// (`{results[], answer, errors[]}`) onto the renderer's shape.
+fn map_gateway_response(payload: &Value, limit: usize) -> Result<SearchResponse, SearchFailure> {
 	let results: &[Value] = match payload.get("results") {
 		None | Some(Value::Null) => &[],
 		Some(Value::Array(items)) => items.as_slice(),
 		Some(_) => {
-			return Err(SearXngFailure::Fatal(ToolError::ExecutionFailed(
+			return Err(SearchFailure::Fatal(ToolError::ExecutionFailed(
+				"search gateway response field `results` is not an array".to_string(),
+			)));
+		},
+	};
+	let now_ms = now_millis();
+	let mut sources = Vec::new();
+	for result in results {
+		let Some(url) = result.get("url").and_then(Value::as_str).filter(|url| !url.is_empty()) else {
+			continue;
+		};
+		let title = result
+			.get("title")
+			.and_then(Value::as_str)
+			.and_then(non_empty)
+			.unwrap_or(url);
+		let snippet = result
+			.get("snippet")
+			.and_then(Value::as_str)
+			.and_then(non_empty)
+			.or_else(|| {
+				result
+					.get("content")
+					.and_then(|content| content.get("text"))
+					.and_then(Value::as_str)
+					.and_then(non_empty)
+			});
+		let published_date = ["published_at", "publishedDate", "published_date"]
+			.iter()
+			.find_map(|key| result.get(*key).and_then(Value::as_str).and_then(non_empty));
+		let age_seconds = published_date
+			.and_then(parse_timestamp_ms)
+			.map(|published_ms| (now_ms - published_ms) / 1_000);
+		sources.push(SearchSource {
+			title: title.to_string(),
+			url: url.to_string(),
+			snippet: snippet.map(str::to_string),
+			published_date: published_date.map(str::to_string),
+			age_seconds,
+		});
+	}
+	let sources: Vec<SearchSource> = sources.into_iter().take(limit).collect();
+	let answer = payload.get("answer").and_then(gateway_answer);
+	if answer.is_none() && sources.is_empty() {
+		// A 200 carrying only upstream `errors` is a failed lookup, not an
+		// empty result set; let the caller fall through to SearXNG/DDG.
+		let upstream_failed = payload
+			.get("errors")
+			.and_then(Value::as_array)
+			.is_some_and(|errors| !errors.is_empty());
+		return Err(if upstream_failed {
+			SearchFailure::Unavailable
+		} else {
+			SearchFailure::Fatal(ToolError::ExecutionFailed(
+				"search gateway returned no renderable search content.".to_string(),
+			))
+		});
+	}
+	Ok(SearchResponse { answer, sources, related_questions: Vec::new(), notes: Vec::new() })
+}
+
+fn gateway_answer(value: &Value) -> Option<String> {
+	if value.is_null() {
+		return None;
+	}
+	if let Some(text) = value.as_str() {
+		return non_empty(text).map(str::to_string);
+	}
+	if value.is_array() {
+		return format_answers(Some(value));
+	}
+	extract_answer_text(value)
+}
+
+fn map_response(payload: &Value, limit: usize) -> Result<SearchResponse, SearchFailure> {
+	let results: &[Value] = match payload.get("results") {
+		None | Some(Value::Null) => &[],
+		Some(Value::Array(items)) => items.as_slice(),
+		Some(_) => {
+			return Err(SearchFailure::Fatal(ToolError::ExecutionFailed(
 				"SearXNG response field `results` is not an array".to_string(),
 			)));
 		},
@@ -1170,7 +1495,7 @@ fn map_response(payload: &Value, limit: usize) -> Result<SearchResponse, SearXng
 	}
 	let sources: Vec<SearchSource> = sources.into_iter().take(limit).collect();
 	if sources.is_empty() && unresponsive_failures(payload).is_some() {
-		return Err(SearXngFailure::Unavailable);
+		return Err(SearchFailure::Unavailable);
 	}
 	Ok(SearchResponse {
 		answer: format_answers(payload.get("answers")),
@@ -1432,7 +1757,7 @@ mod tests {
 			"unresponsive_engines": [["google", "proxy said pass-secret is wrong"]]
 		});
 		let failure = map_response(&payload, DEFAULT_NUM_RESULTS).expect_err("no usable results");
-		assert!(matches!(failure, SearXngFailure::Unavailable));
+		assert!(matches!(failure, SearchFailure::Unavailable));
 	}
 
 	#[test]
@@ -1477,5 +1802,269 @@ mod tests {
 			"{content}"
 		);
 		assert!(content.contains("\n    https://example.org/a\n    snippet"), "{content}");
+	}
+
+	const GATEWAY_RESPONSE: &str = r#"{
+		"provider": "searxng",
+		"query": "rust async",
+		"results": [
+			{
+				"title": "Async Rust",
+				"url": "https://example.org/async",
+				"snippet": "Book on async.",
+				"published_at": "2020-01-01T00:00:00Z"
+			},
+			{ "title": "", "url": "https://example.org/untitled", "snippet": "Fallback title" },
+			{ "title": "No url", "snippet": "dropped" }
+		],
+		"answer": null,
+		"usage": { "queries_used": 1 },
+		"errors": []
+	}"#;
+
+	const SEARXNG_RESPONSE: &str = r#"{
+		"results": [
+			{ "title": "SearXNG hit", "url": "https://example.net/searx", "content": "from searxng" }
+		],
+		"suggestions": [],
+		"answers": []
+	}"#;
+
+	const DDG_HTML: &str = r#"<html><body>
+		<a href="https://example.org/ddg" class="result-link">DDG hit</a>
+		<td class="result-snippet">ddg snippet</td>
+	</body></html>"#;
+
+	fn http_response(status: &str, content_type: &str, body: &str) -> String {
+		format!(
+			"HTTP/1.1 {status}\r\ncontent-type: {content_type}\r\ncontent-length: {}\r\nconnection: \
+			 close\r\n\r\n{body}",
+			body.len()
+		)
+	}
+
+	/// Serve one response per entry in order, one connection each, and stream
+	/// every complete request (head + body) back to the test.
+	async fn loopback(responses: Vec<String>) -> (String, tokio::sync::mpsc::UnboundedReceiver<String>) {
+		use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+		let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind loopback");
+		let address = listener.local_addr().expect("loopback address");
+		let (capture, captured) = tokio::sync::mpsc::unbounded_channel();
+		tokio::spawn(async move {
+			for response in responses {
+				let Ok((mut socket, _)) = listener.accept().await else {
+					break;
+				};
+				let mut buffer = Vec::new();
+				let mut chunk = [0u8; 1024];
+				let mut expected = None;
+				loop {
+					match socket.read(&mut chunk).await {
+						Ok(0) | Err(_) => break,
+						Ok(read) => buffer.extend_from_slice(&chunk[..read]),
+					}
+					if expected.is_none()
+						&& let Some(end) = buffer.windows(4).position(|window| window == b"\r\n\r\n")
+					{
+						let head = String::from_utf8_lossy(&buffer[..end]);
+						let length = head
+							.lines()
+							.filter_map(|line| line.split_once(':'))
+							.find(|(key, _)| key.trim().eq_ignore_ascii_case("content-length"))
+							.and_then(|(_, value)| value.trim().parse::<usize>().ok())
+							.unwrap_or(0);
+						expected = Some(end + 4 + length);
+					}
+					if expected.is_some_and(|expected| buffer.len() >= expected) {
+						break;
+					}
+				}
+				let _ = capture.send(String::from_utf8_lossy(&buffer).into_owned());
+				let _ = socket.write_all(response.as_bytes()).await;
+				let _ = socket.shutdown().await;
+			}
+		});
+		(format!("http://{address}"), captured)
+	}
+
+	/// An address with no listener, so a request fails at connect instead of
+	/// hanging until the transport timeout.
+	async fn closed_endpoint() -> String {
+		let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind");
+		let address = listener.local_addr().expect("address");
+		drop(listener);
+		format!("http://{address}")
+	}
+
+	fn header(head: &str, name: &str) -> Option<String> {
+		head.lines().find_map(|line| {
+			let (key, value) = line.split_once(':')?;
+			key.trim().eq_ignore_ascii_case(name).then(|| value.trim().to_string())
+		})
+	}
+
+	#[tokio::test]
+	async fn gateway_posts_v1_search_with_bearer_and_renders_results() {
+		let (endpoint, mut captured) = loopback(vec![http_response(
+			"200 OK",
+			"application/json",
+			GATEWAY_RESPONSE,
+		)])
+		.await;
+		let tool = WebSearchTool::new(SearxngConfig::default()).with_gateway(GatewaySearchConfig {
+			// A trailing `/v1` must not produce `/v1/v1/search`.
+			endpoint: Some(format!("{endpoint}/v1")),
+			api_key:  Some("gw-secret".to_string()),
+			provider: Some("searxng".to_string()),
+		});
+		let context = AgentContext::new(std::env::temp_dir());
+		let result = tool
+			.execute(
+				&json!({ "query": "rust async !!g", "recency": "week", "limit": 3 }),
+				&context,
+			)
+			.await
+			.expect("gateway search succeeds");
+		let head = captured.recv().await.expect("request captured");
+		assert!(head.starts_with("POST /v1/search "), "{head}");
+		assert_eq!(
+			header(&head, "authorization").as_deref(),
+			Some("Bearer gw-secret"),
+			"{head}"
+		);
+		let body: Value = serde_json::from_str(head.split("\r\n\r\n").nth(1).expect("body")).expect("json body");
+		assert_eq!(body["query"], "rust async", "external bang stripped");
+		assert_eq!(body["provider"], "searxng");
+		assert_eq!(body["max_results"], json!(3));
+		assert_eq!(body["time_range"], "week");
+
+		let content = &result.content;
+		assert!(content.contains("[1] Async Rust"), "{content}");
+		assert!(content.contains("    https://example.org/async\n    Book on async."), "{content}");
+		assert!(
+			content.contains("[2] https://example.org/untitled\n    https://example.org/untitled"),
+			"a titleless row falls back to its url: {content}"
+		);
+		assert!(!content.contains("No url"), "rows without a url are dropped: {content}");
+		assert_eq!(result.details.as_ref().unwrap()["backend"], "gateway");
+	}
+
+	#[tokio::test]
+	async fn gateway_5xx_falls_back_to_searxng() {
+		let (gateway, _captured) = loopback(vec![http_response(
+			"503 Service Unavailable",
+			"application/json",
+			"upstream down",
+		)])
+		.await;
+		let (searxng, mut searxng_requests) =
+			loopback(vec![http_response("200 OK", "application/json", SEARXNG_RESPONSE)]).await;
+		let tool = WebSearchTool::new(SearxngConfig {
+			endpoint: Some(searxng),
+			..SearxngConfig::default()
+		})
+		.with_gateway(GatewaySearchConfig {
+			endpoint: Some(gateway),
+			api_key:  None,
+			provider: None,
+		});
+		let context = AgentContext::new(std::env::temp_dir());
+		let result = tool
+			.execute(&json!({ "query": "rust" }), &context)
+			.await
+			.expect("SearXNG answers after the gateway 503");
+		let head = searxng_requests.recv().await.expect("SearXNG request captured");
+		assert!(head.starts_with("GET /search?"), "{head}");
+		assert!(result.content.contains("SearXNG hit"), "{}", result.content);
+		assert_eq!(result.details.as_ref().unwrap()["backend"], "searxng");
+	}
+
+	#[tokio::test]
+	async fn gateway_transport_failure_falls_back_to_duckduckgo_lite() {
+		let gateway = closed_endpoint().await;
+		let (fallback, mut fallback_requests) =
+			loopback(vec![http_response("200 OK", "text/html", DDG_HTML)]).await;
+		let tool = WebSearchTool::new(SearxngConfig::default())
+			.with_gateway(GatewaySearchConfig {
+				endpoint: Some(gateway),
+				api_key:  Some("gw-secret".to_string()),
+				provider: None,
+			})
+			.with_fallback_endpoint(fallback);
+		let context = AgentContext::new(std::env::temp_dir());
+		let result = tool
+			.execute(&json!({ "query": "rust" }), &context)
+			.await
+			.expect("DuckDuckGo Lite answers after the gateway transport failure");
+		let head = fallback_requests.recv().await.expect("fallback request captured");
+		assert!(head.starts_with("POST / "), "{head}");
+		assert!(
+			result
+				.content
+				.starts_with("Note: Search gateway and SearXNG were unavailable; fell back to duckduckgo-free."),
+			"{}",
+			result.content
+		);
+		assert!(result.content.contains("[1] DDG hit"), "{}", result.content);
+		assert_eq!(result.details.as_ref().unwrap()["backend"], "duckduckgo_free");
+	}
+
+	#[tokio::test]
+	async fn gateway_error_bodies_are_scrubbed_of_the_api_key() {
+		const BODY: &str = r#"{"error":{"message":"invalid key gw-secret; sent Bearer gw-secret"}}"#;
+		let (endpoint, _captured) =
+			loopback(vec![http_response("401 Unauthorized", "application/json", BODY)]).await;
+		let tool = WebSearchTool::new(SearxngConfig {
+			endpoint: Some(closed_endpoint().await),
+			..SearxngConfig::default()
+		})
+		.with_gateway(GatewaySearchConfig {
+			endpoint: Some(endpoint),
+			api_key:  Some("gw-secret".to_string()),
+			provider: None,
+		})
+		.with_fallback_endpoint(closed_endpoint().await);
+		let context = AgentContext::new(std::env::temp_dir());
+		let error = tool
+			.execute(&json!({ "query": "rust" }), &context)
+			.await
+			.expect_err("a 401 is a host configuration error, never a fallback trigger");
+		let message = format!("{error}");
+		assert!(message.contains("401"), "{message}");
+		assert!(!message.contains("gw-secret"), "{message}");
+		assert!(message.contains("[redacted]"), "{message}");
+	}
+
+	#[tokio::test]
+	async fn gateway_error_bodies_scrub_json_escaped_api_keys() {
+		const KEY: &str = "gw\"sec\\ret";
+		// The wire body carries the JSON-escaped spelling, not the raw key.
+		const BODY: &str =
+			r#"{"error":{"message":"invalid key gw\"sec\\ret; sent Bearer gw\"sec\\ret"}}"#;
+		assert!(BODY.contains(r#"gw\"sec\\ret"#));
+		let (endpoint, _captured) =
+			loopback(vec![http_response("401 Unauthorized", "application/json", BODY)]).await;
+		let tool = WebSearchTool::new(SearxngConfig {
+			endpoint: Some(closed_endpoint().await),
+			..SearxngConfig::default()
+		})
+		.with_gateway(GatewaySearchConfig {
+			endpoint: Some(endpoint),
+			api_key:  Some(KEY.to_string()),
+			provider: None,
+		})
+		.with_fallback_endpoint(closed_endpoint().await);
+		let context = AgentContext::new(std::env::temp_dir());
+		let error = tool
+			.execute(&json!({ "query": "rust" }), &context)
+			.await
+			.expect_err("a 401 is a host configuration error, never a fallback trigger");
+		let message = format!("{error}");
+		assert!(message.contains("401"), "{message}");
+		assert!(message.contains("[redacted]"), "{message}");
+		assert!(!message.contains(KEY), "raw key leaked: {message}");
+		assert!(!message.contains(r#"gw\"sec\\ret"#), "JSON-escaped key leaked: {message}");
+		assert!(!message.contains("gw\"sec") && !message.contains(r#"gw\"sec"#), "{message}");
 	}
 }
