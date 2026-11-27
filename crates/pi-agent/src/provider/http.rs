@@ -15,6 +15,14 @@ use super::*;
 /// stays open for minutes, so the caller (CLI, agent loop) owns cancellation.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// Ceiling for a non-streaming success body; a larger body is rejected rather
+/// than buffered, because a truncated turn must never be parsed as complete.
+const MAX_RESPONSE_BODY_BYTES: usize = 8 * 1024 * 1024;
+
+/// Ceiling for an error body kept for diagnostics; the rest is discarded so a
+/// hostile gateway cannot make the client allocate an unbounded string.
+const MAX_ERROR_BODY_BYTES: usize = 64 * 1024;
+
 /// Chat-completions provider for any OpenAI-compatible HTTP endpoint.
 ///
 /// Base URL, API key and model are supplied by the caller (CLI/config): nothing
@@ -270,12 +278,14 @@ impl OpenAiCompatibleProvider {
 impl OpenAiCompatibleProvider {
 	/// Send one request with the per-request credential and the exact auth-retry
 	/// contract: refresh only on 401/403 + parsed `invalid_key`, then reissue the
-	/// same body once. Any other failure is returned unchanged.
+	/// same body once. Any other failure is returned unchanged. The bearer key
+	/// that actually produced the response is returned so diagnostics can be
+	/// redacted with it (a callback may have rotated the configured key).
 	async fn post_authenticated(
 		&self,
 		body: &OpenAiChatRequest,
 		stream: bool,
-	) -> Result<reqwest::Response, ProviderError> {
+	) -> Result<(reqwest::Response, String), ProviderError> {
 		let mut force_refresh = false;
 		let mut key = match &self.credential {
 			Some(callback) => callback(false).map_err(ProviderError::AuthRefresh)?,
@@ -289,22 +299,34 @@ impl OpenAiCompatibleProvider {
 			let response = request.json(body).send().await.map_err(network_error)?;
 			let status = response.status();
 			if status.is_success() {
-				return Ok(response);
+				return Ok((response, key));
 			}
 			if !force_refresh && matches!(status.as_u16(), 401 | 403) {
-				let text = response.text().await.map_err(network_error)?;
-				if is_invalid_key_body(&text) {
+				let body = read_body_bounded(response, MAX_ERROR_BODY_BYTES).await?;
+				if is_invalid_key_body(&body.text) {
 					if let Some(callback) = &self.credential {
 						key = callback(true).map_err(ProviderError::AuthRefresh)?;
 						force_refresh = true;
 						continue;
 					}
 				}
-				return Err(ProviderError::HttpStatus(status.as_u16(), snippet(&text)));
+				return Err(ProviderError::HttpStatus(
+					status.as_u16(),
+					diagnostic_body(&body.text, body.truncated, &self.diagnostic_secrets(&key)),
+				));
 			}
-			let text = response.text().await.map_err(network_error)?;
-			return Err(ProviderError::HttpStatus(status.as_u16(), snippet(&text)));
+			let body = read_body_bounded(response, MAX_ERROR_BODY_BYTES).await?;
+			return Err(ProviderError::HttpStatus(
+				status.as_u16(),
+				diagnostic_body(&body.text, body.truncated, &self.diagnostic_secrets(&key)),
+			));
 		}
+	}
+
+	/// Credential values that must not surface in diagnostics: the configured
+	/// key and the bearer actually sent (a callback may have rotated it).
+	fn diagnostic_secrets(&self, active_key: &str) -> Vec<String> {
+		vec![self.api_key.clone(), active_key.to_string()]
 	}
 }
 
@@ -334,13 +356,25 @@ impl ModelProvider for OpenAiCompatibleProvider {
 	) -> Result<Message, ProviderError> {
 		self.check_support(messages)?;
 		let body = self.request(messages, tools, tool_choice, false)?;
-		let response = self.post_authenticated(&body, false).await?;
+		let (response, key) = self.post_authenticated(&body, false).await?;
 
-		let text = response.text().await.map_err(network_error)?;
+		let body = read_body_bounded(response, MAX_RESPONSE_BODY_BYTES).await?;
+		if body.truncated {
+			return Err(ProviderError::Protocol(format!(
+				"chat completion body exceeded {MAX_RESPONSE_BODY_BYTES} bytes"
+			)));
+		}
+		let text = body.text;
 		let parsed: OpenAiChatResponse = serde_json::from_str(&text).map_err(|err| {
-			ProviderError::Protocol(format!(
-				"invalid chat completion body: {err}; body: {}",
-				snippet(&text)
+			let secrets = self.diagnostic_secrets(&key);
+			// Serde embeds offending response values in its message, so redact
+			// the whole diagnostic, not just the body snippet.
+			ProviderError::Protocol(crate::provider::redact_with(
+				&format!(
+					"invalid chat completion body: {err}; body: {}",
+					diagnostic_body(&text, false, &secrets)
+				),
+				&secrets,
 			))
 		})?;
 		let usage = parsed.usage.as_ref().map(normalize_usage);
@@ -366,17 +400,25 @@ impl ModelProvider for OpenAiCompatibleProvider {
 	) -> Result<ChunkStream, ProviderError> {
 		self.check_support(messages)?;
 		let body = self.request(messages, tools, tool_choice, true)?;
-		let response = self.post_authenticated(&body, true).await?;
+		let (response, key) = self.post_authenticated(&body, true).await?;
 
 		let body = response
 			.bytes_stream()
 			.map(|item| item.map_err(|err| err.to_string()));
-		let secrets = vec![self.api_key.clone()];
+		let secrets = self.diagnostic_secrets(&key);
 		Ok(sse_stream(Box::pin(body))
 			.map(move |item| {
 				item.map_err(|error| match error {
+					ProviderError::Network(text) => {
+						ProviderError::Network(redact_with(&text, &secrets))
+					},
 					ProviderError::Protocol(text) => {
 						ProviderError::Protocol(redact_with(&text, &secrets))
+					},
+					// A serde error carries the offending text in its message
+					// and cannot be rebuilt redacted, so surface it as protocol.
+					ProviderError::Serialization(err) => {
+						ProviderError::Protocol(redact_with(&err.to_string(), &secrets))
 					},
 					other => other,
 				})
@@ -398,6 +440,65 @@ fn normalize_prompt_cache_key(value: &str) -> Option<String> {
 	Some(format!("pc_{hash}"))
 }
 
+/// Body text capped at a byte limit, plus whether bytes were dropped.
+struct BoundedBody {
+	text:      String,
+	truncated: bool,
+}
+
+/// Read at most `limit` body bytes, then stop; never buffers past the ceiling
+/// even for an endless response.
+async fn read_body_bounded(
+	response: reqwest::Response,
+	limit: usize,
+) -> Result<BoundedBody, ProviderError> {
+	let mut stream = response.bytes_stream();
+	let mut bytes: Vec<u8> = Vec::new();
+	let mut truncated = false;
+	while let Some(item) = stream.next().await {
+		let chunk = item.map_err(network_error)?;
+		if bytes.len() + chunk.len() > limit {
+			let room = limit.saturating_sub(bytes.len());
+			bytes.extend_from_slice(&chunk[..room]);
+			truncated = true;
+			break;
+		}
+		bytes.extend_from_slice(&chunk);
+	}
+	let mut text = String::from_utf8_lossy(&bytes).into_owned();
+	if truncated {
+		trim_partial_token(&mut text);
+	}
+	Ok(BoundedBody { text, truncated })
+}
+
+/// Best effort for a byte-capped read: drop the incomplete trailing token so a
+/// credential sliced across the cap is unlikely to survive as a prefix.
+fn trim_partial_token(text: &mut String) {
+	let boundary = text
+		.char_indices()
+		.rev()
+		.find(|(_, ch)| {
+			ch.is_whitespace() || matches!(ch, '"' | '\'' | ',' | ':' | '{' | '}' | '[' | ']')
+		})
+		.map(|(index, ch)| index + ch.len_utf8());
+	if let Some(boundary) = boundary
+		&& boundary < text.len()
+	{
+		text.truncate(boundary);
+	}
+}
+
+/// Redact first, then bound to the diagnostic character limit; `truncated`
+/// marks a byte-capped read so the diagnostic says the tail was dropped.
+fn diagnostic_body(text: &str, truncated: bool, secrets: &[String]) -> String {
+	let mut bounded = snippet(&crate::provider::redact_with(text, secrets));
+	if truncated {
+		bounded.push_str("\n[truncated]");
+	}
+	bounded
+}
+
 fn network_error(err: reqwest::Error) -> ProviderError {
 	ProviderError::Network(err.to_string())
 }
@@ -405,6 +506,8 @@ fn network_error(err: reqwest::Error) -> ProviderError {
 #[cfg(test)]
 mod tests {
 	use super::*;
+	use tokio::io::{AsyncReadExt, AsyncWriteExt};
+	use tokio::net::TcpListener;
 
 	#[test]
 	fn chat_request_uses_explicit_prompt_cache_key_before_session_id() {
@@ -475,5 +578,127 @@ mod tests {
 		// `Bun.hash("cache-key-".repeat(8)).toString(36)` = 2jtb5bhjsyy44.
 		assert_eq!(key, "pc_2jtb5bhjsyy44");
 		assert_ne!(key, long);
+	}
+
+	/// Serve exactly one HTTP/1.1 request with `status`/`body`, then close.
+	async fn serve_once(status: u16, body: Vec<u8>) -> String {
+		let listener = TcpListener::bind(("127.0.0.1", 0)).await.expect("bind");
+		let addr = listener.local_addr().expect("addr");
+		tokio::spawn(async move {
+			let (mut socket, _) = listener.accept().await.expect("accept");
+			let mut request = Vec::new();
+			let mut chunk = [0u8; 1024];
+			loop {
+				let read = socket.read(&mut chunk).await.expect("read request");
+				if read == 0 {
+					break;
+				}
+				request.extend_from_slice(&chunk[..read]);
+				let Some(head_end) = request.windows(4).position(|w| w == b"\r\n\r\n") else {
+					continue;
+				};
+				let head = String::from_utf8_lossy(&request[..head_end]).to_lowercase();
+				let content_length = head
+					.lines()
+					.find_map(|line| line.strip_prefix("content-length:"))
+					.and_then(|value| value.trim().parse::<usize>().ok())
+					.unwrap_or(0);
+				if request.len() >= head_end + 4 + content_length {
+					break;
+				}
+			}
+			let head = format!(
+				"HTTP/1.1 {status} TEST\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+				body.len()
+			);
+			socket.write_all(head.as_bytes()).await.expect("write head");
+			let _ = socket.write_all(&body).await;
+			let _ = socket.shutdown().await;
+		});
+		format!("http://{addr}/v1")
+	}
+
+	#[tokio::test]
+	async fn http_status_diagnostics_redact_the_active_key() {
+		let base_url = serve_once(500, br#"{"error":{"message":"bad key sk-secret-123"}}"#.to_vec())
+			.await;
+		let provider = OpenAiCompatibleProvider::new(base_url, "sk-secret-123", "model-x")
+			.expect("build");
+		let err = provider.complete(&[], &[], &ToolChoice::Auto).await.unwrap_err();
+		let text = match err {
+			ProviderError::HttpStatus(status, text) => {
+				assert_eq!(status, 500);
+				text
+			},
+			other => panic!("expected HttpStatus, got {other:?}"),
+		};
+		assert!(!text.contains("sk-secret-123"), "leaked key: {text}");
+		assert!(text.contains("[redacted]"), "not redacted: {text}");
+	}
+
+	#[tokio::test]
+	async fn http_status_diagnostics_redact_the_rotated_credential() {
+		let base_url = serve_once(500, b"rotated-key-456 rejected".to_vec()).await;
+		let callback: CredentialCallback =
+			std::sync::Arc::new(|_: bool| -> Result<String, String> {
+				Ok("rotated-key-456".to_string())
+			});
+		let provider = OpenAiCompatibleProvider::new(base_url, "configured-key", "model-x")
+			.expect("build")
+			.with_credential_callback(Some(callback));
+		let err = provider.complete(&[], &[], &ToolChoice::Auto).await.unwrap_err();
+		let text = match err {
+			ProviderError::HttpStatus(_, text) => text,
+			other => panic!("expected HttpStatus, got {other:?}"),
+		};
+		assert!(!text.contains("rotated-key-456"), "leaked key: {text}");
+		assert!(text.contains("[redacted]"), "not redacted: {text}");
+	}
+
+	#[tokio::test]
+	async fn protocol_diagnostics_redact_the_active_key() {
+		let base_url = serve_once(200, b"not-json sk-secret-123".to_vec()).await;
+		let provider = OpenAiCompatibleProvider::new(base_url, "sk-secret-123", "model-x")
+			.expect("build");
+		let err = provider.complete(&[], &[], &ToolChoice::Auto).await.unwrap_err();
+		let text = match err {
+			ProviderError::Protocol(text) => text,
+			other => panic!("expected Protocol, got {other:?}"),
+		};
+		assert!(!text.contains("sk-secret-123"), "leaked key: {text}");
+		assert!(text.contains("[redacted]"), "not redacted: {text}");
+	}
+
+	#[tokio::test]
+	async fn serde_diagnostics_redact_response_values() {
+		let base_url = serve_once(200, br#"{"choices":"sk-secret-123"}"#.to_vec()).await;
+		let provider = OpenAiCompatibleProvider::new(base_url, "sk-secret-123", "model-x")
+			.expect("build");
+		let err = provider.complete(&[], &[], &ToolChoice::Auto).await.unwrap_err();
+		let text = match err {
+			ProviderError::Protocol(text) => text,
+			other => panic!("expected Protocol, got {other:?}"),
+		};
+		assert!(!text.contains("sk-secret-123"), "leaked key: {text}");
+		assert!(text.contains("[redacted]"), "not redacted: {text}");
+	}
+
+	#[test]
+	fn trim_partial_token_drops_the_cut_tail() {
+		let mut text = "error: sk-secret".to_string();
+		trim_partial_token(&mut text);
+		assert_eq!(text, "error: ");
+	}
+
+	#[tokio::test]
+	async fn oversized_success_body_is_rejected() {
+		let body = vec![b' '; MAX_RESPONSE_BODY_BYTES + 1];
+		let base_url = serve_once(200, body).await;
+		let provider = OpenAiCompatibleProvider::new(base_url, "key", "model-x").expect("build");
+		let err = provider.complete(&[], &[], &ToolChoice::Auto).await.unwrap_err();
+		assert!(
+			matches!(&err, ProviderError::Protocol(text) if text.contains("exceeded")),
+			"got {err:?}"
+		);
 	}
 }

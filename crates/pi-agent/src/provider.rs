@@ -12,6 +12,10 @@ use crate::state::{Message, Role, StopReason, TokenUsage, ToolCall, UsagePresenc
 /// Maximum characters of an error response body kept for diagnostics.
 const ERROR_BODY_CHARS: usize = 2048;
 
+/// Hard ceiling on one unterminated SSE line; a longer line is a protocol
+/// error instead of unbounded buffering.
+const MAX_SSE_LINE_BYTES: usize = 1024 * 1024;
+
 /// OpenAI-compatible chat-completions transport.
 pub mod http;
 
@@ -1441,7 +1445,26 @@ where
 				}
 
 				match st.body.next().await {
-					Some(Ok(bytes)) => st.buf.extend_from_slice(bytes.as_ref()),
+					Some(Ok(bytes)) => {
+						let bytes = bytes.as_ref();
+						// Each newline starts a fresh line: the first segment
+						// continues the pending line in `buf`, later segments
+						// are whole lines inside this chunk. Every one must fit.
+						let mut pending = st.buf.len();
+						for segment in bytes.split(|byte| *byte == b'\n') {
+							if pending + segment.len() > MAX_SSE_LINE_BYTES {
+								st.done = true;
+								return Some((
+									Err(ProviderError::Protocol(format!(
+										"SSE line exceeded {MAX_SSE_LINE_BYTES} bytes"
+									))),
+									st,
+								));
+							}
+							pending = 0;
+						}
+						st.buf.extend_from_slice(bytes);
+					},
 					Some(Err(err)) => {
 						st.done = true;
 						return Some((Err(ProviderError::Network(err.to_string())), st));
@@ -1675,5 +1698,39 @@ mod tests {
 		};
 		let err = to_openai_messages(&[t1]).unwrap_err();
 		assert!(matches!(err, ProviderError::UnsupportedImage(_)));
+	}
+
+	#[tokio::test]
+	async fn sse_stream_rejects_oversized_line() {
+		let chunks = vec![
+			Ok::<_, String>(vec![b'a'; MAX_SSE_LINE_BYTES]),
+			Ok(vec![b'a'; 1]),
+		];
+		let mut stream = sse_stream(futures::stream::iter(chunks));
+		let err = stream.next().await.expect("first item").expect_err("oversized line must fail");
+		assert!(
+			matches!(&err, ProviderError::Protocol(text) if text.contains("SSE line exceeded")),
+			"got {err:?}"
+		);
+		assert!(stream.next().await.is_none(), "stream must stop after the error");
+	}
+
+	#[tokio::test]
+	async fn sse_stream_rejects_oversized_line_after_newline_in_same_chunk() {
+		for trailing in [false, true] {
+			let mut chunk = b"data: {}\n\n".to_vec();
+			chunk.extend(vec![b'a'; MAX_SSE_LINE_BYTES + 1]);
+			if trailing {
+				chunk.push(b'\n');
+			}
+			let mut stream = sse_stream(futures::stream::iter(vec![Ok::<_, String>(chunk)]));
+			let err =
+				stream.next().await.expect("first item").expect_err("oversized line must fail");
+			assert!(
+				matches!(&err, ProviderError::Protocol(text) if text.contains("SSE line exceeded")),
+				"got {err:?}"
+			);
+			assert!(stream.next().await.is_none(), "stream must stop after the error");
+		}
 	}
 }
