@@ -4495,8 +4495,7 @@ mod tests {
 			std::ffi::OsString::from("GIT_CONFIG_VALUE_0"),
 			std::ffi::OsString::from("PATH"),
 		];
-		let command = git_command_with_ambient(cwd, &["status"], &caller, ambient);
-		let std_command = command.as_std();
+		let std_command = git_command_with_ambient(cwd, &["status"], &caller, ambient);
 		let env: Vec<(String, Option<String>)> = std_command
 			.get_envs()
 			.map(|(key, value)| {
