@@ -149,6 +149,57 @@ impl Writer {
 	}
 }
 
+/// Socket file plus the private `0700` directory that contains it. Dropping
+/// the guard removes both, so every error path and the final teardown clean up.
+#[cfg(unix)]
+struct SocketPath {
+	socket: PathBuf,
+	dir: PathBuf,
+}
+
+#[cfg(unix)]
+impl SocketPath {
+	/// Create a fresh `0700` directory under the system temp dir and reserve
+	/// `<dir>/adapter.sock` inside it. A pre-existing path is an error: never
+	/// adopt a directory this spawn did not create (a planted directory or
+	/// symlink must not be reused).
+	fn create() -> std::io::Result<Self> {
+		use std::os::unix::fs::{DirBuilderExt, MetadataExt};
+
+		static SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+		let sequence = SEQUENCE.fetch_add(1, Ordering::Relaxed);
+		let dir = std::env::temp_dir().join(format!(
+			"dap-{}-{}-{sequence}",
+			std::process::id(),
+			now_millis()
+		));
+		let mut builder = std::fs::DirBuilder::new();
+		builder.mode(0o700);
+		builder.create(&dir)?;
+		let metadata = std::fs::symlink_metadata(&dir)?;
+		if !metadata.is_dir() || metadata.uid() != crate::process_broker::protocol::current_uid() {
+			let _ = std::fs::remove_dir_all(&dir);
+			return Err(std::io::Error::new(
+				std::io::ErrorKind::PermissionDenied,
+				format!("{} is not a private directory owned by the current user", dir.display()),
+			));
+		}
+		Ok(Self { socket: dir.join("adapter.sock"), dir })
+	}
+
+	fn remove(&self) {
+		let _ = std::fs::remove_file(&self.socket);
+		let _ = std::fs::remove_dir_all(&self.dir);
+	}
+}
+
+#[cfg(unix)]
+impl Drop for SocketPath {
+	fn drop(&mut self) {
+		self.remove();
+	}
+}
+
 struct Inner {
 	adapter_name: String,
 	state: StdMutex<ClientState>,
@@ -159,7 +210,8 @@ struct Inner {
 	writer: AsyncMutex<Writer>,
 	process: StdMutex<Option<Child>>,
 	stderr: Arc<StdMutex<Vec<u8>>>,
-	socket_path: StdMutex<Option<PathBuf>>,
+	#[cfg(unix)]
+	socket_path: StdMutex<Option<SocketPath>>,
 	alive: AtomicBool,
 	disposed: AtomicBool,
 	last_activity: AtomicI64,
@@ -212,6 +264,7 @@ impl DapClient {
 				writer: AsyncMutex::new(writer),
 				process: StdMutex::new(process),
 				stderr,
+				#[cfg(unix)]
 				socket_path: StdMutex::new(None),
 				alive: AtomicBool::new(true),
 				disposed: AtomicBool::new(false),
@@ -417,8 +470,9 @@ impl DapClient {
 			// is dropped, which still kills the signalled adapter but does not reap it.
 			let _ = timeout(Duration::from_secs(2), child.wait()).await;
 		}
+		#[cfg(unix)]
 		if let Some(path) = self.inner.socket_path.lock().unwrap_or_else(|poison| poison.into_inner()).take() {
-			let _ = std::fs::remove_file(path);
+			path.remove();
 		}
 	}
 
@@ -508,13 +562,19 @@ impl DapClient {
 		cwd: &Path,
 		env: &HashMap<String, String>,
 	) -> Result<Self, DapError> {
-		use std::os::unix::fs::FileTypeExt;
-		let socket_path = std::env::temp_dir().join(format!(
-			"dap-{}-{}-{}.sock",
-			adapter.name.replace(['/', '\\', ' '], "_"),
-			now_millis(),
-			std::process::id()
-		));
+		use std::os::unix::fs::{FileTypeExt, MetadataExt};
+
+		// The socket lives inside a private 0700 directory, never directly in the
+		// shared temp dir: other users cannot pre-plant a socket or symlink at the
+		// path. `SocketPath` also removes socket and directory on every error and
+		// on drop/close.
+		let socket = SocketPath::create().map_err(|error| {
+			DapError::message(format!(
+				"failed to create a private socket directory for DAP adapter '{}': {error}",
+				adapter.name
+			))
+		})?;
+		let socket_path = socket.socket.as_path();
 		let mut args = adapter.args.clone();
 		args.push(format!("--listen=unix:{}", socket_path.display()));
 		let mut command = base_command(adapter, cwd, env, &args);
@@ -530,17 +590,22 @@ impl DapClient {
 		spawn_stdout_drain(child.stdout.take());
 		let deadline = Instant::now() + SOCKET_READY_TIMEOUT;
 		let stream = loop {
-			let ready = std::fs::symlink_metadata(&socket_path)
-				.map(|metadata| metadata.file_type().is_socket())
+			// `symlink_metadata` never follows links, so a symlink is not a socket
+			// and is rejected; the uid check rejects a socket planted by another
+			// user even if the directory permissions were somehow subverted.
+			let ready = std::fs::symlink_metadata(socket_path)
+				.map(|metadata| {
+					metadata.file_type().is_socket()
+						&& metadata.uid() == crate::process_broker::protocol::current_uid()
+				})
 				.unwrap_or(false);
 			if ready {
-				match timeout(Duration::from_millis(250), UnixStream::connect(&socket_path)).await {
+				match timeout(Duration::from_millis(250), UnixStream::connect(socket_path)).await {
 					Ok(Ok(stream)) => break stream,
 					_ => {},
 				}
 			}
 			if let Ok(Some(_)) = child.try_wait() {
-				let _ = std::fs::remove_file(&socket_path);
 				return Err(DapError::message(format!(
 					"DAP adapter {} exited before socket {} was ready",
 					adapter.name,
@@ -548,7 +613,6 @@ impl DapClient {
 				)));
 			}
 			if Instant::now() >= deadline {
-				let _ = std::fs::remove_file(&socket_path);
 				let _ = child.start_kill();
 				return Err(DapError::message(format!(
 					"socket {} not ready after {}ms",
@@ -560,7 +624,7 @@ impl DapClient {
 		};
 		let (reader, writer) = stream.into_split();
 		let client = Self::new(&adapter.name, Reader::Unix(reader), Writer::Unix(writer), Some(child), stderr, None);
-		*client.inner.socket_path.lock().unwrap_or_else(|poison| poison.into_inner()) = Some(socket_path);
+		*client.inner.socket_path.lock().unwrap_or_else(|poison| poison.into_inner()) = Some(socket);
 		Ok(client)
 	}
 
@@ -1203,5 +1267,46 @@ mod tests {
 		let stdout = String::from_utf8_lossy(&output.stdout);
 		assert!(stdout.contains("PATH=/dap-test-path"), "{stdout}");
 		assert!(stdout.contains("TERM=xterm-256color"), "{stdout}");
+	}
+
+	/// The DAP socket lives in a private `0700` directory owned by the current
+	/// user (never directly in the shared temp dir), and dropping the guard
+	/// removes both the socket and the directory.
+	#[cfg(unix)]
+	#[test]
+	fn socket_path_uses_a_private_dir_and_cleans_it_up_on_drop() {
+		use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+		let first = SocketPath::create().expect("first private socket dir");
+		let second = SocketPath::create().expect("second private socket dir");
+		assert_ne!(first.dir, second.dir, "socket dirs must not be shared between spawns");
+		assert_eq!(
+			first.socket.parent(),
+			Some(first.dir.as_path()),
+			"socket {} is not inside its private dir {}",
+			first.socket.display(),
+			first.dir.display()
+		);
+		assert_ne!(
+			first.socket.parent(),
+			Some(std::env::temp_dir().as_path()),
+			"socket was placed directly in the shared temp dir"
+		);
+
+		let metadata = std::fs::symlink_metadata(&first.dir).expect("socket dir metadata");
+		assert!(metadata.is_dir(), "socket parent is not a directory");
+		assert_eq!(metadata.permissions().mode() & 0o777, 0o700, "socket dir is not 0700");
+		assert_eq!(
+			metadata.uid(),
+			crate::process_broker::protocol::current_uid(),
+			"socket dir is not owned by the current user"
+		);
+
+		let dir = first.dir.clone();
+		drop(first);
+		assert!(!dir.exists(), "private socket dir survived drop: {}", dir.display());
+		let second_dir = second.dir.clone();
+		drop(second);
+		assert!(!second_dir.exists(), "private socket dir survived drop: {}", second_dir.display());
 	}
 }
