@@ -1230,7 +1230,7 @@ async fn debug_tool_shares_root_session_and_isolates_children() {
 		std::fs::write(dir.path().join("main.py"), "print(1)\n").expect("program");
 
 		let manager = Arc::new(DapSessionManager::new());
-		let tool = DapTool::shared(manager.clone());
+		let tool = DapTool::shared(manager.clone()).with_trust_check(Arc::new(|_: &Path| true));
 		let ctx = AgentContext::new(dir.path().to_path_buf());
 		let launch = tool
 			.execute(
@@ -1305,7 +1305,7 @@ async fn debug_tool_breakpoint_continue_stack_trace_and_disconnect_cleanup() {
 		std::fs::write(dir.path().join("main.py"), "print(1)\n").expect("program");
 
 		let manager = Arc::new(DapSessionManager::new());
-		let tool = DapTool::shared(manager.clone());
+		let tool = DapTool::shared(manager.clone()).with_trust_check(Arc::new(|_: &Path| true));
 		let ctx = AgentContext::new(dir.path().to_path_buf());
 
 		let launch = tool
@@ -1402,7 +1402,7 @@ async fn debug_tool_cancellation_aborts_pending_request_and_cleanup_reaps_adapte
 		std::fs::write(dir.path().join("main.py"), "print(1)\n").expect("program");
 
 		let manager = Arc::new(DapSessionManager::new());
-		let tool = DapTool::shared(manager.clone());
+		let tool = DapTool::shared(manager.clone()).with_trust_check(Arc::new(|_: &Path| true));
 		let ctx = AgentContext::new(dir.path().to_path_buf());
 		tool.execute(
 			&json!({"action": "launch", "adapter": "fixture", "program": "main.py", "timeout": 10}),

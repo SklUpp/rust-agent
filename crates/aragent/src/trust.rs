@@ -36,10 +36,11 @@ const TRUST_FILE_NAME: &str = "trust.json";
 /// Project files that can register subprocesses, launch commands, or redirect
 /// a transport. Changes to any of these invalidate a grant.
 ///
-/// `ssh.json` entries choose an SSH destination/identity for `ssh://` reads and
-/// LSP files launch arbitrary server commands, so both are workspace-controlled
+/// `ssh.json` entries choose an SSH destination/identity for `ssh://` reads,
+/// LSP files launch arbitrary server commands, and DAP `dap.*` overlays choose
+/// the adapter executable and its arguments, so all are workspace-controlled
 /// execution surfaces just like the hook/MCP files above.
-const TRACKED_SURFACES: [&str; 40] = [
+const TRACKED_SURFACES: [&str; 70] = [
 	".claude/settings.json",
 	".claude/settings.local.json",
 	".codex/hooks.json",
@@ -80,6 +81,36 @@ const TRACKED_SURFACES: [&str; 40] = [
 	".gemini/.lsp.yaml",
 	".gemini/lsp.yml",
 	".gemini/.lsp.yml",
+	"dap.json",
+	".dap.json",
+	"dap.yaml",
+	".dap.yaml",
+	"dap.yml",
+	".dap.yml",
+	".omp/dap.json",
+	".omp/.dap.json",
+	".omp/dap.yaml",
+	".omp/.dap.yaml",
+	".omp/dap.yml",
+	".omp/.dap.yml",
+	".claude/dap.json",
+	".claude/.dap.json",
+	".claude/dap.yaml",
+	".claude/.dap.yaml",
+	".claude/dap.yml",
+	".claude/.dap.yml",
+	".codex/dap.json",
+	".codex/.dap.json",
+	".codex/dap.yaml",
+	".codex/.dap.yaml",
+	".codex/dap.yml",
+	".codex/.dap.yml",
+	".gemini/dap.json",
+	".gemini/.dap.json",
+	".gemini/dap.yaml",
+	".gemini/.dap.yaml",
+	".gemini/dap.yml",
+	".gemini/.dap.yml",
 ];
 
 /// Project files whose `hooks` block is fingerprinted on its own; unrelated
@@ -651,4 +682,63 @@ pub fn workspace_is_trusted(cwd: &Path) -> bool {
 	TrustStore::load_from_agent_dir(&crate::dirs::agent_dir())
 		.status(cwd)
 		.is_trusted()
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	fn temp_root(label: &str) -> PathBuf {
+		let nanos = SystemTime::now()
+			.duration_since(UNIX_EPOCH)
+			.expect("clock")
+			.as_nanos();
+		let root =
+			std::env::temp_dir().join(format!("omp-trust-{label}-{}-{nanos}", std::process::id()));
+		fs::create_dir_all(root.join("project")).expect("temp project");
+		root
+	}
+
+	/// DAP overlays choose the adapter executable and its arguments, so any
+	/// edit or newly added file must invalidate the workspace grant.
+	#[test]
+	fn dap_config_changes_invalidate_a_grant() {
+		let root = temp_root("dap");
+		let agent = root.join("agent");
+		let project = root.join("project");
+		let dap_config = project.join("dap.json");
+		fs::write(&dap_config, r#"{"adapters":{"gdb":{"command":"/usr/bin/gdb"}}}"#)
+			.expect("dap.json");
+
+		let mut store = TrustStore::load_from_agent_dir(&agent);
+		let report = store.grant(&project).expect("grant");
+		assert!(
+			report.config_hashes.contains_key("dap.json"),
+			"project dap.json must be fingerprinted: {:?}",
+			report.config_hashes.keys().collect::<Vec<_>>()
+		);
+		assert!(store.is_trusted(&project));
+
+		fs::write(&dap_config, r#"{"adapters":{"gdb":{"command":"./repo-gdb"}}}"#)
+			.expect("edit dap.json");
+		match store.status(&project) {
+			TrustStatus::Invalidated { reason } => {
+				assert!(reason.contains("dap.json"), "reason: {reason}");
+			},
+			other => panic!("expected invalidation after dap.json edit, got {other:?}"),
+		}
+
+		store.grant(&project).expect("re-grant");
+		// Tool-directory overlays are fingerprinted from every tracked location.
+		fs::create_dir_all(project.join(".omp")).expect(".omp dir");
+		fs::write(project.join(".omp/dap.yaml"), "adapters:\n  repo:\n    command: ./repo-dap\n")
+			.expect(".omp/dap.yaml");
+		match store.status(&project) {
+			TrustStatus::Invalidated { reason } => {
+				assert!(reason.contains("added .omp/dap.yaml"), "reason: {reason}");
+			},
+			other => panic!("expected invalidation after adding .omp/dap.yaml, got {other:?}"),
+		}
+		let _ = fs::remove_dir_all(&root);
+	}
 }

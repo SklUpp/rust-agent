@@ -18,9 +18,10 @@ use tokio_util::sync::CancellationToken;
 use super::{
 	client::DapError,
 	config::{
-		LaunchAdapterSelection, LaunchProgramKind, adapter_unavailable_message, classify_program,
-		configured_adapter_names, get_adapter_configs, resolve_launch_overrides, select_attach_adapter,
-		select_launch_adapter,
+		LaunchAdapterSelection, LaunchProgramKind, adapter_unavailable_message_with_trust,
+		classify_program, configured_adapter_names_with_trust, get_adapter_configs_with_trust,
+		resolve_launch_overrides, select_attach_adapter_in_session_with_trust,
+		select_launch_adapter_in_session_with_trust,
 	},
 	session::DapSessionManager,
 	types::{
@@ -98,23 +99,34 @@ pub struct DapTool {
 	manager: Arc<DapSessionManager>,
 	/// `tools.maxTimeout` global ceiling, when the host exposes one.
 	max_timeout: Option<u64>,
+	/// Live workspace trust verdict for DAP config and adapter resolution.
+	/// `None` is fail-closed: project surfaces are never loaded or executed.
+	trust_check: Option<Arc<dyn Fn(&Path) -> bool + Send + Sync>>,
 }
 
 impl DapTool {
 	/// Fresh, isolated session tree (child agents and standalone hosts).
 	pub fn new() -> Self {
-		Self { manager: Arc::new(DapSessionManager::new()), max_timeout: None }
+		Self { manager: Arc::new(DapSessionManager::new()), max_timeout: None, trust_check: None }
 	}
 
 	/// Share the root session tree owned by `RunnerSession`.
 	pub fn shared(manager: Arc<DapSessionManager>) -> Self {
-		Self { manager, max_timeout: None }
+		Self { manager, max_timeout: None, trust_check: None }
 	}
 
 	/// Apply the host's `tools.maxTimeout` cap. `None`/`0` disables the cap.
 	#[must_use]
 	pub fn with_max_timeout(mut self, seconds: Option<u64>) -> Self {
 		self.max_timeout = seconds.filter(|seconds| *seconds > 0);
+		self
+	}
+
+	/// Gate project DAP overlays and repository adapter executables on the
+	/// host's live trust store. Without a check the tool stays fail-closed.
+	#[must_use]
+	pub fn with_trust_check(mut self, check: Arc<dyn Fn(&Path) -> bool + Send + Sync>) -> Self {
+		self.trust_check = Some(check);
 		self
 	}
 
@@ -221,23 +233,35 @@ impl Tool for DapTool {
 					Some(cwd) => resolve_to_cwd(cwd, session_cwd),
 					None => session_cwd.to_path_buf(),
 				};
+				let trusted = self
+					.trust_check
+					.as_deref()
+					.is_some_and(|check| check(session_cwd) && check(&command_cwd));
 				let program = resolve_to_cwd(program_arg, &command_cwd);
 				let program_kind = classify_program(&program);
 				let adapter_name = params.get("adapter").and_then(Value::as_str);
-				let selection =
-					select_launch_adapter(&program, &command_cwd, env, adapter_name, program_kind);
+				let selection = select_launch_adapter_in_session_with_trust(
+					&program,
+					session_cwd,
+					&command_cwd,
+					env,
+					adapter_name,
+					program_kind,
+					trusted,
+				);
 				let adapter = match selection {
 					LaunchAdapterSelection::Adapter(adapter) => adapter,
 					LaunchAdapterSelection::Unavailable { adapter_name, command } => {
-						return Err(invalid(adapter_unavailable_message(
+						return Err(invalid(adapter_unavailable_message_with_trust(
 							&adapter_name,
 							&command,
 							&command_cwd,
 							env,
+							trusted,
 						)));
 					},
 					LaunchAdapterSelection::None => {
-						return Err(invalid(no_adapter_message(&command_cwd, env)));
+						return Err(invalid(no_adapter_message(&command_cwd, env, trusted)));
 					},
 				};
 				if program_kind == LaunchProgramKind::Directory && !adapter.accepts_directory_program {
@@ -271,17 +295,34 @@ impl Tool for DapTool {
 					Some(cwd) => resolve_to_cwd(cwd, session_cwd),
 					None => session_cwd.to_path_buf(),
 				};
-				let adapter = match select_attach_adapter(&command_cwd, env, adapter_name, port) {
+				let trusted = self
+					.trust_check
+					.as_deref()
+					.is_some_and(|check| check(session_cwd) && check(&command_cwd));
+				let adapter = match select_attach_adapter_in_session_with_trust(
+					&command_cwd,
+					session_cwd,
+					env,
+					adapter_name,
+					port,
+					trusted,
+				) {
 					Some(adapter) => adapter,
 					None => {
 						if let Some(name) = adapter_name {
-							let command = get_adapter_configs(&command_cwd, env)
+							let command = get_adapter_configs_with_trust(&command_cwd, env, trusted)
 								.get(name)
 								.map(|config| config.command.clone())
 								.unwrap_or_else(|| name.to_string());
-							return Err(invalid(adapter_unavailable_message(name, &command, &command_cwd, env)));
+							return Err(invalid(adapter_unavailable_message_with_trust(
+								name,
+								&command,
+								&command_cwd,
+								env,
+								trusted,
+							)));
 						}
-						return Err(invalid(no_adapter_message(&command_cwd, env)));
+						return Err(invalid(no_adapter_message(&command_cwd, env, trusted)));
 					},
 				};
 				let options = super::session::AttachOptions {
@@ -805,8 +846,12 @@ fn resolve_disassembly_reference(
 	))
 }
 
-fn no_adapter_message(cwd: &Path, env: &std::collections::HashMap<String, String>) -> String {
-	let names = configured_adapter_names(cwd, env);
+fn no_adapter_message(
+	cwd: &Path,
+	env: &std::collections::HashMap<String, String>,
+	trust_project: bool,
+) -> String {
+	let names = configured_adapter_names_with_trust(cwd, env, trust_project);
 	let listed = if names.is_empty() { "none".to_string() } else { names.join(", ") };
 	format!("No debugger adapter available. Installed adapters: {listed}")
 }

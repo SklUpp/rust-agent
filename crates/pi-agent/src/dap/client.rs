@@ -769,6 +769,12 @@ fn base_command(
 	let mut command = Command::new(&adapter.resolved_command);
 	command.args(extra_args);
 	command.current_dir(cwd);
+	// Start from an empty environment, then re-add only the platform allowlist:
+	// ambient provider credentials must never reach an adapter or debuggee.
+	command.env_clear();
+	for (key, value) in crate::state::platform_env(crate::state::utf8_env_vars()) {
+		command.env(key, value);
+	}
 	command.envs(non_interactive_env());
 	// The agent environment is authoritative for PATH/HOME overrides.
 	command.envs(env);
@@ -782,7 +788,9 @@ pub(crate) fn apply_detached(command: &mut Command) {
 	#[cfg(unix)]
 	unsafe {
 		command.pre_exec(|| {
-			libc::setsid();
+			if libc::setsid() == -1 {
+				return Err(std::io::Error::last_os_error());
+			}
 			Ok(())
 		});
 	}
@@ -1107,5 +1115,93 @@ mod tests {
 		);
 		assert!(!client.is_alive(), "stalled transport still alive after dispose");
 		write.abort();
+	}
+
+	#[cfg(unix)]
+	fn env_binary() -> PathBuf {
+		let path = std::env::var_os("PATH").expect("test process PATH");
+		for dir in std::env::split_paths(&path) {
+			let candidate = dir.join("env");
+			if candidate.is_file() {
+				return candidate;
+			}
+		}
+		panic!("`env` binary not found on PATH");
+	}
+
+	#[cfg(unix)]
+	fn env_adapter(command: &Path) -> ResolvedAdapter {
+		ResolvedAdapter {
+			name: "env".to_string(),
+			command: "env".to_string(),
+			args: Vec::new(),
+			resolved_command: command.to_string_lossy().into_owned(),
+			languages: Vec::new(),
+			file_types: Vec::new(),
+			root_markers: Vec::new(),
+			launch_defaults: Value::Null,
+			attach_defaults: Value::Null,
+			connect_mode: ConnectMode::Stdio,
+			accepts_directory_program: false,
+		}
+	}
+
+	/// `base_command` must not hand ambient provider credentials to adapters or
+	/// debuggees: only the platform allowlist plus explicit overrides survive.
+	///
+	/// The assertion runs in a re-executed copy of this test binary so the
+	/// ambient secret exists without ever mutating the process-global env.
+	#[cfg(unix)]
+	#[tokio::test]
+	async fn base_command_env_clear_strips_ambient_credentials() {
+		const CHILD_ENV: &str = "DAP_TEST_ENV_CLEAR_CHILD";
+		const TEST_PATH: &str =
+			"dap::client::tests::base_command_env_clear_strips_ambient_credentials";
+		if std::env::var_os(CHILD_ENV).is_none() {
+			let output =
+				std::process::Command::new(std::env::current_exe().expect("test binary path"))
+					.env("OPENAI_API_KEY", "sk-leak")
+					.env(CHILD_ENV, "1")
+					.arg("--exact")
+					.arg(TEST_PATH)
+					.arg("--nocapture")
+					.output()
+					.expect("re-executed test binary");
+			let harness = format!(
+				"{}{}",
+				String::from_utf8_lossy(&output.stdout),
+				String::from_utf8_lossy(&output.stderr)
+			);
+			assert!(output.status.success(), "child env-clear test failed:\n{harness}");
+			assert!(harness.contains("1 passed"), "child test filter matched nothing:\n{harness}");
+			return;
+		}
+
+		let mut env = HashMap::new();
+		env.insert("DAP_TEST_EXPLICIT".to_string(), "kept".to_string());
+		let command = base_command(&env_adapter(&env_binary()), &std::env::temp_dir(), &env, &[]);
+		let output = command.output().await.expect("env child");
+		let stdout = String::from_utf8_lossy(&output.stdout);
+		assert!(
+			!stdout.contains("OPENAI_API_KEY"),
+			"ambient credential leaked into the child: {stdout}"
+		);
+		assert!(stdout.contains("DAP_TEST_EXPLICIT=kept"), "explicit env lost: {stdout}");
+		assert!(stdout.contains("TERM=dumb"), "non-interactive env lost: {stdout}");
+	}
+
+	/// Explicit overrides are layered after the platform allowlist and
+	/// `non_interactive_env`, so the agent environment stays authoritative.
+	#[cfg(unix)]
+	#[tokio::test]
+	async fn base_command_explicit_env_overrides_platform_and_noninteractive_env() {
+		let mut env = HashMap::new();
+		env.insert("PATH".to_string(), "/dap-test-path".to_string());
+		env.insert("TERM".to_string(), "xterm-256color".to_string());
+		let command = base_command(&env_adapter(&env_binary()), &std::env::temp_dir(), &env, &[]);
+		let output = command.output().await.expect("env child");
+		let stdout = String::from_utf8_lossy(&output.stdout);
+		assert!(stdout.contains("PATH=/dap-test-path"), "{stdout}");
+		assert!(stdout.contains("TERM=xterm-256color"), "{stdout}");
 	}
 }

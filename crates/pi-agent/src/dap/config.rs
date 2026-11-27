@@ -336,17 +336,17 @@ fn push_config_files(sources: &mut Vec<PathBuf>, dir: &Path) {
 
 /// Nearest first: with the later reversal in `load_adapter_configs`, closer
 /// directories override ancestors and the launch cwd overrides everything.
-fn project_ancestors(cwd: &Path) -> Vec<PathBuf> {
-	cwd.ancestors().map(Path::to_path_buf).collect()
-}
-
-fn config_sources(cwd: &Path, env: &HashMap<String, String>) -> Vec<PathBuf> {
+fn config_sources(cwd: &Path, env: &HashMap<String, String>, trust_project: bool) -> Vec<PathBuf> {
 	let mut sources = Vec::new();
-	// Plain files directly in the launch cwd win over every directory overlay.
-	push_config_files(&mut sources, cwd);
-	for ancestor in project_ancestors(cwd) {
+	// Project surfaces can register adapters that launch arbitrary commands, so
+	// they are repository content: untrusted workspaces get home sources only.
+	// A grant fingerprints paths under `cwd` only, so ancestors above it are
+	// never project content here either.
+	if trust_project {
+		// Plain files directly in the launch cwd win over every directory overlay.
+		push_config_files(&mut sources, cwd);
 		for dir in [".omp", ".claude", ".codex", ".gemini"] {
-			push_config_files(&mut sources, &ancestor.join(dir));
+			push_config_files(&mut sources, &cwd.join(dir));
 		}
 	}
 	if let Some(home) = home_dir(env) {
@@ -546,9 +546,9 @@ fn read_config_file(path: &Path) -> Option<Value> {
 	})
 }
 
-fn load_adapter_configs(cwd: &Path, env: &HashMap<String, String>) -> AdapterConfigs {
+fn load_adapter_configs(cwd: &Path, env: &HashMap<String, String>, trust_project: bool) -> AdapterConfigs {
 	let mut configs = defaults();
-	let mut sources = config_sources(cwd, env);
+	let mut sources = config_sources(cwd, env, trust_project);
 	sources.reverse();
 	for source in sources {
 		let Some(Value::Object(overrides)) = read_config_file(&source) else {
@@ -568,7 +568,16 @@ fn load_adapter_configs(cwd: &Path, env: &HashMap<String, String>) -> AdapterCon
 }
 
 pub fn get_adapter_configs(cwd: &Path, env: &HashMap<String, String>) -> AdapterConfigs {
-	load_adapter_configs(cwd, env)
+	get_adapter_configs_with_trust(cwd, env, false)
+}
+
+/// Trusted-caller variant: `trust_project` loads cwd and ancestor DAP overlays.
+pub fn get_adapter_configs_with_trust(
+	cwd: &Path,
+	env: &HashMap<String, String>,
+	trust_project: bool,
+) -> AdapterConfigs {
+	load_adapter_configs(cwd, env, trust_project)
 }
 
 fn is_executable_file(path: &Path) -> bool {
@@ -600,11 +609,93 @@ fn normalize_command_for_cwd(command: &str, cwd: &Path) -> PathBuf {
 	path
 }
 
+/// Canonical project roots an untrusted adapter lookup must never execute
+/// from: the launch cwd, the session workspace, an explicit root-marker dir,
+/// and any enclosing git checkout. `/` and `$HOME` never become checkout roots.
+fn untrusted_checkout_roots(
+	cwd: &Path,
+	session_cwd: Option<&Path>,
+	root_dir: Option<&Path>,
+) -> Vec<PathBuf> {
+	let home = std::env::var_os("HOME")
+		.map(PathBuf::from)
+		.and_then(|home| std::fs::canonicalize(home).ok());
+	let mut roots = Vec::new();
+	for path in [Some(cwd), session_cwd, root_dir].into_iter().flatten() {
+		if let Ok(canonical) = std::fs::canonicalize(path) {
+			roots.push(canonical);
+		}
+	}
+	for path in [Some(cwd), session_cwd].into_iter().flatten() {
+		collect_checkout_roots(path, home.as_deref(), &mut roots);
+	}
+	roots.sort();
+	roots.dedup();
+	roots
+}
+
+/// Push every ancestor (inclusive) of canonical `start` containing `.git`.
+///
+/// Nested markers (submodules, attacker-placed `.git` directories) must not
+/// hide an outer checkout, so the walk continues past a match. It stops before
+/// `/` and `$HOME`.
+fn collect_checkout_roots(start: &Path, home: Option<&Path>, out: &mut Vec<PathBuf>) {
+	// Walk the canonical path: a symlinked workspace alias must still find the
+	// real checkout's `.git` instead of a lexical ancestor of the alias.
+	let canonical_start = std::fs::canonicalize(start).unwrap_or_else(|_| start.to_path_buf());
+	let mut current = canonical_start.as_path();
+	loop {
+		// `Path::parent` is `None` for `/`, so the filesystem root is never
+		// inspected as a checkout.
+		if current.parent().is_none() || home.is_some_and(|home| current == home) {
+			break;
+		}
+		if current.join(".git").exists() {
+			out.push(current.to_path_buf());
+		}
+		let Some(parent) = current.parent() else {
+			break;
+		};
+		current = parent;
+	}
+}
+
 /// Resolve an executable name to an absolute path, without instantiating it.
 pub fn resolve_command(command: &str, cwd: &Path, env: &HashMap<String, String>) -> Option<String> {
+	resolve_command_with_base(command, Some(cwd), &[], env)
+}
+
+/// Whether `path` canonicalizes inside one of the untrusted checkout roots.
+fn path_inside_untrusted_roots(path: &Path, untrusted_roots: &[PathBuf]) -> bool {
+	!untrusted_roots.is_empty()
+		&& std::fs::canonicalize(path).is_ok_and(|candidate| {
+			untrusted_roots
+				.iter()
+				.any(|root| candidate.starts_with(root))
+		})
+}
+
+/// `base` is what an empty `PATH` entry means (`cwd`). A non-empty
+/// `untrusted_roots` turns on fail-closed `PATH` filtering: `base` is `None`,
+/// relative entries are skipped, and any entry or binary that canonicalizes
+/// inside ANY untrusted root is refused, so a checkout (or a sibling directory
+/// in it) cannot shadow a system adapter.
+fn resolve_command_with_base(
+	command: &str,
+	base: Option<&Path>,
+	untrusted_roots: &[PathBuf],
+	env: &HashMap<String, String>,
+) -> Option<String> {
 	let looks_like_path = command.contains('/') || command.contains('\\') || Path::new(command).is_absolute();
 	if looks_like_path {
-		let path = normalize_command_for_cwd(command, cwd);
+		let path = if Path::new(command).is_absolute() {
+			PathBuf::from(command)
+		} else {
+			normalize_command_for_cwd(command, base?)
+		};
+		if path_inside_untrusted_roots(&path, untrusted_roots) {
+			return None;
+		}
 		return is_executable_file(&path).then(|| path.to_string_lossy().into_owned());
 	}
 	let path_var = env_value(env, "PATH")
@@ -613,15 +704,29 @@ pub fn resolve_command(command: &str, cwd: &Path, env: &HashMap<String, String>)
 		.unwrap_or_default();
 	let separator = if cfg!(windows) { ';' } else { ':' };
 	for dir in path_var.split(separator) {
-		let base = if dir.is_empty() { cwd.to_path_buf() } else { PathBuf::from(dir) };
-		let candidate = base.join(command);
-		if is_executable_file(&candidate) {
+		let entry = Path::new(dir);
+		let candidate_base = if dir.is_empty() {
+			match base {
+				Some(base) => base.to_path_buf(),
+				None => continue,
+			}
+		} else {
+			if !untrusted_roots.is_empty() && !entry.is_absolute() {
+				continue;
+			}
+			entry.to_path_buf()
+		};
+		if path_inside_untrusted_roots(&candidate_base, untrusted_roots) {
+			continue;
+		}
+		let candidate = candidate_base.join(command);
+		if is_executable_file(&candidate) && !path_inside_untrusted_roots(&candidate, untrusted_roots) {
 			return Some(candidate.to_string_lossy().into_owned());
 		}
 		if cfg!(windows) {
 			for suffix in [".exe", ".cmd", ".bat"] {
-				let candidate = base.join(format!("{command}{suffix}"));
-				if is_executable_file(&candidate) {
+				let candidate = candidate_base.join(format!("{command}{suffix}"));
+				if is_executable_file(&candidate) && !path_inside_untrusted_roots(&candidate, untrusted_roots) {
 					return Some(candidate.to_string_lossy().into_owned());
 				}
 			}
@@ -630,11 +735,20 @@ pub fn resolve_command(command: &str, cwd: &Path, env: &HashMap<String, String>)
 	None
 }
 
-fn resolve_js_debug_server(cwd: &Path, env: &HashMap<String, String>) -> Option<PathBuf> {
+fn resolve_js_debug_server(
+	cwd: &Path,
+	env: &HashMap<String, String>,
+	trust_project: bool,
+	untrusted_roots: &[PathBuf],
+) -> Option<PathBuf> {
 	let mut candidates = Vec::new();
 	if let Some(configured) = env_value(env, JS_DEBUG_SERVER_ENV).filter(|value| !value.is_empty()) {
 		let configured = PathBuf::from(configured);
-		candidates.push(if configured.is_absolute() { configured } else { cwd.join(configured) });
+		if configured.is_absolute() {
+			candidates.push(configured);
+		} else if trust_project {
+			candidates.push(cwd.join(configured));
+		}
 	}
 	let data_home = env_value(env, "XDG_DATA_HOME")
 		.filter(|value| !value.is_empty())
@@ -646,7 +760,12 @@ fn resolve_js_debug_server(cwd: &Path, env: &HashMap<String, String>) -> Option<
 	if let Some(home) = home_dir(env) {
 		candidates.push(home.join(".local/opt/js-debug/src/dapDebugServer.js"));
 	}
-	candidates.into_iter().find(|candidate| candidate.is_file())
+	// A server inside an untrusted checkout is checkout-controlled code that
+	// Node would execute, even when the path comes from an absolute setting.
+	candidates.into_iter().find(|candidate| {
+		candidate.is_file()
+			&& (trust_project || !path_inside_untrusted_roots(candidate, untrusted_roots))
+	})
 }
 
 fn resolve_adapter_from_config(
@@ -655,11 +774,17 @@ fn resolve_adapter_from_config(
 	cwd: &Path,
 	env: &HashMap<String, String>,
 	local_roots: Option<&[PathBuf]>,
+	untrusted_roots: &[PathBuf],
 ) -> Option<ResolvedAdapter> {
+	let trusted = untrusted_roots.is_empty();
 	let config = configs.get(name)?;
 	if name == "js-debug-adapter" && config.command == "js-debug-adapter" {
-		let server = resolve_js_debug_server(cwd, env)?;
-		let node = resolve_command("node", cwd, env)?;
+		let server = resolve_js_debug_server(cwd, env, trusted, untrusted_roots)?;
+		let node = if trusted {
+			resolve_command("node", cwd, env)?
+		} else {
+			resolve_command_with_base("node", None, untrusted_roots, env)?
+		};
 		return Some(ResolvedAdapter {
 			name: name.to_string(),
 			command: "node".to_string(),
@@ -695,9 +820,19 @@ fn resolve_adapter_from_config(
 				}
 			}
 		}
-		resolved.or_else(|| resolve_command(&config.command, &search_cwd, env))
+		resolved.or_else(|| {
+			if trusted {
+				resolve_command(&config.command, &search_cwd, env)
+			} else {
+				// Empty or relative entries would resolve inside the checkout.
+				resolve_command_with_base(&config.command, None, untrusted_roots, env)
+			}
+		})
+	} else if trusted || Path::new(&config.command).is_absolute() {
+		resolve_command_with_base(&normalized.to_string_lossy(), Some(cwd), untrusted_roots, env)
 	} else {
-		resolve_command(&normalized.to_string_lossy(), cwd, env)
+		// A relative command path would resolve inside the untrusted checkout.
+		None
 	}?;
 	Some(ResolvedAdapter {
 		name: name.to_string(),
@@ -715,16 +850,75 @@ fn resolve_adapter_from_config(
 }
 
 pub fn resolve_adapter(name: &str, cwd: &Path, env: &HashMap<String, String>) -> Option<ResolvedAdapter> {
-	let configs = get_adapter_configs(cwd, env);
-	resolve_adapter_from_config(name, &configs, cwd, env, None)
+	resolve_adapter_with_trust(name, cwd, env, false)
+}
+
+pub fn resolve_adapter_with_trust(
+	name: &str,
+	cwd: &Path,
+	env: &HashMap<String, String>,
+	trust_project: bool,
+) -> Option<ResolvedAdapter> {
+	resolve_adapter_with_untrusted_roots(
+		name,
+		cwd,
+		env,
+		&untrusted_roots_for(cwd, None, None, trust_project),
+	)
+}
+
+fn resolve_adapter_with_untrusted_roots(
+	name: &str,
+	cwd: &Path,
+	env: &HashMap<String, String>,
+	untrusted_roots: &[PathBuf],
+) -> Option<ResolvedAdapter> {
+	let configs = get_adapter_configs_with_trust(cwd, env, untrusted_roots.is_empty());
+	resolve_adapter_from_config(name, &configs, cwd, env, None, untrusted_roots)
 }
 
 pub fn get_available_adapters(cwd: &Path, env: &HashMap<String, String>) -> Vec<ResolvedAdapter> {
-	let configs = get_adapter_configs(cwd, env);
+	get_available_adapters_with_trust(cwd, env, false)
+}
+
+pub fn get_available_adapters_with_trust(
+	cwd: &Path,
+	env: &HashMap<String, String>,
+	trust_project: bool,
+) -> Vec<ResolvedAdapter> {
+	get_available_adapters_with_untrusted_roots(
+		cwd,
+		env,
+		&untrusted_roots_for(cwd, None, None, trust_project),
+	)
+}
+
+fn get_available_adapters_with_untrusted_roots(
+	cwd: &Path,
+	env: &HashMap<String, String>,
+	untrusted_roots: &[PathBuf],
+) -> Vec<ResolvedAdapter> {
+	let configs = get_adapter_configs_with_trust(cwd, env, untrusted_roots.is_empty());
 	configs
 		.iter()
-		.filter_map(|(name, _)| resolve_adapter_from_config(name, &configs, cwd, env, None))
+		.filter_map(|(name, _)| {
+			resolve_adapter_from_config(name, &configs, cwd, env, None, untrusted_roots)
+		})
 		.collect()
+}
+
+/// `untrusted_checkout_roots` for a lookup, empty when the workspace is trusted.
+fn untrusted_roots_for(
+	cwd: &Path,
+	session_cwd: Option<&Path>,
+	root_dir: Option<&Path>,
+	trust_project: bool,
+) -> Vec<PathBuf> {
+	if trust_project {
+		Vec::new()
+	} else {
+		untrusted_checkout_roots(cwd, session_cwd, root_dir)
+	}
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -795,9 +989,17 @@ fn resolve_adapter_for_launch(
 	cwd: &Path,
 	env: &HashMap<String, String>,
 	root_dir: Option<&PathBuf>,
+	untrusted_roots: &[PathBuf],
 ) -> Option<ResolvedAdapter> {
-	let roots = root_dir.filter(|root| root.as_path() != cwd).map(|root| vec![root.clone(), cwd.to_path_buf()]);
-	resolve_adapter_from_config(adapter_name, configs, cwd, env, roots.as_deref())
+	// Root-marker and cwd directories hold repository files; searching them for
+	// a bare adapter executable is a project-controlled command, so only a
+	// trusted workspace may prefer them over `PATH`.
+	let roots = if untrusted_roots.is_empty() {
+		root_dir.filter(|root| root.as_path() != cwd).map(|root| vec![root.clone(), cwd.to_path_buf()])
+	} else {
+		None
+	};
+	resolve_adapter_from_config(adapter_name, configs, cwd, env, roots.as_deref(), untrusted_roots)
 }
 
 fn extensionless_rank(name: &str) -> Option<usize> {
@@ -837,9 +1039,11 @@ fn sort_adapters_for_launch(
 fn select_automatic_launch_adapter(
 	program: &Path,
 	cwd: &Path,
+	session_cwd: Option<&Path>,
 	program_kind: LaunchProgramKind,
 	configs: &AdapterConfigs,
 	env: &HashMap<String, String>,
+	trust_project: bool,
 ) -> LaunchAdapterSelection {
 	let extension = program
 		.extension()
@@ -854,7 +1058,10 @@ fn select_automatic_launch_adapter(
 			}
 			let root = find_root_marker_in_launch_ancestry(program, cwd, &config.root_markers, program_kind);
 			configured.push((name.to_string(), root.clone()));
-			if let Some(adapter) = resolve_adapter_for_launch(name, configs, cwd, env, root.as_ref()) {
+			let untrusted_roots = untrusted_roots_for(cwd, session_cwd, root.as_deref(), trust_project);
+			if let Some(adapter) =
+				resolve_adapter_for_launch(name, configs, cwd, env, root.as_ref(), &untrusted_roots)
+			{
 				available.push(adapter);
 			}
 		}
@@ -881,7 +1088,10 @@ fn select_automatic_launch_adapter(
 		if extensionless_rank(name).is_none() && root.is_none() {
 			continue;
 		}
-		if let Some(adapter) = resolve_adapter_for_launch(name, configs, cwd, env, root.as_ref()) {
+		let untrusted_roots = untrusted_roots_for(cwd, session_cwd, root.as_deref(), trust_project);
+		if let Some(adapter) =
+			resolve_adapter_for_launch(name, configs, cwd, env, root.as_ref(), &untrusted_roots)
+		{
 			available.push(adapter);
 		}
 	}
@@ -933,6 +1143,8 @@ fn unavailable_adapter(name: &str, configs: &AdapterConfigs) -> LaunchAdapterSel
 
 /// Pick a launch adapter. Explicit names win; otherwise ranking is extension,
 /// root-marker, native debugger preference (`gdb`, `lldb-dap`), then name.
+///
+/// Untrusted by default: project DAP overlays and cwd executables are ignored.
 pub fn select_launch_adapter(
 	program: &Path,
 	cwd: &Path,
@@ -940,13 +1152,68 @@ pub fn select_launch_adapter(
 	adapter_name: Option<&str>,
 	program_kind: LaunchProgramKind,
 ) -> LaunchAdapterSelection {
-	let configs = get_adapter_configs(cwd, env);
+	select_launch_adapter_with_trust(program, cwd, env, adapter_name, program_kind, false)
+}
+
+pub fn select_launch_adapter_with_trust(
+	program: &Path,
+	cwd: &Path,
+	env: &HashMap<String, String>,
+	adapter_name: Option<&str>,
+	program_kind: LaunchProgramKind,
+	trust_project: bool,
+) -> LaunchAdapterSelection {
+	select_launch_adapter_core(program, None, cwd, env, adapter_name, program_kind, trust_project)
+}
+
+/// Session-aware variant: `session_cwd` is the workspace's own root, so an
+/// untrusted command cwd nested under it blocks sibling checkout binaries even
+/// when the checkout has no `.git` marker.
+pub fn select_launch_adapter_in_session_with_trust(
+	program: &Path,
+	session_cwd: &Path,
+	cwd: &Path,
+	env: &HashMap<String, String>,
+	adapter_name: Option<&str>,
+	program_kind: LaunchProgramKind,
+	trust_project: bool,
+) -> LaunchAdapterSelection {
+	select_launch_adapter_core(
+		program,
+		Some(session_cwd),
+		cwd,
+		env,
+		adapter_name,
+		program_kind,
+		trust_project,
+	)
+}
+
+fn select_launch_adapter_core(
+	program: &Path,
+	session_cwd: Option<&Path>,
+	cwd: &Path,
+	env: &HashMap<String, String>,
+	adapter_name: Option<&str>,
+	program_kind: LaunchProgramKind,
+	trust_project: bool,
+) -> LaunchAdapterSelection {
+	let configs = get_adapter_configs_with_trust(cwd, env, trust_project);
 	if let Some(name) = adapter_name {
 		let Some(config) = configs.get(name) else {
 			return LaunchAdapterSelection::None;
 		};
-		let root = find_root_marker_in_launch_ancestry(program, cwd, &config.root_markers, program_kind);
-		return match resolve_adapter_for_launch(name, &configs, cwd, env, root.as_ref()) {
+		let root =
+			find_root_marker_in_launch_ancestry(program, cwd, &config.root_markers, program_kind);
+		let untrusted_roots = untrusted_roots_for(cwd, session_cwd, root.as_deref(), trust_project);
+		return match resolve_adapter_for_launch(
+			name,
+			&configs,
+			cwd,
+			env,
+			root.as_ref(),
+			&untrusted_roots,
+		) {
 			Some(adapter) => LaunchAdapterSelection::Adapter(adapter),
 			None => LaunchAdapterSelection::Unavailable {
 				adapter_name: name.to_string(),
@@ -954,7 +1221,15 @@ pub fn select_launch_adapter(
 			},
 		};
 	}
-	select_automatic_launch_adapter(program, cwd, program_kind, &configs, env)
+	select_automatic_launch_adapter(
+		program,
+		cwd,
+		session_cwd,
+		program_kind,
+		&configs,
+		env,
+		trust_project,
+	)
 }
 
 /// Attach selection: explicit name, `debugpy` when a remote port is given,
@@ -965,10 +1240,45 @@ pub fn select_attach_adapter(
 	adapter_name: Option<&str>,
 	port: Option<u16>,
 ) -> Option<ResolvedAdapter> {
+	select_attach_adapter_with_trust(cwd, env, adapter_name, port, false)
+}
+
+pub fn select_attach_adapter_with_trust(
+	cwd: &Path,
+	env: &HashMap<String, String>,
+	adapter_name: Option<&str>,
+	port: Option<u16>,
+	trust_project: bool,
+) -> Option<ResolvedAdapter> {
+	select_attach_adapter_core(cwd, None, env, adapter_name, port, trust_project)
+}
+
+/// Session-aware variant: untrusted roots include `session_cwd`, so sibling
+/// checkout binaries are refused even without a `.git` marker.
+pub fn select_attach_adapter_in_session_with_trust(
+	cwd: &Path,
+	session_cwd: &Path,
+	env: &HashMap<String, String>,
+	adapter_name: Option<&str>,
+	port: Option<u16>,
+	trust_project: bool,
+) -> Option<ResolvedAdapter> {
+	select_attach_adapter_core(cwd, Some(session_cwd), env, adapter_name, port, trust_project)
+}
+
+fn select_attach_adapter_core(
+	cwd: &Path,
+	session_cwd: Option<&Path>,
+	env: &HashMap<String, String>,
+	adapter_name: Option<&str>,
+	port: Option<u16>,
+	trust_project: bool,
+) -> Option<ResolvedAdapter> {
+	let untrusted_roots = untrusted_roots_for(cwd, session_cwd, None, trust_project);
 	if let Some(name) = adapter_name {
-		return resolve_adapter(name, cwd, env);
+		return resolve_adapter_with_untrusted_roots(name, cwd, env, &untrusted_roots);
 	}
-	let available = get_available_adapters(cwd, env);
+	let available = get_available_adapters_with_untrusted_roots(cwd, env, &untrusted_roots);
 	if port.is_some() {
 		if let Some(debugpy) = available.iter().find(|adapter| adapter.name == "debugpy") {
 			return Some(debugpy.clone());
@@ -1014,7 +1324,18 @@ pub fn resolve_launch_overrides(
 
 /// Human-readable `Installed adapters: ...` fallback list.
 pub fn configured_adapter_names(cwd: &Path, env: &HashMap<String, String>) -> Vec<String> {
-	let mut names: Vec<String> = get_available_adapters(cwd, env).into_iter().map(|adapter| adapter.name).collect();
+	configured_adapter_names_with_trust(cwd, env, false)
+}
+
+pub fn configured_adapter_names_with_trust(
+	cwd: &Path,
+	env: &HashMap<String, String>,
+	trust_project: bool,
+) -> Vec<String> {
+	let mut names: Vec<String> = get_available_adapters_with_trust(cwd, env, trust_project)
+		.into_iter()
+		.map(|adapter| adapter.name)
+		.collect();
 	names.sort();
 	names.dedup();
 	names
@@ -1022,6 +1343,16 @@ pub fn configured_adapter_names(cwd: &Path, env: &HashMap<String, String>) -> Ve
 
 /// Accurate missing-prerequisite message for a configured adapter.
 pub fn adapter_unavailable_message(adapter_name: &str, command: &str, cwd: &Path, env: &HashMap<String, String>) -> String {
+	adapter_unavailable_message_with_trust(adapter_name, command, cwd, env, false)
+}
+
+pub fn adapter_unavailable_message_with_trust(
+	adapter_name: &str,
+	command: &str,
+	cwd: &Path,
+	env: &HashMap<String, String>,
+	trust_project: bool,
+) -> String {
 	let canonical_command = match adapter_name {
 		"debugpy" => "python",
 		"dlv" => "dlv",
@@ -1040,7 +1371,7 @@ pub fn adapter_unavailable_message(adapter_name: &str, command: &str, cwd: &Path
 	if adapter_name == "js-debug-adapter" {
 		return "adapter 'js-debug-adapter' is not available: node and a local dapDebugServer.js are required (set JS_DEBUG_DAP_SERVER)".to_string();
 	}
-	let installed = configured_adapter_names(cwd, env);
+	let installed = configured_adapter_names_with_trust(cwd, env, trust_project);
 	let names = if installed.is_empty() {
 		"none".to_string()
 	} else {
@@ -1069,6 +1400,309 @@ mod tests {
 		let mut env = HashMap::new();
 		env.insert("PATH".to_string(), path.to_string());
 		env
+	}
+
+	fn unique_dir(label: &str) -> PathBuf {
+		let dir = std::env::temp_dir().join(format!("omp-dap-trust-{}-{label}", std::process::id()));
+		let _ = std::fs::remove_dir_all(&dir);
+		std::fs::create_dir_all(&dir).expect("temp dir");
+		dir
+	}
+
+	/// Home-only environment: no inherited config, no real `PATH` lookup.
+	fn isolated_env(home: &Path) -> HashMap<String, String> {
+		let mut env = HashMap::new();
+		env.insert("HOME".to_string(), home.to_string_lossy().into_owned());
+		env.insert("PATH".to_string(), home.join("bin").to_string_lossy().into_owned());
+		env
+	}
+
+	fn write_json(path: &Path, json: &str) {
+		if let Some(parent) = path.parent() {
+			std::fs::create_dir_all(parent).expect("config parent");
+		}
+		std::fs::write(path, json).expect("write config");
+	}
+
+	#[test]
+	fn untrusted_workspace_ignores_project_dap_configs() {
+		let root = unique_dir("project-config");
+		let project = root.join("project");
+		let home = root.join("home");
+		std::fs::create_dir_all(&project).expect("project dir");
+		write_json(&project.join("dap.json"), r#"{"adapters":{"project-local":{"command":"sh"}}}"#);
+		write_json(&project.join(".omp/dap.json"), r#"{"adapters":{"project-dir-local":{"command":"sh"}}}"#);
+		write_json(&root.join(".omp/dap.json"), r#"{"adapters":{"ancestor-local":{"command":"sh"}}}"#);
+		write_json(
+			&home.join(".aragent/agent/dap.json"),
+			r#"{"adapters":{"home-local":{"command":"sh"}}}"#,
+		);
+		let env = isolated_env(&home);
+
+		let untrusted = get_adapter_configs_with_trust(&project, &env, false);
+		assert!(untrusted.get("project-local").is_none(), "cwd overlay must be ignored");
+		assert!(untrusted.get("project-dir-local").is_none(), "cwd tool-dir overlay must be ignored");
+		assert!(untrusted.get("ancestor-local").is_none(), "ancestor overlay must be ignored");
+		assert!(untrusted.get("home-local").is_some(), "home overlay stays operator-owned");
+		assert!(
+			get_adapter_configs(&project, &env).get("project-local").is_none(),
+			"default getter is fail-closed"
+		);
+
+		let trusted = get_adapter_configs_with_trust(&project, &env, true);
+		assert!(trusted.get("project-local").is_some(), "trusted cwd overlay loads");
+		assert!(trusted.get("project-dir-local").is_some(), "trusted cwd tool-dir overlay loads");
+		assert!(
+			trusted.get("ancestor-local").is_none(),
+			"the grant covers only cwd; ancestor overlays must not load"
+		);
+		assert!(trusted.get("home-local").is_some());
+	}
+
+	#[cfg(unix)]
+	#[test]
+	fn untrusted_workspace_never_runs_bare_local_adapters() {
+		use std::os::unix::fs::PermissionsExt;
+
+		let root = unique_dir("bare-binary");
+		let project = root.join("project");
+		let home = root.join("home");
+		let program_dir = project.join("src");
+		std::fs::create_dir_all(&program_dir).expect("program dir");
+		std::fs::write(program_dir.join("marker.file"), "").expect("marker");
+		let command = format!("omp-fake-dap-{}", std::process::id());
+		let binary = program_dir.join(&command);
+		std::fs::write(&binary, "#!/bin/sh\n").expect("fake adapter");
+		std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+		let cwd_binary = project.join(&command);
+		std::fs::copy(&binary, &cwd_binary).expect("copy fake adapter");
+		write_json(
+			&home.join(".aragent/agent/dap.json"),
+			&format!(
+				r#"{{"adapters":{{"local-dap":{{"command":"{command}","fileTypes":[".c"],"rootMarkers":["marker.file"]}}}}}}"#
+			),
+		);
+		let mut env = isolated_env(&home);
+		// A trailing empty PATH entry means "current directory"; untrusted
+		// resolution must refuse it.
+		env.insert("PATH".to_string(), String::new());
+		let program = program_dir.join("main.c");
+
+		let untrusted = select_launch_adapter_with_trust(
+			&program,
+			&project,
+			&env,
+			Some("local-dap"),
+			LaunchProgramKind::File,
+			false,
+		);
+		assert!(
+			matches!(untrusted, LaunchAdapterSelection::Unavailable { .. }),
+			"untrusted launch must not resolve repository executables"
+		);
+
+		let trusted = select_launch_adapter_with_trust(
+			&program,
+			&project,
+			&env,
+			Some("local-dap"),
+			LaunchProgramKind::File,
+			true,
+		);
+		match trusted {
+			LaunchAdapterSelection::Adapter(adapter) => {
+				assert_eq!(adapter.resolved_command, binary.to_string_lossy().into_owned());
+			},
+			other => panic!("trusted launch should resolve the root-marker binary: {other:?}"),
+		}
+	}
+
+	#[cfg(unix)]
+	#[test]
+	fn untrusted_path_search_rejects_relative_and_checkout_entries() {
+		use std::os::unix::fs::PermissionsExt;
+
+		let root = unique_dir("untrusted-path");
+		let project = root.join("project");
+		let project_bin = project.join("bin");
+		let external_bin = root.join("external-bin");
+		std::fs::create_dir_all(&project_bin).expect("project bin");
+		std::fs::create_dir_all(&external_bin).expect("external bin");
+		let command = format!("omp-path-dap-{}", std::process::id());
+		for dir in [&project_bin, &external_bin] {
+			let path = dir.join(&command);
+			std::fs::write(&path, "#!/bin/sh\n").expect("fake adapter");
+			std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+		}
+
+		let mut env = HashMap::new();
+		let untrusted_roots = vec![std::fs::canonicalize(&project).expect("canonical project")];
+		env.insert("PATH".to_string(), ".".to_string());
+		assert!(
+			resolve_command_with_base(&command, None, &untrusted_roots, &env).is_none(),
+			"relative PATH entries must not resolve"
+		);
+		env.insert("PATH".to_string(), project_bin.to_string_lossy().into_owned());
+		assert!(
+			resolve_command_with_base(&command, None, &untrusted_roots, &env).is_none(),
+			"PATH entries inside the untrusted cwd must not resolve"
+		);
+		env.insert("PATH".to_string(), external_bin.to_string_lossy().into_owned());
+		let resolved = resolve_command_with_base(&command, None, &untrusted_roots, &env)
+			.expect("an external absolute PATH binary still resolves");
+		assert_eq!(resolved, external_bin.join(&command).to_string_lossy().into_owned());
+	}
+
+	#[cfg(unix)]
+	#[test]
+	fn untrusted_git_checkout_blocks_sibling_binaries() {
+		use std::os::unix::fs::PermissionsExt;
+
+		let root = unique_dir("checkout-git");
+		let repo = root.join("repo");
+		let src = repo.join("src");
+		let bin = repo.join("bin");
+		std::fs::create_dir_all(&src).expect("src dir");
+		std::fs::create_dir_all(repo.join(".git")).expect(".git dir");
+		std::fs::create_dir_all(&bin).expect("bin dir");
+		let gdb = bin.join("gdb");
+		std::fs::write(&gdb, "#!/bin/sh\n").expect("fake gdb");
+		std::fs::set_permissions(&gdb, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+
+		let mut env = HashMap::new();
+		env.insert("PATH".to_string(), bin.to_string_lossy().into_owned());
+		assert!(
+			resolve_adapter_with_trust("gdb", &src, &env, false).is_none(),
+			"the enclosing git checkout must block a sibling PATH binary"
+		);
+		assert!(
+			resolve_adapter_with_trust("gdb", &src, &env, true).is_some(),
+			"trusted launches may still use PATH"
+		);
+	}
+
+	#[cfg(unix)]
+	#[test]
+	fn symlinked_workspace_alias_still_finds_the_checkout_root() {
+		use std::os::unix::fs::PermissionsExt;
+
+		let root = unique_dir("checkout-symlink");
+		let repo = root.join("repo");
+		let src = repo.join("src");
+		let bin = repo.join("bin");
+		std::fs::create_dir_all(&src).expect("src dir");
+		std::fs::create_dir_all(repo.join(".git")).expect(".git dir");
+		std::fs::create_dir_all(&bin).expect("bin dir");
+		let gdb = bin.join("gdb");
+		std::fs::write(&gdb, "#!/bin/sh\n").expect("fake gdb");
+		std::fs::set_permissions(&gdb, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+		let alias = root.join("alias");
+		std::os::unix::fs::symlink(&src, &alias).expect("symlink alias");
+
+		let mut env = HashMap::new();
+		env.insert("PATH".to_string(), bin.to_string_lossy().into_owned());
+		assert!(
+			resolve_adapter_with_trust("gdb", &alias, &env, false).is_none(),
+			"a symlinked cwd must still recognize the real checkout root"
+		);
+	}
+
+	#[cfg(unix)]
+	#[test]
+	fn nested_git_marker_does_not_hide_the_outer_checkout() {
+		use std::os::unix::fs::PermissionsExt;
+
+		let root = unique_dir("checkout-nested");
+		let repo = root.join("repo");
+		let src = repo.join("src");
+		let bin = repo.join("bin");
+		std::fs::create_dir_all(repo.join(".git")).expect(".git dir");
+		std::fs::create_dir_all(src.join(".git")).expect("nested .git dir");
+		std::fs::create_dir_all(&bin).expect("bin dir");
+		let gdb = bin.join("gdb");
+		std::fs::write(&gdb, "#!/bin/sh\n").expect("fake gdb");
+		std::fs::set_permissions(&gdb, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+
+		let mut env = HashMap::new();
+		env.insert("PATH".to_string(), bin.to_string_lossy().into_owned());
+		assert!(
+			resolve_adapter_with_trust("gdb", &src, &env, false).is_none(),
+			"a nested .git marker must not hide the outer checkout from the root set"
+		);
+	}
+
+	#[test]
+	fn untrusted_checkout_cannot_supply_the_js_debug_server() {
+		let root = unique_dir("js-debug-server");
+		let checkout = root.join("checkout");
+		std::fs::create_dir_all(&checkout).expect("checkout dir");
+		let server = checkout.join("dapDebugServer.js");
+		std::fs::write(&server, "// checkout-controlled\n").expect("server file");
+
+		let mut env = HashMap::new();
+		env.insert("JS_DEBUG_DAP_SERVER".to_string(), server.to_string_lossy().into_owned());
+		env.insert("PATH".to_string(), String::new());
+		let untrusted_roots = vec![std::fs::canonicalize(&checkout).expect("canonical checkout")];
+
+		assert!(
+			resolve_js_debug_server(&checkout, &env, false, &untrusted_roots).is_none(),
+			"an untrusted checkout must not provide the js-debug server"
+		);
+		assert_eq!(
+			resolve_js_debug_server(&checkout, &env, true, &untrusted_roots),
+			Some(server),
+			"trusted callers may still use the configured js-debug server"
+		);
+	}
+
+	#[cfg(unix)]
+	#[test]
+	fn untrusted_session_root_blocks_sibling_binaries_without_git() {
+		use std::os::unix::fs::PermissionsExt;
+
+		let root = unique_dir("checkout-session");
+		let repo = root.join("repo");
+		let src = repo.join("src");
+		let bin = repo.join("bin");
+		let external_bin = root.join("external-bin");
+		std::fs::create_dir_all(&src).expect("src dir");
+		std::fs::create_dir_all(&bin).expect("bin dir");
+		std::fs::create_dir_all(&external_bin).expect("external bin");
+		for dir in [&bin, &external_bin] {
+			let gdb = dir.join("gdb");
+			std::fs::write(&gdb, "#!/bin/sh\n").expect("fake gdb");
+			std::fs::set_permissions(&gdb, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+		}
+
+		let mut env = HashMap::new();
+		env.insert("PATH".to_string(), bin.to_string_lossy().into_owned());
+		assert!(
+			select_attach_adapter_in_session_with_trust(&src, &repo, &env, Some("gdb"), None, false)
+				.is_none(),
+			"session_cwd must block sibling binaries without a .git marker"
+		);
+		let program = src.join("main.c");
+		assert!(
+			matches!(
+				select_launch_adapter_in_session_with_trust(
+					&program,
+					&repo,
+					&src,
+					&env,
+					Some("gdb"),
+					LaunchProgramKind::File,
+					false,
+				),
+				LaunchAdapterSelection::Unavailable { .. }
+			),
+			"launch must refuse the sibling checkout binary"
+		);
+
+		env.insert("PATH".to_string(), external_bin.to_string_lossy().into_owned());
+		let adapter =
+			select_attach_adapter_in_session_with_trust(&src, &repo, &env, Some("gdb"), None, false)
+				.expect("an external absolute PATH binary still resolves");
+		assert_eq!(adapter.resolved_command, external_bin.join("gdb").to_string_lossy().into_owned());
 	}
 
 	#[test]

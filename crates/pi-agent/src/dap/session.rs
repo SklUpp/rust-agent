@@ -2533,6 +2533,12 @@ impl ReverseRequestHandler for RunInTerminalHandler {
 		command.stdin(Stdio::null());
 		command.stdout(Stdio::piped());
 		command.stderr(Stdio::null());
+		// Start from an empty environment, then re-add only the platform
+		// allowlist: ambient provider credentials must never reach the debuggee.
+		command.env_clear();
+		for (key, value) in crate::state::platform_env(crate::state::utf8_env_vars()) {
+			command.env(key, value);
+		}
 		command.envs(non_interactive_env());
 		command.envs(session.env.iter().filter(|(_, value)| !value.is_empty()));
 		for (key, value) in &args.env {
