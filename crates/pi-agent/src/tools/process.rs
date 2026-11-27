@@ -546,17 +546,6 @@ struct LogFile {
 	state: Mutex<LogState>,
 }
 
-fn ensure_private_dir(dir: &Path) -> std::io::Result<()> {
-	let mut builder = std::fs::DirBuilder::new();
-	builder.recursive(true);
-	#[cfg(unix)]
-	{
-		use std::os::unix::fs::DirBuilderExt;
-		builder.mode(0o700);
-	}
-	builder.create(dir)
-}
-
 fn create_private(path: &Path) -> std::io::Result<File> {
 	let mut options = OpenOptions::new();
 	options.write(true).create(true).truncate(true);
@@ -612,7 +601,7 @@ fn open_append_private(path: &Path) -> std::io::Result<File> {
 
 impl LogFile {
 	fn open(dir: &Path) -> std::io::Result<Self> {
-		ensure_private_dir(dir)?;
+		crate::process_broker::private_fs::ensure_private_dir(dir)?;
 		let path = dir.join(LOG_FILE);
 		let previous = dir.join(PREVIOUS_LOG_FILE);
 		let _ = std::fs::remove_file(&previous);
@@ -629,7 +618,7 @@ impl LogFile {
 	/// Reopen a log directory left by a previous broker generation, keeping the
 	/// existing bytes (detached processes write this file through their own fd).
 	fn adopt(dir: &Path) -> std::io::Result<Self> {
-		ensure_private_dir(dir)?;
+		crate::process_broker::private_fs::ensure_private_dir(dir)?;
 		let path = dir.join(LOG_FILE);
 		let previous = dir.join(PREVIOUS_LOG_FILE);
 		let size = std::fs::metadata(&path).map_or(0, |metadata| metadata.len());

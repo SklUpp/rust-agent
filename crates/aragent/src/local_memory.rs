@@ -633,13 +633,18 @@ fn write_atomic(file_path: &Path, contents: &str, cancel: Option<&CancelProbe<'_
 		NEXT_TEMP.fetch_add(1, Ordering::Relaxed)
 	));
 	{
-		let mut file = fs::OpenOptions::new()
-			.write(true)
-			.create_new(true)
+		let mut options = fs::OpenOptions::new();
+		options.write(true).create_new(true);
+		#[cfg(unix)]
+		{
+			use std::os::unix::fs::OpenOptionsExt as _;
+			options.mode(0o600);
+		}
+		let mut file = options
 			.open(&tmp)
 			.map_err(|err| Error::with_source(format!("cannot create {}", tmp.display()), err))?;
 		file.write_all(contents.as_bytes())
-			.and_then(|()| file.flush())
+			.and_then(|()| file.sync_all())
 			.map_err(|err| Error::with_source(format!("cannot write {}", tmp.display()), err))?;
 	}
 	if is_cancelled(cancel) {

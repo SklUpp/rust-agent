@@ -10,6 +10,7 @@
 
 pub mod broker;
 pub mod client;
+pub mod private_fs;
 pub mod protocol;
 
 pub use broker::{Broker, BrokerBackend, ManagerBackend, start};

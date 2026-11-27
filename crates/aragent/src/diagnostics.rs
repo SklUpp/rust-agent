@@ -33,8 +33,11 @@ use std::{
 
 use pi_agent::{
 	TurnStatus,
+	process_broker::private_fs::{current_euid, verify_ancestor_chain},
 	supervisor::{SubagentEvent, SubagentLifecycleStatus, SubagentObserver},
 };
+#[cfg(unix)]
+use pi_agent::process_broker::private_fs::{PRIVATE_DIR_MODE, PRIVATE_FILE_MODE};
 use rusqlite::{Connection, OpenFlags, params};
 
 use crate::{config::Config, dirs};
@@ -78,114 +81,10 @@ INSERT INTO spans (
 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 ";
 
-/// Owner-only file mode for the database and its SQLite sidecars.
-#[cfg(unix)]
-const PRIVATE_FILE_MODE: u32 = 0o600;
-/// Owner-only directory mode for a diagnostics directory this process creates.
-#[cfg(unix)]
-const PRIVATE_DIRECTORY_MODE: u32 = 0o700;
-
 fn sidecar_path(path: &Path, suffix: &str) -> PathBuf {
 	let mut os = path.as_os_str().to_os_string();
 	os.push(suffix);
 	PathBuf::from(os)
-}
-
-/// An ancestor owner we trust not to substitute entries: root, the current
-/// user, or (on Android) the platform `system` uid.
-#[cfg(unix)]
-fn trusted_owner(uid: u32, euid: u32) -> bool {
-	#[cfg(target_os = "android")]
-	{
-		if uid == 1000 {
-			return true;
-		}
-	}
-	uid == 0 || uid == euid
-}
-
-/// Prove that a group-writable directory's writable group is exclusive to a
-/// trusted principal. GID 0 is not exclusive (wheel/root groups may contain
-/// other users), so only established Android identities qualify: the platform
-/// `system` uid/gid or an app's own uid/gid pair.
-#[cfg(unix)]
-fn exclusive_group(_uid: u32, _euid: u32, _gid: u32) -> bool {
-	#[cfg(target_os = "android")]
-	{
-		// Verified on device: `/data` and `/data/data` are `system:system`
-		// (uid/gid 1000), mode 0771. Older platform layouts use `root:system`
-		// (uid 0, gid 1000); the writable principal is still the platform-only
-		// gid 1000 either way.
-		if _gid == 1000 && (_uid == 1000 || _uid == 0) {
-			return true;
-		}
-		// App ids start at 10000 and use the app uid as its own private
-		// primary gid; require the directory to match this process exactly.
-		if _euid >= 10_000 && _uid == _euid && _gid == _euid {
-			return true;
-		}
-	}
-	false
-}
-
-/// A directory ancestor is trusted when its owner is trusted and other users
-/// cannot create/rename inside it, or when sticky semantics protect our owned
-/// entries, or when a writable group is provably platform-exclusive.
-fn trusted_ancestor(metadata: &fs::Metadata, euid: u32) -> bool {
-	#[cfg(unix)]
-	{
-		use std::os::unix::fs::{MetadataExt, PermissionsExt};
-		if metadata.file_type().is_symlink() || !metadata.is_dir() {
-			return false;
-		}
-		let mode = metadata.permissions().mode();
-		let uid = metadata.uid();
-		let gid = metadata.gid();
-		let owner_trusted = trusted_owner(uid, euid);
-		if mode & 0o022 == 0 {
-			return owner_trusted;
-		}
-		if mode & 0o1000 != 0 {
-			// Sticky: rename of our entries is limited to root/current user.
-			return owner_trusted;
-		}
-		if mode & 0o002 != 0 {
-			// World-writable without sticky semantics.
-			return false;
-		}
-		// Group-writable only: reject unless the writable group is exclusive.
-		exclusive_group(uid, euid, gid)
-	}
-	#[cfg(not(unix))]
-	{
-		let _ = euid;
-		!metadata.file_type().is_symlink() && metadata.is_dir()
-	}
-}
-
-fn verify_ancestor_chain(
-	dir: &Path,
-	euid: u32,
-	missing_ok: bool,
-) -> Result<(), OpenError> {
-	if !dir.is_absolute() {
-		return Err(OpenError);
-	}
-	for ancestor in dir.ancestors() {
-		if ancestor.as_os_str().is_empty() {
-			continue;
-		}
-		match fs::symlink_metadata(ancestor) {
-			Ok(metadata) => {
-				if !trusted_ancestor(&metadata, euid) {
-					return Err(OpenError);
-				}
-			},
-			Err(error) if missing_ok && error.kind() == io::ErrorKind::NotFound => {},
-			Err(_) => return Err(OpenError),
-		}
-	}
-	Ok(())
 }
 
 /// Require a private diagnostics directory: regular directory, owned by the
@@ -193,18 +92,14 @@ fn verify_ancestor_chain(
 /// ancestor must be safe from rename by other users; a missing directory is
 /// created with that mode. Unsafe ancestors are refused, never chmodded.
 fn ensure_private_directory(dir: &Path) -> Result<(), OpenError> {
-	#[cfg(unix)]
-	// SAFETY: geteuid has no preconditions.
-	let euid = unsafe { libc::geteuid() };
-	#[cfg(not(unix))]
-	let euid = 0;
-	verify_ancestor_chain(dir, euid, true)?;
+	let euid = current_euid();
+	verify_ancestor_chain(dir, euid, true).map_err(|_| OpenError)?;
 	if fs::symlink_metadata(dir).is_err() {
 		#[cfg(unix)]
 		{
 			use std::os::unix::fs::DirBuilderExt;
 			let mut builder = fs::DirBuilder::new();
-			builder.recursive(true).mode(PRIVATE_DIRECTORY_MODE);
+			builder.recursive(true).mode(PRIVATE_DIR_MODE);
 			builder.create(dir).map_err(|_| OpenError)?;
 		}
 		#[cfg(not(unix))]
@@ -212,7 +107,7 @@ fn ensure_private_directory(dir: &Path) -> Result<(), OpenError> {
 			fs::create_dir_all(dir).map_err(|_| OpenError)?;
 		}
 	}
-	verify_ancestor_chain(dir, euid, false)?;
+	verify_ancestor_chain(dir, euid, false).map_err(|_| OpenError)?;
 	verify_private_directory(dir)
 }
 
@@ -224,12 +119,10 @@ fn verify_private_directory(dir: &Path) -> Result<(), OpenError> {
 	#[cfg(unix)]
 	{
 		use std::os::unix::fs::{MetadataExt, PermissionsExt};
-		// SAFETY: geteuid has no preconditions.
-		let uid = unsafe { libc::geteuid() };
-		if metadata.uid() != uid {
+		if metadata.uid() != current_euid() {
 			return Err(OpenError);
 		}
-		if metadata.permissions().mode() & 0o777 != PRIVATE_DIRECTORY_MODE {
+		if metadata.permissions().mode() & 0o777 != PRIVATE_DIR_MODE {
 			return Err(OpenError);
 		}
 	}
@@ -1133,7 +1026,7 @@ pub fn start_session(key: &str) -> Option<SessionTrace> {
 
 #[cfg(all(test, unix))]
 mod security_tests {
-	use super::{exclusive_group, trusted_owner};
+	use pi_agent::process_broker::private_fs::{exclusive_group, trusted_owner};
 
 	#[test]
 	fn only_root_current_or_android_system_owners_are_trusted() {

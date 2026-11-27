@@ -15,6 +15,9 @@
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use pi_agent::process_broker::private_fs::{
+	ensure_private_dir, set_mode_best_effort, tighten_sqlite_sidecars,
+};
 use rusqlite::{Connection, OptionalExtension as _, params};
 use serde::Serialize;
 
@@ -176,16 +179,25 @@ impl CredentialStore {
 	pub fn open(path: impl Into<PathBuf>) -> Result<Self, AuthError> {
 		let path = path.into();
 		if let Some(parent) = path.parent() {
-			if !parent.as_os_str().is_empty() && !parent.exists() {
-				std::fs::create_dir_all(parent)?;
-				set_mode(parent, 0o700);
+			if !parent.as_os_str().is_empty() {
+				if parent.exists() {
+					// `open_at` also serves explicit paths; tighten only a
+					// dedicated credential directory, never `.` or `$HOME`.
+					if is_dedicated_credential_dir(parent) {
+						let _ = ensure_private_dir(parent);
+					}
+				} else {
+					ensure_private_dir(parent)?;
+				}
 			}
 		}
 		let connection = open_with_retry(&path)?;
 		// Best effort, matching TS: an FS that refuses chmod is not fatal.
-		set_mode(&path, 0o600);
+		set_mode_best_effort(&path, 0o600);
 		let store = Self { path, connection };
 		store.initialize()?;
+		// WAL mode creates `-wal`/`-shm` lazily; tighten whatever exists now.
+		tighten_sqlite_sidecars(&store.path);
 		Ok(store)
 	}
 
@@ -1097,14 +1109,45 @@ fn now_ms() -> i64 {
 		.unwrap_or(0)
 }
 
-#[cfg(unix)]
-fn set_mode(path: &Path, mode: u32) {
-	use std::os::unix::fs::PermissionsExt as _;
-	let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode));
+/// Directories this store may tighten when it did not create them.
+///
+/// [`CredentialStore::open`] accepts explicit paths (tests,
+/// `PI_CODING_AGENT_DIR`), so a pre-existing parent is tightened only when its
+/// canonical identity is the configured agent directory. Canonicalization also
+/// catches lexical and symlink aliases; the home directory and the process
+/// working directory themselves are never tightened.
+fn is_dedicated_credential_dir(dir: &Path) -> bool {
+	let cwd = std::env::current_dir().ok();
+	is_dedicated_credential_dir_against(
+		dir,
+		&crate::dirs::agent_dir(),
+		crate::dirs::home_dir().as_deref(),
+		cwd.as_deref(),
+	)
 }
 
-#[cfg(not(unix))]
-fn set_mode(_path: &Path, _mode: u32) {}
+/// Canonical-identity predicate with injectable paths for tests.
+fn is_dedicated_credential_dir_against(
+	dir: &Path,
+	agent_dir: &Path,
+	home_dir: Option<&Path>,
+	cwd: Option<&Path>,
+) -> bool {
+	let Ok(canon_dir) = std::fs::canonicalize(dir) else {
+		return false;
+	};
+	if is_same_canonical_path(home_dir, &canon_dir) || is_same_canonical_path(cwd, &canon_dir) {
+		return false;
+	}
+	std::fs::canonicalize(agent_dir).is_ok_and(|agent| canon_dir == agent)
+}
+
+/// Compare an optional path with an already canonicalized directory.
+fn is_same_canonical_path(candidate: Option<&Path>, canon_dir: &Path) -> bool {
+	candidate
+		.and_then(|candidate| std::fs::canonicalize(candidate).ok())
+		.is_some_and(|candidate| candidate == canon_dir)
+}
 
 #[cfg(test)]
 mod tests {
@@ -1119,6 +1162,58 @@ mod tests {
 			email: Some(format!("{account}@example.com")),
 			..OAuthCredentials::default()
 		})
+	}
+
+	#[test]
+	fn only_canonical_agent_dir_is_tightened() {
+		let root = std::env::temp_dir().join(format!(
+			"aragent-auth-dir-{}-{}",
+			std::process::id(),
+			line!()
+		));
+		let _ = std::fs::remove_dir_all(&root);
+		let home = root.join("agent");
+		let agent = root.join("my-store");
+		let unrelated = root.join("shared");
+		std::fs::create_dir_all(&home).expect("home");
+		std::fs::create_dir_all(&agent).expect("agent");
+		std::fs::create_dir_all(&unrelated).expect("shared");
+		std::fs::create_dir_all(root.join("user")).expect("alias parent");
+
+		assert!(is_dedicated_credential_dir_against(
+			&agent,
+			&agent,
+			Some(home.as_path()),
+			None
+		));
+		assert!(!is_dedicated_credential_dir_against(
+			&unrelated,
+			&agent,
+			Some(home.as_path()),
+			None
+		));
+		// `root/user/../agent` is a lexical alias of HOME; HOME must win.
+		let alias = root.join("user").join("..").join("agent");
+		assert!(
+			!is_dedicated_credential_dir_against(
+				&alias,
+				&home,
+				Some(home.as_path()),
+				None
+			),
+			"a lexical alias of HOME must not be tightened"
+		);
+		// `PI_CODING_AGENT_DIR=.` must not tighten the working directory.
+		assert!(
+			!is_dedicated_credential_dir_against(
+				&root,
+				&root,
+				Some(home.as_path()),
+				Some(root.as_path())
+			),
+			"the working directory must not be tightened"
+		);
+		std::fs::remove_dir_all(&root).expect("cleanup");
 	}
 
 	#[test]
