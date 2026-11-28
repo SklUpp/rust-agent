@@ -582,11 +582,73 @@ mod tests {
 	}
 
 	#[test]
-	fn xdg_supported_covers_every_init_xdg_target() {
-		assert_eq!(
-			xdg_supported(),
-			cfg!(any(target_os = "linux", target_os = "android", target_os = "macos")),
-			"`dirs.rs` XDG roots and `arag config init-xdg` must accept the same targets"
+	fn xdg_agent_root_reads_only_its_own_category_variable() {
+		let _env = crate::TEST_ENV_LOCK.lock().expect("env lock");
+		let home = env::temp_dir().join(format!("aragent-dirs-xdg-category-{}", std::process::id()));
+		let keys = [
+			"HOME",
+			"PI_CONFIG_DIR",
+			"PI_CODING_AGENT_DIR",
+			"ARAGENT_PROFILE",
+			"OMP_PROFILE",
+			"PI_PROFILE",
+			"XDG_CONFIG_HOME",
+			"XDG_DATA_HOME",
+			"XDG_STATE_HOME",
+			"XDG_CACHE_HOME",
+		];
+		let saved = keys.map(env::var_os);
+		let config_home = home.join("config");
+		let state_home = home.join("state");
+		let _ = std::fs::remove_dir_all(&home);
+		// `init-xdg` creates `$XDG_*_HOME/aragent`; only an existing dir pins.
+		std::fs::create_dir_all(config_home.join(XDG_APP_DIR_NAME)).expect("config app dir");
+		std::fs::create_dir_all(state_home.join(XDG_APP_DIR_NAME)).expect("state app dir");
+		// SAFETY: guarded by TEST_ENV_LOCK.
+		unsafe {
+			env::set_var("HOME", &home);
+			for key in &keys[1..] {
+				env::remove_var(*key);
+			}
+			env::set_var("XDG_CONFIG_HOME", &config_home);
+			env::set_var("XDG_STATE_HOME", &state_home);
+		}
+		let supported = xdg_supported();
+		let state_root = xdg_agent_root(AgentDirCategory::State);
+		// `XDG_CONFIG_HOME` is not an agent category, and unset
+		// `XDG_DATA_HOME`/`XDG_CACHE_HOME` never pin.
+		let data_root = xdg_agent_root(AgentDirCategory::Data);
+		let cache_root = xdg_agent_root(AgentDirCategory::Cache);
+		let subdir = root_subdir("sessions", AgentDirCategory::State);
+		let fallback_subdir = config_root().join("sessions");
+		// Only the existing `$XDG_STATE_HOME/aragent` pins; `init-xdg` is what
+		// creates it. Removing it restores the config-root fallback.
+		let _ = std::fs::remove_dir_all(state_home.join(XDG_APP_DIR_NAME));
+		let missing_state_root = xdg_agent_root(AgentDirCategory::State);
+		// SAFETY: guarded by TEST_ENV_LOCK.
+		unsafe {
+			for (key, value) in keys.into_iter().zip(saved) {
+				match value {
+					Some(value) => env::set_var(key, value),
+					None => env::remove_var(key),
+				}
+			}
+		}
+		let _ = std::fs::remove_dir_all(&home);
+		if supported {
+			assert_eq!(state_root, Some(state_home.join(XDG_APP_DIR_NAME)));
+			assert_eq!(subdir, state_home.join(XDG_APP_DIR_NAME).join("sessions"));
+		} else {
+			assert_eq!(state_root, None, "off XDG targets nothing pins");
+			assert_eq!(subdir, fallback_subdir);
+		}
+		assert_eq!(data_root, None, "an unset XDG_DATA_HOME never pins");
+		assert_eq!(cache_root, None, "an unset XDG_CACHE_HOME never pins");
+		assert_eq!(missing_state_root, None, "an absent $XDG_STATE_HOME/aragent never pins");
+		assert_ne!(
+			state_root,
+			Some(config_home.join(XDG_APP_DIR_NAME)),
+			"XDG_CONFIG_HOME is not an agent category"
 		);
 	}
 

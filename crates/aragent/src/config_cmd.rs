@@ -1201,6 +1201,10 @@ fn migrate_settings(raw: &mut Value) {
 		}
 	}
 	// compaction.strategy / remoteEnabled -> methodOrder
+	// `settings_leaf` reads a dotted `compaction.<leaf>` only when the group is
+	// absent; migration must mirror that or the CLI reports values the runtime
+	// ignores. Capture the state before legacy handling can create the group.
+	let had_compaction_group = root.iter().any(|(key, _)| key == "compaction");
 	let configured_order = map_get_mut(root, "compaction")
 		.and_then(|value| match value {
 			Value::Map(inner) => inner.iter().find(|(key, _)| key == "methodOrder").map(|(_, v)| v.clone()),
@@ -1258,7 +1262,7 @@ fn migrate_settings(raw: &mut Value) {
 	}
 	map_take(root, "compaction.strategy");
 	map_take(root, "compaction.remoteEnabled");
-	map_take(root, "compaction.methodOrder");
+	lift_dotted_compaction_leaves(root, had_compaction_group);
 	// snapcompact.systemPrompt boolean -> enum
 	for holder in ["snapcompact", "snapcompact.systemPrompt"] {
 		let flag = match map_get_mut(root, holder) {
@@ -1393,6 +1397,34 @@ fn migrate_settings(raw: &mut Value) {
 		}
 	}
 	migrate_settings_tail(root);
+}
+
+/// Fold flat `compaction.<leaf>` keys (e.g. `compaction.thresholdPercent`,
+/// `compaction.methodOrder`) into a nested `compaction` map, but only for a
+/// layer that had no `compaction` key at all. `settings_leaf` returns the
+/// dotted key only when the group is absent; once a group entry exists (map or
+/// not) it shadows every dotted leaf. Lifting in that case would make the CLI
+/// report values the runtime ignores, so the dotted keys are left untouched.
+fn lift_dotted_compaction_leaves(root: &mut Vec<(String, Value)>, had_compaction_group: bool) {
+	if had_compaction_group {
+		return;
+	}
+	const PREFIX: &str = "compaction.";
+	let dotted: Vec<(String, Value)> = root
+		.iter()
+		.filter(|(key, _)| key.starts_with(PREFIX))
+		.map(|(key, value)| (key[PREFIX.len()..].to_string(), value.clone()))
+		.collect();
+	if dotted.is_empty() {
+		return;
+	}
+	let compaction = ensure_map(root, "compaction");
+	for (leaf, value) in dotted {
+		if compaction.iter().all(|(key, _)| key.as_str() != leaf.as_str()) {
+			map_set(compaction, &leaf, value);
+		}
+	}
+	root.retain(|(key, _)| !key.starts_with(PREFIX));
 }
 
 /// Provider priority lists used by the retired single-preference settings.
@@ -3027,6 +3059,44 @@ mod tests {
 			}),
 			Some("always")
 		);
+	}
+
+	#[test]
+	fn dotted_compaction_leaves_lift_only_without_a_compaction_group() {
+		let mut raw = Value::Map(vec![
+			("compaction.enabled".to_string(), Value::Bool(true)),
+			("compaction.thresholdTokens".to_string(), Value::Int(50_000)),
+			(
+				"compaction.methodOrder".to_string(),
+				Value::List(vec![Value::Str("soft".to_string())]),
+			),
+		]);
+		migrate_settings(&mut raw);
+		assert_eq!(lookup(&raw, "compaction.enabled"), Some(&Value::Bool(true)));
+		assert_eq!(lookup(&raw, "compaction.thresholdTokens"), Some(&Value::Int(50_000)));
+		assert_eq!(
+			lookup(&raw, "compaction.methodOrder"),
+			Some(&Value::List(vec![Value::Str("soft".to_string())]))
+		);
+		assert!(raw.get("compaction.thresholdTokens").is_none(), "dotted keys are consumed");
+		// A second pass is a no-op.
+		let once = raw.clone();
+		migrate_settings(&mut raw);
+		assert_eq!(raw, once);
+
+		// An existing group shadows dotted leaves exactly like `settings_leaf`;
+		// the dotted key survives untouched and never becomes readable.
+		let mut mixed = Value::Map(vec![
+			(
+				"compaction".to_string(),
+				Value::Map(vec![("enabled".to_string(), Value::Bool(false))]),
+			),
+			("compaction.thresholdTokens".to_string(), Value::Int(2_000)),
+		]);
+		migrate_settings(&mut mixed);
+		assert_eq!(lookup(&mixed, "compaction.enabled"), Some(&Value::Bool(false)));
+		assert_eq!(lookup(&mixed, "compaction.thresholdTokens"), None);
+		assert_eq!(mixed.get("compaction.thresholdTokens"), Some(&Value::Int(2_000)));
 	}
 
 	#[cfg(unix)]

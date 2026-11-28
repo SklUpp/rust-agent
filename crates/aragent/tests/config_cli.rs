@@ -555,6 +555,39 @@ fn migration_is_idempotent_and_a_write_does_not_disturb_it() {
 }
 
 #[test]
+fn dotted_compaction_leaves_lift_only_without_a_compaction_group() {
+	let sandbox = Sandbox::new("compaction-dotted");
+	fs::write(
+		sandbox.agent_config(),
+		"compaction.thresholdTokens: 50000\ncompaction.methodOrder:\n  - soft\n",
+	)
+	.expect("write config");
+
+	// With no `compaction:` key the runtime reads the dotted keys itself, so
+	// the CLI may fold them into the nested group.
+	assert_eq!(get_json(&sandbox, "compaction.thresholdTokens")["value"], serde_json::json!(50_000));
+	assert_eq!(get_json(&sandbox, "compaction.methodOrder")["value"], serde_json::json!(["soft"]));
+	let listing = sandbox.stdout_json(&["config", "list", "--json"]);
+	assert_eq!(listing["compaction.methodOrder"]["value"], serde_json::json!(["soft"]));
+	assert_eq!(listing["compaction.thresholdTokens"]["value"], serde_json::json!(50_000));
+}
+
+#[test]
+fn an_existing_compaction_group_shadows_dotted_leaves() {
+	let sandbox = Sandbox::new("compaction-shadow");
+	fs::write(
+		sandbox.agent_config(),
+		"compaction:\n  enabled: false\ncompaction.thresholdTokens: 50000\n",
+	)
+	.expect("write config");
+
+	// Runtime `settings_leaf` ignores the dotted key once the group exists, so
+	// `get` must report the schema default rather than the shadowed 50000.
+	assert_eq!(get_json(&sandbox, "compaction.thresholdTokens")["value"], serde_json::json!(-1));
+	assert_eq!(get_json(&sandbox, "compaction.enabled")["value"], serde_json::json!(false));
+}
+
+#[test]
 fn symlinked_legacy_settings_archives_the_link_not_the_target() {
 	let sandbox = Sandbox::new("symlink-legacy");
 	let target = sandbox.root.join("dotfiles-settings.json");
