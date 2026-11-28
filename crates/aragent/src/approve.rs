@@ -457,7 +457,14 @@ impl Approvals {
 	/// `hub` `start`, whose `application`/`args` launch a child process.
 	fn bash_verdict(&self, name: &str, args: &serde_json::Value) -> PolicyVerdict {
 		if name == "hub" {
-			if args.get("op").and_then(serde_json::Value::as_str) != Some("start") {
+			// `HubTool` resolves the op through `require_non_empty_str`, which
+			// trims, so a padded `start` must still reach the shell policy.
+			if args
+				.get("op")
+				.and_then(serde_json::Value::as_str)
+				.map(str::trim)
+				!= Some("start")
+			{
 				return PolicyVerdict::allow();
 			}
 			let Some(command) = hub_start_command(args) else {
@@ -481,7 +488,9 @@ impl Approvals {
 
 /// Shell line for a `hub` `start` call so the bash policy inspects the same
 /// executable and argv the process backend launches. `None` when
-/// `application` is missing or blank.
+/// `application` is missing/blank or `args` is not an array of strings:
+/// `HubTool::process_args` rejects those calls before launching anything, so
+/// there is no argv to gate.
 fn hub_start_command(args: &serde_json::Value) -> Option<String> {
 	let application = args
 		.get("application")
@@ -489,15 +498,15 @@ fn hub_start_command(args: &serde_json::Value) -> Option<String> {
 		.map(str::trim)
 		.filter(|application| !application.is_empty())?;
 	let mut line = shell_quote_token(application);
-	for argument in args
-		.get("args")
-		.and_then(serde_json::Value::as_array)
-		.into_iter()
-		.flatten()
-		.filter_map(serde_json::Value::as_str)
-	{
-		line.push(' ');
-		line.push_str(&shell_quote_token(argument));
+	match args.get("args") {
+		None | Some(serde_json::Value::Null) => {}
+		Some(serde_json::Value::Array(items)) => {
+			for argument in items {
+				line.push(' ');
+				line.push_str(&shell_quote_token(argument.as_str()?));
+			}
+		},
+		Some(_) => return None,
 	}
 	Some(line)
 }
@@ -1251,6 +1260,62 @@ mod tests {
 			)
 			.await
 			.expect_err("a bash allow rule must not auto-approve a hub start");
+		assert!(
+			error.contains("stdin closed") || error.contains("denied"),
+			"unexpected reason: {error}"
+		);
+	}
+
+	#[tokio::test]
+	async fn hub_start_padded_op_still_reaches_bash_policy() {
+		use pi_agent::ToolApprover;
+		use pi_agent::shell_policy::{BashApproval, BashApprovalRule, BashPolicy};
+		use serde_json::json;
+
+		// A padded op must classify as `start`, so a deny rule hard-denies
+		// even under yolo instead of returning an early allow.
+		let denied = approvals(ApprovalMode::Yolo, &["hub"])
+			.with_bash_policy(BashPolicy::new(vec![BashApprovalRule::new(
+				"curl*",
+				BashApproval::Deny,
+			)]));
+		let error = denied
+			.approve(
+				"hub",
+				&json!({
+					"op": " start ",
+					"name": "fetch",
+					"application": "curl",
+					"args": ["https://example.com"],
+				}),
+			)
+			.await
+			.expect_err("a padded start must not bypass a hard deny");
+		assert!(error.contains("curl*"), "unexpected reason: {error}");
+
+		// Likewise a prompt rule must force the ask under yolo.
+		let closed: Box<dyn std::io::BufRead + Send> =
+			Box::new(Cursor::new(Vec::<u8>::new()));
+		let input: ApprovalInput =
+			std::sync::Arc::new(std::sync::Mutex::new(closed));
+		let prompted = approvals(ApprovalMode::Yolo, &["hub"])
+			.with_bash_policy(BashPolicy::new(vec![BashApprovalRule::new(
+				"git push*",
+				BashApproval::Prompt,
+			)]))
+			.with_input(Some(input));
+		let error = prompted
+			.approve(
+				"hub",
+				&json!({
+					"op": " start ",
+					"name": "push",
+					"application": "git",
+					"args": ["push", "origin", "main"],
+				}),
+			)
+			.await
+			.expect_err("a padded start must not bypass a forced prompt");
 		assert!(
 			error.contains("stdin closed") || error.contains("denied"),
 			"unexpected reason: {error}"
