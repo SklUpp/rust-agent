@@ -47,7 +47,8 @@
 //! conversation history or provider logs — it removes one memory record only.
 
 use std::{
-	collections::{BTreeMap, BTreeSet},
+	cmp::Reverse,
+	collections::{BTreeMap, BTreeSet, BinaryHeap},
 	fmt, fs,
 	path::{Path, PathBuf},
 	sync::{Mutex, MutexGuard},
@@ -63,9 +64,7 @@ use crate::local_memory::{
 	LEARNED_LESSONS_FILE, MAX_LEARNED_CONTENT_CHARS, MAX_LEARNED_CONTEXT_CHARS, MAX_LEARNED_LESSONS,
 	normalize_learned_text,
 };
-use crate::memory_vectors::{
-	cosine_similarity, cosine_similarity_pairs, mmr_rerank_indices, vector_index_top_k,
-};
+use crate::memory_vectors::{cosine_similarity, cosine_similarity_pairs, mmr_rerank_indices};
 
 /// Database filename under the agent directory.
 pub const MEMORY_DB_FILE: &str = "memory.db";
@@ -91,8 +90,6 @@ const RECORD_ID_LEN: usize = 32;
 
 /// Columns selected by every record read, in [`row_to_record`] order.
 pub const RECORD_COLUMNS: &str = "id, scope, cwd, session_id, body, context, origin, actor, source, created_at, updated_at, access_count, last_accessed_at, confidence, ttl_secs, consolidated_into";
-/// [`RECORD_COLUMNS`] qualified for joins with `memory_embeddings`.
-const RECORD_COLUMNS_QUALIFIED: &str = "memories.id, memories.scope, memories.cwd, memories.session_id, memories.body, memories.context, memories.origin, memories.actor, memories.source, memories.created_at, memories.updated_at, memories.access_count, memories.last_accessed_at, memories.confidence, memories.ttl_secs, memories.consolidated_into";
 
 const MEMORIES_V2_TABLE_DDL: &str = "
 	CREATE TABLE memories (
@@ -937,7 +934,7 @@ impl MemoryStore {
 			.max(limit);
 		let connection = self.lock();
 
-		let (query_model, query_vector, vectors) = match embedding {
+		let (query_model, query_vector) = match embedding {
 			Some((model, vector)) => {
 				let model = model.trim();
 				if model.is_empty() {
@@ -950,15 +947,12 @@ impl MemoryStore {
 						"query embedding must be finite and non-empty".to_string(),
 					));
 				}
-				let model = model.to_string();
-				let vectors = load_embeddings_for_model(&connection, &model)?;
 				(
-					Some(model),
+					Some(model.to_string()),
 					Some(vector.iter().map(|&value| f64::from(value)).collect::<Vec<_>>()),
-					vectors,
 				)
 			},
-			None => (None, None, BTreeMap::new()),
+			None => (None, None),
 		};
 
 		let mut candidates: Vec<(MemoryRecord, f64)> = Vec::new();
@@ -988,81 +982,86 @@ impl MemoryStore {
 			}
 		}
 
-		// A semantic hit can have no lexical overlap at all. Union the scoped
-		// vector top-k into the FTS candidate set; absent vectors keep a neutral
-		// lexical score of zero and still flow through the same MMR pass.
+		// A semantic hit can have no lexical overlap at all. Stream the scoped
+		// embedding rows through a bounded heap so the union costs one scan of
+		// the scoped rows and `candidate_limit` hydration lookups, never a
+		// full-table embedding map; absent vectors keep a neutral lexical score
+		// of zero and still flow through the same MMR pass.
 		let mut seen: BTreeSet<String> = candidates.iter().map(|(row, _)| row.id.clone()).collect();
 		if let (Some(model), Some(query_vector)) = (query_model.as_deref(), query_vector.as_ref()) {
-			let mut vector_values = clause_values;
-			vector_values.insert(0, Value::Text(model.to_string()));
-			vector_values.push(Value::Integer(now));
-			let sql = format!(
-				"SELECT {RECORD_COLUMNS_QUALIFIED}, e.dim, e.embedding FROM memories \
-				 JOIN memory_embeddings e ON e.memory_id = memories.id \
-				 WHERE e.model = ? AND {clause} AND memories.consolidated_into IS NULL \
-				   AND (memories.ttl_secs IS NULL OR memories.created_at + memories.ttl_secs > ? \
-				        OR memories.origin = 'asserted') \
-				 ORDER BY memories.rowid"
-			);
-			let mut vector_rows: Vec<(MemoryRecord, Vec<f32>)> = Vec::new();
-			{
-				let mut statement = connection.prepare(&sql)?;
-				let rows = statement.query_map(params_from_iter(vector_values.iter()), |row| {
-					let record = row_to_record(row)?;
-					let dim: i64 = row.get(16)?;
-					let blob: Vec<u8> = row.get(17)?;
-					Ok((record, dim, blob))
-				})?;
-				for row in rows {
-					let (record, dim, blob) = row?;
-					let Some(vector) = decode_embedding(&blob, dim) else {
-						continue;
-					};
-					if vector.len() == query_vector.len() {
-						vector_rows.push((record, vector));
-					}
-				}
-			}
 			let query_norm = query_vector
 				.iter()
 				.map(|value| value * value)
 				.sum::<f64>()
 				.sqrt();
-			if !vector_rows.is_empty() && query_norm > 0.0 && query_norm.is_finite() {
-				let dimensions = query_vector.len();
-				let mut matrix = Vec::with_capacity(vector_rows.len() * dimensions);
-				for (_, vector) in &vector_rows {
-					let norm = vector
-						.iter()
-						.map(|value| {
-							let value = f64::from(*value);
-							value * value
-						})
-						.sum::<f64>()
-						.sqrt();
-					if norm > 0.0 && norm.is_finite() {
-						matrix.extend(vector.iter().map(|value| (f64::from(*value) / norm) as f32));
-					} else {
-						matrix.extend(std::iter::repeat_n(0.0f32, dimensions));
+			if query_norm > 0.0 && query_norm.is_finite() {
+				let mut vector_values = clause_values;
+				vector_values.insert(0, Value::Text(model.to_string()));
+				vector_values.push(Value::Integer(now));
+				let sql = format!(
+					"SELECT memories.rowid, memories.id, e.dim, e.embedding FROM memories \
+					 JOIN memory_embeddings e ON e.memory_id = memories.id \
+					 WHERE e.model = ? AND {clause} AND memories.consolidated_into IS NULL \
+					   AND (memories.ttl_secs IS NULL OR memories.created_at + memories.ttl_secs > ? \
+					        OR memories.origin = 'asserted') \
+					 ORDER BY memories.rowid"
+				);
+				let mut winners: BinaryHeap<Reverse<VectorHit>> =
+					BinaryHeap::with_capacity(candidate_limit.saturating_add(1));
+				{
+					let mut statement = connection.prepare(&sql)?;
+					let rows = statement.query_map(params_from_iter(vector_values.iter()), |row| {
+						Ok((
+							row.get::<_, i64>(0)?,
+							row.get::<_, String>(1)?,
+							row.get::<_, i64>(2)?,
+							row.get::<_, Vec<u8>>(3)?,
+						))
+					})?;
+					for row in rows {
+						let (rowid, id, dim, blob) = row?;
+						let Some(vector) = decode_embedding(&blob, dim) else {
+							continue;
+						};
+						if vector.len() != query_vector.len()
+							|| vector.iter().any(|value| !value.is_finite())
+						{
+							continue;
+						}
+						let stored: Vec<f64> =
+							vector.iter().map(|&value| f64::from(value)).collect();
+						winners.push(Reverse(VectorHit {
+							score: cosine_similarity(query_vector, &stored),
+							rowid,
+							id,
+						}));
+						if winners.len() > candidate_limit {
+							winners.pop();
+						}
 					}
 				}
-				let order = vector_index_top_k(
-					&matrix,
-					dimensions,
-					query_vector,
-					candidate_limit,
-				)
-				.map_err(|message| MemoryStoreError::Validation(message.to_string()))?;
-				for index in order.indices {
-					let Some((record, _)) = vector_rows.get(index as usize) else {
-						continue;
-					};
-					if seen.insert(record.id.clone()) {
-						candidates.push((record.clone(), 0.0));
+				for Reverse(hit) in winners {
+					if seen.insert(hit.id.clone()) {
+						if let Some(record) = load_record(&connection, &hit.id)? {
+							candidates.push((record, 0.0));
+						}
 					}
 				}
 			}
 		}
+
+		// Stored vectors are needed only for the final candidate window's
+		// hybrid scoring and MMR pass.
+		let vectors = match query_model.as_deref() {
+			Some(model) if !candidates.is_empty() => {
+				let ids: Vec<&str> = candidates
+					.iter()
+					.map(|(record, _)| record.id.as_str())
+					.collect();
+				load_embeddings_for_ids(&connection, model, &ids)?
+			},
+			_ => BTreeMap::new(),
+		};
 
 		let use_vectors = query_vector.as_ref().is_some_and(|query| {
 			candidates.iter().any(|(record, _)| {
@@ -2437,14 +2436,60 @@ fn decode_embedding(blob: &[u8], dim: i64) -> Option<Vec<f32>> {
 	Some(vector)
 }
 
-fn load_embeddings_for_model(
+/// Ranking key for the bounded vector union. Higher similarity wins; exact
+/// ties keep the earlier `memories.rowid`, matching the streamed row order of
+/// the former dense `vector_index_top_k` pass.
+struct VectorHit {
+	score: f64,
+	rowid: i64,
+	id: String,
+}
+
+impl Ord for VectorHit {
+	fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+		self
+			.score
+			.total_cmp(&other.score)
+			.then_with(|| other.rowid.cmp(&self.rowid))
+	}
+}
+
+impl PartialOrd for VectorHit {
+	fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+		Some(self.cmp(other))
+	}
+}
+
+impl PartialEq for VectorHit {
+	fn eq(&self, other: &Self) -> bool {
+		self.cmp(other) == std::cmp::Ordering::Equal
+	}
+}
+
+impl Eq for VectorHit {}
+
+/// Stored vectors for the given ids only.
+///
+/// ponytail: one `IN (...)` query; recall's candidate window stays well below
+/// SQLite's bound-parameter limit. Add chunking if this becomes reusable.
+fn load_embeddings_for_ids(
 	connection: &Connection,
 	model: &str,
+	ids: &[&str],
 ) -> MemoryResult<BTreeMap<String, Vec<f32>>> {
-	let mut statement = connection.prepare(
-		"SELECT memory_id, dim, embedding FROM memory_embeddings WHERE model = ?1",
-	)?;
-	let rows = statement.query_map(params![model], |row| {
+	if ids.is_empty() {
+		return Ok(BTreeMap::new());
+	}
+	let placeholders = std::iter::repeat_n("?", ids.len()).collect::<Vec<_>>().join(",");
+	let sql = format!(
+		"SELECT memory_id, dim, embedding FROM memory_embeddings \
+		 WHERE model = ? AND memory_id IN ({placeholders})"
+	);
+	let mut values: Vec<Value> = Vec::with_capacity(ids.len() + 1);
+	values.push(Value::Text(model.to_string()));
+	values.extend(ids.iter().map(|id| Value::Text((*id).to_string())));
+	let mut statement = connection.prepare(&sql)?;
+	let rows = statement.query_map(params_from_iter(values.iter()), |row| {
 		Ok((
 			row.get::<_, String>(0)?,
 			row.get::<_, i64>(1)?,
@@ -2454,8 +2499,13 @@ fn load_embeddings_for_model(
 	let mut embeddings = BTreeMap::new();
 	for row in rows {
 		let (id, dim, blob) = row?;
+		// Hand-edited rows can carry non-finite values; drop them here too so a
+		// lexical candidate falls back to the neutral score instead of
+		// poisoning hybrid scoring.
 		if let Some(vector) = decode_embedding(&blob, dim) {
-			embeddings.insert(id, vector);
+			if vector.iter().all(|value| value.is_finite()) {
+				embeddings.insert(id, vector);
+			}
 		}
 	}
 	Ok(embeddings)
@@ -3401,6 +3451,186 @@ mod tests {
 		store
 			.recall_hybrid("deploy staging", Some("/work/one"), None, Some(("test-model", query.as_slice())), Some(2))
 			.expect("hybrid falls back when vectors are missing");
+	}
+
+	#[test]
+	fn vector_union_streams_exact_top_k_and_stays_in_scope() {
+		let store = MemoryStore::open_in_memory().expect("store");
+		let query = [1.0f32, 0.0];
+		let mut seeded: Vec<MemoryRecord> = Vec::new();
+		for index in 0..60usize {
+			let record = add_project(&store, "/work/one", &format!("vectorword{index}"));
+			// Cosine against `query` descends strictly with `index`.
+			store
+				.set_embedding(
+					&record.id,
+					"test-model",
+					&[(1000 - index) as f32, 1.0],
+				)
+				.expect("embed");
+			seeded.push(record);
+		}
+		let other_project = add_project(&store, "/work/two", "outsidescope");
+		store
+			.set_embedding(&other_project.id, "test-model", &[5000.0, 1.0])
+			.expect("other project vector");
+		let other_session = store
+			.add(&AddInput::session_lesson(
+				"session-b",
+				"otherconversation",
+				None,
+			))
+			.expect("session record");
+		store
+			.set_embedding(&other_session.id, "test-model", &[5000.0, 1.0])
+			.expect("session vector");
+
+		let hits = store
+			.recall_hybrid(
+				"?!?!",
+				Some("/work/one"),
+				None,
+				Some(("test-model", query.as_slice())),
+				Some(5),
+			)
+			.expect("vector recall");
+		let ids: Vec<&str> = hits.iter().map(|record| record.id.as_str()).collect();
+		let expected: Vec<&str> = seeded[..5].iter().map(|record| record.id.as_str()).collect();
+		assert_eq!(ids, expected, "highest cosines win in score order");
+		assert!(
+			hits
+				.iter()
+				.all(|record| record.cwd.as_deref() == Some("/work/one")),
+			"only this project's rows"
+		);
+		assert!(
+			hits
+				.iter()
+				.all(|record| record.id != other_project.id && record.id != other_session.id),
+			"other cwd and session vectors must not leak"
+		);
+	}
+
+	#[test]
+	fn corrupt_embeddings_are_skipped_without_failing_recall() {
+		let store = MemoryStore::open_in_memory().expect("store");
+		let query = [1.0f32, 0.0, 0.0, 0.0];
+		let good_a = add_project(&store, "/work/one", "healthyalpha");
+		let good_b = add_project(&store, "/work/one", "healthybeta");
+		store
+			.set_embedding(&good_a.id, "test-model", &[1.0, 0.0, 0.0, 0.0])
+			.expect("good a");
+		store
+			.set_embedding(&good_b.id, "test-model", &[0.5, 0.5, 0.5, 0.5])
+			.expect("good b");
+		let short_dim = add_project(&store, "/work/one", "shortdim");
+		let nan_dim = add_project(&store, "/work/one", "nandim");
+		let truncated = add_project(&store, "/work/one", "truncatedblob");
+		let wrong_dim = add_project(&store, "/work/one", "wrongdimension");
+		{
+			let guard = store.lock();
+			// Rows that `set_embedding` would refuse, inserted raw.
+			guard
+				.execute(
+					"INSERT INTO memory_embeddings (memory_id, model, dim, embedding, created_at) \
+					 VALUES (?1, 'test-model', 3, ?2, 1)",
+					params![short_dim.id, vec![0u8; 8]],
+				)
+				.expect("dim/blob mismatch row");
+			let nan = encode_embedding(&[f32::NAN, 0.0, 0.0, 0.0]);
+			guard
+				.execute(
+					"INSERT INTO memory_embeddings (memory_id, model, dim, embedding, created_at) \
+					 VALUES (?1, 'test-model', 4, ?2, 1)",
+					params![nan_dim.id, nan],
+				)
+				.expect("non-finite row");
+			guard
+				.execute(
+					"INSERT INTO memory_embeddings (memory_id, model, dim, embedding, created_at) \
+					 VALUES (?1, 'test-model', 4, ?2, 1)",
+					params![truncated.id, vec![0u8; 8]],
+				)
+				.expect("truncated row");
+			// A well-formed 2D vector while the query is 4D: decodes, but its
+			// length must exclude it from ranking.
+			guard
+				.execute(
+					"INSERT INTO memory_embeddings (memory_id, model, dim, embedding, created_at) \
+					 VALUES (?1, 'test-model', 2, ?2, 1)",
+					params![wrong_dim.id, encode_embedding(&[1.0, 0.0])],
+				)
+				.expect("wrong dimension row");
+		}
+
+		let hits = store
+			.recall_hybrid(
+				"?!?!",
+				Some("/work/one"),
+				None,
+				Some(("test-model", query.as_slice())),
+				Some(10),
+			)
+			.expect("corrupt embeddings must not fail recall");
+		let ids: Vec<&str> = hits.iter().map(|record| record.id.as_str()).collect();
+		assert_eq!(ids.len(), 2, "only the two healthy vectors are candidates");
+		assert_eq!(hits[0].id, good_a.id);
+		assert!(ids.contains(&good_b.id.as_str()));
+		assert!(
+			!ids
+				.iter()
+				.any(|id| *id == short_dim.id
+					|| *id == nan_dim.id
+					|| *id == truncated.id
+					|| *id == wrong_dim.id),
+			"corrupt or wrong-dimension rows are skipped, not returned"
+		);
+	}
+
+	#[test]
+	fn recall_bumps_access_only_for_returned_records() {
+		let store = MemoryStore::open_in_memory().expect("store");
+		let query = [1.0f32, 0.0];
+		let mut seeded: Vec<MemoryRecord> = Vec::new();
+		for index in 0..12usize {
+			let record = add_project(&store, "/work/one", &format!("accessword{index}"));
+			store
+				.set_embedding(
+					&record.id,
+					"test-model",
+					&[(1000 - index) as f32, 1.0],
+				)
+				.expect("embed");
+			seeded.push(record);
+		}
+
+		let hits = store
+			.recall_hybrid(
+				"?!?!",
+				Some("/work/one"),
+				None,
+				Some(("test-model", query.as_slice())),
+				Some(2),
+			)
+			.expect("recall");
+		assert_eq!(hits.len(), 2);
+		assert_eq!(hits[0].id, seeded[0].id);
+		assert_eq!(hits[1].id, seeded[1].id);
+		assert_eq!(hits[0].access_count, 1);
+		assert_eq!(hits[1].access_count, 1);
+
+		// candidate_limit is 8: rows 2..=7 were hydrated and scored but not
+		// returned, rows 8..=11 were scanned only. None may be bumped.
+		for (index, record) in seeded.iter().enumerate() {
+			let stored = store.get(&record.id, Some("/work/one")).expect("get");
+			if index < 2 {
+				assert_eq!(stored.access_count, 1, "returned row {index} bumped");
+				assert!(stored.last_accessed_at.is_some());
+			} else {
+				assert_eq!(stored.access_count, 0, "row {index} must stay untouched");
+				assert!(stored.last_accessed_at.is_none());
+			}
+		}
 	}
 
 	#[test]
