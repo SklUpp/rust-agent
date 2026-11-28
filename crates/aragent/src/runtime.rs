@@ -3467,6 +3467,9 @@ fn wire_provider(
 				// The resolved per-family selection, never the launch flag alone.
 				.with_service_tier(service_tier)
 				.with_credential_callback(credential)
+				// Scrub registered credentials, bearer tokens, JWTs and redirect
+				// secrets from every provider diagnostic before it is logged.
+				.with_diagnostic_redactor(Some(Arc::new(crate::auth::error::redact_free_text)))
 				// Assembly stamps the real route on produced messages so signed
 				// reasoning is only replayed to the provider that issued it.
 				.with_provider_id(target.provider.to_string())

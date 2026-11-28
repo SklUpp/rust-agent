@@ -54,6 +54,11 @@ pub(crate) mod transform;
 pub type CredentialCallback =
 	std::sync::Arc<dyn Fn(bool) -> Result<String, String> + Send + Sync>;
 
+/// Optional caller-supplied scrubber for provider diagnostics. Runs after the
+/// built-in credential redaction, so it can remove host-specific secrets a
+/// gateway might echo back.
+pub type DiagnosticRedactor = std::sync::Arc<dyn Fn(&str) -> String + Send + Sync>;
+
 /// Exact `invalid_key` classification for an auth-retry decision. Parses the
 /// body; status codes and free-form text alone never trigger a refresh.
 #[must_use]
@@ -1656,11 +1661,30 @@ pub(crate) fn snippet(text: &str) -> String {
 /// Replace every known credential value in diagnostics. Shared with providers
 /// that echo stream errors so a gateway cannot leak the key it received.
 pub(crate) fn redact_with(text: &str, secrets: &[String]) -> String {
+	// Own the ordering here so no caller can leak a fragment: longer secrets
+	// first, duplicates removed, blank values skipped.
+	let mut secrets: Vec<&str> =
+		secrets.iter().map(String::as_str).filter(|secret| !secret.trim().is_empty()).collect();
+	secrets.sort_by(|a, b| b.len().cmp(&a.len()).then_with(|| a.cmp(b)));
+	secrets.dedup();
 	let mut redacted = text.to_string();
-	for secret in secrets.iter().filter(|secret| !secret.trim().is_empty()) {
-		redacted = redacted.replace(secret.as_str(), "[redacted]");
+	for secret in secrets {
+		redacted = redacted.replace(secret, "[redacted]");
 	}
 	redacted
+}
+
+/// Credential redaction followed by any caller-installed diagnostic scrubber.
+pub(crate) fn redact_diagnostic_with(
+	text: &str,
+	secrets: &[String],
+	redactor: Option<&DiagnosticRedactor>,
+) -> String {
+	let redacted = redact_with(text, secrets);
+	match redactor {
+		Some(redactor) => redactor(&redacted),
+		None => redacted,
+	}
 }
 
 #[cfg(test)]
@@ -1875,6 +1899,48 @@ mod tests {
 			);
 			assert!(stream.next().await.is_none(), "stream must stop after the error");
 		}
+	}
+
+	#[tokio::test]
+	async fn sse_stream_joins_a_record_split_across_transport_chunks() {
+		let record = br#"data: {"choices":[{"delta":{"content":"hello"}}]}"#;
+		let split = 10;
+		let chunks = vec![
+			Ok::<_, String>(record[..split].to_vec()),
+			Ok(record[split..].to_vec()),
+			Ok(b"\n\n".to_vec()),
+		];
+		let mut stream = sse_stream(futures::stream::iter(chunks));
+		let chunk = stream.next().await.expect("content chunk").expect("parsed");
+		assert_eq!(chunk.content.as_deref(), Some("hello"));
+		assert!(stream.next().await.is_none(), "no terminal reason means no synthetic done");
+	}
+
+	#[tokio::test]
+	async fn sse_stream_flushes_eof_tail_and_synthesizes_done_without_marker() {
+		let chunks = vec![Ok::<_, String>(
+			br#"data: {"choices":[{"delta":{"content":"tail"},"finish_reason":"stop"}]}"#.to_vec(),
+		)];
+		let mut stream = sse_stream(futures::stream::iter(chunks));
+		let chunk = stream.next().await.expect("content chunk").expect("parsed");
+		assert_eq!(chunk.content.as_deref(), Some("tail"));
+		assert_eq!(chunk.stop_reason, Some(StopReason::Stop));
+		assert!(!chunk.is_done);
+		let done = stream.next().await.expect("synthetic done").expect("parsed");
+		assert!(done.is_done);
+		assert_eq!(done.stop_reason, Some(StopReason::Stop));
+		assert!(stream.next().await.is_none());
+	}
+
+	#[test]
+	fn redact_with_sorts_longest_first_and_dedups() {
+		let secrets = vec![
+			"sk-secret".to_string(),
+			"   ".to_string(),
+			"sk-secret-long".to_string(),
+			"sk-secret-long".to_string(),
+		];
+		assert_eq!(redact_with("token sk-secret-long", &secrets), "token [redacted]");
 	}
 
 	/// Minimal stream chunk for assembler tests; adapters fill the rest.

@@ -91,6 +91,8 @@ pub struct OpenAiCompatibleProvider {
 	provider_id: Option<String>,
 	/// Per-request credential callback; `None` uses `api_key`.
 	credential: Option<CredentialCallback>,
+	/// Caller-supplied diagnostic scrubber, applied after credential redaction.
+	diagnostic_redactor: Option<DiagnosticRedactor>,
 	/// Retry budget and delay schedule for transient HTTP failures.
 	retry: RetryPolicy,
 }
@@ -152,6 +154,7 @@ impl OpenAiCompatibleProvider {
 			metadata: None,
 			provider_id: None,
 			credential: None,
+			diagnostic_redactor: None,
 			retry: RetryPolicy::default(),
 		}
 	}
@@ -160,6 +163,15 @@ impl OpenAiCompatibleProvider {
 	#[must_use]
 	pub fn with_credential_callback(mut self, callback: Option<CredentialCallback>) -> Self {
 		self.credential = callback;
+		self
+	}
+
+	/// Install a caller-supplied diagnostic scrubber. It runs after the
+	/// built-in credential redaction on every provider error and streamed
+	/// error message.
+	#[must_use]
+	pub fn with_diagnostic_redactor(mut self, redactor: Option<DiagnosticRedactor>) -> Self {
+		self.diagnostic_redactor = redactor;
 		self
 	}
 
@@ -442,9 +454,9 @@ impl OpenAiCompatibleProvider {
 	/// same body once. Transient HTTP failures (408/409/429/5xx) are retried
 	/// inside this method, before a response is handed to a stream, so no chunk
 	/// from a failed attempt can ever be observed (`fetchWithRetry` parity).
-	/// Any other failure is returned unchanged. The bearer key that actually
-	/// produced the response is returned so diagnostics can be redacted with it
-	/// (a callback may have rotated the configured key).
+	/// The bearer key that actually produced the response is returned so
+	/// diagnostics can be redacted with it (a callback may have rotated the
+	/// configured key).
 	async fn post_authenticated(
 		&self,
 		body: &OpenAiChatRequest,
@@ -453,7 +465,8 @@ impl OpenAiCompatibleProvider {
 		let mut force_refresh = false;
 		let mut attempt = 0u32;
 		let mut key = match &self.credential {
-			Some(callback) => callback(false).map_err(ProviderError::AuthRefresh)?,
+			Some(callback) => callback(false)
+				.map_err(|err| self.auth_refresh_error(err, &self.api_key))?,
 			None => self.api_key.clone(),
 		};
 		loop {
@@ -461,28 +474,31 @@ impl OpenAiCompatibleProvider {
 			if stream {
 				request = request.header(reqwest::header::ACCEPT, "text/event-stream");
 			}
-			let response = request.json(body).send().await.map_err(network_error)?;
+			let response = request
+				.json(body)
+				.send()
+				.await
+				.map_err(|err| self.network_error(err, &key))?;
 			let status = response.status();
 			if status.is_success() {
 				return Ok((response, key));
 			}
 			let headers = response.headers().clone();
-			let bounded = read_body_bounded(response, MAX_ERROR_BODY_BYTES).await?;
+			let bounded = read_body_bounded(response, MAX_ERROR_BODY_BYTES)
+				.await
+				.map_err(|err| self.diagnostic_error(err, &key))?;
 			if !force_refresh && matches!(status.as_u16(), 401 | 403) {
 				if is_invalid_key_body(&bounded.text) {
 					if let Some(callback) = &self.credential {
-						key = callback(true).map_err(ProviderError::AuthRefresh)?;
+						key = callback(true)
+							.map_err(|err| self.auth_refresh_error(err, &key))?;
 						force_refresh = true;
 						continue;
 					}
 				}
 				return Err(ProviderError::HttpStatus(
 					status.as_u16(),
-					bounded_redaction(
-						&bounded.text,
-						&self.diagnostic_secrets(&key),
-						bounded.truncated,
-					),
+					self.bounded_diagnostic(&bounded.text, &key, bounded.truncated),
 				));
 			}
 			// A concurrency-admission 429 is a proxy shed, not backpressure:
@@ -498,19 +514,70 @@ impl OpenAiCompatibleProvider {
 			}
 			return Err(ProviderError::HttpStatus(
 				status.as_u16(),
-				bounded_redaction(
-					&bounded.text,
-					&self.diagnostic_secrets(&key),
-					bounded.truncated,
-				),
+				self.bounded_diagnostic(&bounded.text, &key, bounded.truncated),
 			));
 		}
 	}
 
 	/// Credential values that must not surface in diagnostics: the configured
 	/// key and the bearer actually sent (a callback may have rotated it).
+	///
+	/// Longest first so a key that is a prefix of another cannot leave a
+	/// fragment behind; deduplicated because both are often the same string.
 	fn diagnostic_secrets(&self, active_key: &str) -> Vec<String> {
-		vec![self.api_key.clone(), active_key.to_string()]
+		let mut secrets = vec![self.api_key.clone(), active_key.to_string()];
+		secrets.sort_by(|a, b| b.len().cmp(&a.len()).then_with(|| a.cmp(b)));
+		secrets.dedup();
+		secrets
+	}
+
+	/// Scrub free-form diagnostics with both credential redaction and the
+	/// installed caller scrubber.
+	fn redact_diagnostic(&self, text: &str, active_key: &str) -> String {
+		redact_diagnostic_with(
+			text,
+			&self.diagnostic_secrets(active_key),
+			self.diagnostic_redactor.as_ref(),
+		)
+	}
+
+	/// Same as [`Self::redact_diagnostic`], bounded for an error body.
+	fn bounded_diagnostic(&self, text: &str, active_key: &str, truncated: bool) -> String {
+		bounded_redaction(
+			text,
+			&self.diagnostic_secrets(active_key),
+			self.diagnostic_redactor.as_ref(),
+			truncated,
+		)
+	}
+
+	fn network_error(&self, err: reqwest::Error, active_key: &str) -> ProviderError {
+		ProviderError::Network(self.redact_diagnostic(&err.to_string(), active_key))
+	}
+
+	fn auth_refresh_error(&self, err: String, active_key: &str) -> ProviderError {
+		ProviderError::AuthRefresh(self.redact_diagnostic(&err, active_key))
+	}
+
+	/// Apply both scrubbers to any error text the transport can surface.
+	fn diagnostic_error(&self, error: ProviderError, active_key: &str) -> ProviderError {
+		match error {
+			ProviderError::Network(text) => {
+				ProviderError::Network(self.redact_diagnostic(&text, active_key))
+			},
+			ProviderError::Protocol(text) => {
+				ProviderError::Protocol(self.redact_diagnostic(&text, active_key))
+			},
+			ProviderError::HttpStatus(code, text) => {
+				ProviderError::HttpStatus(code, self.redact_diagnostic(&text, active_key))
+			},
+			ProviderError::AuthRefresh(text) => {
+				ProviderError::AuthRefresh(self.redact_diagnostic(&text, active_key))
+			},
+			// Serde embeds the offending text in its own error and cannot be
+			// rebuilt redacted; callers convert it to `Protocol` instead.
+			other => other,
+		}
 	}
 }
 
@@ -542,7 +609,9 @@ impl ModelProvider for OpenAiCompatibleProvider {
 		let body = self.request(messages, tools, tool_choice, false)?;
 		let (response, key) = self.post_authenticated(&body, false).await?;
 
-		let body = read_body_bounded(response, MAX_RESPONSE_BODY_BYTES).await?;
+		let body = read_body_bounded(response, MAX_RESPONSE_BODY_BYTES)
+			.await
+			.map_err(|err| self.diagnostic_error(err, &key))?;
 		if body.truncated {
 			return Err(ProviderError::Protocol(format!(
 				"chat completion body exceeded {MAX_RESPONSE_BODY_BYTES} bytes"
@@ -550,15 +619,13 @@ impl ModelProvider for OpenAiCompatibleProvider {
 		}
 		let text = body.text;
 		let parsed: OpenAiChatResponse = serde_json::from_str(&text).map_err(|err| {
-			let secrets = self.diagnostic_secrets(&key);
 			// Serde embeds offending response values in its message, so redact
-			// the whole diagnostic, not just the body snippet.
-			ProviderError::Protocol(crate::provider::redact_with(
-				&format!(
-					"invalid chat completion body: {err}; body: {}",
-					bounded_redaction(&text, &secrets, false)
-				),
-				&secrets,
+			// both components. Each is redacted before it is bounded, so a
+			// credential cut by the snippet cap cannot survive.
+			ProviderError::Protocol(format!(
+				"invalid chat completion body: {}; body: {}",
+				self.redact_diagnostic(&err.to_string(), &key),
+				self.bounded_diagnostic(&text, &key, false),
 			))
 		})?;
 		let usage = parsed.usage.as_ref().map(normalize_usage);
@@ -577,6 +644,9 @@ impl ModelProvider for OpenAiCompatibleProvider {
 			message.stop_reason = Some(stop_reason);
 			message.error_message = error_message;
 		}
+		if let Some(error_message) = message.error_message.as_mut() {
+			*error_message = self.redact_diagnostic(error_message, &key);
+		}
 		Ok(message)
 	}
 
@@ -593,27 +663,150 @@ impl ModelProvider for OpenAiCompatibleProvider {
 		let body = response
 			.bytes_stream()
 			.map(|item| item.map_err(|err| err.to_string()));
-		let secrets = self.diagnostic_secrets(&key);
-		let chunks = sse_stream(Box::pin(body))
-			.map(move |item| {
-				item.map_err(|error| match error {
-					ProviderError::Network(text) => {
-						ProviderError::Network(redact_with(&text, &secrets))
-					},
-					ProviderError::Protocol(text) => {
-						ProviderError::Protocol(redact_with(&text, &secrets))
-					},
-					// A serde error carries the offending text in its message
-					// and cannot be rebuilt redacted, so surface it as protocol.
-					ProviderError::Serialization(err) => {
-						ProviderError::Protocol(redact_with(&err.to_string(), &secrets))
-					},
-					other => other,
-				})
-			})
-			.boxed();
+		let secrets: std::sync::Arc<[String]> = self.diagnostic_secrets(&key).into();
+		let redactor = self.diagnostic_redactor.clone();
+		let inner = sse_stream(Box::pin(body));
+		let chunks = futures::stream::unfold(
+			(inner, String::new(), None::<ProviderError>, false),
+			move |(mut inner, mut refusal_acc, pending, finished): (
+				ChunkStream,
+				String,
+				Option<ProviderError>,
+				bool,
+			)| {
+				let secrets = std::sync::Arc::clone(&secrets);
+				let redactor = redactor.clone();
+				async move {
+					let secrets = secrets.as_ref();
+					if finished {
+						return None;
+					}
+					if let Some(error) = pending {
+						return Some((Err(error), (inner, refusal_acc, None, true)));
+					}
+					match inner.next().await {
+						Some(item) => {
+							let mut chunk =
+								match sanitize_stream_item(item, secrets, redactor.as_ref()) {
+									Ok(chunk) => chunk,
+									Err(error) => {
+										if let Some(chunk) = flush_refusal(
+											&mut refusal_acc,
+											secrets,
+											redactor.as_ref(),
+										) {
+											return Some((
+												Ok(chunk),
+												(inner, refusal_acc, Some(error), false),
+											));
+										}
+										return Some((
+											Err(error),
+											(inner, refusal_acc, None, true),
+										));
+									},
+								};
+							if let Some(fragment) = chunk.refusal.take() {
+								if refusal_acc
+									.len()
+									.saturating_add(fragment.len())
+									> MAX_ERROR_BODY_BYTES
+								{
+									refusal_acc.clear();
+									return Some((
+										Err(ProviderError::Protocol(
+											"streamed refusal exceeded maximum size".to_string(),
+										)),
+										(inner, refusal_acc, None, true),
+									));
+								}
+								refusal_acc.push_str(&fragment);
+							}
+							// A refusal split across deltas only matches a secret
+							// once joined, so scrub the assembled text on the
+							// terminal chunk (`finish_reason` or `[DONE]`).
+							if (chunk.stop_reason.is_some() || chunk.is_done)
+								&& !refusal_acc.is_empty()
+							{
+								chunk.refusal = Some(redact_diagnostic_with(
+									&std::mem::take(&mut refusal_acc),
+									secrets,
+									redactor.as_ref(),
+								));
+							}
+							Some((Ok(chunk), (inner, refusal_acc, None, false)))
+						},
+						None => flush_refusal(&mut refusal_acc, secrets, redactor.as_ref())
+							.map(|chunk| (Ok(chunk), (inner, refusal_acc, None, false))),
+					}
+				}
+			},
+		)
+		.boxed();
 		Ok(super::thinking_loop::guard_chunk_stream(chunks, &self.model))
 	}
+}
+
+/// Scrub every provider-supplied string a stream can surface: transport and
+/// protocol errors, plus a terminal chunk's `error_message`.
+fn sanitize_stream_item(
+	item: Result<StreamChunk, ProviderError>,
+	secrets: &[String],
+	redactor: Option<&DiagnosticRedactor>,
+) -> Result<StreamChunk, ProviderError> {
+	let scrubbed = |text: &str| redact_diagnostic_with(text, secrets, redactor);
+	match item {
+		Ok(mut chunk) => {
+			if let Some(message) = chunk.error_message.as_mut() {
+				*message = scrubbed(message);
+			}
+			if let Some(refusal) = chunk.refusal.as_mut() {
+				*refusal = scrubbed(refusal);
+			}
+			Ok(chunk)
+		},
+		Err(error) => Err(match error {
+			ProviderError::Network(text) => ProviderError::Network(scrubbed(&text)),
+			ProviderError::Protocol(text) => ProviderError::Protocol(scrubbed(&text)),
+			// A serde error carries the offending text in its message and
+			// cannot be rebuilt redacted, so surface it as protocol.
+			ProviderError::Serialization(err) => {
+				ProviderError::Protocol(scrubbed(&err.to_string()))
+			},
+			ProviderError::HttpStatus(code, text) => {
+				ProviderError::HttpStatus(code, scrubbed(&text))
+			},
+			ProviderError::AuthRefresh(text) => ProviderError::AuthRefresh(scrubbed(&text)),
+			other => other,
+		}),
+	}
+}
+
+/// Emit buffered refusal fragments as one already-scrubbed chunk. Joining
+/// before redaction catches a secret split across separate SSE deltas.
+fn flush_refusal(
+	refusal_acc: &mut String,
+	secrets: &[String],
+	redactor: Option<&DiagnosticRedactor>,
+) -> Option<StreamChunk> {
+	if refusal_acc.is_empty() {
+		return None;
+	}
+	let refusal = redact_diagnostic_with(&std::mem::take(refusal_acc), secrets, redactor);
+	Some(StreamChunk {
+		refusal: Some(refusal),
+		content: None,
+		reasoning: None,
+		tool_call_deltas: Vec::new(),
+		usage: None,
+		is_done: false,
+		disabled_features: None,
+		content_index: None,
+		signature: None,
+		redacted: None,
+		stop_reason: None,
+		error_message: None,
+	})
 }
 
 /// Normalize a cache identity to the OpenAI wire limit (TS `normalizeOpenAIPromptCacheKey`).
@@ -636,6 +829,7 @@ fn network_error(err: reqwest::Error) -> ProviderError {
 #[cfg(test)]
 mod tests {
 	use super::*;
+	use crate::provider::timeout::{RequestTimeoutConfig, TimeoutProvider};
 	use crate::tools::registry::tool_schema_envelope;
 	use tokio::io::{AsyncReadExt, AsyncWriteExt};
 	use tokio::net::TcpListener;
@@ -682,6 +876,63 @@ mod tests {
 			.expect("request");
 		let payload = serde_json::to_value(request).expect("serialize");
 		assert_eq!(payload["tool_choice"], serde_json::json!("required"));
+	}
+
+	#[test]
+	fn diagnostic_secrets_are_longest_first_and_deduplicated() {
+		let provider = OpenAiCompatibleProvider::new("https://example.test/v1", "sk-short", "m")
+			.expect("build");
+		assert_eq!(
+			provider.diagnostic_secrets("sk-short-long"),
+			vec!["sk-short-long".to_string(), "sk-short".to_string()]
+		);
+		// Replacing the shorter key first would leave "-long" behind.
+		let secrets = provider.diagnostic_secrets("sk-short-long");
+		assert_eq!(redact_with("sk-short-long value", &secrets), "[redacted] value");
+		assert_eq!(provider.diagnostic_secrets("sk-short"), vec!["sk-short".to_string()]);
+	}
+
+	#[test]
+	fn stream_chunk_error_messages_use_both_scrubbers() {
+		let provider = OpenAiCompatibleProvider::new("https://example.test/v1", "sk-key", "m")
+			.expect("build")
+			.with_diagnostic_redactor(Some(std::sync::Arc::new(|text: &str| {
+				text.replace("secret-token", "[scrubbed]")
+			})));
+		let secrets = provider.diagnostic_secrets("sk-key");
+		let chunk: StreamChunk = serde_json::from_value(serde_json::json!({
+			"is_done": true,
+			"error_message": "boom sk-key secret-token",
+		}))
+		.expect("chunk");
+		let sanitized =
+			sanitize_stream_item(Ok(chunk), &secrets, provider.diagnostic_redactor.as_ref())
+				.expect("chunk stays ok");
+		assert_eq!(sanitized.error_message.as_deref(), Some("boom [redacted] [scrubbed]"));
+	}
+
+	#[test]
+	fn network_and_auth_refresh_errors_use_both_scrubbers() {
+		let provider = OpenAiCompatibleProvider::new("https://example.test/v1", "sk-key", "m")
+			.expect("build")
+			.with_diagnostic_redactor(Some(std::sync::Arc::new(|text: &str| {
+				text.replace("secret-token", "[scrubbed]")
+			})));
+		let secrets = provider.diagnostic_secrets("sk-key");
+		let network = sanitize_stream_item(
+			Err(ProviderError::Network("boom sk-key secret-token".to_string())),
+			&secrets,
+			provider.diagnostic_redactor.as_ref(),
+		)
+		.expect_err("network error");
+		match network {
+			ProviderError::Network(text) => assert_eq!(text, "boom [redacted] [scrubbed]"),
+			other => panic!("expected network error, got {other:?}"),
+		}
+		match provider.auth_refresh_error("refresh sk-key secret-token".to_string(), "sk-key") {
+			ProviderError::AuthRefresh(text) => assert_eq!(text, "refresh [redacted] [scrubbed]"),
+			other => panic!("expected auth refresh error, got {other:?}"),
+		}
 	}
 
 	#[test]
@@ -977,6 +1228,132 @@ mod tests {
 		assert!(message.content.is_empty());
 		assert_eq!(message.stop_reason, Some(StopReason::Error));
 		assert_eq!(message.error_message.as_deref(), Some("blocked by safety"));
+	}
+
+	#[tokio::test]
+	async fn complete_scrubs_secrets_from_refusal_and_unknown_finish_reason() {
+		let cases: [(&[u8], &str); 2] = [
+			(
+				br#"{"choices":[{"message":{"role":"assistant","content":null,"refusal":"blocked sk-key"},"finish_reason":"stop"}]}"#,
+				"blocked [redacted]",
+			),
+			(
+				br#"{"choices":[{"message":{"role":"assistant","content":"ok"},"finish_reason":"weird sk-key"}]}"#,
+				"Provider finish_reason: weird [redacted]",
+			),
+		];
+		for (body, expected) in cases {
+			let base_url = serve_once(200, body.to_vec()).await;
+			let provider =
+				OpenAiCompatibleProvider::new(base_url, "sk-key", "model-x").expect("build");
+			let message = provider
+				.complete(&[], &[], &ToolChoice::Auto)
+				.await
+				.expect("complete");
+			assert_eq!(message.error_message.as_deref(), Some(expected));
+		}
+	}
+
+	#[tokio::test]
+	async fn stream_scrubs_secrets_from_refusal_deltas() {
+		let sse = concat!(
+			"data: {\"choices\":[{\"delta\":{\"refusal\":\"blocked sk-key\"}}]}\n\n",
+			"data: [DONE]\n\n",
+		)
+		.as_bytes()
+		.to_vec();
+		let base_url = serve_once(200, sse).await;
+		let provider = OpenAiCompatibleProvider::new(base_url, "sk-key", "model-x").expect("build");
+		let mut stream = provider.stream(&[], &[], &ToolChoice::Auto).await.expect("stream");
+		let mut chunks = Vec::new();
+		while let Some(item) = stream.next().await {
+			chunks.push(item.expect("chunk"));
+		}
+		let done = chunks.iter().find(|chunk| chunk.is_done).expect("done chunk");
+		assert_eq!(done.refusal.as_deref(), Some("blocked [redacted]"));
+		let refusals: String = chunks.iter().filter_map(|chunk| chunk.refusal.as_deref()).collect();
+		assert_eq!(refusals, "blocked [redacted]");
+		assert!(!refusals.contains("sk-key"));
+	}
+
+	#[tokio::test]
+	async fn oversized_streamed_refusal_fails_closed() {
+		let fragment = "x".repeat(MAX_ERROR_BODY_BYTES / 2 + 1);
+		let sse = format!(
+			"data: {{\"choices\":[{{\"delta\":{{\"refusal\":\"{fragment}\"}}}}]}}\n\n\
+			 data: {{\"choices\":[{{\"delta\":{{\"refusal\":\"{fragment}\"}}}}]}}\n\n"
+		);
+		let base_url = serve_once(200, sse.into_bytes()).await;
+		let provider = OpenAiCompatibleProvider::new(base_url, "key", "model-x").expect("build");
+		let mut stream = provider.stream(&[], &[], &ToolChoice::Auto).await.expect("stream");
+		let error = loop {
+			match stream.next().await {
+				Some(Err(error)) => break error,
+				Some(Ok(_)) => {},
+				None => panic!("oversized refusal must fail"),
+			}
+		};
+		assert!(matches!(
+			error,
+			ProviderError::Protocol(text) if text == "streamed refusal exceeded maximum size"
+		));
+		assert!(stream.next().await.is_none());
+	}
+
+	#[tokio::test]
+	async fn split_refusal_secret_is_scrubbed_after_joining_across_chunks() {
+		let sse = concat!(
+			"data: {\"choices\":[{\"delta\":{\"refusal\":\"sk-\"}}]}\n\n",
+			"data: {\"choices\":[{\"delta\":{\"refusal\":\"key\"}}]}\n\n",
+			"data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+			"data: [DONE]\n\n",
+		)
+		.as_bytes()
+		.to_vec();
+		for via_timeout in [false, true] {
+			let base_url = serve_once(200, sse.clone()).await;
+			let inner: std::sync::Arc<dyn ModelProvider> = std::sync::Arc::new(
+				OpenAiCompatibleProvider::new(base_url, "sk-key", "model-x").expect("build"),
+			);
+			let mut stream = if via_timeout {
+				let timeout = TimeoutProvider::new(inner, RequestTimeoutConfig::disabled());
+				timeout
+					.stream(&[], &[], &ToolChoice::Auto)
+					.await
+					.expect("stream")
+			} else {
+				inner.stream(&[], &[], &ToolChoice::Auto).await.expect("stream")
+			};
+			let mut assembler = StreamAssembler::new();
+			while let Some(item) = stream.next().await {
+				assembler.push(&item.expect("chunk")).expect("push");
+			}
+			let message = assembler.finish().expect("finish");
+			assert_eq!(
+				message.error_message.as_deref(),
+				Some("[redacted]"),
+				"via_timeout={via_timeout}"
+			);
+		}
+	}
+
+	#[tokio::test]
+	async fn refusal_secret_is_scrubbed_on_eof_flush_without_terminal_reason() {
+		let sse = concat!(
+			"data: {\"choices\":[{\"delta\":{\"refusal\":\"sk-\"}}]}\n\n",
+			"data: {\"choices\":[{\"delta\":{\"refusal\":\"key\"}}]}\n\n",
+		)
+		.as_bytes()
+		.to_vec();
+		let base_url = serve_once(200, sse).await;
+		let provider = OpenAiCompatibleProvider::new(base_url, "sk-key", "model-x").expect("build");
+		let mut stream = provider.stream(&[], &[], &ToolChoice::Auto).await.expect("stream");
+		let mut assembler = StreamAssembler::new();
+		while let Some(item) = stream.next().await {
+			assembler.push(&item.expect("chunk")).expect("push");
+		}
+		let message = assembler.finish().expect("finish");
+		assert_eq!(message.error_message.as_deref(), Some("[redacted]"));
 	}
 
 	#[tokio::test]

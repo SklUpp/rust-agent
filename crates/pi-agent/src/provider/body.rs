@@ -5,7 +5,7 @@
 
 use futures::StreamExt;
 
-use crate::provider::{ProviderError, redact_with, snippet};
+use crate::provider::{DiagnosticRedactor, ProviderError, redact_diagnostic_with, snippet};
 
 /// Body text capped at a byte limit, plus whether bytes were dropped.
 pub(crate) struct BoundedBody {
@@ -58,8 +58,13 @@ pub(crate) fn trim_partial_token(text: &mut String) {
 
 /// Redact before bounding so a credential cut by the character limit cannot
 /// survive as a prefix; `truncated` marks a byte-capped read.
-pub(crate) fn bounded_redaction(text: &str, secrets: &[String], truncated: bool) -> String {
-	let mut bounded = snippet(&redact_with(text, secrets));
+pub(crate) fn bounded_redaction(
+	text: &str,
+	secrets: &[String],
+	redactor: Option<&DiagnosticRedactor>,
+	truncated: bool,
+) -> String {
+	let mut bounded = snippet(&redact_diagnostic_with(text, secrets, redactor));
 	if truncated {
 		bounded.push_str("\n[truncated]");
 	}
@@ -86,10 +91,23 @@ mod tests {
 		// The secret straddles the character cap, so truncating first would keep
 		// a credential prefix; redaction runs before the cap.
 		let text = format!("{}sk-secret", "x".repeat(ERROR_BODY_CHARS - 5));
-		let bounded = bounded_redaction(&text, &["sk-secret".to_string()], true);
+		let bounded = bounded_redaction(&text, &["sk-secret".to_string()], None, true);
 		assert!(!bounded.contains("sk-secret"), "leaked secret: {bounded}");
 		assert!(bounded.ends_with("[truncated]"));
 		assert!(bounded.chars().count() <= ERROR_BODY_CHARS + "\n[truncated]".chars().count());
+	}
+
+	#[test]
+	fn bounded_redaction_runs_the_caller_redactor() {
+		let redactor: DiagnosticRedactor =
+			std::sync::Arc::new(|text: &str| text.replace("secret-token", "[scrubbed]"));
+		let bounded = bounded_redaction(
+			"key sk-secret token secret-token",
+			&["sk-secret".to_string()],
+			Some(&redactor),
+			false,
+		);
+		assert_eq!(bounded, "key [redacted] token [scrubbed]");
 	}
 
 	#[tokio::test]
