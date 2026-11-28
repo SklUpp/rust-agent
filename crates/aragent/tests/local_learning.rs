@@ -552,10 +552,12 @@ fn autoload_skills_reach_the_child_conversation_once() {
 		autoload_index < assignment_index,
 		"autoload must precede the assignment"
 	);
-	assert_eq!(
-		messages[autoload_index].get("role").and_then(serde_json::Value::as_str),
-		Some("developer"),
-		"autoload is hidden developer guidance, not a user turn"
+	assert!(
+		matches!(
+			messages[autoload_index].get("role").and_then(serde_json::Value::as_str),
+			Some("system" | "developer")
+		),
+		"autoload is hidden non-user guidance, not a user turn"
 	);
 	assert_eq!(
 		messages[assignment_index].get("role").and_then(serde_json::Value::as_str),

@@ -313,7 +313,7 @@ class Provider:
 
         reminder_marker = "Plan mode turn ended without a required tool call."
         if self.hang_continuation and any(
-            message.get("role") == "developer"
+            message.get("role") in ("system", "developer")
             and reminder_marker in text_of(message.get("content"))
             for message in messages
         ):
