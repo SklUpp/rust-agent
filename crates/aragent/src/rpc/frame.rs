@@ -12,6 +12,8 @@ use std::hash::{Hash, Hasher};
 use pi_agent::state::is_valid_base64_payload;
 use serde_json::{Map, Value, json};
 
+use super::types::SUPPORTED_PROTOCOL_VERSIONS;
+
 /// Maximum UTF-8 size of one newline-delimited RPC frame, including the newline.
 pub const MAX_RPC_FRAME_BYTES: usize = 1024 * 1024;
 /// Maximum UTF-8 size of one logical frame reassembled by protocol v2.
@@ -298,7 +300,7 @@ impl RpcFrameEncoder {
 	}
 
 	pub fn set_protocol_version(&mut self, version: u8) -> Result<(), String> {
-		if version != 1 && version != 2 {
+		if !SUPPORTED_PROTOCOL_VERSIONS.contains(&version) {
 			return Err(format!("Unsupported RPC protocol version: {version}"));
 		}
 		self.protocol_version = version;

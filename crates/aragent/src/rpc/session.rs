@@ -327,7 +327,6 @@ pub struct RpcSession {
 	pub(crate) host_tools: Arc<HostToolBridge>,
 	pub(crate) host_uris: Arc<HostUriBridge>,
 	pub(crate) subagent_level: SubagentSubscriptionLevel,
-	pub(crate) protocol_version: u8,
 	/// One router for every turn: the host URI bridge mounts its validated
 	/// schemes here, and the runner hands the same handle to root and child
 	/// `read`/`write` tools.
@@ -574,7 +573,6 @@ impl RpcSession {
 			host_tools,
 			host_uris,
 			subagent_level: SubagentSubscriptionLevel::Off,
-			protocol_version: 1,
 			internal_urls,
 			memory_session,
 			observer,

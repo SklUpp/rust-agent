@@ -2493,7 +2493,7 @@ fn probe_syscall(name: &str) -> u8 {
 			},
 			true,
 		),
-		"memfd_create" | "memfd_create_execveat" => (
+		"memfd_create" => (
 			// SAFETY: memfd_create only allocates an anonymous in-memory file.
 			unsafe {
 				libc::syscall(

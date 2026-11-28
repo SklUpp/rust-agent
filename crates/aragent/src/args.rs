@@ -1629,7 +1629,7 @@ pub enum Command {
 	#[command(hide = true, name = "__probe", disable_help_flag = true)]
 	InternalProbe {
 		/// Probe name (`pidfd_open`, `landlock_create_ruleset`,
-		/// `seccomp_unotify`, `unshare_user`, `memfd_create_execveat`).
+		/// `seccomp_unotify`, `unshare_user`).
 		#[arg(value_name = "SYSCALL", allow_hyphen_values = true)]
 		syscall: String,
 	},

@@ -790,6 +790,20 @@ mod tests {
 	}
 
 	#[test]
+	fn ready_frame_advertises_versions_and_limits() {
+		assert_eq!(
+			ready_frame(1024, 2048),
+			json!({
+				"type": "ready",
+				"protocolVersion": 1,
+				"supportedProtocolVersions": [1, 2],
+				"maxFrameBytes": 1024,
+				"maxReassembledFrameBytes": 2048,
+			})
+		);
+	}
+
+	#[test]
 	fn control_frame_guards_mirror_upstream() {
 		assert!(matches!(
 			parse_control_frame(&json!({ "type": "extension_ui_response", "id": "u1", "value": "x" })),

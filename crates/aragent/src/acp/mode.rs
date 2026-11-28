@@ -349,7 +349,7 @@ impl AcpAgent {
 				}
 				Ok(json!({}))
 			},
-			method if method.starts_with("_omp/") || method == "speech.models.list" => {
+			method if method.starts_with("_omp/") => {
 				if notification {
 					return Ok(json!({}));
 				}
@@ -587,4 +587,20 @@ pub fn run<R: BufRead, W: Write + Send + 'static>(
 		.manager
 		.shutdown_all(outcome.reason.as_deref().unwrap_or("ACP connection closed"));
 	Ok(outcome.reason)
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+	use crate::acp::protocol::METHOD_NOT_FOUND;
+
+	#[test]
+	fn speech_models_list_is_method_not_found() {
+		let agent = AcpAgent::new();
+		let error = agent
+			.dispatch_request("speech.models.list", None, false)
+			.expect_err("speech.models.list is not an ACP method");
+		assert_eq!(error.code, METHOD_NOT_FOUND);
+		assert_eq!(error.message, "\"Method not found\": speech.models.list");
+	}
 }
