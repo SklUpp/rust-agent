@@ -3403,11 +3403,9 @@ fn wire_provider(
 	service_tier: Option<String>,
 	credential: Option<pi_agent::provider::CredentialCallback>,
 ) -> std::result::Result<Arc<dyn ModelProvider>, String> {
-	// Only the direct-provider adapters read catalog metadata; the
-	// OpenAI-compatible arm shapes its request from the resolved target.
-	#[cfg(not(feature = "direct-providers"))]
-	let _ = catalog;
-	#[cfg(feature = "direct-providers")]
+	// Every adapter resolves catalog metadata: the OpenAI-compatible arm needs
+	// the model row's output cap and compat record, and the direct-provider
+	// arms read more of it.
 	let info = catalog
 		.providers
 		.get(target.provider)
@@ -3417,6 +3415,9 @@ fn wire_provider(
 	#[cfg(feature = "direct-providers")]
 	let thinking = catalog.model_thinking(target.provider, target.model);
 	let setup = |err: pi_agent::ProviderError| format!("pi-agent provider setup failed: {err}");
+	// Per-request wall-clock budget, possibly widened by the dialect's stream
+	// idle floor below.
+	let mut request_timeout = config.model_request_timeout.effective();
 	let inner: Arc<dyn ModelProvider> = match target.dialect {
 		WireDialect::OpenAiCompletions => {
 			// Per-model `compat.supportsUsageInStreaming` override, else the TS
@@ -3425,6 +3426,35 @@ fn wire_provider(
 			let usage_in_streaming = target
 				.usage_in_streaming
 				.unwrap_or(target.provider != "cerebras");
+			// Resolved compat: always against the effective endpoint, so a
+			// `config.yml` `base_url` override drives detection, while the
+			// catalog row still supplies `reasoning` and sparse `compat`
+			// overrides.
+			let openai_compat = crate::catalog::OpenAiCompat::resolve(
+				target.provider,
+				Some(target.base_url),
+				target.model,
+				info.is_some_and(|info| info.reasoning),
+				info.and_then(|info| info.compat.as_ref()),
+			);
+			let max_tokens_field = match openai_compat.max_tokens_field {
+				crate::catalog::MaxTokensField::MaxTokens => {
+					pi_agent::provider::MaxTokensField::MaxTokens
+				},
+				crate::catalog::MaxTokensField::MaxCompletionTokens => {
+					pi_agent::provider::MaxTokensField::MaxCompletionTokens
+				},
+			};
+			// Slow reasoning/cold-load hosts idle longer than the default
+			// budget before their first SSE event; widen, never narrow.
+			if let Some(idle_ms) = openai_compat.stream_idle_timeout_ms {
+				let floor = std::time::Duration::from_millis(idle_ms);
+				if let Some(current) = request_timeout.timeout
+					&& current < floor
+				{
+					request_timeout.timeout = Some(floor);
+				}
+			}
 			let provider = OpenAiCompatibleProvider::new(target.base_url, target.api_key, target.model)
 				.map_err(setup)?
 				.with_effort(target.effort.map(str::to_string))
@@ -3439,7 +3469,14 @@ fn wire_provider(
 				.with_credential_callback(credential)
 				// Assembly stamps the real route on produced messages so signed
 				// reasoning is only replayed to the provider that issued it.
-				.with_provider_id(target.provider.to_string());
+				.with_provider_id(target.provider.to_string())
+				.with_developer_role(openai_compat.supports_developer_role)
+				.with_reasoning_effort_support(openai_compat.supports_reasoning_effort)
+				.with_effort_map(openai_compat.reasoning_effort_map.clone())
+				.with_max_tokens_field(max_tokens_field)
+				.with_max_tokens(info.and_then(|info| info.max_tokens))
+				.with_strict_mode(openai_compat.supports_strict_mode)
+				.with_store(openai_compat.supports_store);
 			Arc::new(provider) as Arc<dyn ModelProvider>
 		},
 		#[cfg(feature = "direct-providers")]
@@ -3541,7 +3578,7 @@ fn wire_provider(
 			Arc::new(provider) as Arc<dyn ModelProvider>
 		},
 	};
-	Ok(TimeoutProvider::wrap(inner, config.model_request_timeout.effective()))
+	Ok(TimeoutProvider::wrap(inner, request_timeout))
 }
 
 /// Parse the catalog `cost` block into the TS `ModelCost` record: the four
@@ -11118,8 +11155,15 @@ mod tests {
 #[cfg(test)]
 mod process_scope_tests {
 	use super::*;
-	use std::sync::atomic::{AtomicUsize, Ordering};
+	use std::{
+		collections::BTreeMap,
+		sync::atomic::{AtomicUsize, Ordering},
+	};
 
+	use crate::{
+		catalog::{Catalog, ModelInfo},
+		config::Config,
+	};
 	use pi_agent::AssistantGuard;
 
 	#[test]
@@ -11763,4 +11807,219 @@ mod process_scope_tests {
 		assert!(message.content.contains("quarantined"));
 	}
 
+	/// Minimal chat-completions server: captures JSON request bodies and replies
+	/// with one assistant turn after `delay`.
+	async fn capture_chat_server(
+		delay: std::time::Duration,
+	) -> (String, Arc<tokio::sync::Mutex<Vec<serde_json::Value>>>) {
+		use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+		let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+			.await
+			.expect("bind");
+		let addr = listener.local_addr().expect("addr");
+		let captured = Arc::new(tokio::sync::Mutex::new(Vec::new()));
+		let sink = Arc::clone(&captured);
+		tokio::spawn(async move {
+			loop {
+				let Ok((mut socket, _)) = listener.accept().await else {
+					return;
+				};
+				let mut request = Vec::new();
+				let mut chunk = [0u8; 2048];
+				loop {
+					let read = socket.read(&mut chunk).await.unwrap_or(0);
+					if read == 0 {
+						break;
+					}
+					request.extend_from_slice(&chunk[..read]);
+					let Some(head_end) = request.windows(4).position(|w| w == b"\r\n\r\n") else {
+						continue;
+					};
+					let head = String::from_utf8_lossy(&request[..head_end]).to_lowercase();
+					let content_length = head
+						.lines()
+						.find_map(|line| line.strip_prefix("content-length:"))
+						.and_then(|value| value.trim().parse::<usize>().ok())
+						.unwrap_or(0);
+					if request.len() >= head_end + 4 + content_length {
+						break;
+					}
+				}
+				if let Some(head_end) = request.windows(4).position(|w| w == b"\r\n\r\n") {
+					let body = String::from_utf8_lossy(&request[head_end + 4..]).to_string();
+					if let Ok(value) = serde_json::from_str::<serde_json::Value>(&body) {
+						sink.lock().await.push(value);
+					}
+				}
+				tokio::time::sleep(delay).await;
+				let response = br#"{"choices":[{"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}]}"#;
+				let head = format!(
+					"HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+					response.len()
+				);
+				let _ = socket.write_all(head.as_bytes()).await;
+				let _ = socket.write_all(response).await;
+				let _ = socket.shutdown().await;
+			}
+		});
+		(format!("http://{addr}/v1"), captured)
+	}
+
+	#[tokio::test]
+	async fn wire_provider_applies_catalog_openai_compat_and_idle_floor() {
+		let (base_url, captured) =
+			capture_chat_server(std::time::Duration::from_millis(150)).await;
+		let mut catalog = Catalog::default();
+		let mut models = BTreeMap::new();
+		models.insert("compat-model".to_string(), ModelInfo {
+			provider:   "local".to_string(),
+			base_url:   Some(base_url.clone()),
+			reasoning:  true,
+			max_tokens: Some(1234),
+			compat:     Some(serde_json::json!({
+				"supportsDeveloperRole": false,
+				"supportsStore": false,
+				"supportsReasoningEffort": false,
+				"maxTokensField": "max_tokens",
+				"supportsStrictMode": false,
+				"streamIdleTimeoutMs": 2500
+			})),
+			..ModelInfo::default()
+		});
+		catalog.providers.insert("local".to_string(), models);
+		let mut config = Config::default();
+		// Shorter than the compat idle floor; the floor must widen the budget.
+		config.model_request_timeout.timeout_ms = Some(50);
+		let target = WireTarget {
+			dialect:            WireDialect::OpenAiCompletions,
+			provider:           "local",
+			model:              "compat-model",
+			base_url:           &base_url,
+			api_key:            "test-key",
+			effort:             Some("high"),
+			supports_images:    false,
+			usage_in_streaming: None,
+		};
+		let provider = wire_provider(&catalog, &config, &target, None, None, None, None)
+			.expect("provider");
+		let tools = vec![serde_json::json!({
+			"type": "function",
+			"function": {
+				"name": "read",
+				"description": "Read a file",
+				"parameters": {"type": "object"},
+				"strict": true
+			}
+		})];
+		let message = provider
+			.complete(
+				&[pi_agent::Message::developer("policy"), pi_agent::Message::user("hi")],
+				&tools,
+				&pi_agent::ToolChoice::Auto,
+			)
+			.await
+			.expect("complete survives the 50ms budget via the 2500ms idle floor");
+		assert_eq!(message.content, "ok");
+		let bodies = captured.lock().await;
+		let body = bodies.first().expect("captured request");
+		assert_eq!(body["messages"][0]["role"], "system", "developer folds: {body}");
+		assert!(body.get("reasoning_effort").is_none(), "effort unsupported: {body}");
+		assert_eq!(body["max_tokens"], 1234);
+		assert!(body.get("max_completion_tokens").is_none());
+		assert!(body.get("store").is_none(), "store unsupported: {body}");
+		assert!(
+			body["tools"][0]["function"].get("strict").is_none(),
+			"strict stripped: {body}"
+		);
+	}
+
+	#[tokio::test]
+	async fn wire_provider_resolves_compat_against_config_base_url_override() {
+		let (base_url, captured) =
+			capture_chat_server(std::time::Duration::from_millis(0)).await;
+		let mut catalog = Catalog::default();
+		let mut models = BTreeMap::new();
+		// The catalog URL would detect OpenAI; the config override points at a
+		// local test server, so compat must follow the effective endpoint.
+		models.insert("override-model".to_string(), ModelInfo {
+			provider:  "custom".to_string(),
+			base_url:  Some("https://api.openai.com/v1".to_string()),
+			reasoning: false,
+			..ModelInfo::default()
+		});
+		catalog.providers.insert("custom".to_string(), models);
+		let config = Config::default();
+		let target = WireTarget {
+			dialect:            WireDialect::OpenAiCompletions,
+			provider:           "custom",
+			model:              "override-model",
+			base_url:           &base_url,
+			api_key:            "test-key",
+			effort:             None,
+			supports_images:    false,
+			usage_in_streaming: None,
+		};
+		let provider = wire_provider(&catalog, &config, &target, None, None, None, None)
+			.expect("provider");
+		let tools = vec![serde_json::json!({
+			"type": "function",
+			"function": {
+				"name": "read",
+				"description": "Read a file",
+				"parameters": {"type": "object"},
+				"strict": true
+			}
+		})];
+		let message = provider
+			.complete(
+				&[pi_agent::Message::developer("policy")],
+				&tools,
+				&pi_agent::ToolChoice::Auto,
+			)
+			.await
+			.expect("complete");
+		assert_eq!(message.content, "ok");
+		let bodies = captured.lock().await;
+		let body = bodies.first().expect("captured request");
+		assert_eq!(
+			body["messages"][0]["role"], "system",
+			"effective endpoint folds developer: {body}"
+		);
+		assert!(
+			body["tools"][0]["function"].get("strict").is_none(),
+			"effective endpoint strips strict: {body}"
+		);
+	}
+
+	#[tokio::test]
+	async fn wire_provider_falls_back_to_resolved_compat_for_unlisted_models() {
+		let (base_url, captured) = capture_chat_server(std::time::Duration::ZERO).await;
+		let catalog = Catalog::default();
+		let config = Config::default();
+		let target = WireTarget {
+			dialect:            WireDialect::OpenAiCompletions,
+			provider:           "kimi-code",
+			model:              "kimi-k3",
+			base_url:           &base_url,
+			api_key:            "test-key",
+			effort:             Some("minimal"),
+			supports_images:    false,
+			usage_in_streaming: None,
+		};
+		let provider = wire_provider(&catalog, &config, &target, None, None, None, None)
+			.expect("provider");
+		provider
+			.complete(&[], &[], &pi_agent::ToolChoice::Auto)
+			.await
+			.expect("complete");
+		let bodies = captured.lock().await;
+		let body = bodies.first().expect("captured request");
+		assert_eq!(body["model"], "kimi-k3");
+		assert_eq!(
+			body["reasoning_effort"], "low",
+			"fallback compat remaps the kimi-k3 effort: {body}"
+		);
+		assert!(body.get("store").is_none(), "moonshot-native host: {body}");
+	}
 }

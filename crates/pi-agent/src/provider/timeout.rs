@@ -462,6 +462,7 @@ mod tests {
 
 	fn done_chunk(text: &str, is_done: bool) -> StreamChunk {
 		StreamChunk {
+			refusal: None,
 			content: Some(text.to_string()),
 			reasoning: None,
 			tool_call_deltas: Vec::new(),
@@ -573,6 +574,7 @@ mod tests {
 
 	fn empty_done_chunk() -> StreamChunk {
 		StreamChunk {
+			refusal:     None,
 			is_done:     true,
 			stop_reason: Some(StopReason::Stop),
 			..done_chunk("", true)
@@ -591,6 +593,8 @@ mod tests {
 		EmptyThenDone,
 		/// One stream emits visible text followed by an empty stop.
 		VisibleThenEmptyStop,
+		/// One stream emits a refusal chunk then a low-usage empty stop.
+		RefusalThenEmptyStop,
 	}
 
 	struct ScriptedStream {
@@ -647,6 +651,21 @@ mod tests {
 				StreamMode::VisibleThenEmptyStop => Ok(futures::stream::iter(vec![
 					Ok(done_chunk("part", false)),
 					Ok(empty_done_chunk()),
+				])
+				.boxed()),
+				StreamMode::RefusalThenEmptyStop => Ok(futures::stream::iter(vec![
+					Ok(StreamChunk {
+						content: None,
+						refusal: Some("blocked by safety".to_string()),
+						..done_chunk("", false)
+					}),
+					Ok(StreamChunk {
+						usage: Some(crate::state::TokenUsage {
+							output: 1,
+							..Default::default()
+						}),
+						..empty_done_chunk()
+					}),
 				])
 				.boxed()),
 			}
@@ -739,6 +758,32 @@ mod tests {
 			"empty stop after visible output is terminal"
 		);
 		assert_eq!(inner.calls.load(Ordering::SeqCst), 1, "no reissue after output");
+	}
+
+	#[tokio::test]
+	async fn stream_preserves_refusal_without_empty_completion_retry() {
+		let inner = Arc::new(ScriptedStream {
+			calls: AtomicUsize::new(0),
+			mode:  StreamMode::RefusalThenEmptyStop,
+		});
+		let provider = TimeoutProvider::new(inner.clone(), config(1_000, 0));
+		let mut stream = provider
+			.stream(&[Message::user("hi")], &[], &ToolChoice::Auto)
+			.await
+			.expect("established");
+		let mut refusal = None;
+		while let Some(item) = stream.next().await {
+			let chunk = item.expect("chunk");
+			if chunk.refusal.is_some() {
+				refusal = chunk.refusal;
+			}
+		}
+		assert_eq!(refusal.as_deref(), Some("blocked by safety"));
+		assert_eq!(
+			inner.calls.load(Ordering::SeqCst),
+			1,
+			"a refusal chunk commits the attempt; no empty-completion retry"
+		);
 	}
 
 	#[tokio::test]

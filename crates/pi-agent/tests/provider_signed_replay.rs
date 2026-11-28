@@ -19,6 +19,7 @@ fn chunk(
 	tool_call_deltas: Vec<ToolCallDelta>,
 ) -> StreamChunk {
 	StreamChunk {
+		refusal: None,
 		content: content.map(str::to_string),
 		reasoning: reasoning.map(str::to_string),
 		tool_call_deltas,
@@ -35,6 +36,7 @@ fn chunk(
 
 fn done(stop_reason: StopReason, error_message: Option<&str>) -> StreamChunk {
 	StreamChunk {
+		refusal: None,
 		content: None,
 		reasoning: None,
 		tool_call_deltas: Vec::new(),

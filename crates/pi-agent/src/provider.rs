@@ -160,6 +160,11 @@ pub struct StreamChunk {
 	/// Public provider-supplied reasoning delta for this chunk.
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub reasoning: Option<String>,
+	/// Safety-refusal fragment. Streamed refusals arrive as deltas like text;
+	/// the assembler concatenates them and decides at `finish` whether the turn
+	/// is a refusal-only error.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub refusal: Option<String>,
 	#[serde(default, skip_serializing_if = "Vec::is_empty")]
 	pub tool_call_deltas: Vec<ToolCallDelta>,
 	/// Usage snapshot the provider reported with this chunk, when the dialect
@@ -304,6 +309,8 @@ pub struct StreamAssembler {
 	usage:         Option<TokenUsage>,
 	stop_reason:   Option<crate::state::StopReason>,
 	error_message: Option<String>,
+	/// Concatenated safety-refusal deltas, in arrival order.
+	refusal_buf:   String,
 }
 
 #[derive(Debug)]
@@ -396,10 +403,17 @@ impl StreamAssembler {
 			})?;
 			self.set_signature(index, signature)?;
 		}
+		if let Some(refusal) = &chunk.refusal {
+			self.refusal_buf.push_str(refusal);
+		}
 		if let Some(usage) = chunk.usage {
 			self.usage = Some(usage);
 		}
-		if let Some(reason) = chunk.stop_reason {
+		// A provider error already surfaced (content filter, stream error) wins
+		// over a later benign `finish_reason: "stop"` chunk.
+		if let Some(reason) = chunk.stop_reason
+			&& !(self.error_message.is_some() && reason != StopReason::Error)
+		{
 			self.stop_reason = Some(reason);
 		}
 		if let Some(message) = &chunk.error_message {
@@ -653,10 +667,23 @@ impl StreamAssembler {
 			})
 			.collect();
 		let mut message = Message::assistant_with_tools(content, tool_calls);
+		// A refusal-only turn (no visible content, no tool calls, no other
+		// provider error) is a terminal safety error, even when the host also
+		// reported a benign `finish_reason: "stop"`.
+		if !self.refusal_buf.trim().is_empty()
+			&& message.content.trim().is_empty()
+			&& message.tool_calls.is_empty()
+			&& self.error_message.is_none()
+		{
+			message.stop_reason = Some(StopReason::Error);
+			message.error_message = Some(self.refusal_buf);
+		}
 		message.parts = parts;
 		message.usage = self.usage;
-		message.stop_reason = self.stop_reason;
-		message.error_message = self.error_message;
+		if message.error_message.is_none() {
+			message.stop_reason = self.stop_reason;
+		}
+		message.error_message = message.error_message.or(self.error_message);
 		message.disabled_features = self.disabled_features;
 		Ok(message)
 	}
@@ -676,6 +703,18 @@ impl StreamAssembler {
 	}
 }
 
+/// Wire field carrying the output-token cap on an OpenAI-compatible request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum MaxTokensField {
+	/// Legacy `max_tokens` (Mistral, native Kimi/Moonshot, Z.ai/Zhipu, Chutes,
+	/// Fireworks, DeepSeek's first-party API).
+	MaxTokens,
+	/// `max_completion_tokens`, used by OpenAI and every host that does not
+	/// require the legacy field.
+	#[default]
+	MaxCompletionTokens,
+}
+
 /// Request schema for the OpenAI Chat Completions REST API.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OpenAiChatRequest {
@@ -692,6 +731,9 @@ pub struct OpenAiChatRequest {
 	/// and for dialects without streaming usage support.
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub stream_options: Option<OpenAiStreamOptions>,
+	/// OpenAI-compatible `store`; omitted when the host rejects it.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub store: Option<bool>,
 	/// OpenAI-compatible `reasoning_effort`; omitted when unset.
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub reasoning_effort: Option<String>,
@@ -1050,7 +1092,18 @@ pub fn normalize_usage(raw: &OpenAiUsage) -> TokenUsage {
 }
 
 /// Convert pi-agent domain messages into OpenAI API messages.
+///
+/// Keeps the historical behavior: `Role::Developer` is sent as `"developer"`.
 pub fn to_openai_messages(messages: &[Message]) -> Result<Vec<OpenAiMessage>, ProviderError> {
+	to_openai_messages_with_developer_role(messages, true)
+}
+
+/// Convert domain messages honoring the host's `supportsDeveloperRole`
+/// decision: when false, `Role::Developer` folds into `"system"`.
+pub fn to_openai_messages_with_developer_role(
+	messages: &[Message],
+	supports_developer_role: bool,
+) -> Result<Vec<OpenAiMessage>, ProviderError> {
 	let transformed = transform::transform_messages(messages);
 	let messages = transformed.as_ref();
 	let mut out = Vec::new();
@@ -1136,7 +1189,13 @@ pub fn to_openai_messages(messages: &[Message]) -> Result<Vec<OpenAiMessage>, Pr
 			Role::User => "user",
 			Role::Assistant => "assistant",
 			Role::Tool => unreachable!(),
-			Role::Developer => "developer",
+			Role::Developer => {
+				if supports_developer_role {
+					"developer"
+				} else {
+					"system"
+				}
+			},
 		};
 
 		let tool_calls = if m.tool_calls.is_empty() {
@@ -1261,6 +1320,13 @@ pub fn from_openai_response(resp_msg: OpenAiResponseMessage) -> Message {
 
 	let content = resp_msg.content.unwrap_or_default();
 	let mut message = Message::assistant_with_tools(content.clone(), tool_calls);
+	// A refusal-only reply is a terminal safety error, not an empty answer.
+	let refusal = resp_msg
+		.refusal
+		.as_deref()
+		.filter(|text| !text.trim().is_empty())
+		.filter(|_| content.trim().is_empty() && message.tool_calls.is_empty())
+		.map(str::to_string);
 	if let Some(reasoning) = first_nonempty([
 		resp_msg.reasoning_content.as_deref(),
 		resp_msg.reasoning.as_deref(),
@@ -1271,6 +1337,10 @@ pub fn from_openai_response(resp_msg: OpenAiResponseMessage) -> Message {
 			parts.push(crate::state::ContentPart::Text { text: content });
 		}
 		message.parts = parts;
+	}
+	if let Some(refusal) = refusal {
+		message.stop_reason = Some(StopReason::Error);
+		message.error_message = Some(refusal);
 	}
 	message
 }
@@ -1318,6 +1388,7 @@ pub fn parse_sse_line(line: &str) -> Option<Result<StreamChunk, ProviderError>> 
 	let data = trimmed.strip_prefix("data:")?.trim();
 	if data == "[DONE]" {
 		return Some(Ok(StreamChunk {
+			refusal: None,
 			content: None,
 			reasoning: None,
 			tool_call_deltas: Vec::new(),
@@ -1348,6 +1419,7 @@ pub fn parse_sse_line(line: &str) -> Option<Result<StreamChunk, ProviderError>> 
 			}
 			let mut content = None;
 			let mut reasoning = None;
+			let mut refusal = None;
 			let mut stop_reason = None;
 			let mut error_message = None;
 			let mut tool_call_deltas = Vec::new();
@@ -1368,6 +1440,9 @@ pub fn parse_sse_line(line: &str) -> Option<Result<StreamChunk, ProviderError>> 
 				}
 				if let Some(delta) = choice.delta.content {
 					content = Some(delta);
+				}
+				if let Some(text) = choice.delta.refusal.as_deref().filter(|text| !text.is_empty()) {
+					refusal = Some(text.to_string());
 				}
 				if let Some(delta) = first_nonempty([
 					choice.delta.reasoning_content.as_deref(),
@@ -1392,6 +1467,7 @@ pub fn parse_sse_line(line: &str) -> Option<Result<StreamChunk, ProviderError>> 
 			}
 
 			Some(Ok(StreamChunk {
+				refusal,
 				content,
 				reasoning,
 				tool_call_deltas,
@@ -1453,6 +1529,7 @@ where
 	/// Synthetic terminal chunk for a body that ended after `finish_reason`.
 	fn terminal_chunk(stop_reason: Option<StopReason>, error_message: Option<String>) -> StreamChunk {
 		StreamChunk {
+			refusal: None,
 			content: None,
 			reasoning: None,
 			tool_call_deltas: Vec::new(),
@@ -1594,6 +1671,7 @@ mod tests {
 	fn finish_rejects_missing_tool_name() {
 		let mut assembler = StreamAssembler::new();
 		assembler.push(&StreamChunk {
+			refusal: None,
 			content: Some("text".into()),
 			tool_call_deltas: vec![ToolCallDelta {
 				index: 0,
@@ -1611,7 +1689,8 @@ mod tests {
 			redacted: None,
 			stop_reason: None,
 			error_message: None,
-		}).unwrap();
+		})
+		.unwrap();
 		let err = assembler.finish().unwrap_err();
 		assert!(matches!(err, ProviderError::Protocol(_)));
 	}
@@ -1620,6 +1699,7 @@ mod tests {
 	fn finish_rejects_empty_or_whitespace_tool_name() {
 		let mut assembler = StreamAssembler::new();
 		assembler.push(&StreamChunk {
+			refusal: None,
 			content: Some("text".into()),
 			tool_call_deltas: vec![ToolCallDelta {
 				index: 0,
@@ -1637,7 +1717,8 @@ mod tests {
 			redacted: None,
 			stop_reason: None,
 			error_message: None,
-		}).unwrap();
+		})
+		.unwrap();
 		let err = assembler.finish().unwrap_err();
 		assert!(matches!(err, ProviderError::Protocol(_)));
 	}
@@ -1646,6 +1727,7 @@ mod tests {
 	fn finish_accepts_valid_tool_call() {
 		let mut assembler = StreamAssembler::new();
 		assembler.push(&StreamChunk {
+			refusal: None,
 			content: Some("text".into()),
 			tool_call_deltas: vec![ToolCallDelta {
 				index: 0,
@@ -1663,7 +1745,8 @@ mod tests {
 			redacted: None,
 			stop_reason: None,
 			error_message: None,
-		}).unwrap();
+		})
+		.unwrap();
 		let msg = assembler.finish().unwrap();
 		assert_eq!(msg.content, "text");
 		assert_eq!(msg.tool_calls.len(), 1);
@@ -1792,5 +1875,180 @@ mod tests {
 			);
 			assert!(stream.next().await.is_none(), "stream must stop after the error");
 		}
+	}
+
+	/// Minimal stream chunk for assembler tests; adapters fill the rest.
+	fn stream_chunk(
+		content: Option<&str>,
+		stop_reason: Option<StopReason>,
+		error_message: Option<&str>,
+	) -> StreamChunk {
+		StreamChunk {
+			refusal: None,
+			content: content.map(str::to_string),
+			reasoning: None,
+			tool_call_deltas: Vec::new(),
+			usage: None,
+			is_done: false,
+			content_index: None,
+			signature: None,
+			redacted: None,
+			stop_reason,
+			error_message: error_message.map(str::to_string),
+			disabled_features: None,
+		}
+	}
+
+	#[test]
+	fn developer_role_folds_to_system_when_host_does_not_support_it() {
+		let messages = [Message::developer("policy"), Message::user("hi")];
+		let folded =
+			to_openai_messages_with_developer_role(&messages, false).expect("wire messages");
+		assert_eq!(folded[0].role, "system");
+		assert_eq!(folded[1].role, "user");
+		// Backwards-compatible entry point keeps the `developer` role.
+		let kept = to_openai_messages(&messages).expect("wire messages");
+		assert_eq!(kept[0].role, "developer");
+	}
+
+	#[test]
+	fn parse_sse_line_carries_refusal_delta_without_deciding() {
+		let line = r#"data: {"choices":[{"delta":{"refusal":"I cannot help with that"}}]}"#;
+		let chunk = parse_sse_line(line).expect("chunk").expect("parsed");
+		assert_eq!(chunk.refusal.as_deref(), Some("I cannot help with that"));
+		assert_eq!(chunk.stop_reason, None);
+		assert!(chunk.error_message.is_none());
+		assert!(chunk.content.is_none());
+	}
+
+	#[test]
+	fn parse_sse_line_keeps_refusal_alongside_content_or_tools() {
+		let with_content =
+			r#"data: {"choices":[{"delta":{"content":"answer","refusal":"nope"}}]}"#;
+		let chunk = parse_sse_line(with_content).expect("chunk").expect("parsed");
+		assert_eq!(chunk.refusal.as_deref(), Some("nope"));
+		assert_eq!(chunk.stop_reason, None);
+		assert!(chunk.error_message.is_none());
+
+		let with_tool = r#"data: {"choices":[{"delta":{"refusal":"nope","tool_calls":[{"index":0,"id":"call_1","function":{"name":"read","arguments":"{}"}}]}}]}"#;
+		let chunk = parse_sse_line(with_tool).expect("chunk").expect("parsed");
+		assert_eq!(chunk.refusal.as_deref(), Some("nope"));
+		assert_eq!(chunk.stop_reason, None);
+		assert!(chunk.error_message.is_none());
+		assert_eq!(chunk.tool_call_deltas.len(), 1);
+	}
+
+	#[test]
+	fn assembler_accumulates_split_refusal_deltas_into_terminal_error() {
+		let mut assembler = StreamAssembler::new();
+		// A standalone `" "` fragment must survive parsing and assembly.
+		for fragment in ["I cannot", " ", "help with that"] {
+			let line = format!(
+				r#"data: {{"choices":[{{"delta":{{"refusal":{}}}}}]}}"#,
+				serde_json::to_string(fragment).expect("json")
+			);
+			let chunk = parse_sse_line(&line).expect("chunk").expect("parsed");
+			assembler.push(&chunk).expect("refusal chunk");
+		}
+		assembler
+			.push(&stream_chunk(None, Some(StopReason::Stop), None))
+			.expect("trailing stop chunk");
+		let message = assembler.finish().expect("finish");
+		assert!(message.content.is_empty());
+		assert_eq!(message.stop_reason, Some(StopReason::Error));
+		assert_eq!(message.error_message.as_deref(), Some("I cannot help with that"));
+	}
+
+	#[test]
+	fn assembler_keeps_tool_use_when_refusal_and_tool_call_chunks_differ() {
+		let mut assembler = StreamAssembler::new();
+		assembler
+			.push(&StreamChunk {
+				refusal: Some("nope".into()),
+				..stream_chunk(None, None, None)
+			})
+			.expect("refusal chunk");
+		assembler
+			.push(&StreamChunk {
+				tool_call_deltas: vec![ToolCallDelta {
+					index: 0,
+					id: Some("call_1".into()),
+					name: Some("read".into()),
+					arguments_delta: Some("{}".into()),
+					content_index: None,
+				}],
+				..stream_chunk(None, None, None)
+			})
+			.expect("tool chunk");
+		assembler
+			.push(&stream_chunk(None, Some(StopReason::ToolUse), None))
+			.expect("trailing tool_use chunk");
+		let message = assembler.finish().expect("finish");
+		assert_eq!(message.stop_reason, Some(StopReason::ToolUse));
+		assert!(message.error_message.is_none());
+		assert_eq!(message.tool_calls.len(), 1);
+		assert_eq!(message.tool_calls[0].name, "read");
+	}
+
+	#[test]
+	fn from_openai_response_surfaces_refusal_only_reply_as_error() {
+		let message = from_openai_response(OpenAiResponseMessage {
+			content: None,
+			reasoning_content: None,
+			reasoning: None,
+			reasoning_text: None,
+			tool_calls: None,
+			refusal: Some("I cannot help with that".to_string()),
+			annotations: None,
+		});
+		assert!(message.content.is_empty());
+		assert_eq!(message.stop_reason, Some(StopReason::Error));
+		assert_eq!(message.error_message.as_deref(), Some("I cannot help with that"));
+	}
+
+	#[test]
+	fn from_openai_response_keeps_refusal_with_content_or_tools_and_ignores_blank() {
+		let with_content = from_openai_response(OpenAiResponseMessage {
+			content: Some("answer".to_string()),
+			reasoning_content: None,
+			reasoning: None,
+			reasoning_text: None,
+			tool_calls: None,
+			refusal: Some("nope".to_string()),
+			annotations: None,
+		});
+		assert_eq!(with_content.stop_reason, None);
+		assert!(with_content.error_message.is_none());
+
+		let with_tool = from_openai_response(OpenAiResponseMessage {
+			content: None,
+			reasoning_content: None,
+			reasoning: None,
+			reasoning_text: None,
+			tool_calls: Some(vec![OpenAiToolCall {
+				id:        "call_1".to_string(),
+				call_type: "function".to_string(),
+				function:  OpenAiFunctionCall {
+					name:      "read".to_string(),
+					arguments: "{}".to_string(),
+				},
+			}]),
+			refusal: Some("nope".to_string()),
+			annotations: None,
+		});
+		assert_eq!(with_tool.stop_reason, None);
+		assert!(with_tool.error_message.is_none());
+
+		let blank = from_openai_response(OpenAiResponseMessage {
+			content: None,
+			reasoning_content: None,
+			reasoning: None,
+			reasoning_text: None,
+			tool_calls: None,
+			refusal: Some("   ".to_string()),
+			annotations: None,
+		});
+		assert_eq!(blank.stop_reason, None);
+		assert!(blank.error_message.is_none());
 	}
 }

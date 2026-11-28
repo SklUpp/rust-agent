@@ -84,12 +84,13 @@ impl ReplaySafeStreamRetryPolicy {
 /// A streamed chunk that delivers content worth committing the attempt for.
 ///
 /// Mirrors the donor `isMeaningfulCompletionEvent`: non-empty text/thinking/
-/// redacted deltas, any tool-call delta, or a thinking signature commit the
-/// attempt. Empty openers and usage-only chunks stay buffered.
+/// redacted/refusal deltas, any tool-call delta, or a thinking signature commit
+/// the attempt. Empty openers and usage-only chunks stay buffered.
 pub(crate) fn is_meaningful_chunk(chunk: &StreamChunk) -> bool {
 	chunk.content.as_deref().is_some_and(|text| !text.is_empty())
 		|| chunk.reasoning.as_deref().is_some_and(|text| !text.is_empty())
 		|| chunk.redacted.as_deref().is_some_and(|text| !text.is_empty())
+		|| chunk.refusal.as_deref().is_some_and(|text| !text.is_empty())
 		|| !chunk.tool_call_deltas.is_empty()
 		|| chunk.signature.is_some()
 }
@@ -326,6 +327,7 @@ mod tests {
 
 	fn chunk() -> StreamChunk {
 		StreamChunk {
+			refusal:           None,
 			content:           None,
 			reasoning:         None,
 			tool_call_deltas:  Vec::new(),
@@ -341,11 +343,12 @@ mod tests {
 	}
 
 	fn text(text: &str) -> StreamChunk {
-		StreamChunk { content: Some(text.to_string()), ..chunk() }
+		StreamChunk { content: Some(text.to_string()), refusal: None, ..chunk() }
 	}
 
 	fn empty_done() -> StreamChunk {
 		StreamChunk {
+			refusal:     None,
 			is_done:     true,
 			stop_reason: Some(StopReason::Stop),
 			..chunk()

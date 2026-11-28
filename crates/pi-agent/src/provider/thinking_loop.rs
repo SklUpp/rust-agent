@@ -713,6 +713,7 @@ mod tests {
 			.chunks(40)
 			.map(|chunk| {
 				Ok(StreamChunk {
+					refusal: None,
 					reasoning: Some(chunk.iter().collect()),
 					content: None,
 					tool_call_deltas: Vec::new(),

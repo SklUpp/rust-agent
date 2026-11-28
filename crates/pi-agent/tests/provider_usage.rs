@@ -402,6 +402,7 @@ impl ModelProvider for FailingAfterUsageProvider {
 		let usage = self.usage;
 		let items: Vec<Result<StreamChunk, ProviderError>> = vec![
 			Ok(StreamChunk {
+				refusal: None,
 				content: Some("partial".to_string()),
 				tool_call_deltas: Vec::new(),
 				usage: Some(usage),

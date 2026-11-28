@@ -38,6 +38,7 @@ fn delta(
 
 fn chunk(content: Option<&str>, deltas: Vec<ToolCallDelta>) -> StreamChunk {
 	StreamChunk {
+		refusal: None,
 		content: content.map(str::to_string),
 		tool_call_deltas: deltas,
 		usage: None,

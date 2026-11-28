@@ -3,7 +3,7 @@
 //! Isolated from [`super`] so the provider trait, stream chunk types and the
 //! stream assembler carry no concrete HTTP client dependency.
 
-use std::time::Duration;
+use std::{collections::BTreeMap, time::Duration};
 
 use async_trait::async_trait;
 
@@ -61,6 +61,31 @@ pub struct OpenAiCompatibleProvider {
 	force_reasoning_off: bool,
 	/// OpenAI `service_tier`; omitted when unset/`none`/empty.
 	service_tier: Option<String>,
+	/// Accept the `developer` role instead of folding it into `system`.
+	developer_role: bool,
+	/// Accept `reasoning_effort` at all; when false the field is omitted.
+	supports_reasoning_effort: bool,
+	/// Per-model effort remap applied to `reasoning_effort`.
+	reasoning_effort_map: BTreeMap<String, String>,
+	/// Wire field carrying the output-token cap.
+	max_tokens_field: MaxTokensField,
+	/// Output-token cap sent on every request (catalog `maxTokens`).
+	max_tokens: Option<u64>,
+	/// Accept OpenAI strict-mode tool schemas; when false `function.strict`
+	/// is stripped from every offered tool.
+	supports_strict_mode: bool,
+	/// Accept the OpenAI `store` request field.
+	supports_store: bool,
+	/// Sampling temperature; omitted when unset.
+	temperature: Option<f64>,
+	/// Nucleus-sampling probability mass; omitted when unset.
+	top_p: Option<f64>,
+	/// Stop sequence(s), passed through verbatim; omitted when unset.
+	stop: Option<serde_json::Value>,
+	/// End-user identifier for abuse monitoring; omitted when unset.
+	user: Option<String>,
+	/// Request metadata object, passed through verbatim; omitted when unset.
+	metadata: Option<serde_json::Value>,
 	/// Configured provider id (catalog key) stamped on produced messages so
 	/// signed reasoning is only replayed to the route that issued it.
 	provider_id: Option<String>,
@@ -113,6 +138,18 @@ impl OpenAiCompatibleProvider {
 			usage_in_streaming: true,
 			force_reasoning_off: false,
 			service_tier: None,
+			developer_role: true,
+			supports_reasoning_effort: true,
+			reasoning_effort_map: BTreeMap::new(),
+			max_tokens_field: MaxTokensField::default(),
+			max_tokens: None,
+			supports_strict_mode: true,
+			supports_store: true,
+			temperature: None,
+			top_p: None,
+			stop: None,
+			user: None,
+			metadata: None,
 			provider_id: None,
 			credential: None,
 			retry: RetryPolicy::default(),
@@ -220,6 +257,79 @@ impl OpenAiCompatibleProvider {
 		self
 	}
 
+	/// Accept the `developer` role; when false it folds into `system`.
+	pub fn with_developer_role(mut self, enabled: bool) -> Self {
+		self.developer_role = enabled;
+		self
+	}
+
+	/// Accept `reasoning_effort`; when false the field is omitted entirely.
+	pub fn with_reasoning_effort_support(mut self, enabled: bool) -> Self {
+		self.supports_reasoning_effort = enabled;
+		self
+	}
+
+	/// Install the per-model `reasoning_effort` remap.
+	pub fn with_effort_map(mut self, map: BTreeMap<String, String>) -> Self {
+		self.reasoning_effort_map = map;
+		self
+	}
+
+	/// Choose the wire field carrying the output-token cap.
+	pub fn with_max_tokens_field(mut self, field: MaxTokensField) -> Self {
+		self.max_tokens_field = field;
+		self
+	}
+
+	/// Set the output-token cap sent on every request.
+	pub fn with_max_tokens(mut self, max_tokens: Option<u64>) -> Self {
+		self.max_tokens = max_tokens;
+		self
+	}
+
+	/// Accept OpenAI strict-mode tool schemas; when false `function.strict`
+	/// is stripped from every offered tool.
+	pub fn with_strict_mode(mut self, enabled: bool) -> Self {
+		self.supports_strict_mode = enabled;
+		self
+	}
+
+	/// Accept the OpenAI `store` field; when false it is omitted.
+	pub fn with_store(mut self, enabled: bool) -> Self {
+		self.supports_store = enabled;
+		self
+	}
+
+	/// Sampling temperature; `None` omits the field.
+	pub fn with_temperature(mut self, temperature: Option<f64>) -> Self {
+		self.temperature = temperature;
+		self
+	}
+
+	/// Nucleus-sampling probability mass; `None` omits the field.
+	pub fn with_top_p(mut self, top_p: Option<f64>) -> Self {
+		self.top_p = top_p;
+		self
+	}
+
+	/// Stop sequence(s), passed through verbatim; `None` omits the field.
+	pub fn with_stop(mut self, stop: Option<serde_json::Value>) -> Self {
+		self.stop = stop;
+		self
+	}
+
+	/// End-user identifier; `None` omits the field.
+	pub fn with_user(mut self, user: Option<String>) -> Self {
+		self.user = user;
+		self
+	}
+
+	/// Request metadata object, passed through verbatim; `None` omits it.
+	pub fn with_metadata(mut self, metadata: Option<serde_json::Value>) -> Self {
+		self.metadata = metadata;
+		self
+	}
+
 	/// Effective prompt-cache identity: explicit key, else provider session id.
 	///
 	/// Mirrors `getOpenAIPromptCacheKey`: `promptCacheKey ?? sessionId`, normalized
@@ -273,30 +383,57 @@ impl OpenAiCompatibleProvider {
 				})
 			},
 		};
+		let tools = if self.supports_strict_mode {
+			tools.to_vec()
+		} else {
+			tools.iter().map(strip_strict).collect()
+		};
+		let (max_tokens, max_completion_tokens) = match (self.max_tokens, self.max_tokens_field) {
+			(Some(cap), MaxTokensField::MaxTokens) => (Some(cap), None),
+			(Some(cap), MaxTokensField::MaxCompletionTokens) => (None, Some(cap)),
+			(None, _) => (None, None),
+		};
 		Ok(OpenAiChatRequest {
 			model: self.model.clone(),
-			messages: to_openai_messages(messages)?,
-			tools: tools.to_vec(),
+			messages: to_openai_messages_with_developer_role(messages, self.developer_role)?,
+			tools,
 			tool_choice,
 			stream,
 			stream_options: (stream && self.usage_in_streaming)
 				.then_some(OpenAiStreamOptions { include_usage: true }),
-			reasoning_effort: if self.force_reasoning_off {
+			store: self.supports_store.then_some(true),
+			reasoning_effort: if !self.supports_reasoning_effort {
+				None
+			} else if self.force_reasoning_off {
 				Some("none".to_string())
 			} else {
-				self.effort.clone()
+				self.effort.as_deref().map(|effort| {
+					self.reasoning_effort_map
+						.get(effort)
+						.cloned()
+						.unwrap_or_else(|| effort.to_string())
+				})
 			},
 			prompt_cache_key: self.prompt_cache_enabled.then(|| self.prompt_cache_key()).flatten(),
 			service_tier: self.service_tier.clone(),
-			max_tokens: None,
-			max_completion_tokens: None,
-			temperature: None,
-			top_p: None,
-			stop: None,
-			user: None,
-			metadata: None,
+			max_tokens,
+			max_completion_tokens,
+			temperature: self.temperature,
+			top_p: self.top_p,
+			stop: self.stop.clone(),
+			user: self.user.clone(),
+			metadata: self.metadata.clone(),
 		})
 	}
+}
+
+/// Drop `function.strict` for dialects that reject OpenAI strict-mode schemas.
+fn strip_strict(tool: &serde_json::Value) -> serde_json::Value {
+	let mut tool = tool.clone();
+	if let Some(function) = tool.get_mut("function").and_then(serde_json::Value::as_object_mut) {
+		function.remove("strict");
+	}
+	tool
 }
 
 impl OpenAiCompatibleProvider {
@@ -431,7 +568,11 @@ impl ModelProvider for OpenAiCompatibleProvider {
 		let finish_reason = choice.finish_reason.clone();
 		let mut message = from_openai_response(choice.message);
 		message.usage = usage;
-		if let Some(reason) = finish_reason.as_deref() {
+		// A refusal already surfaced as a terminal error must not be downgraded
+		// by the host's benign `finish_reason: "stop"`.
+		if let Some(reason) = finish_reason.as_deref()
+			&& message.stop_reason.is_none()
+		{
 			let (stop_reason, error_message) = map_openai_finish_reason(reason);
 			message.stop_reason = Some(stop_reason);
 			message.error_message = error_message;
@@ -731,5 +872,180 @@ mod tests {
 			matches!(&err, ProviderError::Protocol(text) if text.contains("exceeded")),
 			"got {err:?}"
 		);
+	}
+
+	#[test]
+	fn compat_builders_shape_the_chat_request() {
+		let provider = OpenAiCompatibleProvider::new("https://example.test/v1", "key", "model-x")
+			.expect("build")
+			.with_developer_role(false)
+			.with_effort(Some("high".to_string()))
+			.with_effort_map(BTreeMap::from([(
+				"high".to_string(),
+				"medium".to_string(),
+			)]))
+			.with_max_tokens_field(MaxTokensField::MaxTokens)
+			.with_max_tokens(Some(1234))
+			.with_strict_mode(false)
+			.with_store(false)
+			.with_temperature(Some(0.2))
+			.with_top_p(Some(0.9))
+			.with_stop(Some(serde_json::json!(["END"])))
+			.with_user(Some("user-1".to_string()))
+			.with_metadata(Some(serde_json::json!({"trace": "t1"})));
+		let tools = vec![serde_json::json!({
+			"type": "function",
+			"function": {
+				"name": "read",
+				"description": "Read a file",
+				"parameters": {"type": "object"},
+				"strict": true
+			}
+		})];
+		let request = provider
+			.request(&[Message::developer("policy")], &tools, &ToolChoice::Auto, false)
+			.expect("request");
+		let payload = serde_json::to_value(request).expect("serialize");
+		assert_eq!(payload["messages"][0]["role"], "system", "developer folds: {payload}");
+		assert_eq!(payload["reasoning_effort"], "medium");
+		assert_eq!(payload["max_tokens"], 1234);
+		assert!(payload.get("max_completion_tokens").is_none());
+		assert!(payload.get("store").is_none(), "store omitted: {payload}");
+		assert!(payload["tools"][0]["function"].get("strict").is_none());
+		assert_eq!(payload["temperature"], 0.2);
+		assert_eq!(payload["top_p"], 0.9);
+		assert_eq!(payload["stop"], serde_json::json!(["END"]));
+		assert_eq!(payload["user"], "user-1");
+		assert_eq!(payload["metadata"], serde_json::json!({"trace": "t1"}));
+	}
+
+	#[test]
+	fn compat_defaults_send_store_and_keep_strict_schemas() {
+		let provider = OpenAiCompatibleProvider::new("https://example.test/v1", "key", "model-x")
+			.expect("build");
+		let tools = vec![serde_json::json!({
+			"type": "function",
+			"function": {
+				"name": "read",
+				"description": "Read a file",
+				"parameters": {"type": "object"},
+				"strict": true
+			}
+		})];
+		let payload = serde_json::to_value(
+			provider
+				.request(&[], &tools, &ToolChoice::Auto, true)
+				.expect("request"),
+		)
+		.expect("serialize");
+		assert_eq!(payload["store"], true);
+		assert_eq!(payload["tools"][0]["function"]["strict"], true);
+	}
+
+	#[test]
+	fn max_completion_tokens_and_unsupported_effort_shape_the_body() {
+		let provider = OpenAiCompatibleProvider::new("https://example.test/v1", "key", "model-x")
+			.expect("build")
+			.with_effort(Some("high".to_string()))
+			.with_force_reasoning_off(true)
+			.with_reasoning_effort_support(false)
+			.with_max_tokens_field(MaxTokensField::MaxCompletionTokens)
+			.with_max_tokens(Some(7));
+		let payload = serde_json::to_value(
+			provider
+				.request(&[], &[], &ToolChoice::Auto, false)
+				.expect("request"),
+		)
+		.expect("serialize");
+		assert!(
+			payload.get("reasoning_effort").is_none(),
+			"unsupported effort is omitted: {payload}"
+		);
+		assert_eq!(payload["max_completion_tokens"], 7);
+		assert!(payload.get("max_tokens").is_none());
+	}
+
+	#[tokio::test]
+	async fn complete_preserves_refusal_error_over_stop_finish_reason() {
+		let body = br#"{"choices":[{"message":{"role":"assistant","content":null,"refusal":"blocked by safety"},"finish_reason":"stop"}]}"#.to_vec();
+		let base_url = serve_once(200, body).await;
+		let provider = OpenAiCompatibleProvider::new(base_url, "key", "model-x").expect("build");
+		let message = provider
+			.complete(&[], &[], &ToolChoice::Auto)
+			.await
+			.expect("complete");
+		assert!(message.content.is_empty());
+		assert_eq!(message.stop_reason, Some(StopReason::Error));
+		assert_eq!(message.error_message.as_deref(), Some("blocked by safety"));
+	}
+
+	#[tokio::test]
+	async fn stream_preserves_refusal_error_after_trailing_stop_chunk() {
+		let sse = concat!(
+			"data: {\"choices\":[{\"delta\":{\"refusal\":\"blocked by safety\"}}]}\n\n",
+			"data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+			"data: [DONE]\n\n",
+		)
+		.as_bytes()
+		.to_vec();
+		let base_url = serve_once(200, sse).await;
+		let provider = OpenAiCompatibleProvider::new(base_url, "key", "model-x").expect("build");
+		let mut stream = provider.stream(&[], &[], &ToolChoice::Auto).await.expect("stream");
+		let mut assembler = StreamAssembler::new();
+		while let Some(item) = stream.next().await {
+			assembler.push(&item.expect("chunk")).expect("push");
+		}
+		let message = assembler.finish().expect("finish");
+		assert!(message.content.is_empty());
+		assert_eq!(message.stop_reason, Some(StopReason::Error));
+		assert_eq!(message.error_message.as_deref(), Some("blocked by safety"));
+	}
+
+	#[tokio::test]
+	async fn stream_accumulates_split_refusal_deltas() {
+		let sse = concat!(
+			"data: {\"choices\":[{\"delta\":{\"refusal\":\"I cannot\"}}]}\n\n",
+			"data: {\"choices\":[{\"delta\":{\"refusal\":\" \"}}]}\n\n",
+			"data: {\"choices\":[{\"delta\":{\"refusal\":\"help with that\"}}]}\n\n",
+			"data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+			"data: [DONE]\n\n",
+		)
+		.as_bytes()
+		.to_vec();
+		let base_url = serve_once(200, sse).await;
+		let provider = OpenAiCompatibleProvider::new(base_url, "key", "model-x").expect("build");
+		let mut stream = provider.stream(&[], &[], &ToolChoice::Auto).await.expect("stream");
+		let mut assembler = StreamAssembler::new();
+		while let Some(item) = stream.next().await {
+			assembler.push(&item.expect("chunk")).expect("push");
+		}
+		let message = assembler.finish().expect("finish");
+		assert!(message.content.is_empty());
+		assert_eq!(message.stop_reason, Some(StopReason::Error));
+		assert_eq!(message.error_message.as_deref(), Some("I cannot help with that"));
+	}
+
+	#[tokio::test]
+	async fn stream_runs_tool_calls_when_refusal_delta_precedes_them() {
+		let sse = concat!(
+			"data: {\"choices\":[{\"delta\":{\"refusal\":\"nope\"}}]}\n\n",
+			"data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"function\":{\"name\":\"read\",\"arguments\":\"{}\"}}]}}]}\n\n",
+			"data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n",
+			"data: [DONE]\n\n",
+		)
+		.as_bytes()
+		.to_vec();
+		let base_url = serve_once(200, sse).await;
+		let provider = OpenAiCompatibleProvider::new(base_url, "key", "model-x").expect("build");
+		let mut stream = provider.stream(&[], &[], &ToolChoice::Auto).await.expect("stream");
+		let mut assembler = StreamAssembler::new();
+		while let Some(item) = stream.next().await {
+			assembler.push(&item.expect("chunk")).expect("push");
+		}
+		let message = assembler.finish().expect("finish");
+		assert_eq!(message.stop_reason, Some(StopReason::ToolUse));
+		assert!(message.error_message.is_none());
+		assert_eq!(message.tool_calls.len(), 1);
+		assert_eq!(message.tool_calls[0].name, "read");
 	}
 }

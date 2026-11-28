@@ -5751,6 +5751,7 @@ mod tests {
 			_tool_choice: &ToolChoice,
 		) -> std::result::Result<ChunkStream, ProviderError> {
 			let chunk = crate::provider::StreamChunk {
+				refusal: None,
 				content: Some("partial answer".to_string()),
 				reasoning: None,
 				tool_call_deltas: Vec::new(),

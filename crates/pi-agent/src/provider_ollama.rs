@@ -3887,6 +3887,7 @@ fn delta_chunk(
 	content_index: usize,
 ) -> StreamChunk {
 	StreamChunk {
+		refusal: None,
 		content,
 		reasoning,
 		tool_call_deltas,
@@ -3907,6 +3908,7 @@ fn done_chunk(
 	error_message: Option<String>,
 ) -> StreamChunk {
 	StreamChunk {
+		refusal: None,
 		content: None,
 		reasoning: None,
 		tool_call_deltas: Vec::new(),

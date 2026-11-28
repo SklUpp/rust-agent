@@ -89,6 +89,7 @@ impl ModelProvider for TestProvider {
 fn text_stream(reply: &str) -> ChunkStream {
 	let items: Vec<Result<StreamChunk, ProviderError>> = vec![
 		Ok(StreamChunk {
+			refusal: None,
 			content: Some(reply.to_string()),
 			tool_call_deltas: Vec::new(),
 			usage: None,
@@ -102,6 +103,7 @@ fn text_stream(reply: &str) -> ChunkStream {
 			error_message: None,
 		}),
 		Ok(StreamChunk {
+			refusal: None,
 			content: None,
 			tool_call_deltas: Vec::new(),
 			usage: None,

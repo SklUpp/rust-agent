@@ -3746,6 +3746,7 @@ fn is_known_event(kind: &str) -> bool {
 
 fn empty_chunk() -> StreamChunk {
 	StreamChunk {
+		refusal: None,
 		content: None,
 		reasoning: None,
 		tool_call_deltas: Vec::new(),

@@ -122,6 +122,7 @@ impl ModelProvider for NoopProvider {
 
 fn text_chunk(content: String) -> StreamChunk {
 	StreamChunk {
+		refusal: None,
 		content: Some(content),
 		reasoning: None,
 		tool_call_deltas: Vec::new(),
@@ -138,6 +139,7 @@ fn text_chunk(content: String) -> StreamChunk {
 
 fn done_chunk() -> StreamChunk {
 	StreamChunk {
+		refusal: None,
 		content: None,
 		reasoning: None,
 		tool_call_deltas: Vec::new(),
@@ -205,6 +207,7 @@ impl ModelProvider for GatedProvider {
 			let reply = self.reply.clone();
 			return Ok(Box::pin(stream::iter(vec![
 				Ok(StreamChunk {
+					refusal: None,
 					content: Some(reply),
 					reasoning: None,
 					tool_call_deltas: vec![delta],

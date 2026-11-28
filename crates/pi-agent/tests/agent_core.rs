@@ -1966,6 +1966,7 @@ impl ModelProvider for StreamingProvider {
 
 fn text_chunk(delta: &str) -> StreamChunk {
 	StreamChunk {
+		refusal: None,
 		content: Some(delta.to_string()),
 		tool_call_deltas: Vec::new(),
 		usage: None,
@@ -1987,6 +1988,7 @@ fn tool_delta(
 	arguments_delta: Option<&str>,
 ) -> StreamChunk {
 	StreamChunk {
+		refusal: None,
 		content: None,
 		tool_call_deltas: vec![ToolCallDelta {
 			index,
@@ -2009,6 +2011,7 @@ fn tool_delta(
 
 fn done_chunk() -> StreamChunk {
 	StreamChunk {
+		refusal: None,
 		content: None,
 		reasoning: None,
 		tool_call_deltas: Vec::new(),
@@ -2119,6 +2122,7 @@ async fn streaming_keeps_tool_calls_finalized_across_turns() {
 async fn streaming_rejects_missing_tool_name() {
 	let mut assembler = StreamAssembler::new();
 	assembler.push(&StreamChunk {
+		refusal: None,
 		content: Some("text".to_string()),
 		tool_call_deltas: vec![ToolCallDelta {
 			index: 0,
@@ -2319,6 +2323,7 @@ fn reasoning_effort_is_serialized_only_when_set() {
 		tool_choice: None,
 		stream: false,
 		stream_options: None,
+		store: None,
 		reasoning_effort: None,
 		prompt_cache_key: None,
 		service_tier: None,

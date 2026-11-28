@@ -53,6 +53,7 @@ fn registry_with_builtins() -> ToolRegistry {
 
 fn stream_text(content: &str) -> StreamChunk {
 	StreamChunk {
+		refusal: None,
 		content: Some(content.to_string()),
 		reasoning: None,
 		tool_call_deltas: Vec::new(),
@@ -69,6 +70,7 @@ fn stream_text(content: &str) -> StreamChunk {
 
 fn stream_done() -> StreamChunk {
 	StreamChunk {
+		refusal: None,
 		content: None,
 		reasoning: None,
 		tool_call_deltas: Vec::new(),
@@ -93,6 +95,7 @@ fn message_chunks(message: &Message) -> Vec<Result<StreamChunk, ProviderError>> 
 	}
 	for (index, call) in message.tool_calls.iter().enumerate() {
 		chunks.push(Ok(StreamChunk {
+			refusal: None,
 			content: None,
 			reasoning: None,
 			tool_call_deltas: vec![ToolCallDelta {
