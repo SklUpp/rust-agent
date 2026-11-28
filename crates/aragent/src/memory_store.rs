@@ -2502,10 +2502,10 @@ fn load_embeddings_for_ids(
 		// Hand-edited rows can carry non-finite values; drop them here too so a
 		// lexical candidate falls back to the neutral score instead of
 		// poisoning hybrid scoring.
-		if let Some(vector) = decode_embedding(&blob, dim) {
-			if vector.iter().all(|value| value.is_finite()) {
-				embeddings.insert(id, vector);
-			}
+		if let Some(vector) = decode_embedding(&blob, dim)
+			&& vector.iter().all(|value| value.is_finite())
+		{
+			embeddings.insert(id, vector);
 		}
 	}
 	Ok(embeddings)
