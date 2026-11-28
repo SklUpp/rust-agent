@@ -666,7 +666,7 @@ const MISSING_VERBS: [&str; 15] = [
 /// Rust surfaces that are not TypeScript registry verbs. Every other clap
 /// subcommand also exists upstream (`packages/coding-agent/src/cli-commands.ts`),
 /// where `resolveCliArgv` hoists it ahead of the default `launch` command.
-const RUST_ONLY_VERBS: [&str; 3] = ["repl", "export", "check"];
+const RUST_ONLY_VERBS: [&str; 4] = ["repl", "export", "check", "security"];
 
 /// Whether the first operand names a verb the TypeScript runner dispatches.
 ///
@@ -1515,6 +1515,33 @@ pub enum Command {
 		/// Output as JSON.
 		#[arg(short = 'j', long)]
 		json:   bool,
+	},
+
+	/// Import external security results or inspect the project security store.
+	///
+	/// Usage: `arag security import-sarif <PATH>`, `import-codex <DIR>`,
+	/// `list`, or `show <SCAN_ID>`. Imports write the same project store
+	/// native scans use; `--repo` selects the repository root (default: the
+	/// current directory's git worktree).
+	Security {
+		/// `import-sarif`, `import-codex`, `list`, or `show`.
+		#[arg(
+			value_name = "ACTION",
+			value_parser = ["import-sarif", "import-codex", "list", "show"]
+		)]
+		action:  String,
+		/// SARIF file, Codex bundle directory, or scan id (`show`).
+		#[arg(value_name = "TARGET")]
+		target:  Option<PathBuf>,
+		/// Repository root (default: the current directory's git worktree).
+		#[arg(long, value_name = "DIR")]
+		repo:    Option<PathBuf>,
+		/// Fixed scan id for imports (default: a fresh `secscan_...`).
+		#[arg(long = "scan-id", value_name = "ID")]
+		scan_id: Option<String>,
+		/// Print machine-readable JSON.
+		#[arg(long)]
+		json:    bool,
 	},
 
 	/// On-disk storage maintenance (dry-run unless `--apply`).
@@ -2827,6 +2854,69 @@ mod tests {
 		);
 		// Destructive sub-actions are not exposed in this slice; clap rejects them.
 		assert!(Cli::try_parse_from(["arag", "grievances", "clean"]).is_err());
+	}
+
+	#[test]
+	fn security_subcommand_parses_imports_lists_and_shows() {
+		assert_eq!(
+			parse(&["arag", "security", "import-sarif", "results.sarif"]).command,
+			Some(Command::Security {
+				action:  "import-sarif".to_string(),
+				target:  Some(PathBuf::from("results.sarif")),
+				repo:    None,
+				scan_id: None,
+				json:    false,
+			})
+		);
+		assert_eq!(
+			parse(&[
+				"arag",
+				"security",
+				"import-codex",
+				"bundle",
+				"--repo",
+				"/tmp/repo",
+				"--scan-id",
+				"secscan_abc",
+				"--json",
+			])
+			.command,
+			Some(Command::Security {
+				action:  "import-codex".to_string(),
+				target:  Some(PathBuf::from("bundle")),
+				repo:    Some(PathBuf::from("/tmp/repo")),
+				scan_id: Some("secscan_abc".to_string()),
+				json:    true,
+			})
+		);
+		assert_eq!(
+			parse(&["arag", "security", "list", "--json"]).command,
+			Some(Command::Security {
+				action:  "list".to_string(),
+				target:  None,
+				repo:    None,
+				scan_id: None,
+				json:    true,
+			})
+		);
+		assert_eq!(
+			parse(&["arag", "security", "show", "secscan_abc"]).command,
+			Some(Command::Security {
+				action:  "show".to_string(),
+				target:  Some(PathBuf::from("secscan_abc")),
+				repo:    None,
+				scan_id: None,
+				json:    false,
+			})
+		);
+		// The action is a closed set; the operand is positional only and the
+		// flags require values. `import-sarif` parses without a target: the
+		// handler, not clap, owns the per-action operand rule.
+		assert!(Cli::try_parse_from(["arag", "security"]).is_err());
+		assert!(Cli::try_parse_from(["arag", "security", "bogus"]).is_err());
+		assert!(Cli::try_parse_from(["arag", "security", "import-sarif"]).is_ok());
+		assert!(Cli::try_parse_from(["arag", "security", "list", "--repo"]).is_err());
+		assert!(Cli::try_parse_from(["arag", "security", "show", "id", "extra"]).is_err());
 	}
 
 	#[test]

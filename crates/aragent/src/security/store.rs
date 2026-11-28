@@ -97,7 +97,8 @@ struct SecurityStoreIndex {
 }
 
 /// `listScans` projection; findings are counted from the bundle.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct SecurityScanSummary {
 	pub id: String,
 	pub status: String,

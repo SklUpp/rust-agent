@@ -22,7 +22,10 @@ use pi_agent::{
 		EVAL_DEFAULT_TIMEOUT_SECS, EvalAllowance, EvalFlagOverrides, EvalHost, EvalRuntime,
 		EvalSessionInfo, EvalSettings, EvalTool, EvalToolBinder, Interpreters,
 	},
-	provider::{ModelProvider, ToolChoice},
+	provider::{
+		ModelProvider, ToolChoice,
+		oneshot_retry::{OneshotRetryOptions, retry_transient_completion},
+	},
 	state::{AgentContext, Message, ToolCall, ToolResult},
 	supervisor::{DelegationLimits, Supervisor},
 	tool::ToolError,
@@ -388,7 +391,18 @@ impl EvalHost for CliEvalHost {
 		}
 		let provider = self.provider_for(model)?;
 		let messages = completion_messages(prompt, system, schema)?;
-		let completion = provider.complete(&messages, &[], &ToolChoice::Auto);
+		// A oneshot completion has no streaming side effects, so a transient
+		// 429/5xx/network failure is replayed wholesale; deterministic failures
+		// (bad request, context overflow, tool-call parse errors) return at once.
+		// Dropping the retry future on cancellation also aborts a pending
+		// backoff sleep, so cancellation never waits for the schedule.
+		let completion = retry_transient_completion(
+			provider.as_ref(),
+			&messages,
+			&[],
+			&ToolChoice::Auto,
+			OneshotRetryOptions::default(),
+		);
 		let message = tokio::select! {
 			biased;
 			_ = ctx.cancellation_token.cancelled() => {
@@ -1061,6 +1075,153 @@ mod tests {
 			.await
 			.expect_err("cancelled completion");
 		assert!(error.contains("cancelled"));
+	}
+
+	#[tokio::test]
+	async fn completion_retries_transient_failures_wholesale() {
+		use std::sync::atomic::AtomicUsize;
+
+		struct FlakyProvider {
+			calls: Arc<AtomicUsize>,
+		}
+
+		#[async_trait]
+		impl ModelProvider for FlakyProvider {
+			async fn complete(
+				&self,
+				_messages: &[Message],
+				_tools: &[Value],
+				_tool_choice: &ToolChoice,
+			) -> Result<Message, pi_agent::provider::ProviderError> {
+				if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
+					return Err(pi_agent::provider::ProviderError::HttpStatus(503, String::new()));
+				}
+				Ok(Message::assistant("recovered"))
+			}
+
+			async fn stream(
+				&self,
+				_messages: &[Message],
+				_tools: &[Value],
+				_tool_choice: &ToolChoice,
+			) -> Result<pi_agent::provider::ChunkStream, pi_agent::provider::ProviderError> {
+				unreachable!("completion tests never stream")
+			}
+		}
+
+		let calls = Arc::new(AtomicUsize::new(0));
+		let mut host = host(None);
+		host.provider = Arc::new(FlakyProvider { calls: Arc::clone(&calls) });
+		let ctx = AgentContext::new(PathBuf::from("."));
+		let value = host
+			.completion(json!({"prompt": "answer"}), &ctx)
+			.await
+			.expect("transient retry recovers");
+		assert_eq!(value["text"], "recovered");
+		assert_eq!(calls.load(Ordering::SeqCst), 2, "one failed attempt then success");
+	}
+
+	#[tokio::test]
+	async fn completion_fails_fast_on_deterministic_errors() {
+		use std::sync::atomic::AtomicUsize;
+
+		struct RejectingProvider {
+			calls: Arc<AtomicUsize>,
+		}
+
+		#[async_trait]
+		impl ModelProvider for RejectingProvider {
+			async fn complete(
+				&self,
+				_messages: &[Message],
+				_tools: &[Value],
+				_tool_choice: &ToolChoice,
+			) -> Result<Message, pi_agent::provider::ProviderError> {
+				self.calls.fetch_add(1, Ordering::SeqCst);
+				Err(pi_agent::provider::ProviderError::HttpStatus(
+					400,
+					"invalid request".to_string(),
+				))
+			}
+
+			async fn stream(
+				&self,
+				_messages: &[Message],
+				_tools: &[Value],
+				_tool_choice: &ToolChoice,
+			) -> Result<pi_agent::provider::ChunkStream, pi_agent::provider::ProviderError> {
+				unreachable!("completion tests never stream")
+			}
+		}
+
+		let calls = Arc::new(AtomicUsize::new(0));
+		let mut host = host(None);
+		host.provider = Arc::new(RejectingProvider { calls: Arc::clone(&calls) });
+		let ctx = AgentContext::new(PathBuf::from("."));
+		let error = host
+			.completion(json!({"prompt": "answer"}), &ctx)
+			.await
+			.expect_err("deterministic failure surfaces");
+		assert!(error.starts_with("completion failed: "), "{error}");
+		assert_eq!(calls.load(Ordering::SeqCst), 1, "a 400 must never replay");
+	}
+
+	#[tokio::test(flavor = "current_thread", start_paused = true)]
+	async fn completion_cancellation_aborts_during_retry() {
+		use std::{
+			sync::atomic::AtomicUsize,
+			time::Duration,
+		};
+
+		struct FailingProvider {
+			calls: Arc<AtomicUsize>,
+		}
+
+		#[async_trait]
+		impl ModelProvider for FailingProvider {
+			async fn complete(
+				&self,
+				_messages: &[Message],
+				_tools: &[Value],
+				_tool_choice: &ToolChoice,
+			) -> Result<Message, pi_agent::provider::ProviderError> {
+				self.calls.fetch_add(1, Ordering::SeqCst);
+				// Transient, so the retry loop continues and sleeps in backoff.
+				Err(pi_agent::provider::ProviderError::Network("connection reset".to_string()))
+			}
+
+			async fn stream(
+				&self,
+				_messages: &[Message],
+				_tools: &[Value],
+				_tool_choice: &ToolChoice,
+			) -> Result<pi_agent::provider::ChunkStream, pi_agent::provider::ProviderError> {
+				unreachable!("completion tests never stream")
+			}
+		}
+
+		let calls = Arc::new(AtomicUsize::new(0));
+		let token = CancellationToken::new();
+		let cancel = token.clone();
+		let mut host = host(None);
+		host.provider = Arc::new(FailingProvider { calls: Arc::clone(&calls) });
+		let ctx = AgentContext::with_cancellation(PathBuf::from("."), token);
+		// The current-thread runtime only polls this task once the completion
+		// future yields inside the retry loop, so by the time it runs the loop
+		// has taken its transient error and is parked in the backoff sleep.
+		// The paused clock makes the advance local and the cancellation has no
+		// wall-clock component.
+		tokio::spawn(async move {
+			tokio::task::yield_now().await;
+			tokio::time::advance(Duration::from_millis(20)).await;
+			cancel.cancel();
+		});
+		let error = host
+			.completion(json!({"prompt": "answer"}), &ctx)
+			.await
+			.expect_err("cancellation during retry");
+		assert!(error.contains("cancelled"), "{error}");
+		assert_eq!(calls.load(Ordering::SeqCst), 1, "no attempt may follow cancellation");
 	}
 
 	#[test]

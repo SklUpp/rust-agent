@@ -59,4 +59,4 @@ test-support = ["pi-agent/test-support"]
 [dev-dependencies]
 clap.workspace = true
 futures.workspace = true
-tokio = { workspace = true, features = ["full"] }
+tokio = { workspace = true, features = ["full", "test-util"] }

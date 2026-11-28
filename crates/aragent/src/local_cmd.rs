@@ -1037,7 +1037,7 @@ const TTSR_SOURCES: [&str; 3] = ["text", "thinking", "tool"];
 /// Escape terminal control characters from project/DB-provided text before
 /// human-readable rendering. ESC/OSC/CSI and other C0/C1 controls are emitted
 /// as visible `\u{..}` escapes; JSON serialization is untouched.
-fn escape_terminal_text(input: &str, keep_newlines: bool) -> String {
+pub(crate) fn escape_terminal_text(input: &str, keep_newlines: bool) -> String {
 	let mut out = String::with_capacity(input.len());
 	for ch in input.chars() {
 		if ch.is_control() {

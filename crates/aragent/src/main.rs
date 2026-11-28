@@ -39,6 +39,7 @@ use aragent::{
 		session::{RpcLaunch, SteerFn, SteeringMessage},
 	},
 	runtime::{self, PiAgentRunner},
+	security_cmd,
 	session::{
 		self, ContentPart, MessageContent, MessageEntry, SessionHeader, SessionMessage,
 		SessionOptions, SessionStore, TurnBuilder, TurnRecord,
@@ -92,6 +93,28 @@ fn base_dir(cli: &Cli) -> Result<PathBuf> {
 		Some(cwd) => Ok(dirs::absolute(&std::env::current_dir()?, cwd)),
 		None => Ok(std::env::current_dir()?),
 	}
+}
+
+/// `arag security` dispatch, split out of `run()` so a test can drive
+/// clap-parsed argv through the real handler with an isolated state root.
+fn run_security_command(
+	cli: &Cli,
+	state_root: Option<&Path>,
+	out: &mut impl Write,
+) -> std::result::Result<(), CliError> {
+	let base = base_dir(cli)?;
+	let Some(Command::Security { action, target, repo, scan_id, json }) = &cli.command else {
+		return Err(CliError::usage("security dispatch requires a `security` command"));
+	};
+	let request = security_cmd::Request {
+		action:  action.clone(),
+		target:  target.clone(),
+		repo:    repo.clone(),
+		scan_id: scan_id.clone(),
+		json:    *json,
+	};
+	security_cmd::run_with_state_root(&request, &base, state_root, out)
+		.map_err(|err| CliError::fail(err.to_string()))
 }
 
 /// `arag trust` dispatch: an explicit relative `PATH` is relative to the
@@ -899,6 +922,13 @@ fn run() -> std::result::Result<(), CliError> {
 			out.flush()?;
 			err.flush()?;
 			return local_exit(code);
+		},
+		Some(Command::Security { .. }) => {
+			let stdout = io::stdout();
+			let mut out = io::BufWriter::new(stdout.lock());
+			run_security_command(&cli, None, &mut out)?;
+			out.flush().map_err(|err| CliError::fail(err.to_string()))?;
+			return Ok(());
 		},
 		Some(Command::Completions { shell }) => {
 			return completions::run(shell.as_deref()).map_err(|message| CliError::fail(message));
@@ -6038,5 +6068,148 @@ mod tests {
 			assert!(redacted.contains("[REDACTED]"));
 		}
 		let _ = std::fs::remove_dir_all(&dir);
+	}
+
+	/// `arag security` end to end from parsed argv: both importers, `list`,
+	/// `show` (JSON and text), and the failure exits share one isolated store.
+	#[test]
+	fn security_cli_imports_lists_shows_and_rejects_bad_input() {
+		const SARIF: &str = r#"{
+			"version": "2.1.0",
+			"runs": [{
+				"tool": {"driver": {"name": "demo"}},
+				"results": [{
+					"ruleId": "rust.unsafe",
+					"message": {"text": "unsafe block"},
+					"locations": [{"physicalLocation": {
+						"artifactLocation": {"uri": "src/a.rs"},
+						"region": {"startLine": 3}
+					}}]
+				}]
+			}]
+		}"#;
+		const CODEX_MANIFEST: &str = r#"{
+			"documentType": "codex-security.scan-manifest",
+			"schemaVersion": "1.0",
+			"scan": {
+				"id": "codex-scan-1",
+				"startedAt": "2026-01-01T00:00:00Z",
+				"completedAt": "2026-01-01T00:00:01Z"
+			}
+		}"#;
+		const CODEX_FINDINGS: &str = r#"{
+			"documentType": "codex-security.findings",
+			"schemaVersion": "1.0",
+			"scanId": "codex-scan-1",
+			"findings": [{
+				"findingId": "F1",
+				"ruleId": "rust.unsafe",
+				"title": "Unsafe block",
+				"summary": "writes through a raw pointer",
+				"severity": {"level": "high"},
+				"locations": [{"path": "src/a.rs", "startLine": 2}]
+			}]
+		}"#;
+
+		let root = std::env::temp_dir().join(format!(
+			"aragent-security-cli-{}-{}",
+			std::process::id(),
+			line!()
+		));
+		let _ = std::fs::remove_dir_all(&root);
+		let repo = root.join("repo");
+		let state = root.join("state");
+		std::fs::create_dir_all(repo.join("src")).expect("repo");
+		let sarif_path = repo.join("results.sarif");
+		std::fs::write(&sarif_path, SARIF).expect("sarif");
+		let bundle = root.join("codex-bundle");
+		std::fs::create_dir_all(&bundle).expect("bundle");
+		std::fs::write(bundle.join("manifest.json"), CODEX_MANIFEST).expect("manifest");
+		std::fs::write(bundle.join("findings.json"), CODEX_FINDINGS).expect("findings");
+
+		let repo_text = repo.to_str().expect("utf8 repo");
+		let sarif_text = sarif_path.to_str().expect("utf8 sarif");
+		let bundle_text = bundle.to_str().expect("utf8 bundle");
+		// Parses the same argv clap sees in `run()`, then calls the same
+		// dispatch helper; only the state root is injected.
+		let security = |args: &[&str], out: &mut Vec<u8>| {
+			let mut argv = vec!["arag", "--cwd", repo_text];
+			argv.extend_from_slice(args);
+			let cli = parse_cli(argv.iter().map(std::ffi::OsString::from).collect());
+			run_security_command(&cli, Some(&state), out)
+		};
+
+		let mut out = Vec::new();
+		security(
+			&["security", "import-sarif", sarif_text, "--scan-id", "secscan_cli01", "--json"],
+			&mut out,
+		)
+		.expect("import-sarif");
+		let imported: serde_json::Value = serde_json::from_slice(&out).expect("import json");
+		assert_eq!(imported["id"], "secscan_cli01");
+		assert_eq!(imported["findingIds"].as_array().expect("finding ids").len(), 1);
+
+		let mut out = Vec::new();
+		security(
+			&["security", "import-codex", bundle_text, "--scan-id", "secscan_cli02", "--json"],
+			&mut out,
+		)
+		.expect("import-codex");
+		let imported: serde_json::Value = serde_json::from_slice(&out).expect("codex json");
+		assert_eq!(imported["id"], "secscan_cli02");
+		assert_eq!(imported["findingIds"].as_array().expect("finding ids").len(), 1);
+
+		let mut out = Vec::new();
+		security(&["security", "list", "--json"], &mut out).expect("list");
+		let listed: serde_json::Value = serde_json::from_slice(&out).expect("list json");
+		let ids: Vec<&str> = listed
+			.as_array()
+			.expect("summaries")
+			.iter()
+			.filter_map(|summary| summary["id"].as_str())
+			.collect();
+		assert!(ids.contains(&"secscan_cli01"), "{listed}");
+		assert!(ids.contains(&"secscan_cli02"), "{listed}");
+
+		let mut out = Vec::new();
+		security(&["security", "show", "secscan_cli01", "--json"], &mut out).expect("show");
+		let shown: serde_json::Value = serde_json::from_slice(&out).expect("show json");
+		assert_eq!(shown["scan"]["id"], "secscan_cli01");
+		assert_eq!(shown["findings"][0]["ruleId"], "rust.unsafe");
+
+		let mut out = Vec::new();
+		security(&["security", "show", "secscan_cli02"], &mut out).expect("show text");
+		let text = String::from_utf8(out).expect("utf8");
+		assert!(text.contains("secscan_cli02 [completed]"), "{text}");
+		assert!(text.contains("[src/a.rs:2]"), "{text}");
+
+		let error =
+			security(&["security", "show", "secscan_missing"], &mut Vec::new()).expect_err("unknown scan");
+		assert_eq!(error.code, aragent::EXIT_FAILURE);
+		assert!(error.message.contains("Unknown security scan"), "{}", error.message);
+
+		let error =
+			security(&["security", "list", "extra"], &mut Vec::new()).expect_err("list operand");
+		assert_eq!(error.code, aragent::EXIT_FAILURE);
+		assert!(error.message.contains("takes no operand"), "{}", error.message);
+
+		let missing = root.join("missing.sarif");
+		let error = security(
+			&["security", "import-sarif", missing.to_str().expect("utf8")],
+			&mut Vec::new(),
+		)
+		.expect_err("missing sarif");
+		assert_eq!(error.code, aragent::EXIT_FAILURE);
+
+		let missing_bundle = root.join("missing-bundle");
+		let error = security(
+			&["security", "import-codex", missing_bundle.to_str().expect("utf8")],
+			&mut Vec::new(),
+		)
+		.expect_err("missing codex bundle");
+		assert_eq!(error.code, aragent::EXIT_FAILURE);
+		assert!(error.message.contains("Codex Security"), "{}", error.message);
+
+		let _ = std::fs::remove_dir_all(&root);
 	}
 }
