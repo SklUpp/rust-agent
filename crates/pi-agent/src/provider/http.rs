@@ -737,11 +737,12 @@ impl ModelProvider for OpenAiCompatibleProvider {
 							Some((Ok(chunk), (inner, refusal_acc, None, false)))
 						},
 						None => flush_refusal(&mut refusal_acc, secrets, redactor.as_ref())
-							.map(|chunk| (Ok(chunk), (inner, refusal_acc, None, false))),
+							.map(|chunk| (Ok(chunk), (inner, refusal_acc, None, true))),
 					}
 				}
 			},
 		)
+		.fuse()
 		.boxed();
 		Ok(super::thinking_loop::guard_chunk_stream(chunks, &self.model))
 	}
